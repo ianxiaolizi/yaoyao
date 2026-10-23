@@ -94,7 +94,13 @@ try {
             if (-not $total) {
                 throw 'the coverage report has no TOTAL line to read'
             }
-            $measured = [double](($total -split '\s+')[3].TrimEnd('%'))
+            # `cargo llvm-cov report` prints one table row per file:
+            #   name | regions | missed regions | region cover | functions |
+            #   missed functions | executed | lines | missed lines | line cover
+            # (branch columns, when present, follow the line block). The gate's
+            # name, its threshold, and the baseline's `measured.lines` are all
+            # line coverage, so read column 9, not the region column at 3.
+            $measured = [double](($total -split '\s+')[9].TrimEnd('%'))
             if ($measured -lt $Threshold) {
                 Write-Host "coverage gate failed: line coverage $measured% is below $Threshold%"
                 $gate = 1
