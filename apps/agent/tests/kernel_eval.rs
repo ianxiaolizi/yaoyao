@@ -30,11 +30,10 @@
 //! | `retry` | state — the named file is absent; a sibling holds the answer |
 //! | `fresh` | time — the file is rewritten between turns, so the first reading is stale |
 //!
-//! Run the judgment fixtures with `AGENT_JUDGMENT=off` for the baseline arm on
-//! the same build, or `AGENT_JUDGMENT=gates` for the middle arm: the
-//! deterministic repeat and stale-read refusals without the ledger's tool and
-//! advice. The report counts the gate's firings and the records either way, so
-//! the arms compare row by row.
+//! The default arm is `gates`; the report counts the gate's firings and the
+//! records either way, so the arms compare row by row. Set `AGENT_JUDGMENT=on`
+//! for the full ledger and `AGENT_JUDGMENT=off` for the baseline that predates
+//! the pipeline.
 //!
 //! Four fixtures probe the second cut of the thinking pipeline. Two of its
 //! requirements are advice now — a sentence in the task layer, never a hold —
@@ -1521,11 +1520,11 @@ fn print_report(reports: &[TaskReport]) {
     let reconciled = reports.iter().filter(|report| report.reconciled).count();
     let judgment_arm = std::env::var("AGENT_JUDGMENT")
         .map(|value| value.trim().to_ascii_lowercase())
-        .unwrap_or_else(|_| String::from("on"));
+        .unwrap_or_else(|_| String::from("gates"));
     let arm = match judgment_arm.as_str() {
         "off" => "off (baseline arm)",
-        "gates" => "gates only (no ledger)",
-        _ => "on",
+        "on" | "full" => "on (full ledger)",
+        _ => "gates only (default, no ledger)",
     };
     println!(
         "summary: solved {solved}/{total}; failures {episodes}; evidence-first {evidence}, \

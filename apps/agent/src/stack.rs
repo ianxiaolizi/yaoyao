@@ -89,8 +89,8 @@ pub struct Inputs {
     /// controls of their own.
     pub network_allowed: bool,
     /// Whether the loop runs the thinking pipeline at all. The binary passes
-    /// true; [`judgment_arm`] then reads `AGENT_JUDGMENT` to pick the full
-    /// pipeline, the deterministic gates without the ledger, or neither.
+    /// true; [`judgment_arm`] then reads `AGENT_JUDGMENT` to pick the default
+    /// deterministic gates, the full ledger, or neither.
     /// A test whose subject is another boundary states the premise here.
     pub judgment: bool,
 }
@@ -144,9 +144,10 @@ pub enum StackError {
 
 /// Which part of the thinking pipeline a run gets.
 ///
-/// The three arms exist for the evaluation: `Full` is the product, `Gates` is
-/// the control that keeps the deterministic refusals without the ledger's tool
-/// and advice, and `Off` is the baseline that predates the pipeline.
+/// The arms exist for the evaluation and for audit runs: `Gates` is the
+/// product default (the deterministic refusals, without the ledger's tool and
+/// advice), `Full` adds the ledger, and `Off` is the baseline that predates
+/// the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JudgmentArm {
     Full,
@@ -154,7 +155,7 @@ enum JudgmentArm {
     Off,
 }
 
-/// Read the arm from `AGENT_JUDGMENT` (default `on`).
+/// Read the arm from `AGENT_JUDGMENT` (default `gates`).
 ///
 /// `enabled` is the caller's premise; `false` forces `Off` without reading the
 /// environment, which is what a test that disables the pipeline means.
@@ -163,7 +164,7 @@ fn judgment_arm(enabled: bool) -> Result<JudgmentArm, StackError> {
         return Ok(JudgmentArm::Off);
     }
     match std::env::var("AGENT_JUDGMENT").ok().as_deref().map(str::trim) {
-        None | Some("") => Ok(JudgmentArm::Full),
+        None | Some("") => Ok(JudgmentArm::Gates),
         Some(value) if value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("full") => {
             Ok(JudgmentArm::Full)
         }
@@ -575,11 +576,11 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     if let Some(advisor) = advisor {
         loop_ = loop_.with_decisions(advisor);
     }
-    // The evaluation's arms: `AGENT_JUDGMENT=off` is the baseline that
-    // predates the pipeline, `gates` keeps the deterministic refusals without
-    // the ledger's tool and advice, and `on` (the default) is the product. The
-    // binary passes `judgment: true`; a test may pass false to state that it
-    // is not exercising the pipeline at all.
+    // The arms: `gates` (the default) keeps the deterministic refusals without
+    // the ledger's tool and advice, `on` adds the ledger for audit and the
+    // evaluation's full arm, and `off` is the baseline that predates the
+    // pipeline. The binary passes `judgment: true`; a test may pass false to
+    // state that it is not exercising the pipeline at all.
     match judgment_arm(judgment)? {
         JudgmentArm::Full => {}
         JudgmentArm::Gates => loop_ = loop_.without_ledger(),

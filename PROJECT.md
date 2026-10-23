@@ -184,6 +184,8 @@ cargo test -p agent --test m6_acceptance
 # 内核评测：真端点、真二进制，任务按结果判定，并记录失败之后的动作
 cargo test -p agent --test kernel_eval -- --ignored --nocapture
 # 重复次数、只跑指定 fixture、报告路径：KERNEL_EVAL_RUNS=3、KERNEL_EVAL_TASKS=recall,anchor、KERNEL_EVAL_REPORT=<path>
+# 思考流水线档位：gates（默认，只保留确定性闸门）/ on（完整 judgment 账本）/ off（评测基线）
+$env:AGENT_JUDGMENT = 'on'
 ```
 
 Windows 注意：Git Bash 的 `/usr/bin/link` 会遮蔽 MSVC 的 `link.exe` 导致链接失败，确保 VS C++ 工具路径在 PATH 中优先；VS Build Tools 2022 需装「使用 C++ 的桌面开发」工作负载。
