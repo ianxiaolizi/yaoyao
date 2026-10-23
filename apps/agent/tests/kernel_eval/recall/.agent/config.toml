@@ -1,0 +1,11 @@
+# A window small enough that the second turn's request has to summarize the
+# first one. Whatever the second turn knows about the first then comes from
+# the records compaction writes: the step ledger, the user's words, and the
+# failures — not from messages that are no longer sent.
+[budget]
+max_steps = 16
+max_tool_calls = 16
+wall_clock_timeout = "10m"
+max_input_tokens = 4000
+reserved_output_tokens = 500
+compact_at_percent = 60

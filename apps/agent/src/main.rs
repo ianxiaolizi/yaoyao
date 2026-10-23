@@ -1,0 +1,1994 @@
+//! Agent binary — the only concrete assembly point.
+//!
+//! Wires the real JSONL store, the default loop (echo model by default, a real
+//! OpenAI-compatible endpoint when `AGENT_MODEL_PROVIDER=openai`), the guarded
+//! tool gateway (policy + approval + resource boundary + redaction), and the
+//! kernel Scheduler/Inbox/Recovery into CLI commands.
+//!
+//! Everything shared by the commands — which session to act on, whether the
+//! output is structured — is read once from the parsed command line, and every
+//! command reports through one place so that `--events` means the same thing
+//! wherever it is used.
+
+#![deny(unsafe_code)]
+
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_cli::args::{self, Args, DEFAULT_SESSION};
+use agent_cli::context::run_context_inspect;
+use agent_cli::memory::{DEFAULT_SEARCH_LIMIT, run_memory_reindex, run_memory_search};
+use agent_cli::schedule::{
+    SERVE_POLL, Tick, earliest_due, next_wait, render_did_not_run, render_ran, run_schedule_at,
+    run_schedule_cancel, run_schedule_list, run_tick, tick_once,
+};
+use agent_cli::{
+    CliOutcome, CliOutput, LiveLines, Verdict, render_events, render_live, run_approve,
+    run_artifact_get, run_ask, run_deny, run_doctor, run_export, run_fork, run_interrupt,
+    run_resume, run_status, run_steer, run_tool,
+};
+use agent_index_sqlite::SqliteMemoryIndex;
+use agent_kernel::doctor::KernelDoctor;
+use agent_kernel::inbox::Inbox;
+use agent_ports::context_engine::ContextEngine;
+use agent_ports::event_store::EventStore;
+use agent_ports::live_event_bus::{LiveEventBus, LiveEventSubscription};
+use agent_protocol::ids::{EventSeq, SchemaVersion, SessionId, TurnId};
+use agent_store_artifact::FsArtifactStore;
+use agent_store_jsonl::JsonlEventStore;
+use futures_util::FutureExt;
+
+use agent::checks::{
+    BuildHealthCheck, ExecutionSandboxCheck, ProfileHealthCheck, SessionHealthCheck,
+};
+use agent::stack::Runtime;
+use agent::{config, plugins, sandbox, stack};
+
+/// The exit status of a command whose subject answered "no".
+///
+/// Reserved for an answer that *is* a refusal: the command ran, the thing it was
+/// asked about came back, and what came back was bad. Two commands have such a
+/// subject — `tool`, when the call itself failed, and `doctor`, when the build
+/// is unhealthy — and neither writes `1` itself: both say `AnsweredNo` and
+/// [`exit_on`] reads the number off. It is named here rather than there because
+/// it is about what the status means to a caller, not about which command
+/// happens to return it first.
+const EXIT_ANSWERED_NO: i32 = 1;
+
+/// The exit status of a command that did not run.
+///
+/// Every way a command can end without running: a usage error, a configuration
+/// that does not resolve, a name nobody registered, a call the gateway would not
+/// dispatch. The two statuses are the whole alphabet — a caller that reads only
+/// `$?` learns whether the answer was "no" or whether there was no answer at
+/// all — and this is the one that must never be confused with the other, because
+/// "nothing ran, read stderr" and "it ran, read the answer" call for opposite
+/// things next.
+const EXIT_DID_NOT_RUN: i32 = 2;
+
+/// The exit status a verdict calls for — the whole alphabet, in one place.
+///
+/// One place, because a second one would be a second answer to the same
+/// question: two sites that each decided what "no" costs could disagree, and
+/// nothing would say which was right. Everything a command learns about its own
+/// outcome arrives as a [`Verdict`]; this is what turns it into what a caller
+/// reads.
+fn exit_status(verdict: Verdict) -> i32 {
+    match verdict {
+        Verdict::Answered => 0,
+        Verdict::AnsweredNo => EXIT_ANSWERED_NO,
+        Verdict::DidNotRun => EXIT_DID_NOT_RUN,
+    }
+}
+
+/// End the process on a command's verdict, unless the verdict is an answer.
+///
+/// Every command that is handed a verdict ends here, so a verdict is honoured
+/// wherever it is produced rather than only where someone remembered. An
+/// `Answered` verdict is left alone: falling out of the command is the same
+/// exit, without skipping a destructor on the way.
+fn exit_on(verdict: Verdict) {
+    let status = exit_status(verdict);
+    if status != 0 {
+        std::process::exit(status);
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // The sandbox file worker runs this same binary inside the AppContainer. It
+    // is not a user command — it takes one root and speaks the worker protocol
+    // on stdio — so it is dispatched before the argument parser, which would
+    // refuse a command it does not know.
+    if argv.first().is_some_and(|argument| argument == agent_tools_fs::WORKER_COMMAND) {
+        let root = argv
+            .iter()
+            .position(|argument| argument == "--root")
+            .and_then(|index| argv.get(index + 1));
+        let Some(root) = root else {
+            eprintln!("the sandbox file worker needs --root");
+            std::process::exit(EXIT_DID_NOT_RUN);
+        };
+        match agent_tools_fs::serve_worker(Path::new(root)) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("the sandbox file worker failed: {error}");
+                std::process::exit(EXIT_DID_NOT_RUN);
+            }
+        }
+    }
+    let args = match args::parse(&argv) {
+        Ok(args) => args,
+        Err(args::ArgsError::NoCommand) => {
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    };
+
+    match args.command.as_str() {
+        "doctor" => doctor(&args).await,
+        "run" | "ask" => run(&args).await,
+        "resume" => resume(&args).await,
+        "fork" => fork(&args).await,
+        "steer" => steer(&args).await,
+        "interrupt" => interrupt(&args).await,
+        "export" => export(&args).await,
+        "status" => status(&args).await,
+        "approve" => approve(&args).await,
+        "deny" => deny(&args).await,
+        "tool" => tool(&args).await,
+        "plugin" => plugin(&args).await,
+        "schedule" => schedule(&args).await,
+        "tick" => tick(&args).await,
+        "serve" => serve(&args).await,
+        "memory" => memory(&args).await,
+        "context" => context(&args).await,
+        "artifact" => artifact(&args).await,
+        "sandbox" => sandbox_command(&args),
+        other => {
+            eprintln!("unknown command '{other}'");
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+fn usage() {
+    eprintln!(
+        "Usage: agent <command> [options]\n\n\
+         Commands:\n  \
+         run <text>                 Ask the agent to do something (alias: ask)\n  \
+         ask <text>                 Alias of run\n  \
+         resume [text]              Continue a turn that was waiting on a decision\n  \
+         fork [--at <turn>]         Derive a new session from a closed turn boundary\n  \
+         steer \"<text>\"           Queue text for the turn in flight (applied at the next step)\n  \
+         interrupt                  Stop the run in flight at its next step boundary\n  \
+         export [--out <dir>]       Write the session as session.md + bundle.json (or stdout)\n  \
+         export --redacted          Same, with secret-shaped tokens replaced by ***\n  \
+         status                     Show session state\n  \
+         approve <id> [scope]       Approve a pending request [once|turn|session|always]\n  \
+         deny <id> [--only]         Deny a pending request (cascades to the session's pending)\n  \
+         tool <name> [json-args]    Run a tool through the policy gateway\n  \
+         plugin list                What the configuration, the log and the queue say about plugins\n  \
+         plugin disable <id>        Ask for a plugin to be withdrawn at the next turn boundary\n  \
+         plugin enable <id>         Ask for a disabled plugin to be registered again\n  \
+         schedule at <when> <text>  Schedule a turn: RFC3339 or +10m; run it with tick\n  \
+         schedule list              Show scheduled turns that have not run\n  \
+         schedule cancel <id>       Withdraw a scheduled turn before it runs\n  \
+         tick                       Run at most one pending or due turn\n  \
+         serve                      Keep running turns as they become due (one per session)\n  \
+         memory search <text>       Find events whose text contains <text>\n  \
+         memory reindex             Rebuild the searchable index from the session log\n  \
+         context inspect            Show what the next request would carry (size, kinds, budget)\n  \
+         artifact get <ref> [--out] Fetch a stored blob (locator or hash). Text to stdout otherwise\n  \
+         sandbox setup              Create the AppContainer profile and its grants (elevated)\n  \
+         sandbox status             Report whether the AppContainer setup is in place\n  \
+         doctor                     Run health checks\n\n\
+         Options:\n  \
+         --session <id>             Act on this session (default: {DEFAULT_SESSION})\n  \
+         --profile <name>           Compose this profile for the run\n  \
+         --model <name>             Ask the provider for this model\n  \
+         --json                     One structured object on stdout\n  \
+         --events                   The events this command produced, one JSON object per line\n\
+         \nOptions may appear before or after the command. --json and --events are \
+         mutually exclusive.\n\n\
+         Configuration, in order of authority:\n  \
+         {managed}   machine-wide policy (deny list)\n  \
+         {user}      capabilities and trusted plugins\n  \
+         <workspace>/{workspace}   project configuration\n\
+         \nA profile selects inside what the user configuration authorized; it cannot add to it.",
+        managed = config::ENV_MANAGED_POLICY,
+        user = config::ENV_USER_CONFIG,
+        workspace = config::WORKSPACE_CONFIG,
+    );
+}
+
+async fn doctor(args: &Args) {
+    let schema_version = SchemaVersion::current();
+    let data_dir = PathBuf::from(data_dir());
+
+    // Zero wait, because a session another process is driving has no evidence
+    // to offer right now: waiting for the writer would make `doctor` hang behind
+    // a long turn, and judging the log mid-append would call a live writer's
+    // torn line a crash. The store is shared by the session checks so a log is
+    // replayed once, and `log_tail` is registered first because it reports the
+    // repair that replay performs.
+    let store = Arc::new(JsonlEventStore::new(&data_dir).with_lease_wait(Duration::ZERO));
+    let doctor = KernelDoctor::new(vec![
+        Box::new(BuildHealthCheck::new(schema_version.clone())),
+        Box::new(SessionHealthCheck::log_tail(store.clone(), data_dir.clone())),
+        Box::new(SessionHealthCheck::seq_contiguity(store.clone(), data_dir.clone())),
+        Box::new(SessionHealthCheck::open_entities(store.clone(), data_dir.clone())),
+        Box::new(SessionHealthCheck::checkpoint_consistency(store, data_dir)),
+        Box::new(ProfileHealthCheck::new(workspace_root(), args.clone())),
+        Box::new(ExecutionSandboxCheck::from_environment()),
+    ])
+    .expect("the doctor's check IDs are unique");
+    let outcome = match run_doctor(&doctor, schema_version, args.json).await {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    print(&outcome.output);
+    // The verdict goes to the exit status, not into the report: a check that
+    // reports "unhealthy" and exits `0` is a check nobody can act on (§3 C3.4).
+    exit_on(outcome.verdict);
+}
+
+/// `sandbox setup|status`: the machine-level half of the AppContainer backend.
+///
+/// Not a session command: it reads no workspace configuration, opens no store
+/// and writes no event. `setup` changes the machine once, from an elevated
+/// prompt; `status` only reads, and is what the doctor and a caller who wants to
+/// gate on readiness use.
+fn sandbox_command(args: &Args) {
+    match args.command_args().first().map(String::as_str) {
+        Some("setup") => sandbox_setup(args),
+        Some("status") => sandbox_status(args),
+        Some(other) => {
+            eprintln!("unknown sandbox subcommand '{other}'");
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+        None => {
+            eprintln!(
+                "Usage: agent sandbox setup [--readonly <path>]...\n       agent sandbox status"
+            );
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+/// `sandbox setup`: idempotent, and refuses rather than half-succeeds.
+fn sandbox_setup(args: &Args) {
+    let readonly = sandbox_readonly_paths(args);
+    let report = agent_sandbox_win::setup(agent_sandbox_win::PROFILE_NAME, &readonly)
+        .unwrap_or_else(|e| fail(args, &e.to_string()));
+    if args.json {
+        match agent_cli::json_output(&serde_json::json!({
+            "profile": report.profile,
+            "sid": report.sid,
+            "created": report.created,
+            "nul_device": report.nul_granted,
+            "read_execute": report.granted,
+        })) {
+            Ok(text) => println!("{text}"),
+            Err(e) => fail(args, &e.to_string()),
+        }
+        return;
+    }
+    println!(
+        "execution sandbox: profile={} sid={} created={} nul_device={}",
+        report.profile,
+        report.sid,
+        if report.created { "yes" } else { "no" },
+        if report.nul_granted { "granted" } else { "missing" }
+    );
+    for path in &report.granted {
+        println!("granted read+execute: {path}");
+    }
+}
+
+/// `sandbox status`: says whether the machine is ready, and is not ready when it
+/// is not.
+fn sandbox_status(args: &Args) {
+    let status = agent_sandbox_win::status(agent_sandbox_win::PROFILE_NAME)
+        .unwrap_or_else(|e| fail(args, &e.to_string()));
+    if args.json {
+        match agent_cli::json_output(&serde_json::json!({
+            "profile": status.profile,
+            "sid": status.sid,
+            "nul_device": status.nul_granted,
+        })) {
+            Ok(text) => println!("{text}"),
+            Err(e) => fail(args, &e.to_string()),
+        }
+    } else {
+        println!(
+            "execution sandbox: profile={} sid={} nul_device={}",
+            status.profile,
+            status.sid,
+            if status.nul_granted { "granted" } else { "missing" }
+        );
+    }
+    if !status.nul_granted {
+        eprintln!(
+            "the AppContainer setup is not in place: the null-device grant is missing. \
+             Windows resets that device's security descriptor at every boot, so the grant \
+             must be re-applied after a reboot: run `agent sandbox setup` from an elevated \
+             prompt"
+        );
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+}
+
+/// The `--readonly` paths a setup run names, which must exist.
+fn sandbox_readonly_paths(args: &Args) -> Vec<PathBuf> {
+    let words = args.command_args();
+    let mut paths = Vec::new();
+    let mut index = 1; // after `setup`
+    while let Some(word) = words.get(index) {
+        if word == "--readonly" {
+            let Some(value) = words.get(index + 1) else {
+                fail(args, "--readonly needs a path");
+            };
+            paths.push(PathBuf::from(value));
+            index += 2;
+        } else if let Some(value) = word.strip_prefix("--readonly=") {
+            if value.is_empty() {
+                fail(args, "--readonly needs a path");
+            }
+            paths.push(PathBuf::from(value));
+            index += 1;
+        } else {
+            fail(args, &format!("unexpected argument '{word}'"));
+        }
+    }
+    paths
+}
+
+/// `run` and `ask`: one implementation, two names.
+async fn run(args: &Args) {
+    let Some(text) = args.command_args().first() else {
+        eprintln!("Usage: agent run <text>");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+
+    // Repair any dangling open state from a previous crash before running.
+    if let Err(e) = runtime.recovery.recover(&args.session).await {
+        eprintln!("recovery failed: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+
+    let outcome = watch(
+        &runtime,
+        args,
+        from,
+        run_ask(&runtime.scheduler, &args.session, text, agent::clock::now(), args.json),
+    )
+    .await;
+    exit_on(outcome.verdict);
+}
+
+/// Settle the call a paused turn is waiting on, then drive the turn that
+/// carries on from it.
+///
+/// Recovery runs first for the same reason `run` runs it: a crash in the middle
+/// of a previous resume leaves a dispatched call with no outcome, and resume
+/// must not read the older `approval_pending` behind it as a wait that is still
+/// open. Recovery is idempotent, so running it here costs nothing.
+async fn resume(args: &Args) {
+    let text = args.joined_text();
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+
+    if let Err(e) = runtime.recovery.recover(&args.session).await {
+        eprintln!("recovery failed: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+
+    let outcome = watch(
+        &runtime,
+        args,
+        from,
+        run_resume(
+            &runtime.resume,
+            &runtime.scheduler,
+            &args.session,
+            &text,
+            agent::clock::now(),
+            args.json,
+        ),
+    )
+    .await;
+    exit_on(outcome.verdict);
+}
+
+/// Derive a new session from a closed turn boundary of this one.
+///
+/// No recovery pass first, unlike `run` and `resume`: recovery writes to the
+/// log it repairs, and a fork must not change the session it reads from. What
+/// the child inherits is the source exactly as it stands — including a tail
+/// that needs closing, which the child closes in its own copy.
+async fn fork(args: &Args) {
+    let at = option(args, "--at");
+    let reason = option(args, "--reason").unwrap_or_else(|| "user fork".to_string());
+    let runtime = assemble(args).await;
+
+    // The chain is the *child's*, and a new session's log is entirely this
+    // command's doing, so it starts at zero rather than at the source's head.
+    let from = args.events.then_some(EventSeq::ZERO);
+    let produced = run_fork(&runtime.fork, &args.session, at.as_deref(), &reason, args.json)
+        .await
+        .map(|(output, child)| Produced {
+            output,
+            session: child.unwrap_or_else(|| args.session.clone()),
+        });
+    report(runtime.store.as_ref(), args, from, produced).await;
+}
+
+async fn status(args: &Args) {
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+    let outcome =
+        watch(&runtime, args, from, run_status(&runtime.scheduler, &args.session, args.json)).await;
+    exit_on(outcome.verdict);
+}
+
+/// `steer`: queue text for whatever turn is in flight in this session.
+///
+/// No recovery pass: steering is an append to a session another process may be
+/// driving right now, and repairing that session's tail would be writing to a
+/// log this command is only here to talk to.
+async fn steer(args: &Args) {
+    let text = args.joined_text();
+    if text.trim().is_empty() {
+        eprintln!("Usage: agent steer \"<text>\"");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+    let outcome =
+        watch(&runtime, args, from, run_steer(&runtime.scheduler, &args.session, &text, args.json))
+            .await;
+    exit_on(outcome.verdict);
+}
+
+/// `interrupt`: ask for the run in flight to stop at its next boundary.
+///
+/// Same road as `steer` and the same reason for it — this appends to a session
+/// another process may be driving right now, so there is no recovery pass. The
+/// kernel decides whether there is anything to interrupt; refusing here would
+/// be guessing at a lifecycle this process has not read.
+async fn interrupt(args: &Args) {
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+    let outcome =
+        watch(&runtime, args, from, run_interrupt(&runtime.scheduler, &args.session, args.json))
+            .await;
+    exit_on(outcome.verdict);
+}
+
+/// `export`: write the session out as a readable document and a machine bundle.
+async fn export(args: &Args) {
+    let out = option(args, "--out");
+    // A command-level flag, read the way `deny --only` is: `--redacted` is not
+    // in the shared option parser because no other command has a use for it,
+    // and teaching the parser about a flag exactly one command reads would make
+    // every command's help a little less true.
+    let redacted = args.command_args().iter().any(|a| a == "--redacted");
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+    let outcome = watch(
+        &runtime,
+        args,
+        from,
+        run_export(runtime.store.as_ref(), &args.session, out.as_deref(), redacted, args.json),
+    )
+    .await;
+    exit_on(outcome.verdict);
+}
+
+async fn approve(args: &Args) {
+    let positional = positionals(args);
+    let Some(approval_id) = positional.first() else {
+        eprintln!("Usage: agent approve <approval_id> [once|turn|session|always]");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    let scope = positional.get(1).map(|s| s.as_str()).unwrap_or("once");
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+
+    let outcome = watch(
+        &runtime,
+        args,
+        from,
+        run_approve(
+            runtime.approvals.as_ref(),
+            runtime.scheduler.inbox(),
+            &args.session,
+            approval_id,
+            scope,
+            args.json,
+        ),
+    )
+    .await;
+    exit_on(outcome.verdict);
+}
+
+async fn deny(args: &Args) {
+    let positional = positionals(args);
+    let Some(approval_id) = positional.first() else {
+        eprintln!("Usage: agent deny <approval_id> [--only]");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    let only = args.command_args().iter().any(|a| a == "--only");
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+
+    let outcome = watch(
+        &runtime,
+        args,
+        from,
+        run_deny(
+            runtime.approvals.as_ref(),
+            runtime.scheduler.inbox(),
+            &args.session,
+            approval_id,
+            only,
+            args.json,
+        ),
+    )
+    .await;
+    exit_on(outcome.verdict);
+}
+
+/// `tool`: run one tool through the same gateway a model's call goes through.
+///
+/// Its exit status is the command's whole alphabet. `0` when the call ran and
+/// completed. `1` when it ran and came back failed: the result is the answer, it
+/// is printed on stdout in whichever shape was asked for, and the status carries
+/// the verdict — the one thing that cannot be put *in* the output, so a script
+/// reads it without parsing. A call that could not be dispatched at all — an
+/// unknown name, a policy denial, a path outside the workspace — is not an
+/// answer but the absence of one: nothing on stdout, the reason on stderr, and
+/// `2`, the same status every command returns when it did not run.
+async fn tool(args: &Args) {
+    let Some(tool_name) = args.command_args().first() else {
+        eprintln!("Usage: agent tool <tool_name> [<json-args>]");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    let arguments: serde_json::Value = match args.command_args().get(1) {
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("invalid JSON args: {e}");
+                std::process::exit(EXIT_DID_NOT_RUN);
+            }
+        },
+        None => serde_json::json!({}),
+    };
+    let runtime = assemble(args).await;
+    let from = chain_start(runtime.store.as_ref(), args).await;
+
+    let outcome = watch(
+        &runtime,
+        args,
+        from,
+        run_tool(runtime.gateway.as_ref(), &args.session, tool_name, arguments, args.json),
+    )
+    .await;
+    // The tool's result has been printed by now, on stdout and in whichever
+    // shape was asked for. The exit status is the one thing that cannot be put
+    // in the output — it is what a script reads without parsing it.
+    exit_on(outcome.verdict);
+}
+
+/// `plugin`: the verbs that read or change the plugin surface.
+///
+/// None of them assembles a runtime, and that is the point rather than a
+/// shortcut. `list` answers a question about a file, a log and a queue; `disable`
+/// and `enable` append to that queue. None needs a model, a tool surface or a
+/// started MCP server. Assembling one anyway would make all three fail whenever
+/// the *model provider* is misconfigured — a failure with nothing to do with what
+/// was asked — and would make `list` write `plugin/loaded` events into the very
+/// log it describes.
+///
+/// The two changing verbs are mirrors of each other and neither performs its
+/// change: the process driving the session owns the registration, so it is the
+/// one that applies the request at a boundary. What makes that arrangement work
+/// across processes is that a disabled plugin is *recorded* as disabled, which is
+/// why a later run does not register it and why `enable` is a registration rather
+/// than an erasure of some hidden flag.
+async fn plugin(args: &Args) {
+    match args.command_args().first().map(String::as_str) {
+        Some("list") => plugin_list(args).await,
+        Some("disable") => plugin_disable(args).await,
+        Some("enable") => plugin_enable(args).await,
+        Some(other) => {
+            eprintln!("unknown plugin subcommand '{other}'");
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+        None => {
+            eprintln!(
+                "Usage: agent plugin list\n       \
+                 agent plugin disable <plugin_id> [--reason <text>]\n       \
+                 agent plugin enable <plugin_id>"
+            );
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+/// `plugin list`: three durable sources, and a note about the one it cannot see.
+///
+/// The configuration is read here rather than by `assemble`, so that the listing
+/// is the same answer whether or not anything could be started.
+async fn plugin_list(args: &Args) {
+    let root = workspace_root();
+    let resolved = config::load(&root, args).unwrap_or_else(|e| {
+        eprintln!("configuration: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+    for note in &resolved.notes {
+        eprintln!("configuration: {note}");
+    }
+
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
+    let from = chain_start(store.as_ref(), args).await;
+    let enabled = plugins::configured_plugins(&resolved);
+    report(
+        store.as_ref(),
+        args,
+        from,
+        plugins::list(&enabled, &store, &args.session, args.json)
+            .await
+            .map(|output| Produced { output, session: args.session.clone() }),
+    )
+    .await;
+}
+
+/// `plugin disable`: queue the change; do not make it.
+///
+/// The withdrawal belongs to whichever process is driving the session, because
+/// only that process holds the registration. This one appends the request and
+/// says so, which is also why the wording is "will be disabled" and not "was".
+async fn plugin_disable(args: &Args) {
+    // The first word is `disable`; the plugin id is the first bare word after
+    // it. `--reason`'s value is skipped with the flag, so the flag may come
+    // before the id: `plugin disable --reason because mcp.one` names `mcp.one`.
+    let plugin_id = plugin_id_argument(args, "disable", "[--reason <text>]");
+    let reason = option(args, "--reason");
+
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
+    let from = chain_start(store.as_ref(), args).await;
+    let inbox = Inbox::new(store.clone());
+    report(
+        store.as_ref(),
+        args,
+        from,
+        plugins::disable(&inbox, &args.session, plugin_id, reason.as_deref(), args.json)
+            .await
+            .map(|output| Produced { output, session: args.session.clone() }),
+    )
+    .await;
+}
+
+/// `plugin enable`: queue the registration; do not make it.
+///
+/// The mirror of `disable`, and the reason a disable can be undone at all: what
+/// keeps a plugin off in later runs is the log's last word about it, and a
+/// registration is a later word. Nothing here reads the configuration either — a
+/// name the configuration does not have is refused at the boundary, by the
+/// process that can say what the configuration does have.
+async fn plugin_enable(args: &Args) {
+    let plugin_id = plugin_id_argument(args, "enable", "");
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
+    let from = chain_start(store.as_ref(), args).await;
+    let inbox = Inbox::new(store.clone());
+    report(
+        store.as_ref(),
+        args,
+        from,
+        plugins::enable(&inbox, &args.session, plugin_id, args.json)
+            .await
+            .map(|output| Produced { output, session: args.session.clone() }),
+    )
+    .await;
+}
+
+/// `schedule`: arrange, list, or cancel turns that run at a time.
+///
+/// None of the three assembles a runtime, for the same reason the `plugin`
+/// verbs do not: what they touch is a log and a queue, and assembling a model,
+/// a tool surface and a plugin registry would make scheduling fail whenever the
+/// model provider is misconfigured — a failure with nothing to do with the
+/// question asked.
+async fn schedule(args: &Args) {
+    match args.command_args().first().map(String::as_str) {
+        Some("at") => schedule_at(args).await,
+        Some("list") => schedule_list(args).await,
+        Some("cancel") => schedule_cancel(args).await,
+        Some(other) => {
+            eprintln!("unknown schedule subcommand '{other}'");
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+        None => {
+            eprintln!(
+                "Usage: agent schedule at <when> <text>\n       \
+                 agent schedule list\n       \
+                 agent schedule cancel <item_id>"
+            );
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+/// The store and queue the `schedule` verbs work on.
+fn schedule_queue() -> (Arc<dyn EventStore>, Inbox) {
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
+    (store.clone(), Inbox::new(store))
+}
+
+/// `schedule at`: append one turn with the time it should run.
+///
+/// The time is read here, at the app edge, and passed in — the kernel compares
+/// `due_at` against a `now` it is given, and never reads a clock itself.
+async fn schedule_at(args: &Args) {
+    let positional = positionals(args);
+    let Some(when) = positional.get(1) else {
+        eprintln!("Usage: agent schedule at <when> <text>");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    let text = positional.iter().skip(2).map(|word| word.as_str()).collect::<Vec<_>>().join(" ");
+    if text.trim().is_empty() {
+        eprintln!("Usage: agent schedule at <when> <text>");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+
+    let (store, inbox) = schedule_queue();
+    let from = chain_start(store.as_ref(), args).await;
+    let outcome =
+        match run_schedule_at(&inbox, &args.session, when, &text, agent::clock::now(), args.json)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => fail(args, &e),
+        };
+    let verdict = outcome.verdict;
+    report(
+        store.as_ref(),
+        args,
+        from,
+        Ok(Produced { output: outcome.output, session: args.session.clone() }),
+    )
+    .await;
+    exit_on(verdict);
+}
+
+/// `schedule list`: the scheduled turns that have not run.
+async fn schedule_list(args: &Args) {
+    let (store, inbox) = schedule_queue();
+    let from = chain_start(store.as_ref(), args).await;
+    let outcome =
+        match run_schedule_list(&inbox, &args.session, agent::clock::now(), args.json).await {
+            Ok(outcome) => outcome,
+            Err(e) => fail(args, &e),
+        };
+    let verdict = outcome.verdict;
+    report(
+        store.as_ref(),
+        args,
+        from,
+        Ok(Produced { output: outcome.output, session: args.session.clone() }),
+    )
+    .await;
+    exit_on(verdict);
+}
+
+/// `schedule cancel`: withdraw a scheduled turn before it runs.
+async fn schedule_cancel(args: &Args) {
+    let positional = positionals(args);
+    let Some(item_id) = positional.get(1) else {
+        eprintln!("Usage: agent schedule cancel <item_id>");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+
+    let (store, inbox) = schedule_queue();
+    let from = chain_start(store.as_ref(), args).await;
+    let outcome = match run_schedule_cancel(&inbox, &args.session, item_id, args.json).await {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    let verdict = outcome.verdict;
+    report(
+        store.as_ref(),
+        args,
+        from,
+        Ok(Produced { output: outcome.output, session: args.session.clone() }),
+    )
+    .await;
+    exit_on(verdict);
+}
+
+/// `tick`: drive at most one turn — an explicit `next_turn` first, then the
+/// earliest due scheduled item.
+///
+/// `--events` is refused because a tick can run a whole turn: the chain is not
+/// unbounded, but watching it would mean holding a subscription for a command
+/// whose whole purpose is to be called from a scheduler. Read the log instead.
+async fn tick(args: &Args) {
+    if args.events {
+        eprintln!("tick does not support --events; read the session log instead");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    let runtime = assemble(args).await;
+    // A tick may be the first process to look at a session after a crash, so
+    // repair dangling state before deciding what to run.
+    if let Err(e) = runtime.recovery.recover(&args.session).await {
+        eprintln!("recovery failed: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+
+    let outcome = match run_tick(
+        &runtime.scheduler,
+        runtime.approvals.as_ref(),
+        &args.session,
+        agent::clock::now(),
+        args.json,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    print(&outcome.output);
+    exit_on(outcome.verdict);
+}
+
+/// `serve`: keep running turns as their time arrives.
+///
+/// One process per session. Within one loop the runs are serialized by
+/// construction; two loops would be kept from interleaving appends by the
+/// store's lease, but nothing would stop them choosing the same item, so the
+/// help says "one per session" rather than pretending the log enforces it.
+///
+/// The loop is quiet on purpose: it prints when a turn ran, and when it first
+/// enters the "held at a decision" state — not every poll, or a session left
+/// waiting overnight would fill the terminal with the same sentence.
+async fn serve(args: &Args) {
+    if args.events {
+        eprintln!("serve does not support --events; read the session log instead");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    let runtime = assemble(args).await;
+    // A long-lived process is the likeliest first reader of a session after a
+    // crash, so repair dangling state once before the loop starts. Per-tick
+    // failures are transient and handled below.
+    if let Err(e) = runtime.recovery.recover(&args.session).await {
+        eprintln!("recovery failed: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    eprintln!("serving {} (one serve per session; Ctrl-C to stop)", args.session);
+
+    let mut waiting_on: Option<TurnId> = None;
+    loop {
+        let now = agent::clock::now();
+        // A failed tick sleeps a full poll interval below: retrying a store
+        // error at zero delay would turn a transient fault into a hot loop.
+        let mut failed = false;
+        match tick_once(&runtime.scheduler, runtime.approvals.as_ref(), &args.session, now).await {
+            Ok(Tick::Ran(report)) => {
+                waiting_on = None;
+                match render_ran(report, args.json) {
+                    Ok(outcome) => print(&outcome.output),
+                    Err(e) => eprintln!("tick failed: {e}"),
+                }
+            }
+            Ok(Tick::AwaitingDecision { turn_id }) => {
+                // Announced on entering, not on every poll: the decision is a
+                // person's to make, and polling does not change the answer.
+                if waiting_on.as_ref() != Some(&turn_id) {
+                    let reason =
+                        format!("turn {turn_id} is waiting on a decision; settle it with `resume`");
+                    match render_did_not_run(&reason, args.json) {
+                        Ok(outcome) => print(&outcome.output),
+                        Err(e) => eprintln!("tick failed: {e}"),
+                    }
+                    waiting_on = Some(turn_id);
+                }
+            }
+            Ok(Tick::Idle) => waiting_on = None,
+            Err(e) => {
+                eprintln!("tick failed: {e}");
+                failed = true;
+            }
+        }
+
+        let wait = if waiting_on.is_some() || failed {
+            // A held session keeps its due item pending; sleeping until that
+            // due time would be a zero-length sleep and a spin.
+            SERVE_POLL
+        } else {
+            let earliest = match earliest_due(runtime.scheduler.inbox(), &args.session).await {
+                Ok(earliest) => earliest,
+                Err(e) => {
+                    eprintln!("cannot read the schedule: {e}");
+                    None
+                }
+            };
+            // The clock is read again after the tick: a turn can outlast the
+            // wait that was computed before it, and the item it was waiting for
+            // may already be due.
+            next_wait(earliest, agent::clock::now(), SERVE_POLL)
+        };
+        let wait = wait.to_std().unwrap_or(Duration::ZERO);
+
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = tokio::signal::ctrl_c() => {
+                print_stop(args.json);
+                return;
+            }
+        }
+    }
+}
+
+/// The line `serve` ends on.
+fn print_stop(json: bool) {
+    if json {
+        match agent_cli::json_output(&serde_json::json!({ "stopped": true })) {
+            Ok(line) => println!("{line}"),
+            Err(e) => eprintln!("could not render the stop line: {e}"),
+        }
+    } else {
+        println!("stopped");
+    }
+}
+
+/// `memory search` and `memory reindex`: the derived index over the log.
+///
+/// Neither assembles the run. Reading a session's memory has to work when the
+/// model configuration does not, for the same reason `schedule` and `plugin`
+/// do, and neither command starts a turn. `--events` is refused because nothing
+/// here appends: a search that wrote would make the model's history depend on
+/// who looked.
+async fn memory(args: &Args) {
+    let words: Vec<&String> =
+        args.command_args().iter().filter(|word| !word.starts_with("--")).collect();
+    match words.first().map(|word| word.as_str()) {
+        Some("search") => {
+            let query = words[1..].iter().map(|word| word.as_str()).collect::<Vec<_>>().join(" ");
+            if query.trim().is_empty() {
+                eprintln!("Usage: agent memory search <text>");
+                std::process::exit(EXIT_DID_NOT_RUN);
+            }
+            if args.events {
+                eprintln!("memory search does not support --events; it writes no events");
+                std::process::exit(EXIT_DID_NOT_RUN);
+            }
+            let index = memory_index();
+            let outcome = match run_memory_search(
+                &index,
+                &args.session,
+                &query,
+                DEFAULT_SEARCH_LIMIT,
+                args.json,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => fail(args, &e),
+            };
+            print(&outcome.output);
+            exit_on(outcome.verdict);
+        }
+        Some("reindex") => {
+            if args.events {
+                eprintln!("memory reindex does not support --events; it writes no events");
+                std::process::exit(EXIT_DID_NOT_RUN);
+            }
+            let index = memory_index();
+            let outcome = match run_memory_reindex(&index, &args.session, args.json).await {
+                Ok(outcome) => outcome,
+                Err(e) => fail(args, &e),
+            };
+            print(&outcome.output);
+            exit_on(outcome.verdict);
+        }
+        Some(other) => {
+            eprintln!("unknown memory subcommand '{other}'");
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+        None => {
+            eprintln!(
+                "Usage: agent memory search <text>\n       \
+                 agent memory reindex"
+            );
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+/// The index the `memory` verbs read: under the same data directory as the log.
+fn memory_index() -> SqliteMemoryIndex {
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
+    SqliteMemoryIndex::open(store, data_dir())
+}
+
+/// `context inspect`: what the next request would carry, measured but not sent.
+///
+/// A reader, like `memory` and `artifact get`: no model, no tool surface, no
+/// plugin registry is assembled, so it still answers when the provider or the
+/// sandbox is misconfigured. It does read the configuration, because the window
+/// the answer is measured against lives there — and a window nobody can read
+/// would make the budget line a guess, so that is a failed run (`2`) rather
+/// than an answer.
+///
+/// Reading the log waits for no writer. The command only looks, and waiting
+/// behind a long turn would make "what does the context look like" hang for
+/// exactly as long as the thing it is inspecting.
+async fn context(args: &Args) {
+    let positional = positionals(args);
+    let Some(verb) = positional.first() else {
+        eprintln!("Usage: agent context inspect [--top <n>] [--json]");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    if verb.as_str() != "inspect" {
+        eprintln!("unknown context subcommand '{verb}'");
+        usage();
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    if args.events {
+        eprintln!("context inspect does not support --events; it writes no events");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    let top = match option(args, "--top") {
+        None => agent_cli::context::DEFAULT_TOP_MESSAGES,
+        Some(text) => match text.parse::<usize>() {
+            Ok(top) if top > 0 => top,
+            _ => {
+                eprintln!("--top needs a positive number of messages, got '{text}'");
+                std::process::exit(EXIT_DID_NOT_RUN);
+            }
+        },
+    };
+
+    let resolved = config::load(&workspace_root(), args).unwrap_or_else(|e| {
+        eprintln!("configuration: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+    for note in &resolved.notes {
+        eprintln!("configuration: {note}");
+    }
+
+    // The same policy `stack::assemble` builds from the same configuration: a
+    // report measured against a default window would describe a request this
+    // build would never send.
+    let data_dir = PathBuf::from(data_dir());
+    let store: Arc<dyn EventStore> =
+        Arc::new(JsonlEventStore::new(&data_dir).with_lease_wait(Duration::ZERO));
+    let engine = agent_context::ProjectionContextEngine::new(store.clone(), &data_dir);
+    let engine = match resolved.budget.max_input_tokens {
+        Some(max_input_tokens) => engine.with_context_policy(agent_context::trim::ContextPolicy {
+            max_input_tokens,
+            reserved_output_tokens: resolved.budget.reserved_output_tokens.unwrap_or(0),
+            compact_at_percent: resolved.budget.compact_at_percent,
+        }),
+        None => engine,
+    };
+
+    let derived = match engine.derive(&args.session).await {
+        Ok(derived) => derived,
+        Err(e) => {
+            eprintln!("context derive failed: {e}");
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    };
+    let report = agent_context::inspect::report(&derived.messages, &derived.usage, top);
+
+    // The final section is read back from the log rather than recomputed: what
+    // the last request actually carried is a recorded fact, and a prediction
+    // would answer a different question.
+    let events = match store.read_stream(&args.session, EventSeq::ZERO, usize::MAX).await {
+        Ok(events) => events,
+        Err(e) => {
+            eprintln!("context log read failed: {e}");
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    };
+    let outcome =
+        match run_context_inspect(&report, &args.session, derived.revision, &events, args.json) {
+            Ok(outcome) => outcome,
+            Err(e) => fail(args, &e),
+        };
+    print(&outcome.output);
+    exit_on(outcome.verdict);
+}
+
+/// `artifact get`: fetch the bytes behind a locator the log handed out.
+///
+/// Neither assembles the run nor reads the configuration: stored output has to
+/// be retrievable when the model or the sandbox is misconfigured, for the same
+/// reason `memory` does not assemble one. The store is built from the same
+/// `<data_dir>/artifacts` root the run writes to, and nothing here appends.
+async fn artifact(args: &Args) {
+    let positional = positionals(args);
+    let Some(verb) = positional.first() else {
+        eprintln!("Usage: agent artifact get <locator|hash> [--out <path>]");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    if verb.as_str() != "get" {
+        eprintln!("unknown artifact subcommand '{verb}'");
+        usage();
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    let Some(reference) = positional.get(1) else {
+        eprintln!("Usage: agent artifact get <locator|hash> [--out <path>]");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    if args.events {
+        eprintln!("artifact get does not support --events; it writes no events");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+
+    let out = option(args, "--out");
+    let store = FsArtifactStore::new(PathBuf::from(data_dir()).join("artifacts"));
+    let outcome = match run_artifact_get(&store, reference, out.as_deref(), args.json) {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    print(&outcome.output);
+    exit_on(outcome.verdict);
+}
+
+/// The plugin id both changing verbs take, or a usage line and no process.
+///
+/// The first word of the arguments is the verb; the id is the first word after
+/// it that is not itself a flag or a flag's value. The value is skipped with
+/// its flag, so `plugin disable --reason because mcp.one` reads `mcp.one`.
+fn plugin_id_argument<'a>(args: &'a Args, verb: &str, extra: &str) -> &'a str {
+    let positional = positionals(args);
+    let Some(plugin_id) = positional.get(1) else {
+        let extra = if extra.is_empty() { String::new() } else { format!(" {extra}") };
+        eprintln!("Usage: agent plugin {verb} <plugin_id>{extra}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    plugin_id.as_str()
+}
+
+/// The command's positional arguments, with each flag and its value skipped.
+///
+/// A flag's *value* is not a positional. Dropping only the flag itself used to
+/// make `plugin disable --reason because mcp.one` read `because` as the plugin
+/// id, and the same filter serves `approve` and `deny` (YA-76). The
+/// value-taking flags are a closed set shared by every command — a flag does
+/// not change its arity from one verb to the next — so this reader knows them
+/// without being told which command it serves.
+///
+/// Both spellings are handled: `--flag value` consumes the next word, and
+/// `--flag=value` is a single word whose value is already inside it. Boolean
+/// flags (`--only`) and flags this binary does not define are dropped alone:
+/// there is no declared value to skip, and guessing that the next word belongs
+/// to an unknown flag would silently eat a positional.
+fn positionals(args: &Args) -> Vec<&String> {
+    const VALUE_FLAGS: &[&str] = &["--at", "--reason", "--out"];
+    let mut out = Vec::new();
+    let mut tokens = args.command_args().iter();
+    while let Some(token) = tokens.next() {
+        if token.starts_with("--") {
+            if VALUE_FLAGS.contains(&token.as_str()) {
+                tokens.next();
+            }
+            continue;
+        }
+        out.push(token);
+    }
+    out
+}
+
+/// A command's output, and the session whose log gained the events.
+///
+/// The two are the same except for `fork`, which writes to the child it
+/// creates — so a caller printing the event chain cannot assume the session it
+/// was given is the one that grew.
+struct Produced {
+    output: CliOutput,
+    session: SessionId,
+}
+
+/// Where a `--events` chain starts for a command that writes to the session it
+/// was given: just past the history that was already there.
+///
+/// Read before the command runs, because afterwards the same question has a
+/// different answer. `None` means the chain was not asked for.
+///
+/// Takes the store rather than the `Runtime`, because the two `plugin` verbs
+/// have a store and no runtime — and `--events` has to mean the same thing for
+/// them as for everything else.
+async fn chain_start(store: &dyn EventStore, args: &Args) -> Option<EventSeq> {
+    if !args.events {
+        return None;
+    }
+    match store.read_stream(&args.session, EventSeq::ZERO, usize::MAX).await {
+        Ok(events) => Some(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO)),
+        Err(e) => {
+            eprintln!("cannot read the session's history: {e}");
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+/// Where a watched command's output goes.
+///
+/// A trait rather than three closures because the three streams are distinct
+/// audiences — a program reads the chain, a person reads the live text — and
+/// because a test can implement this to see exactly what a terminal would have
+/// been shown, without a terminal.
+trait WatchSink {
+    /// One durable event, already rendered as the chain's JSON object.
+    fn chain(&mut self, line: &str);
+    /// Live text, already assembled with its labels and line breaks.
+    fn live(&mut self, text: &str);
+    /// A command's result, printed after the chain it produced.
+    fn answer(&mut self, output: &CliOutput);
+    /// Something went wrong while watching. The command itself is unaffected.
+    fn note(&mut self, message: &str);
+}
+
+/// Everything a watched command writes goes to stdout as the chain and stderr
+/// as the human-readable half, which is what keeps `… --events | jq` usable
+/// while a person still sees the answer.
+struct TerminalSink;
+
+impl WatchSink for TerminalSink {
+    fn chain(&mut self, line: &str) {
+        println!("{line}");
+    }
+
+    fn live(&mut self, text: &str) {
+        eprint!("{text}");
+        // stderr is unbuffered in Rust, but a delta is written without a
+        // newline and the point of watching is that it appears now.
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+
+    fn answer(&mut self, output: &CliOutput) {
+        match output {
+            CliOutput::Text(text) => eprintln!("{text}"),
+            CliOutput::Json(json) => eprintln!("{json}"),
+        }
+    }
+
+    fn note(&mut self, message: &str) {
+        eprintln!("{message}");
+    }
+}
+
+/// Watch a command's own work when `--events` asks for it, or just run it.
+///
+/// `from` is where the chain starts, read before the command ran — by the
+/// caller rather than here, because some commands repair the log before they
+/// work and that repair is part of what the command did.
+async fn watch<F, O>(
+    runtime: &Runtime,
+    args: &Args,
+    from: Option<EventSeq>,
+    command: F,
+) -> CliOutcome
+where
+    F: Future<Output = Result<O, String>> + Send,
+    O: Into<CliOutcome>,
+{
+    let Some(from) = from else {
+        return match command.await {
+            Ok(output) => {
+                let outcome = output.into();
+                print(&outcome.output);
+                outcome
+            }
+            Err(e) => fail(args, &e),
+        };
+    };
+
+    let mut live = match runtime.live.subscribe().await {
+        Ok(live) => live,
+        Err(e) => fail(args, &format!("cannot watch live output: {e}")),
+    };
+    let mut sink = TerminalSink;
+    match watch_with(runtime.store.as_ref(), live.as_mut(), &args.session, from, command, &mut sink)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    }
+}
+
+/// A command's own option, or a usage refusal.
+///
+/// [`Args::option`] tells "not given" apart from "given without a value", and
+/// the difference is the point: whoever typed `--at` and nothing after it meant
+/// something, and reading that as "not given" would quietly substitute a
+/// default for a typo. The refusal is the same one the shared flags get —
+/// `<command> failed: --at needs a value`, and nothing ran.
+fn option(args: &Args, name: &str) -> Option<String> {
+    args.option(name).unwrap_or_else(|e| fail(args, &e.to_string()))
+}
+
+/// Report a command's failure the way every command does, and stop.
+///
+/// A command that reaches here did not run: the message is the reason, and there
+/// is no answer to read. That is [`EXIT_DID_NOT_RUN`] and never
+/// [`EXIT_ANSWERED_NO`] — the difference is which stream the caller should have
+/// been reading.
+fn fail(args: &Args, message: &str) -> ! {
+    eprintln!("{} failed: {message}", args.command);
+    std::process::exit(EXIT_DID_NOT_RUN);
+}
+
+/// Run a command while its own events stream out.
+///
+/// Without `--events` nothing is watched and the output is printed as before.
+/// With it, two subscriptions are driven alongside the command: durable events
+/// to the chain as they are appended, live model text to the human half.
+///
+/// The live path decides *when* a line appears and never *which* lines exist.
+/// When the command returns, the session is read once from `from` and anything
+/// not yet printed is printed, so the chain that ends up on stdout is exactly
+/// what reading the log afterwards would have produced — a long turn shows
+/// progress instead of a blank screen, and a crash mid-turn still shows what
+/// happened, without the live path being able to change the answer.
+async fn watch_with<F, O>(
+    store: &dyn EventStore,
+    live: &mut dyn LiveEventSubscription,
+    session: &SessionId,
+    from: EventSeq,
+    command: F,
+    sink: &mut dyn WatchSink,
+) -> Result<CliOutcome, String>
+where
+    F: Future<Output = Result<O, String>> + Send,
+    O: Into<CliOutcome>,
+{
+    let mut events = store
+        .subscribe(session, from)
+        .await
+        .map_err(|e| format!("cannot watch the session: {e}"))?;
+
+    let mut lines = LiveLines::default();
+    let mut last: Option<u64> = None;
+    let mut events_open = true;
+    let mut live_open = true;
+
+    tokio::pin!(command);
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut command => break outcome,
+            event = events.next(), if events_open => match event {
+                Ok(Some(stored)) => {
+                    last = Some(stored.seq.as_u64());
+                    sink.chain(&render_events(std::slice::from_ref(&stored)));
+                }
+                // The store is gone; the read at the end still has the last word.
+                Ok(None) => events_open = false,
+                // A subscription that cannot read right now might read later, but
+                // polling one that failed would spin: the final read covers it.
+                Err(e) => {
+                    sink.note(&format!("live view stopped: {e}"));
+                    events_open = false;
+                }
+            },
+            chunk = live.next(), if live_open => match chunk {
+                Some(event) => {
+                    if let Some(chunk) = render_live(&event) {
+                        sink.live(&lines.push(chunk));
+                    }
+                }
+                None => live_open = false,
+            },
+        }
+    };
+
+    // A command can return in the very poll that published its last deltas, and
+    // the select stops as soon as it does: what was already published would be
+    // thrown away with the queue. Those deltas were produced while the command
+    // ran, so they are drained rather than dropped. `now_or_never` does not
+    // wait — a delta that has not arrived by now is not part of this run's
+    // preview, and the answer that follows is the model's own final text.
+    while live_open {
+        match live.next().now_or_never() {
+            Some(Some(event)) => {
+                if let Some(chunk) = render_live(&event) {
+                    sink.live(&lines.push(chunk));
+                }
+            }
+            Some(None) => live_open = false,
+            None => break,
+        }
+    }
+
+    // The authoritative pass, and the reason the live one is a preview. It also
+    // closes the gap the select left behind: events appended just before the
+    // command returned may not have been delivered to the subscription yet.
+    match store.read_stream(session, from, usize::MAX).await {
+        Ok(events) => {
+            for stored in events {
+                if last.is_some_and(|l| stored.seq.as_u64() <= l) {
+                    continue;
+                }
+                last = Some(stored.seq.as_u64());
+                sink.chain(&render_events(std::slice::from_ref(&stored)));
+            }
+        }
+        Err(e) => sink.note(&format!("could not read the event chain: {e}")),
+    }
+
+    // Close an open live line before anything else is written to stderr, so the
+    // answer never runs into the middle of a model's sentence.
+    let close = lines.finish();
+    if !close.is_empty() {
+        sink.live(close);
+    }
+
+    match outcome {
+        Ok(output) => {
+            let outcome = output.into();
+            sink.answer(&outcome.output);
+            Ok(outcome)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Print a command's result, and with `--events` the chain it produced.
+///
+/// The chain goes to stdout and the human line to stderr when both are asked
+/// for. That is the point of the flag: stdout stays something a program can
+/// read, and nothing is hidden to get it.
+async fn report(
+    store: &dyn EventStore,
+    args: &Args,
+    from: Option<EventSeq>,
+    produced: Result<Produced, String>,
+) {
+    let produced = match produced {
+        Ok(produced) => produced,
+        Err(e) => fail(args, &e),
+    };
+
+    let Some(from) = from else {
+        print(&produced.output);
+        return;
+    };
+    match store.read_stream(&produced.session, from, usize::MAX).await {
+        Ok(events) => {
+            let chain = render_events(&events);
+            if !chain.is_empty() {
+                println!("{chain}");
+            }
+        }
+        Err(e) => eprintln!("could not read the event chain: {e}"),
+    }
+    match &produced.output {
+        CliOutput::Text(text) => eprintln!("{text}"),
+        CliOutput::Json(json) => eprintln!("{json}"),
+    }
+}
+
+/// Assemble the stack this process runs on.
+///
+/// Everything the process environment decides is read here — the workspace root,
+/// the data directory, the configuration, and the provider `AGENT_MODEL_PROVIDER`
+/// names — and every way the assembly can refuse to start becomes one exit status
+/// with a sentence on stderr. What the stack *is* is built in [`stack::assemble`],
+/// which is the same function the acceptance tests call; this wrapper exists so
+/// that "which run, where, under what configuration" is answered from the
+/// environment rather than from a caller.
+///
+/// The configuration is read and resolved first, because everything after it
+/// depends on the answer: which policy the gateway enforces, which model the
+/// provider is asked for, and which budget the scheduler runs under. A
+/// configuration that does not resolve stops the command here, before a store
+/// is opened — a run that began under a configuration nobody agreed to is worse
+/// than one that did not begin.
+async fn assemble(args: &Args) -> Runtime {
+    let root = workspace_root();
+    let resolved = config::load(&root, args).unwrap_or_else(|e| {
+        eprintln!("configuration: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+    // Narrowing that a higher layer applied is reported, not swallowed: the
+    // person who wrote the layer that lost is the one who can fix it.
+    for note in &resolved.notes {
+        eprintln!("configuration: {note}");
+    }
+    // The backend is the host's choice, and a choice this build cannot honour
+    // stops the command before any store is opened rather than falling back to
+    // a less confined one.
+    let sandbox = sandbox::from_environment().unwrap_or_else(|e| {
+        eprintln!("execution sandbox: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+    // The network policy is parsed for every mode, so a typo is reported now
+    // rather than the first time someone switches to a sandboxed backend.
+    let network_allowed = sandbox::network_from_environment().unwrap_or_else(|e| {
+        eprintln!("execution sandbox: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+
+    stack::assemble(stack::Inputs {
+        session: args.session.clone(),
+        workspace_root: PathBuf::from(root),
+        data_dir: PathBuf::from(data_dir()),
+        network_allowed,
+        judgment: true,
+        resolved,
+        model: None,
+        decisions: stack::Decisions::FromConfiguration,
+        sandbox,
+    })
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    })
+}
+
+/// Where a run's filesystem boundary is rooted.
+///
+/// `AGENT_WORKSPACE_DIR` names it outright; with nothing named it is the
+/// directory the command was invoked from. There is no third answer and no
+/// default hidden in the code: a run whose base cannot be determined must not
+/// begin, so an unreadable current directory is reported and stops the command
+/// rather than panicking where no caller can catch it.
+fn workspace_root() -> String {
+    match resolve_workspace_root(
+        std::env::var("AGENT_WORKSPACE_DIR").ok().as_deref(),
+        std::env::current_dir(),
+    ) {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!(
+                "workspace root: AGENT_WORKSPACE_DIR is not set and the current directory \
+                 could not be read: {error}"
+            );
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+/// `AGENT_WORKSPACE_DIR` against the process's current directory.
+///
+/// Split from [`workspace_root`] the way [`resolve_data_dir`] is split from
+/// [`data_dir`]: the choice is a pure function of what the environment said and
+/// what the current directory turned out to be, so "there is no current
+/// directory" can be tested without making the test's own directory unreadable.
+fn resolve_workspace_root(
+    configured: Option<&str>,
+    cwd: std::io::Result<PathBuf>,
+) -> Result<String, std::io::Error> {
+    match configured {
+        Some(configured) => Ok(configured.to_string()),
+        None => cwd.map(|dir| dir.display().to_string()),
+    }
+}
+
+/// The data directory's name when the environment names none.
+///
+/// A bare name rather than a path: it resolves against the workspace root like
+/// every other relative path, so it means "inside the workspace", not "wherever
+/// this process was started from".
+const DEFAULT_DATA_DIR: &str = ".agent-data";
+
+/// Where event logs and artifacts go.
+fn data_dir() -> String {
+    resolve_data_dir(&workspace_root(), std::env::var("AGENT_DATA_DIR").ok().as_deref())
+}
+
+/// `AGENT_DATA_DIR` against the workspace root, or the default inside it.
+///
+/// A relative value resolves against the workspace root — the same rule
+/// `ResourceGuard` and the tool layer follow, and the reason the workspace root
+/// exists: a run's paths all share one base, so a run's own state cannot land
+/// in whatever directory the command happened to be invoked from. An absolute
+/// value is already unambiguous and is taken as given. An empty value names no
+/// directory at all and is treated as unset, because resolving "" against the
+/// root yields the root itself — which would put the event log and the artifact
+/// directory at the top of the workspace.
+fn resolve_data_dir(root: &str, configured: Option<&str>) -> String {
+    let configured = configured.filter(|dir| !dir.is_empty()).unwrap_or(DEFAULT_DATA_DIR);
+    let path = Path::new(configured);
+    if path.is_absolute() {
+        configured.to_string()
+    } else {
+        Path::new(root).join(path).display().to_string()
+    }
+}
+
+fn print(output: &agent_cli::CliOutput) {
+    match output {
+        agent_cli::CliOutput::Text(t) => println!("{t}"),
+        agent_cli::CliOutput::Json(j) => println!("{j}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_kernel::live_bus::InMemoryLiveEventBus;
+    use agent_protocol::events::{Actor, EventDraft, EventType, LiveEvent};
+    use agent_protocol::ids::{EventId, RunId, StepId, TurnId};
+    use agent_protocol::model::ModelStreamEvent;
+    use agent_testkit::FakeEventStore;
+    use std::time::Duration;
+
+    /// The alphabet is three statuses, and no two verdicts share one.
+    ///
+    /// A caller that reads only `$?` has to be able to name what happened from
+    /// the number alone, so the numbers may not collide — and a fourth verdict
+    /// added to the enum without a status here would be a verdict that exits
+    /// like one of the three.
+    #[test]
+    fn the_verdict_alphabet_is_three_distinct_statuses() {
+        let statuses =
+            [Verdict::Answered, Verdict::AnsweredNo, Verdict::DidNotRun].map(exit_status);
+
+        assert_eq!(statuses, [0, EXIT_ANSWERED_NO, EXIT_DID_NOT_RUN]);
+        assert_eq!(
+            statuses.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            3,
+            "two verdicts share a status: {statuses:?}"
+        );
+    }
+
+    /// The data directory follows the workspace root, not the process.
+    ///
+    /// `AGENT_DATA_DIR` is the one path a run cannot do without when nobody
+    /// named one, and where "nowhere named" points has to be decided by the
+    /// rule every other relative path follows. Otherwise the event log of a run
+    /// against a workspace goes to whatever directory the command was invoked
+    /// from: a different place per invocation, and none of them the workspace.
+    #[test]
+    fn an_unnamed_data_directory_is_resolved_inside_the_workspace() {
+        let root = if cfg!(windows) { "C:\\ws" } else { "/ws" };
+
+        // Unset and empty are the same request: a name inside the workspace.
+        for configured in [None, Some("")] {
+            let resolved = resolve_data_dir(root, configured);
+            assert_eq!(resolved, Path::new(root).join(DEFAULT_DATA_DIR).display().to_string());
+            assert!(
+                Path::new(&resolved).starts_with(root),
+                "{resolved:?} is outside the workspace"
+            );
+        }
+
+        // A relative value is relative to the workspace root, which is the whole
+        // point — it is not relative to whatever cwd the process has.
+        assert_eq!(
+            resolve_data_dir(root, Some("state")),
+            Path::new(root).join("state").display().to_string()
+        );
+        assert_eq!(
+            resolve_data_dir(root, Some(Path::new("nested").join("state").to_str().unwrap())),
+            Path::new(root).join("nested").join("state").display().to_string()
+        );
+
+        // An absolute value is already unambiguous and is taken as given.
+        let absolute = if cfg!(windows) { "C:\\agent-state" } else { "/var/agent-state" };
+        assert_eq!(resolve_data_dir(root, Some(absolute)), absolute);
+    }
+
+    /// A run's base is the configured root, or the cwd — and never a panic.
+    ///
+    /// `AGENT_WORKSPACE_DIR` decides the base when it is set. With none named,
+    /// the current directory is the answer; and when even that cannot be read,
+    /// the command has no workspace to root a run in and says so (YA-30). The
+    /// failure is a message and an exit status, not a panic: a `current_dir()`
+    /// that returns `Err` used to be `.unwrap()`ed, which took the whole process
+    /// down with a backtrace a CLI caller can neither read nor catch.
+    #[test]
+    fn a_workspace_root_is_the_configured_dir_or_the_cwd_and_never_a_panic() {
+        let configured = if cfg!(windows) { "C:\\ws" } else { "/ws" };
+        // A configured root is taken as given, readable cwd or not.
+        assert_eq!(
+            resolve_workspace_root(Some(configured), Err(no_current_dir())).unwrap(),
+            configured
+        );
+
+        // With none named, the current directory is the base.
+        let cwd = PathBuf::from(if cfg!(windows) { "C:\\cwd" } else { "/cwd" });
+        assert_eq!(
+            resolve_workspace_root(None, Ok(cwd.clone())).unwrap(),
+            cwd.display().to_string()
+        );
+
+        // With none named and no readable cwd, the reason is carried out — the
+        // caller prints it and stops, rather than a panic the caller never sees.
+        let error = resolve_workspace_root(None, Err(no_current_dir())).unwrap_err();
+        assert!(error.to_string().contains("the directory is gone"), "reason lost: {error}");
+    }
+
+    fn no_current_dir() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "the directory is gone")
+    }
+
+    /// Records what a terminal would have been shown, in order.
+    #[derive(Default)]
+    struct Recording {
+        lines: Vec<String>,
+    }
+    struct RecordingSink(Arc<std::sync::Mutex<Recording>>);
+
+    impl RecordingSink {
+        fn record(&self, line: String) {
+            self.0.lock().unwrap().lines.push(line);
+        }
+    }
+
+    impl WatchSink for RecordingSink {
+        fn chain(&mut self, line: &str) {
+            self.record(format!("chain|{line}"));
+        }
+
+        fn live(&mut self, text: &str) {
+            self.record(format!("live|{text}"));
+        }
+
+        fn answer(&mut self, output: &CliOutput) {
+            let text = match output {
+                CliOutput::Text(text) => text.clone(),
+                CliOutput::Json(text) => text.as_str().to_string(),
+            };
+            self.record(format!("answer|{text}"));
+        }
+
+        fn note(&mut self, message: &str) {
+            self.record(format!("note|{message}"));
+        }
+    }
+
+    fn draft(session_id: &str, event_type: &str) -> EventDraft {
+        EventDraft {
+            event_id: EventId::new(),
+            event_type: EventType::new(event_type),
+            schema_version: agent_protocol::ids::SchemaVersion::from_string("0.1.0"),
+            session_id: SessionId::from_string(session_id),
+            run_id: Some(RunId::new()),
+            turn_id: Some(TurnId::new()),
+            step_id: Some(StepId::new()),
+            actor: Actor::System,
+            created_at: chrono::Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            ignorable: false,
+        }
+    }
+
+    fn text_delta(text: &str) -> LiveEvent {
+        LiveEvent {
+            live_seq: 1,
+            event_type: EventType::new(EventType::MODEL_STREAM_DELTA),
+            session_id: SessionId::from_string("watched"),
+            created_at: chrono::Utc::now(),
+            payload: serde_json::to_value(ModelStreamEvent::TextDelta { text: text.to_string() })
+                .unwrap(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    /// Wait until the recorder has something, or give up.
+    async fn wait_for(recorded: &Arc<std::sync::Mutex<Recording>>, want: usize) -> bool {
+        for _ in 0..400 {
+            if recorded.lock().unwrap().lines.len() >= want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// The claim E2 exists to make: a line a person can read appears while the
+    /// command is still working, not after it returns.
+    #[tokio::test]
+    async fn the_chain_appears_before_the_command_finishes() {
+        let store = Arc::new(FakeEventStore::new());
+        let bus = InMemoryLiveEventBus::new(8);
+        let sid = SessionId::from_string("watched");
+        let recorded = Arc::new(std::sync::Mutex::new(Recording::default()));
+        let mut sink = RecordingSink(recorded.clone());
+        let mut live = bus.subscribe().await.unwrap();
+
+        let writing = store.clone();
+        let watched = sid.clone();
+        let observed = recorded.clone();
+        let command = async move {
+            writing
+                .append(&watched, EventSeq::ZERO, vec![draft("watched", EventType::TURN_STARTED)])
+                .await
+                .unwrap();
+            let appeared = wait_for(&observed, 1).await;
+            // Asserted from inside the command: this future has not returned, so
+            // if the line is here, it was printed while the turn was running.
+            assert!(appeared, "the chain line did not appear before the command finished");
+            Ok(CliOutput::Text("done".to_string()))
+        };
+
+        // The verdict is not what these tests are about: the sink is. It is
+        // dropped on purpose, not by omission.
+        let _ = watch_with(store.as_ref(), live.as_mut(), &sid, EventSeq::ZERO, command, &mut sink)
+            .await
+            .unwrap();
+
+        let lines = recorded.lock().unwrap().lines.clone();
+        assert_eq!(lines.len(), 2, "one chain line and the answer: {lines:?}");
+        assert!(lines[0].starts_with("chain|"), "{}", lines[0]);
+        assert_eq!(lines[1], "answer|done");
+    }
+
+    /// Live model text goes to the human half; the chain stays a machine's.
+    #[tokio::test]
+    async fn live_text_reaches_the_human_half_and_never_the_chain() {
+        let store = Arc::new(FakeEventStore::new());
+        let bus = Arc::new(InMemoryLiveEventBus::new(8));
+        let sid = SessionId::from_string("watched");
+        let recorded = Arc::new(std::sync::Mutex::new(Recording::default()));
+        let mut sink = RecordingSink(recorded.clone());
+        let mut live = bus.subscribe().await.unwrap();
+
+        let publishing = bus.clone();
+        let observed = recorded.clone();
+        let command = async move {
+            publishing.publish(text_delta("hi")).await.unwrap();
+            assert!(wait_for(&observed, 1).await, "the live text did not appear while running");
+            Ok(CliOutput::Text("done".to_string()))
+        };
+
+        // The verdict is not what these tests are about: the sink is. It is
+        // dropped on purpose, not by omission.
+        let _ = watch_with(store.as_ref(), live.as_mut(), &sid, EventSeq::ZERO, command, &mut sink)
+            .await
+            .unwrap();
+
+        let lines = recorded.lock().unwrap().lines.clone();
+        assert_eq!(lines[0], "live|[model] hi");
+        assert_eq!(lines[1], "live|\n", "the open line is closed before the answer");
+        assert_eq!(lines[2], "answer|done");
+        assert!(
+            !lines.iter().any(|line| line.starts_with("chain|")),
+            "a live delta is not a durable fact: {lines:?}"
+        );
+    }
+
+    /// A command that returns in the same poll that publishes its delta still
+    /// shows that delta.
+    ///
+    /// This is the shape a fast provider has — the local echo model finishes
+    /// before the select ever reaches its live branch — and without the drain
+    /// the preview is thrown away with the queue, so the feature looks inert
+    /// against every model quick enough not to need it.
+    #[tokio::test]
+    async fn a_command_that_finishes_at_once_still_shows_its_delta() {
+        let store = Arc::new(FakeEventStore::new());
+        let bus = Arc::new(InMemoryLiveEventBus::new(8));
+        let sid = SessionId::from_string("watched");
+        let recorded = Arc::new(std::sync::Mutex::new(Recording::default()));
+        let mut sink = RecordingSink(recorded.clone());
+        let mut live = bus.subscribe().await.unwrap();
+
+        let publishing = bus.clone();
+        let command = async move {
+            publishing.publish(text_delta("quick")).await.unwrap();
+            Ok(CliOutput::Text("quick".to_string()))
+        };
+
+        // The verdict is not what these tests are about: the sink is. It is
+        // dropped on purpose, not by omission.
+        let _ = watch_with(store.as_ref(), live.as_mut(), &sid, EventSeq::ZERO, command, &mut sink)
+            .await
+            .unwrap();
+
+        let lines = recorded.lock().unwrap().lines.clone();
+        assert_eq!(lines[0], "live|[model] quick", "{lines:?}");
+        assert_eq!(lines[1], "live|\n");
+        assert_eq!(lines[2], "answer|quick");
+    }
+
+    /// A command that appends and returns immediately still gets its whole chain
+    /// printed: the final read is what decides which lines exist, so the live
+    /// pass is early, never different.
+    #[tokio::test]
+    async fn the_final_read_covers_what_the_live_pass_missed() {
+        let store = Arc::new(FakeEventStore::new());
+        let bus = InMemoryLiveEventBus::new(8);
+        let sid = SessionId::from_string("watched");
+        let recorded = Arc::new(std::sync::Mutex::new(Recording::default()));
+        let mut sink = RecordingSink(recorded.clone());
+        let mut live = bus.subscribe().await.unwrap();
+
+        let writing = store.clone();
+        let watched = sid.clone();
+        // No waiting and no yielding: the command returns before the live pass
+        // can possibly have delivered anything.
+        let command = async move {
+            writing
+                .append(&watched, EventSeq::ZERO, vec![draft("watched", EventType::TURN_STARTED)])
+                .await
+                .unwrap();
+            Ok(CliOutput::Text("done".to_string()))
+        };
+
+        // The verdict is not what these tests are about: the sink is. It is
+        // dropped on purpose, not by omission.
+        let _ = watch_with(store.as_ref(), live.as_mut(), &sid, EventSeq::ZERO, command, &mut sink)
+            .await
+            .unwrap();
+
+        let lines = recorded.lock().unwrap().lines.clone();
+        let chain: Vec<&String> = lines.iter().filter(|l| l.starts_with("chain|")).collect();
+        assert_eq!(chain.len(), 1, "printed exactly once, not once per path: {lines:?}");
+        assert!(chain[0].contains("\"seq\":0"), "{}", chain[0]);
+        assert!(lines.last().unwrap().starts_with("answer|"), "the answer comes last");
+    }
+
+    /// The recorder is shared with the command future, so the sink needs to be
+    /// usable from two tasks at once. Guarded here rather than in each test.
+    #[tokio::test]
+    async fn a_failing_command_is_reported_and_not_answered() {
+        let store = Arc::new(FakeEventStore::new());
+        let bus = InMemoryLiveEventBus::new(8);
+        let sid = SessionId::from_string("watched");
+        let recorded = Arc::new(std::sync::Mutex::new(Recording::default()));
+        let mut sink = RecordingSink(recorded.clone());
+        let mut live = bus.subscribe().await.unwrap();
+
+        let command = async move { Err::<CliOutput, String>("model refused".to_string()) };
+        let outcome =
+            watch_with(store.as_ref(), live.as_mut(), &sid, EventSeq::ZERO, command, &mut sink)
+                .await;
+        assert_eq!(outcome.unwrap_err(), "model refused");
+
+        let lines = recorded.lock().unwrap().lines.clone();
+        assert_eq!(lines.len(), 0, "nothing was answered or invented: {lines:?}");
+    }
+
+    /// A flag's value is never a positional (YA-76).
+    ///
+    /// The three commands that read a positional word — `approve`, `deny`, and
+    /// the two plugin verbs — used to drop only the flag itself, so a value
+    /// before the id became the id. This pins the reader they now share,
+    /// including the two spellings and a boolean flag that must not eat the
+    /// word after it.
+    #[test]
+    fn a_flag_value_is_never_read_as_a_positional() {
+        let words = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|word| word.to_string()).collect();
+            let args = args::parse(&argv).expect("a readable command line");
+            positionals(&args).into_iter().cloned().collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            words(&["plugin", "disable", "--reason", "because", "mcp.one"]),
+            ["disable", "mcp.one"]
+        );
+        assert_eq!(
+            words(&["plugin", "disable", "--reason=because", "mcp.one"]),
+            ["disable", "mcp.one"]
+        );
+        assert_eq!(words(&["deny", "--only", "call-1"]), ["call-1"]);
+        assert_eq!(words(&["approve", "call-1", "turn"]), ["call-1", "turn"]);
+    }
+}

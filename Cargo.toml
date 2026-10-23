@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-protocol",
+    "crates/agent-ports",
+    "crates/agent-config",
+    "crates/agent-store-jsonl",
+    "crates/agent-store-artifact",
+    "crates/agent-store-secret",
+    "crates/agent-projection",
+    "crates/agent-context",
+    "crates/agent-decision",
+    "crates/agent-decision-laya",
+    "crates/agent-kernel",
+    "crates/agent-loop",
+    "crates/agent-tools-fs",
+    "crates/agent-tools-git",
+    "crates/agent-tools-mcp",
+    "crates/agent-subagent-stdio",
+    "crates/agent-sandbox-win",
+    "crates/agent-model-openai",
+    "crates/agent-index-sqlite",
+    "crates/agent-testkit",
+    "crates/agent-cli",
+    "apps/agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+authors = ["道权"]
+repository = "https://github.com/ianxiaolizi/yaoyao"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# Parsing only: configuration is read from a file a person wrote, never written
+# back, so the serializer would be a dependency that only exists to be unused.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Channels and a timer that do not drag an async runtime into the crates that
+# use them: the core crates choose no executor, and the CLI picks tokio at the
+# edge. `futures-channel` was already in the tree through `futures-util`.
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+futures-timer = "3"
+# Bundled rather than linked against the system SQLite: the index must behave
+# the same on every machine, including the ones without a SQLite development
+# package. The CI toolchain already has a C compiler.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# rustls rather than native-tls: no OpenSSL build dependency, and TLS behavior
+# is identical across the platforms we target.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+# Read-only repository inspection without spawning `git`: the AppContainer
+# backend cannot give git a working directory at startup, so the git tools read
+# the repository in process instead. Only the local-file side of libgit2 is
+# used, so the transport features (ssh, https) stay off; libgit2 itself is
+# vendored and built from source, the same way SQLite is.
+git2 = { version = "0.21", default-features = false }
+# Windows commands write the console's OEM code page to a redirected pipe, not
+# UTF-8. Pure Rust and no unsafe of our own: the decoder lives behind a safe
+# API, which keeps the captured failure text readable without relaxing the
+# `deny(unsafe_code)` every crate except the sandbox backend carries.
+encoding_rs = "0.8"

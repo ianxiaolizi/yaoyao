@@ -1,0 +1,22 @@
+[package]
+name = "agent-index-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+async-trait = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+agent-store-jsonl = { path = "../agent-store-jsonl" }
+agent-testkit = { path = "../agent-testkit" }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

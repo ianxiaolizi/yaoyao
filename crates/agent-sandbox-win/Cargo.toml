@@ -1,0 +1,26 @@
+[package]
+name = "agent-sandbox-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-ports = { path = "../agent-ports" }
+
+# The backend is Windows-only, and so is the FFI. Keeping the dependency under
+# the target table means the crate builds (as a refusal stub) everywhere else
+# without asking for a Windows SDK.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Isolation",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+  "Win32_UI_Shell",
+] }

@@ -1,0 +1,18 @@
+[package]
+name = "agent-decision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+agent-testkit = { path = "../agent-testkit" }

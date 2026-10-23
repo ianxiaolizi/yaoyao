@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-17",
+  "host": "x86_64-pc-windows-msvc",
+  "rustc": "1.99.0",
+  "tool": "cargo-llvm-cov 0.9.1",
+  "scope": "cargo llvm-cov --workspace; doctests are not collected by the default run",
+  "measured": {
+    "lines": 94.64,
+    "functions": 92.70,
+    "regions": 93.95
+  },
+  "threshold_lines": 92.64,
+  "policy": "threshold_lines = measured.lines - 2.00; raise it when coverage improves, never lower it to make a change pass"
+}

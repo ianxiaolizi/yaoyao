@@ -1,0 +1,46 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Coverage instrumentation output (the instrumented test binaries write these
+# into the current directory when `cargo llvm-cov` runs)
+*.profraw
+
+# Reference code (separate project)
+laya/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local runtime state written by `agent` (event logs, artifacts, smoke runs)
+/.agent-data/
+/.agent-smoke*/
+
+# Secrets
+.env
+.env.*
+credentials.*
+*private*key*
+*token*
+*secret*
+
+# `agent-store-secret` is a source crate (a SecretProvider adapter), not a
+# credential file, so exempt it from the broad `*secret*` ignore above.
+!crates/agent-store-secret/
+
+# The port `SecretProvider` is defined in is source too. Without this line the
+# broad pattern above silently keeps it out of git: the file builds locally and
+# is missing from every fresh clone.
+!crates/agent-ports/src/secret_provider.rs
+
+# Local kernel-eval output (reports and transcripts from live runs)
+/apps/agent/kernel-eval-*.json
+/apps/agent/target/

@@ -1,0 +1,27 @@
+[package]
+name = "agent-model-openai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `net`, `io-util`, `time` and `macros` are for the `fake-openai-server` fixture
+# in `examples/`, which is a real HTTP server on a real socket — as
+# `agent-tools-mcp`'s tokio entry is for its own fixture. They cost the adapter
+# nothing: it opens no listener, and `transport.rs` is the only file that reaches
+# a socket at all.
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
+
+[dev-dependencies]
+agent-testkit = { path = "../agent-testkit" }
+agent-store-secret = { path = "../agent-store-secret" }
+tokio = { version = "1", features = ["rt", "macros"] }

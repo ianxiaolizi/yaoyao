@@ -1,0 +1,33 @@
+[package]
+name = "agent-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+# A fake decision backend has to be able to outlast a caller's deadline.
+tokio = { version = "1", features = ["time"] }
+# The in-memory artifact store has to name blobs the way the real one does: the
+# port says a blob name is the 64-hex SHA-256 of the content, and a double whose
+# addresses are a different shape is a double of a type that does not exist.
+# Already in the tree (agent-store-artifact pulls it), so this is an edge, not a
+# package.
+sha2 = "0.10"
+# The fake event store signals live subscribers the way the real one does.
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+# The architecture guard reads the manifests with the same parser the product
+# reads its config with, rather than scanning lines: a checker that can be
+# fooled by how a manifest is written checks the writing, not the graph. It is
+# a dev-dependency because only the guard's test binary uses it.
+toml = { workspace = true }

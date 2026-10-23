@@ -1,0 +1,376 @@
+//! Tool protocol: definitions, invocations, and results.
+//!
+//! These are the stable DTOs the kernel, loop, and adapters exchange. A model
+//! proposes a tool call; the loop turns it into a `ToolInvocation`; policy and
+//! approval attach a `policy_decision` before execution; the adapter returns a
+//! `ToolResult` whose large output is offloaded as `artifacts`.
+
+use crate::permissions::{ArtifactRef, Capability, PolicyDecision, RedactionMetadata};
+use serde::{Deserialize, Serialize};
+
+/// How much risk a tool carries, used by policy and replay/recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSideEffect {
+    Pure,
+    Read,
+    Write,
+    Network,
+    Destructive,
+}
+
+/// Where a tool definition came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSource {
+    Builtin,
+    Plugin,
+    Mcp,
+}
+
+/// Whether a tool run reached a terminal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// The `outcome` field a `tool/failed` carries when the call did not run
+/// because it is waiting on an approval, rather than because it failed.
+///
+/// Three parties have to agree on this word: the loop writes it, the
+/// model-context projection must not read it as an answer (nothing was
+/// executed, so the call stays open), and `resume` is what answers it once a
+/// decision exists.
+pub const APPROVAL_PENDING_OUTCOME: &str = "approval_pending";
+
+/// The `outcome` field a `tool/failed` carries when an approval settled
+/// negatively — denied, expired or cancelled. The call did not run, so it is
+/// not an observation about the world and must not be read as a failure the
+/// judgment gate holds the turn on.
+pub const APPROVAL_DENIED_OUTCOME: &str = "approval_denied";
+
+/// The `outcome` field a `tool/failed` carries when a kernel gate held the
+/// step before any of its calls ran.
+///
+/// The call did not run and did not fail: the loop refused to dispatch the
+/// batch until the model answered the check (record a branch, or stop replaying
+/// the same call). It gets a result anyway because every tool call in a
+/// provider response needs one; the text is the gate's instruction, and the
+/// judgment gate must not read it as an observation about the world.
+pub const GATE_REFUSED_OUTCOME: &str = "gate_refused";
+
+/// The `outcome` field a `tool/failed` carries when the gateway refused the
+/// call before it ran (unknown tool, policy, resource).
+///
+/// The distinction is what the judgment gate keys on: a refusal is a decision
+/// with actionable text, while a tool that ran and reported failure is an
+/// observation about the world — the class that ends in a silent stop.
+pub const GATEWAY_REFUSED_OUTCOME: &str = "gateway_refused";
+
+/// A tool's declared metadata, used by policy and manifest generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    /// Model-facing prose. It is the only field a model reasons about when
+    /// choosing a tool, so an empty one is a real defect, not a nicety.
+    pub description: String,
+    pub source: ToolSource,
+    pub side_effect: ToolSideEffect,
+    pub capability_requirements: Vec<Capability>,
+    /// Whether the tool is safe to retry (idempotent).
+    pub idempotent: bool,
+    pub timeout_ms: Option<u64>,
+    pub input_schema: serde_json::Value,
+}
+
+/// A request to run a tool. `policy_decision` is attached by the policy
+/// pipeline before execution; it is `None` when the loop proposes the call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInvocation {
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    /// The model's `ToolUse` id this invocation came from. `None` for
+    /// invocations started outside a model response, such as `agent tool`.
+    pub provider_tool_call_id: Option<String>,
+    pub policy_decision: Option<PolicyDecision>,
+}
+
+impl ToolInvocation {
+    /// An invocation proposed without a model-originated call id.
+    pub fn proposed(tool_name: impl Into<String>, arguments: serde_json::Value) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            arguments,
+            provider_tool_call_id: None,
+            policy_decision: None,
+        }
+    }
+
+    /// An invocation derived from a model's `ToolUse` block. Keeping the call id
+    /// here is what lets a replay rebuild a valid tool-role message later.
+    pub fn from_tool_call(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments: serde_json::Value,
+    ) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            arguments,
+            provider_tool_call_id: Some(tool_call_id.into()),
+            policy_decision: None,
+        }
+    }
+
+    /// Attach the policy decision reached before execution.
+    pub fn with_policy_decision(mut self, decision: PolicyDecision) -> Self {
+        self.policy_decision = Some(decision);
+        self
+    }
+}
+
+/// Facts about a result that are cheaper to carry than to parse out of its text.
+///
+/// The model does not see these: the request keeps exactly the tool's own
+/// words, so nothing here changes what is sent. They are recorded beside the
+/// result so later readers — the step ledger, and the turn-boundary trimming
+/// that compares results — can describe and group results without re-parsing
+/// prose that only happens to look structured. A provider that knows nothing
+/// about a fact leaves it `None`; a fact is never guessed from the text.
+///
+/// The locator of an offloaded result is not here: `ToolResult::artifacts`
+/// already carries it as a value. Repeating it would make two copies that can
+/// disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFacts {
+    /// The exit status of a process the tool ran. `Some(0)` is recorded too:
+    /// "the command ran and said yes" is a fact a reader needs, not only the
+    /// failure codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Lines in the full result, before any preview replaced part of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_count: Option<u64>,
+}
+
+impl ToolFacts {
+    /// Whether nothing is known. An empty set is omitted from payloads, so a
+    /// result with no facts serializes exactly as it did before this type
+    /// existed.
+    pub fn is_empty(&self) -> bool {
+        self.exit_code.is_none() && self.line_count.is_none()
+    }
+}
+
+/// A tool run's result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub status: ToolStatus,
+    /// Small result text that can enter the model context directly.
+    pub content: String,
+    /// Large results offloaded to the ArtifactStore.
+    pub artifacts: Vec<ArtifactRef>,
+    /// Whether output reached the framework and did not reach the model — cut
+    /// by the execution environment's size cap, or a content block the adapter
+    /// had no way to carry (an MCP image or audio payload, say) while the rest
+    /// of the result went through.
+    ///
+    /// This is not the other fact an artifact states. `truncated` says output
+    /// was lost before the model saw it; `artifacts` says what was large or had
+    /// no text form was *kept* and named by a locator. A result may be either,
+    /// both, or neither, and the two must not be read as one — which is why
+    /// offloading a block clears this flag rather than setting it.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Structured facts beside the text, for readers that must not parse it.
+    #[serde(default, skip_serializing_if = "ToolFacts::is_empty")]
+    pub facts: ToolFacts,
+    pub redaction_metadata: RedactionMetadata,
+    pub duration_ms: Option<u64>,
+}
+
+impl ToolResult {
+    /// A successful result with no artifacts and no redaction.
+    pub fn completed(content: impl Into<String>) -> Self {
+        Self {
+            status: ToolStatus::Completed,
+            content: content.into(),
+            artifacts: Vec::new(),
+            truncated: false,
+            facts: ToolFacts::default(),
+            redaction_metadata: RedactionMetadata::default(),
+            duration_ms: None,
+        }
+    }
+
+    /// A failed result with no artifacts and no redaction.
+    pub fn failed(content: impl Into<String>) -> Self {
+        Self { status: ToolStatus::Failed, ..Self::completed(content) }
+    }
+
+    /// Mark that the underlying output was cut at the source.
+    pub fn truncated(mut self) -> Self {
+        self.truncated = true;
+        self
+    }
+
+    /// Record the exit status of the process this result came from.
+    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
+        self.facts.exit_code = Some(exit_code);
+        self
+    }
+
+    /// Record how many lines the full result had before any preview.
+    pub fn with_line_count(mut self, line_count: u64) -> Self {
+        self.facts.line_count = Some(line_count);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn side_effect_and_status_serialize_snake_case() {
+        assert_eq!(serde_json::to_string(&ToolSideEffect::Write).unwrap(), "\"write\"");
+        assert_eq!(serde_json::to_string(&ToolStatus::Cancelled).unwrap(), "\"cancelled\"");
+        assert_eq!(serde_json::to_string(&ToolSource::Builtin).unwrap(), "\"builtin\"");
+    }
+
+    #[test]
+    fn tool_definition_round_trips_through_serde() {
+        let def = ToolDefinition {
+            name: "fs.read".to_string(),
+            description: "Read a text file".to_string(),
+            source: ToolSource::Builtin,
+            side_effect: ToolSideEffect::Read,
+            capability_requirements: vec![Capability::new(Capability::FS_READ)],
+            idempotent: true,
+            timeout_ms: Some(1000),
+            input_schema: json!({ "type": "object", "properties": { "path": { "type": "string" } } }),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        let decoded: ToolDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.name, "fs.read");
+        assert_eq!(decoded.description, "Read a text file");
+        assert_eq!(decoded.side_effect, ToolSideEffect::Read);
+        assert_eq!(decoded.capability_requirements, def.capability_requirements);
+        assert!(decoded.idempotent);
+    }
+
+    #[test]
+    fn tool_invocation_round_trips_with_and_without_policy_decision() {
+        let no_decision = ToolInvocation::proposed("fs.read", json!({ "path": "src/main.rs" }));
+        let decoded: ToolInvocation =
+            serde_json::from_str(&serde_json::to_string(&no_decision).unwrap()).unwrap();
+        assert!(decoded.policy_decision.is_none());
+        assert!(decoded.provider_tool_call_id.is_none());
+
+        let with_decision = ToolInvocation::proposed("shell.run", json!({ "command": "ls" }))
+            .with_policy_decision(PolicyDecision::Ask);
+        let decoded: ToolInvocation =
+            serde_json::from_str(&serde_json::to_string(&with_decision).unwrap()).unwrap();
+        assert_eq!(decoded.policy_decision, Some(PolicyDecision::Ask));
+    }
+
+    #[test]
+    fn model_originated_invocation_keeps_the_provider_call_id() {
+        let inv = ToolInvocation::from_tool_call("call_1", "fs.read", json!({ "path": "a.txt" }));
+        assert_eq!(inv.provider_tool_call_id.as_deref(), Some("call_1"));
+        assert!(inv.policy_decision.is_none());
+
+        let decoded: ToolInvocation =
+            serde_json::from_str(&serde_json::to_string(&inv).unwrap()).unwrap();
+        assert_eq!(decoded.provider_tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn tool_result_round_trips_with_artifacts() {
+        let result = ToolResult {
+            status: ToolStatus::Completed,
+            content: "hello".to_string(),
+            artifacts: vec![ArtifactRef {
+                hash: "abc".to_string(),
+                mime_type: "text/plain".to_string(),
+                size: 5,
+            }],
+            truncated: false,
+            facts: ToolFacts::default(),
+            redaction_metadata: RedactionMetadata {
+                redacted: true,
+                patterns: vec!["token".to_string()],
+            },
+            duration_ms: Some(12),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: ToolResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.status, ToolStatus::Completed);
+        assert_eq!(decoded.content, "hello");
+        assert_eq!(decoded.artifacts.len(), 1);
+        assert!(decoded.redaction_metadata.redacted);
+    }
+
+    #[test]
+    fn helper_constructors_set_status_and_defaults() {
+        let ok = ToolResult::completed("done");
+        assert_eq!(ok.status, ToolStatus::Completed);
+        assert!(ok.artifacts.is_empty());
+        assert!(!ok.truncated);
+        assert!(!ok.redaction_metadata.redacted);
+
+        let err = ToolResult::failed("boom");
+        assert_eq!(err.status, ToolStatus::Failed);
+    }
+
+    #[test]
+    fn truncation_is_opt_in_and_absent_results_read_as_untruncated() {
+        assert!(ToolResult::completed("cut").truncated().truncated);
+
+        // A result written before the flag existed must not read as truncated:
+        // "we lost output" is not a thing to infer from a missing field.
+        let older: ToolResult = serde_json::from_value(json!({
+            "status": "completed",
+            "content": "hello",
+            "artifacts": [],
+            "redaction_metadata": { "redacted": false, "patterns": [] },
+            "duration_ms": null,
+        }))
+        .unwrap();
+        assert!(!older.truncated);
+    }
+
+    #[test]
+    fn facts_are_omitted_when_empty_and_round_trip_when_set() {
+        let plain = ToolResult::completed("ok");
+        assert!(plain.facts.is_empty());
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("facts").is_none(), "an empty fact set must not add a key");
+
+        let result = ToolResult::completed("ok").with_exit_code(3).with_line_count(12);
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["facts"], json!({ "exit_code": 3, "line_count": 12 }));
+
+        let decoded: ToolResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.facts.exit_code, Some(3));
+        assert_eq!(decoded.facts.line_count, Some(12));
+    }
+
+    #[test]
+    fn a_result_without_facts_reads_as_unknown() {
+        // A result written before the field existed says nothing about its
+        // exit status or size; both must read as unknown, not as zero.
+        let older: ToolResult = serde_json::from_value(json!({
+            "status": "completed",
+            "content": "hello",
+            "artifacts": [],
+            "redaction_metadata": { "redacted": false, "patterns": [] },
+            "duration_ms": null,
+        }))
+        .unwrap();
+        assert!(older.facts.is_empty());
+    }
+}

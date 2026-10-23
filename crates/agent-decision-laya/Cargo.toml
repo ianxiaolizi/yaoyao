@@ -1,0 +1,23 @@
+[package]
+name = "agent-decision-laya"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Host classification for the loopback check. Already in the tree through
+# `reqwest`; named here because this crate parses the URL itself rather than
+# handing an unvalidated string to a transport.
+url = "2"
+tokio = { version = "1", features = ["net", "io-util", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "process", "io-util", "net"] }

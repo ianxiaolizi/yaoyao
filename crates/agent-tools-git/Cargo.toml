@@ -1,0 +1,23 @@
+[package]
+name = "agent-tools-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+async-trait = { workspace = true }
+# The repository is read in process. Spawning `git` is not an option under the
+# AppContainer backend: git cannot obtain its working directory there, while a
+# process that already has one — this one — reads the same repository fine.
+git2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The integration tests build repositories with the real `git` binary and then
+# check this provider against them.
+tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"

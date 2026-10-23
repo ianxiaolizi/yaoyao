@@ -1,0 +1,20 @@
+[package]
+name = "agent-store-jsonl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
+futures-timer = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+tempfile = "3"

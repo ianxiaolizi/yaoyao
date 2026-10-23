@@ -1,0 +1,42 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../../crates/agent-protocol" }
+agent-ports = { path = "../../crates/agent-ports" }
+agent-config = { path = "../../crates/agent-config" }
+agent-kernel = { path = "../../crates/agent-kernel" }
+agent-projection = { path = "../../crates/agent-projection" }
+agent-cli = { path = "../../crates/agent-cli" }
+agent-loop = { path = "../../crates/agent-loop" }
+agent-store-jsonl = { path = "../../crates/agent-store-jsonl" }
+agent-store-artifact = { path = "../../crates/agent-store-artifact" }
+agent-tools-fs = { path = "../../crates/agent-tools-fs" }
+agent-tools-git = { path = "../../crates/agent-tools-git" }
+agent-tools-mcp = { path = "../../crates/agent-tools-mcp" }
+agent-subagent-stdio = { path = "../../crates/agent-subagent-stdio" }
+agent-sandbox-win = { path = "../../crates/agent-sandbox-win" }
+agent-model-openai = { path = "../../crates/agent-model-openai" }
+agent-store-secret = { path = "../../crates/agent-store-secret" }
+agent-context = { path = "../../crates/agent-context" }
+agent-decision = { path = "../../crates/agent-decision" }
+agent-decision-laya = { path = "../../crates/agent-decision-laya" }
+agent-index-sqlite = { path = "../../crates/agent-index-sqlite" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+futures-util = { workspace = true }
+chrono = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+
+[dev-dependencies]
+agent-testkit = { path = "../../crates/agent-testkit" }
+tempfile = "3"
+# The tests in main.rs wait on a real clock, so they can watch a line appear
+# while the command is still running rather than only after it returns.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

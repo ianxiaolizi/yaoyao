@@ -1,0 +1,23 @@
+[package]
+name = "agent-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+agent-projection = { path = "../agent-projection" }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
+agent-testkit = { path = "../agent-testkit" }
+agent-loop = { path = "../agent-loop" }
+agent-kernel = { path = "../agent-kernel" }
+agent-store-jsonl = { path = "../agent-store-jsonl" }
+agent-tools-fs = { path = "../agent-tools-fs" }
+serde_json = { workspace = true }
+chrono = { workspace = true }

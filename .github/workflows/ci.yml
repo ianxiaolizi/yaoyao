@@ -1,0 +1,174 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # So the workflow can be re-run from the Actions page after a runner-side
+  # failure without an empty commit.
+  workflow_dispatch:
+
+# Pushes to main run the full gate; pull requests run the same workflow.
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # windows-latest, not ubuntu: this project runs on Windows, and only on
+    # Windows. A Linux runner would verify a configuration nobody uses, and its
+    # red would not be a defect. The gate should fail for the target platform,
+    # not for one the target never sees.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        # Pinned to the workspace's `rust-version`, not `stable`. A floating
+        # stable turns a new rustfmt or clippy lint into a red build with no
+        # code change; the pin makes the gate reproducible. Bump it together
+        # with STYLE.md's baseline, so the number and the toolchain move in one
+        # deliberate step.
+        #
+        # `dtolnay/rust-toolchain@stable` used to be written as
+        # `rust-toolchain@stable`; there the toolchain is the branch, so that
+        # names a repository that does not exist (checked: HTTP 404, against
+        # 200 for `rust-toolchain`). The workflow never ran, so the reference
+        # was never resolved, and it would have failed on its first step.
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          # The action's default profile is minimal, which carries rustc and
+          # cargo but neither rustfmt nor clippy. Both are installed on the
+          # developer machine, so a gate built from local habits passed there
+          # and failed here with `cargo-fmt.exe is not installed`. Name the
+          # tools the job runs, rather than relying on a default that does not
+          # include them.
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-check-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  coverage:
+    # The line-coverage gate from stage 5.6, run where its result can be seen
+    # by someone other than the developer's machine. It repeats the test suite
+    # under instrumentation, which is why it is its own job rather than another
+    # step in `check`: a coverage failure and a test failure should not hide
+    # each other.
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust with llvm-tools
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-coverage-
+
+      - name: Cache cargo-llvm-cov
+        # Keyed by the tool version, not the lockfile: the binary does not
+        # change when the workspace's dependencies do.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov.exe
+          key: ${{ runner.os }}-cargo-llvm-cov-0.9.1
+
+      - name: Install cargo-llvm-cov
+        # `--locked` builds the crate's own lockfile, so the tool is the same
+        # version the baseline was measured with. With the cache above in
+        # place this is a version check, not a build.
+        #
+        # `cargo install` refuses to overwrite a binary the cache just
+        # restored ("already exists in destination"), so only install when the
+        # tool is missing or the wrong version. `--force` would rebuild on
+        # every run and make the cache pointless.
+        shell: bash
+        run: |
+          if ! cargo llvm-cov --version 2>/dev/null | grep -q '0\.9\.1'; then
+            cargo install cargo-llvm-cov --version 0.9.1 --locked
+          fi
+
+      - name: Prepare the AppContainer backend
+        # The AppContainer live suite is part of the coverage measurement: most
+        # of the backend's FFI is only reachable from processes that really run
+        # inside the container. The one-time setup needs an elevated prompt;
+        # GitHub's Windows runners are elevated. If this step fails the job
+        # fails here, with the setup's own message, rather than later as a
+        # coverage drop that hides the cause.
+        run: cargo run -p agent -- sandbox setup
+
+      - name: Coverage gate
+        # `-Jobs 4`: the runner has four cores and room to commit them. The
+        # script's default of 2 is for the developer machine that hit the
+        # Windows commit limit at full parallelism.
+        env:
+          AGENT_APPCONTAINER_TEST: '1'
+        run: pwsh -File scripts/coverage.ps1 -Jobs 4
+
+  perf-smoke:
+    # The performance example from stage 5.4, run for its correctness
+    # sentinels only. Its numbers are not compared against `perf/baseline.json`:
+    # that baseline was measured on one machine, and a hosted runner's absolute
+    # throughput is not the same quantity. A comparison here would report a
+    # regression on every run and teach readers to ignore it.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-perf-
+
+      - name: Run the perf baseline example
+        # Release because the workloads are timed; a debug build measures a
+        # different program. No `--check`: see the job comment.
+        run: cargo run --release -p agent --example perf_baseline -- --label ci --iterations 3 --warmups 1

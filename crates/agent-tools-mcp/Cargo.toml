@@ -1,0 +1,45 @@
+[package]
+name = "agent-tools-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Image and audio blocks arrive base64-encoded and are decoded on their way to
+# the artifact store. Base64 is exactly the kind of primitive not to hand-roll;
+# the crate is already in this tree through `reqwest`, so nothing new is built.
+base64 = "0.23"
+# Header names and values for the Streamable HTTP transport's custom headers.
+# The same `http` major version `rmcp` links against, so a header built here is
+# the type the transport expects rather than one coerced into it.
+http = "1"
+# The official Model Context Protocol SDK. Only this adapter sees it: the kernel
+# and the loop know nothing about MCP, and a change here reaches no crate above.
+# `client` plus the two transports; `macros` and the server half are not used.
+rmcp = { version = "3.5", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+# `net`, `io-util`, and `macros` are for the `fake-mcp-http-server` fixture in
+# `examples/`, which is a real HTTP server on a real socket. They cost the
+# adapter nothing: it never opens a listener itself.
+tokio = { version = "1", features = [
+    "process",
+    "time",
+    "sync",
+    "rt",
+    "net",
+    "io-util",
+    "macros",
+] }
+
+[dev-dependencies]
+agent-testkit = { path = "../agent-testkit" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "process", "io-util"] }
