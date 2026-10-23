@@ -274,13 +274,23 @@ pub struct DefaultAgentLoop {
     live_bus: Option<Arc<dyn LiveEventBus>>,
     /// Monotonic across turns so a subscriber can order live events.
     live_seq: Arc<AtomicU64>,
-    /// Whether the judgment ledger and its failure gate are part of this loop.
+    /// Whether the judgment ledger, its tool and its advice are part of this
+    /// loop.
     ///
     /// On by default. The switch exists for the evaluation that has to show
-    /// the gate changes behavior: the same fixtures are run with it off to get
-    /// a baseline on the same build, rather than compared against a different
-    /// one.
-    judgment_enabled: bool,
+    /// what the ledger costs: the same fixtures are run with it off to get a
+    /// baseline on the same build, rather than compared against a different
+    /// one. The deterministic gates are a separate switch, so an arm can keep
+    /// them without paying for the tool on every step.
+    judgment_ledger: bool,
+    /// Whether the gates that need no ledger run: the stale-read gate and the
+    /// repeat gate. On in the full and gates arms, off in the baseline.
+    ///
+    /// These are refusals the kernel can decide from the manifest and the
+    /// turn's own calls. The failure, retry and stop gates are not here: they
+    /// are answers to a `judgment.update` call, so they cannot fire without
+    /// the tool.
+    judgment_gates: bool,
 }
 
 impl DefaultAgentLoop {
@@ -298,17 +308,31 @@ impl DefaultAgentLoop {
             decisions: None,
             live_bus: None,
             live_seq: Arc::new(AtomicU64::new(0)),
-            judgment_enabled: true,
+            judgment_ledger: true,
+            judgment_gates: true,
         }
     }
 
-    /// Turn the judgment ledger and the failure gate off.
+    /// Turn the thinking pipeline off: no ledger, no advice, no gates.
     ///
     /// This is the baseline arm of the evaluation, not a user preference: with
-    /// the ledger off the tool is not offered, no record is written, and the
-    /// gate cannot fire. Everything else about the turn is unchanged.
+    /// the ledger off the tool is not offered and no record is written; with
+    /// the gates off the stale-read and repeat refusals do not fire either.
+    /// Everything else about the turn is unchanged.
     pub fn without_judgment(mut self) -> Self {
-        self.judgment_enabled = false;
+        self.judgment_ledger = false;
+        self.judgment_gates = false;
+        self
+    }
+
+    /// Keep the deterministic gates, drop the ledger.
+    ///
+    /// The middle arm of the evaluation: the repeat and stale-read gates still
+    /// refuse, but the loop does not offer `judgment.update`, does not put the
+    /// ledger or its advice in the task layer, and cannot run the reconcile
+    /// gates that need the tool.
+    pub fn without_ledger(mut self) -> Self {
+        self.judgment_ledger = false;
         self
     }
 
@@ -1279,7 +1303,7 @@ impl AgentLoop for DefaultAgentLoop {
             // The judgment tool is offered on the same terms as the plan: the
             // loop answers it itself, so a provider that claimed the name would
             // only describe a tool that can never run.
-            if self.judgment_enabled {
+            if self.judgment_ledger {
                 definitions.push(judgment::tool_definition());
             }
             (
@@ -1345,9 +1369,9 @@ impl AgentLoop for DefaultAgentLoop {
                     &ctx.user_input,
                     facts,
                     ctx.plan.as_ref(),
-                    if self.judgment_enabled { ctx.judgment.as_ref() } else { None },
+                    if self.judgment_ledger { ctx.judgment.as_ref() } else { None },
                     stale.as_ref(),
-                    if self.judgment_enabled { Some(&advice) } else { None },
+                    if self.judgment_ledger { Some(&advice) } else { None },
                 ),
             };
             messages.push(ModelMessage::state_for_turn(&ctx.turn_id, layers.state.clone()));
@@ -1882,7 +1906,8 @@ impl AgentLoop for DefaultAgentLoop {
                 // made, and nothing has been looked at since the turn began:
                 // the answer would restate a fact about then. Refused once,
                 // like the others — a kernel note, not a hang.
-                if let Some(stale) = turn.stale.clone()
+                if self.judgment_gates
+                    && let Some(stale) = turn.stale.clone()
                     && !turn.stale_gate_fired
                     && !turn.acted_this_turn
                     && turn.manifest.entries.iter().any(|entry| entry.tool_id == stale.tool)
@@ -1941,7 +1966,7 @@ impl AgentLoop for DefaultAgentLoop {
             // because a transient failure deserves exactly one unchanged
             // retry (`transient`); the third is refused once, so a model with
             // no other idea is not left looping until the step budget ends.
-            if self.judgment_enabled
+            if self.judgment_gates
                 && !turn.repeat_refused
                 && turn.identical_streak >= 2
                 && let Some(call) = tool_calls.iter().find(|call| {
@@ -2058,7 +2083,7 @@ impl AgentLoop for DefaultAgentLoop {
                                     Some(&plan),
                                     turn.judgment.as_ref(),
                                     turn.stale.as_ref(),
-                                    self.judgment_enabled.then_some(&advice),
+                                    self.judgment_ledger.then_some(&advice),
                                 );
                                 if let Some(layers) = turn.context_layers.as_mut() {
                                     layers.task = text.clone();
@@ -2113,7 +2138,7 @@ impl AgentLoop for DefaultAgentLoop {
                 // and a later fold read the same chain. A reconcile must name
                 // the call that actually failed — a reconcile of something
                 // else is refused with the tool it should have named.
-                if self.judgment_enabled && call.tool_name == judgment::TOOL_NAME {
+                if self.judgment_ledger && call.tool_name == judgment::TOOL_NAME {
                     // `reviewed` names a fact the loop already has: the call
                     // that just failed. The model may send it, but a reconcile
                     // that leaves it out is filled in rather than refused —
@@ -2245,7 +2270,7 @@ impl AgentLoop for DefaultAgentLoop {
                                                 turn.ctx.plan.as_ref(),
                                                 Some(&merged),
                                                 turn.stale.as_ref(),
-                                                self.judgment_enabled.then_some(&advice),
+                                                self.judgment_ledger.then_some(&advice),
                                             );
                                             if let Some(layers) = turn.context_layers.as_mut() {
                                                 layers.task = text.clone();
@@ -3696,6 +3721,48 @@ mod tests {
             })
             .count();
         assert_eq!(ran, 3, "the one retry and the changed call both ran");
+        assert_eq!(outcome.final_content.as_deref(), Some("done"));
+    }
+
+    /// The middle arm: the repeat gate still refuses, but the ledger's tool
+    /// and its task-layer advice are gone.
+    #[tokio::test]
+    async fn the_gates_arm_keeps_the_repeat_gate_and_drops_the_ledger() {
+        let same = serde_json::json!({"path": "x"});
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", same.clone()),
+            FakeModelProvider::tool_call("echo", same.clone()),
+            FakeModelProvider::tool_call("echo", same.clone()),
+            FakeModelProvider::answer("done"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "same", ToolSideEffect::Read));
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        )
+        .without_ledger();
+
+        let mut turn = ctx();
+        turn.state = Some(facts());
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let required = outcome
+            .events
+            .iter()
+            .filter(|e| e.event_type.as_str() == EventType::JUDGMENT_REQUIRED)
+            .count();
+        assert_eq!(required, 1, "the repeat gate fires without the ledger");
+
+        let first = &model.requests()[0];
+        assert!(
+            !first.tool_manifest.entries.iter().any(|entry| entry.tool_id == judgment::TOOL_NAME),
+            "the ledger's tool is not offered"
+        );
+        let text = task_message(first, &turn.turn_id);
+        assert!(!text.contains("Judgment:"), "no ledger in the task layer: {text}");
         assert_eq!(outcome.final_content.as_deref(), Some("done"));
     }
 

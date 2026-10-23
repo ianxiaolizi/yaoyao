@@ -12,7 +12,7 @@ cargo test --workspace
 
 三门全绿才谈得上「改完了」。**CI 跑的就是这三条**（`.github/workflows/ci.yml`，push / PR 到 `main`，可 `workflow_dispatch` 手动重跑）。另外两个 job：`coverage`（`scripts/coverage.ps1`，阈值在 `scripts/coverage-baseline.json`；设 `AGENT_APPCONTAINER_TEST=1` 时合并 AppContainer 真跑测量，否则本机会低于阈值）与 `perf-smoke`（release 跑性能示例的正确性哨兵，不与单机基线比对）。CI 的 Rust 版本钉在 workspace 的 `rust-version`（`1.99.0`）。
 
-本机跑法：`cargo test --workspace`；clippy 加 `-j 1`（本地并行偶发 `0xc0000409`）。**当前基线（2026-10-23）：1408 passed / 0 failed / 14 ignored**（76 个 test binary、22 个 Doc-tests）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
+本机跑法：`cargo test --workspace`；clippy 加 `-j 1`（本地并行偶发 `0xc0000409`）。**当前基线（2026-10-23）：1409 passed / 0 failed / 14 ignored**（76 个 test binary、22 个 Doc-tests）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
 
 ## 1. Rust 工程规则（硬）
 

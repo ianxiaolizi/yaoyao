@@ -30,9 +30,11 @@
 //! | `retry` | state — the named file is absent; a sibling holds the answer |
 //! | `fresh` | time — the file is rewritten between turns, so the first reading is stale |
 //!
-//! Run the judgment fixtures with `AGENT_JUDGMENT=off` for a baseline arm on
-//! the same build; the report counts the gate's firings and the records either
-//! way, so the two arms compare row by row.
+//! Run the judgment fixtures with `AGENT_JUDGMENT=off` for the baseline arm on
+//! the same build, or `AGENT_JUDGMENT=gates` for the middle arm: the
+//! deterministic repeat and stale-read refusals without the ledger's tool and
+//! advice. The report counts the gate's firings and the records either way, so
+//! the arms compare row by row.
 //!
 //! Four fixtures probe the second cut of the thinking pipeline. Two of its
 //! requirements are advice now — a sentence in the task layer, never a hold —
@@ -1517,14 +1519,18 @@ fn print_report(reports: &[TaskReport]) {
     let loops = reports.iter().filter(|report| report.longest_identical_streak >= 3).count();
     let gates: u64 = reports.iter().map(|report| report.judgment_required).sum();
     let reconciled = reports.iter().filter(|report| report.reconciled).count();
-    let judgment_enabled = std::env::var("AGENT_JUDGMENT")
-        .map(|value| !value.eq_ignore_ascii_case("off"))
-        .unwrap_or(true);
+    let judgment_arm = std::env::var("AGENT_JUDGMENT")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|_| String::from("on"));
+    let arm = match judgment_arm.as_str() {
+        "off" => "off (baseline arm)",
+        "gates" => "gates only (no ledger)",
+        _ => "on",
+    };
     println!(
         "summary: solved {solved}/{total}; failures {episodes}; evidence-first {evidence}, \
          adjusted-retry {adjusted}, identical-retry {identical}, stopped {stopped}; loops {loops}; \
-         judgment {} with {gates} gate(s) and {reconciled} reconciled run(s)",
-        if judgment_enabled { "on" } else { "off (baseline arm)" }
+         judgment {arm} with {gates} gate(s) and {reconciled} reconciled run(s)"
     );
 }
 

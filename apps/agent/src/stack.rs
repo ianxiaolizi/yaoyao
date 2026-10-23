@@ -88,11 +88,10 @@ pub struct Inputs {
     /// decision as `sandbox`, and ignored by the modes that have no network
     /// controls of their own.
     pub network_allowed: bool,
-    /// Whether the loop runs the thinking pipeline: the judgment ledger, and
-    /// the gates that hold an irreversible call, an unanswered change and a
-    /// repeated call. The binary always does. A test whose subject is another
-    /// boundary — approval and resume plumbing, say — states the premise here
-    /// instead of scripting around a gate it is not testing.
+    /// Whether the loop runs the thinking pipeline at all. The binary passes
+    /// true; [`judgment_arm`] then reads `AGENT_JUDGMENT` to pick the full
+    /// pipeline, the deterministic gates without the ledger, or neither.
+    /// A test whose subject is another boundary states the premise here.
     pub judgment: bool,
 }
 
@@ -137,6 +136,41 @@ pub enum StackError {
     /// confined one.
     #[error("execution sandbox {mode} is unavailable: {reason}")]
     SandboxUnavailable { mode: &'static str, reason: String },
+    /// `AGENT_JUDGMENT` names an arm this build does not know. Fail closed:
+    /// a typo must not silently pick the expensive pipeline or the baseline.
+    #[error("judgment mode '{0}' is not one of `on`, `gates` or `off`")]
+    JudgmentMode(String),
+}
+
+/// Which part of the thinking pipeline a run gets.
+///
+/// The three arms exist for the evaluation: `Full` is the product, `Gates` is
+/// the control that keeps the deterministic refusals without the ledger's tool
+/// and advice, and `Off` is the baseline that predates the pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JudgmentArm {
+    Full,
+    Gates,
+    Off,
+}
+
+/// Read the arm from `AGENT_JUDGMENT` (default `on`).
+///
+/// `enabled` is the caller's premise; `false` forces `Off` without reading the
+/// environment, which is what a test that disables the pipeline means.
+fn judgment_arm(enabled: bool) -> Result<JudgmentArm, StackError> {
+    if !enabled {
+        return Ok(JudgmentArm::Off);
+    }
+    match std::env::var("AGENT_JUDGMENT").ok().as_deref().map(str::trim) {
+        None | Some("") => Ok(JudgmentArm::Full),
+        Some(value) if value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("full") => {
+            Ok(JudgmentArm::Full)
+        }
+        Some(value) if value.eq_ignore_ascii_case("gates") => Ok(JudgmentArm::Gates),
+        Some(value) if value.eq_ignore_ascii_case("off") => Ok(JudgmentArm::Off),
+        Some(other) => Err(StackError::JudgmentMode(other.to_string())),
+    }
 }
 
 /// The assembled stack: one event store, one tool surface, and the kernel
@@ -541,13 +575,15 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     if let Some(advisor) = advisor {
         loop_ = loop_.with_decisions(advisor);
     }
-    // The evaluation's baseline arm. `kernel_eval` runs the same fixtures with
-    // `AGENT_JUDGMENT=off` to measure what the ledger and its gates changed on
-    // this build; nothing else in a normal session reads this value.
-    let judgment = judgment
-        && !std::env::var("AGENT_JUDGMENT").is_ok_and(|value| value.eq_ignore_ascii_case("off"));
-    if !judgment {
-        loop_ = loop_.without_judgment();
+    // The evaluation's arms: `AGENT_JUDGMENT=off` is the baseline that
+    // predates the pipeline, `gates` keeps the deterministic refusals without
+    // the ledger's tool and advice, and `on` (the default) is the product. The
+    // binary passes `judgment: true`; a test may pass false to state that it
+    // is not exercising the pipeline at all.
+    match judgment_arm(judgment)? {
+        JudgmentArm::Full => {}
+        JudgmentArm::Gates => loop_ = loop_.without_ledger(),
+        JudgmentArm::Off => loop_ = loop_.without_judgment(),
     }
     let loop_ = Arc::new(loop_);
     // The configuration is frozen here, now that the route is known, and handed
