@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-cli = { path = "../agent-cli" }
 agent-protocol = { path = "../agent-protocol" }
 agent-ports = { path = "../agent-ports" }
 agent-projection = { path = "../agent-projection" }

@@ -17,6 +17,7 @@ use agent_protocol::ids::{
 };
 use agent_protocol::inbox::{InboxItem, InboxItemStatus, InboxKind};
 use agent_protocol::model::ModelResponse;
+use agent_protocol::reason::{Basis, ReasonKind, ReasonNode, ReasonSource};
 use agent_store_jsonl::JsonlEventStore;
 use agent_web::{Config, Meta, Server};
 use chrono::Utc;
@@ -122,6 +123,53 @@ async fn seeded() -> (Arc<dyn EventStore>, TempDir, SessionId) {
     ];
     store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the log");
     (store, dir, session)
+}
+
+/// A session whose log holds a two-node reasoning chain.
+async fn seeded_chain() -> (Arc<dyn EventStore>, TempDir) {
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let situation = ReasonNode {
+        id: "r/t1/1".to_string(),
+        turn_id: "t1".to_string(),
+        step: 0,
+        kind: ReasonKind::Situation,
+        claim: "the person asked a question".to_string(),
+        basis: vec![Basis { node: None, event: None, fact: Some("their words".to_string()) }],
+        rule: "situation/derive".to_string(),
+        source: ReasonSource::Kernel,
+    };
+    let verdict = ReasonNode {
+        id: "r/t1/2".to_string(),
+        turn_id: "t1".to_string(),
+        step: 0,
+        kind: ReasonKind::Verdict,
+        claim: "answered".to_string(),
+        basis: vec![Basis { node: Some("r/t1/1".to_string()), event: None, fact: None }],
+        rule: "verdict/answer".to_string(),
+        source: ReasonSource::Kernel,
+    };
+    let drafts = vec![
+        draft(
+            &session,
+            EventType::REASON_RECORDED,
+            Some(&turn),
+            None,
+            json!({ "node": situation }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::REASON_RECORDED,
+            Some(&turn),
+            None,
+            json!({ "node": verdict }),
+            Actor::Agent,
+        ),
+    ];
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the chain");
+    (store, dir)
 }
 
 /// Bind on an ephemeral port and start serving.
@@ -276,5 +324,31 @@ async fn an_unknown_session_is_not_found() {
     let (status, response) =
         request(addr, "/api/sessions/ghost/transcript", Some(&token), None).await;
     assert_eq!(status, 404, "{response}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn the_why_report_is_the_chain() {
+    let (store, dir) = seeded_chain().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/why", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["turn"], "t1");
+    assert_eq!(payload["check"], "ok");
+    assert_eq!(payload["verdict"]["rule"], "verdict/answer");
+    assert_eq!(payload["nodes"].as_array().expect("nodes").len(), 2);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_session_without_a_chain_is_not_found() {
+    let (store, dir, _) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/why", Some(&token), None).await;
+    assert_eq!(status, 404, "{response}");
+    assert!(body(&response).contains("\"code\":\"why_unavailable\""), "{response}");
     handle.abort();
 }

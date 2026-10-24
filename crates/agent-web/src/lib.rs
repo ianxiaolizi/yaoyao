@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_cli::reason::WhyError;
 use agent_ports::event_store::EventStore;
 use agent_protocol::ids::SessionId;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -152,6 +153,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/meta", get(meta))
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{id}/transcript", get(transcript))
+        .route("/api/sessions/{id}/why", get(why))
         .layer(middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
 }
@@ -215,6 +217,42 @@ async fn transcript(
     Ok(Json(payload))
 }
 
+/// `GET /api/sessions/{id}/why?turn=<turn>`.
+///
+/// A reader, not a run: it opens the log and answers from the nodes the kernel
+/// recorded. Nothing here assembles a model or a sandbox, so it still answers
+/// when the configuration that ran the turn has since broken.
+async fn why(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiFailure> {
+    if !sessions::safe_session_id(&id) {
+        return Err(ApiFailure::bad_request(format!("'{id}' is not a session id")));
+    }
+    if !state.data_dir.join(&id).join("events.jsonl").is_file() {
+        return Err(ApiFailure::not_found(format!("no session '{id}'")));
+    }
+    let report = agent_cli::reason::why_report(
+        state.store.as_ref(),
+        &SessionId::from_string(&id),
+        query.get("turn").map(String::as_str),
+    )
+    .await
+    .map_err(ApiFailure::why)?;
+
+    Ok(Json(serde_json::json!({
+        "v": PROTOCOL,
+        "ok": true,
+        "session": report.session,
+        "turn": report.turn,
+        "nodes": report.nodes,
+        "verdict": report.verdict,
+        "stop": report.stop,
+        "check": report.check,
+    })))
+}
+
 /// A handler's refusal, in the same envelope as the gate's.
 struct ApiFailure {
     status: StatusCode,
@@ -239,6 +277,25 @@ impl ApiFailure {
             kind: "not_found",
             code: "not_found",
             message: message.into(),
+        }
+    }
+
+    /// A chain that is not there is an answer (404); one that cannot be read is
+    /// not (500). The two call for different next steps.
+    fn why(error: WhyError) -> Self {
+        match error {
+            WhyError::Unavailable(message) => Self {
+                status: StatusCode::NOT_FOUND,
+                kind: "not_found",
+                code: "why_unavailable",
+                message,
+            },
+            other => Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                kind: "internal",
+                code: "why_failed",
+                message: other.to_string(),
+            },
         }
     }
 

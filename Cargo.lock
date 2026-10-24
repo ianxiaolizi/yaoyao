@@ -341,6 +341,7 @@ dependencies = [
 name = "agent-web"
 version = "0.1.0"
 dependencies = [
+ "agent-cli",
  "agent-ports",
  "agent-projection",
  "agent-protocol",

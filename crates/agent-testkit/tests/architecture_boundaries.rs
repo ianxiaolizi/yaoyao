@@ -176,10 +176,11 @@ fn dependency_direction_matches_spec() {
         ("crates/agent-index-sqlite", &["agent-protocol", "agent-ports"]),
         ("crates/agent-testkit", &["agent-protocol", "agent-ports"]),
         ("crates/agent-cli", &["agent-protocol", "agent-ports", "agent-kernel"]),
-        // The front door: a transport and the read model over the log. It may
-        // fold projections (the transcript is a view, not a second source) but
-        // never names the kernel — writes go through the command layer.
-        ("crates/agent-web", &["agent-protocol", "agent-ports", "agent-projection"]),
+        // The front door: a transport, the read model over the log, and the
+        // command layer's readers. It may fold projections and call `agent-cli`,
+        // but it never names the kernel — writes go through the same commands
+        // the terminal uses.
+        ("crates/agent-web", &["agent-cli", "agent-protocol", "agent-ports", "agent-projection"]),
         (
             "apps/agent",
             &[

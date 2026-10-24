@@ -17,6 +17,7 @@ use agent_ports::event_store::EventStore;
 use agent_protocol::events::{EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::reason::{ReasonKind, ReasonNode, rule};
+use serde::Serialize;
 
 use crate::{CliOutcome, CliOutput, json_output};
 
@@ -26,6 +27,116 @@ use crate::{CliOutcome, CliOutput, json_output};
 /// that hangs on a hand-made loop would be worse than one that says where it
 /// stopped.
 pub const DEFAULT_DEPTH: usize = 64;
+
+/// Why a structured report could not be produced.
+///
+/// `Unavailable` is an answer — the session or turn genuinely has no chain —
+/// while the other two are failures to read one that should exist. The web
+/// endpoint maps the first to 404 and the others to 500 for the same reason the
+/// CLI distinguishes them: a missing record and an unreadable one call for
+/// different next steps.
+#[derive(Debug, thiserror::Error)]
+pub enum WhyError {
+    #[error("{0}")]
+    Unavailable(String),
+    #[error("{0}")]
+    Store(String),
+    #[error("{0}")]
+    Malformed(String),
+}
+
+/// One turn's reasoning chain, structured.
+#[derive(Debug, Clone, Serialize)]
+pub struct WhyReport {
+    pub session: String,
+    pub turn: String,
+    /// Every node of the turn, in log order.
+    pub nodes: Vec<ReasonNode>,
+    /// The latest verdict node, if the turn wrote one.
+    pub verdict: Option<WhyVerdict>,
+    /// How the turn ended, when the log says so.
+    pub stop: Option<WhyStop>,
+    /// `"ok"`, or what the edge check objected to.
+    pub check: String,
+}
+
+/// The turn's self-description: the rule it stopped on and the claim it made.
+#[derive(Debug, Clone, Serialize)]
+pub struct WhyVerdict {
+    pub rule: String,
+    pub claim: String,
+    pub step: u32,
+}
+
+/// The terminal event, reduced to the two words a reader needs.
+#[derive(Debug, Clone, Serialize)]
+pub struct WhyStop {
+    pub event: String,
+    pub reason: String,
+}
+
+/// Read one turn's reasoning chain as data.
+///
+/// The CLI's [`run_why`] renders the same selection; this returns the nodes
+/// themselves so a second front end does not have to parse our JSON back out of
+/// a string. Both read the log from the start: a chain is a derivation, and a
+/// later node is only checkable against the ones before it.
+pub async fn why_report(
+    store: &dyn EventStore,
+    session_id: &SessionId,
+    turn: Option<&str>,
+) -> Result<WhyReport, WhyError> {
+    let events = store
+        .read_stream(session_id, EventSeq::ZERO, usize::MAX)
+        .await
+        .map_err(|error| WhyError::Store(format!("cannot read the session log: {error}")))?;
+    let chain = Chain::parse(&events).map_err(|error| {
+        WhyError::Malformed(format!("the reasoning chain is unreadable: {error}"))
+    })?;
+    if chain.is_empty() {
+        return Err(WhyError::Unavailable(String::from(
+            "no reasoning chain recorded in this session: it was written by an older build, \
+             or no turn has run since the chain was introduced",
+        )));
+    }
+    let turn = select_turn(&chain, turn).map_err(WhyError::Unavailable)?;
+    let nodes = chain.turn_nodes(&turn);
+    if nodes.is_empty() {
+        return Err(WhyError::Unavailable(format!(
+            "no reasoning chain recorded for turn '{turn}'"
+        )));
+    }
+    let check = chain.check(&turn).map_or_else(|error| error.to_string(), |_| String::from("ok"));
+    let end = TurnEnd::of(&events, &turn);
+    let verdict = verdict_node(&nodes).map(|node| WhyVerdict {
+        rule: node.rule.clone(),
+        claim: node.claim.clone(),
+        step: node.step,
+    });
+    let stop = end.map(|end| {
+        let reason = end.reason();
+        WhyStop { event: end.event, reason }
+    });
+    Ok(WhyReport {
+        session: session_id.as_str().to_string(),
+        turn,
+        nodes: nodes.into_iter().cloned().collect(),
+        verdict,
+        stop,
+        check,
+    })
+}
+
+/// The turn a report is about: the one named, or the latest with a chain.
+fn select_turn(chain: &Chain, turn: Option<&str>) -> Result<String, String> {
+    match turn {
+        Some(turn) => Ok(turn.to_string()),
+        None => chain
+            .latest_turn()
+            .map(|turn| turn.to_string())
+            .ok_or_else(|| String::from("no turn to explain")),
+    }
+}
 
 /// Execute the `why` command: render the reasoning chain of one turn.
 ///
@@ -51,10 +162,7 @@ pub async fn run_why(
              or no turn has run since the chain was introduced",
         ))));
     }
-    let turn_id = match turn {
-        Some(turn) => turn.to_string(),
-        None => chain.latest_turn().ok_or_else(|| String::from("no turn to explain"))?.to_string(),
-    };
+    let turn_id = select_turn(&chain, turn)?;
     let nodes = chain.turn_nodes(&turn_id);
     if nodes.is_empty() {
         return Ok(CliOutcome::did_not_run(CliOutput::Text(format!(

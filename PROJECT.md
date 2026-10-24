@@ -80,7 +80,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-index-sqlite` | `SqliteMemoryIndex`（可丢弃的 SQLite 读模型：从日志重建、词面子串检索；版本不符拒绝，只由 `reindex` 重建）+ `memory.search` 工具（装配时绑定当前 session，能力 `memory.read`） |
 | `agent-testkit` | FakeEventStore / FakeModel·Tool·Gateway / FakeSecret / FakeDoctorCheck + 架构守卫 |
 | `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `why` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `web` `memory search\|reindex` `context inspect` `artifact get` |
-| `agent-web` | 本地回环 HTTP 入口：静态页、一次性令牌、`/api/meta`、`/api/sessions` 与 transcript 读模型；写操作只走 `agent-cli` 的命令层，不直连内核 |
+| `agent-web` | 本地回环 HTTP 入口：静态页、一次性令牌、`/api/meta`、`/api/sessions`、transcript 与 why 读模型；写操作只走 `agent-cli` 的命令层，不直连内核 |
 | `apps/agent` | 唯一具体组装入口（二进制）；`instructions` 模块把工作区根部的 `AGENTS.md` + 内置前言组成每次运行的系统指令 |
 
 `agent-kernel` 一个 crate 占 src 的约四分之一；`agent-loop`、`agent-cli` 是单文件大模块。
