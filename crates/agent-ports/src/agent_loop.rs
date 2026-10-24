@@ -98,6 +98,13 @@ pub struct TurnStateFacts {
     pub input_kind: TurnInputKind,
     /// How the most recent turn that ended ended, if any turn has ended.
     pub previous_turn: Option<TurnEnding>,
+    /// The decision word of the approval this turn continues, when it opened
+    /// on a resume (`granted`, `denied`, ...). `None` for every ordinary turn.
+    ///
+    /// It rides the inbox item rather than the log because the item is what
+    /// carries `resumed: true` already; the posture needs the word, not the
+    /// settlement.
+    pub resumed: Option<String>,
     /// The most steps this run may take, from the run's configuration.
     pub max_steps: u32,
 }

@@ -1474,6 +1474,7 @@ impl AgentLoop for DefaultAgentLoop {
                 Some(TurnInputKind::User) | None => String::from("user"),
             },
             previous_turn: turn_facts.and_then(|facts| facts.previous_turn).map(ending_word),
+            resumed: turn_facts.and_then(|facts| facts.resumed.clone()),
             queued_inputs: turn_facts.map(|facts| facts.queued_inputs).unwrap_or(0),
             max_steps: turn_facts.map(|facts| facts.max_steps).unwrap_or(0),
             plan_done: ctx.plan.as_ref().map_or(0, |plan| {
@@ -4024,6 +4025,43 @@ mod tests {
         assert_eq!(outcome.final_content.as_deref(), Some("done"));
     }
 
+    /// The other half of the resume boundary: the approval was granted and
+    /// nothing failed, so the turn continues the work. Its words ("批准了，继续。")
+    /// carry no cue at all; the posture has to come from the decision the item
+    /// carries, and the chain says which fact it used.
+    #[tokio::test]
+    async fn a_granted_continuation_opens_in_act_and_says_so() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({"s": "hi"})),
+            FakeModelProvider::answer("done"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        let mut state = facts();
+        state.resumed = Some(String::from("granted"));
+        turn.state = Some(state);
+        turn.user_input = serde_json::json!({"text": "批准了，继续。"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let situation =
+            nodes.iter().find(|node| node.kind == ReasonKind::Situation).expect("a situation");
+        assert!(situation.claim.contains("resumed: granted"), "{}", situation.claim);
+        let reading =
+            nodes.iter().find(|node| node.kind == ReasonKind::Reading).expect("a reading");
+        assert_eq!(reading.rule, "reading/no-cue", "the words themselves name nothing");
+        let stance = nodes.iter().find(|node| node.kind == ReasonKind::Stance).expect("a stance");
+        assert_eq!(stance.rule, "stance/continuation-granted");
+    }
+
     /// A reconcile that omits `reviewed` is completed with the call that
     /// actually failed, instead of costing the model a call to restate a fact
     /// the loop already holds.
@@ -6302,6 +6340,7 @@ mod tests {
             queued_inputs: 1,
             input_kind: TurnInputKind::User,
             previous_turn: Some(TurnEnding::Cancelled),
+            resumed: None,
             max_steps: 16,
         }
     }

@@ -239,12 +239,18 @@ impl Resume {
         // `resumed` marks the turn this item opens as the continuation of an
         // interrupted one: the held call has now run, and if it failed that
         // failure belongs to a turn that has already closed. The Scheduler
-        // reads it back from the log for exactly these items.
+        // reads it back from the log for exactly these items. `decision` is the
+        // same word `turn/resumed` carries: the continuation's text may be the
+        // person's own "go ahead", which says nothing about what just happened.
         self.inbox
             .append(
                 session_id,
                 InboxKind::NextTurn,
-                serde_json::json!({ "text": continuation, "resumed": true }),
+                serde_json::json!({
+                    "text": continuation,
+                    "resumed": true,
+                    "decision": disposition.label(),
+                }),
                 0,
                 Actor::User,
             )

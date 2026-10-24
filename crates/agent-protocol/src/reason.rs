@@ -333,6 +333,11 @@ pub const RULES: &[Rule] = &[
         text: "a scheduled turn with no action cue reports back instead of starting work",
     },
     Rule {
+        id: "stance/continuation-granted",
+        version: 1,
+        text: "the turn continues a call whose approval was granted, so the posture is act: what is left is the work the request asked for, not a new reading of the message",
+    },
+    Rule {
         id: "switch/failure-repair",
         version: 1,
         text: "a real tool failure arrived while the turn was not already repairing, so the posture changes to repair: the next move must change one variable instead of repeating the failed call",
@@ -474,6 +479,11 @@ impl Reading {
 pub struct Situation {
     pub input_kind: String,
     pub previous_turn: Option<String>,
+    /// The decision word of the approval this turn continues, when the turn
+    /// opened on a resume (`granted`, `denied`, ...). The continuation's text
+    /// is often the person's own "go ahead", which reads as no cue at all; the
+    /// decision is what the posture has to come from.
+    pub resumed: Option<String>,
     pub queued_inputs: usize,
     pub max_steps: u32,
     pub plan_done: usize,
@@ -493,6 +503,9 @@ impl Situation {
     pub fn render(&self) -> String {
         let mut parts = vec![format!("{} turn", self.input_kind)];
         parts.push(format!("previous turn: {}", self.previous_turn.as_deref().unwrap_or("none")));
+        if let Some(resumed) = &self.resumed {
+            parts.push(format!("resumed: {resumed}"));
+        }
         if self.queued_inputs > 0 {
             parts.push(format!("{} queued", self.queued_inputs));
         }
@@ -676,6 +689,17 @@ pub fn select(situation: &Situation, reading: &Reading) -> Selection {
         return Selection::new(
             Stance::Repair,
             "stance/repair-failure",
+            !situation.irreversible.is_empty(),
+        );
+    }
+    // A granted approval is context the text does not carry: the continuation
+    // is usually the person's own "go ahead", which names no action and no
+    // question. What is left after the call ran is the work the request asked
+    // for, so the posture is act whatever the words look like.
+    if situation.resumed.as_deref() == Some("granted") {
+        return Selection::new(
+            Stance::Act,
+            "stance/continuation-granted",
             !situation.irreversible.is_empty(),
         );
     }
@@ -902,6 +926,7 @@ mod tests {
         Situation {
             input_kind: String::from("user"),
             previous_turn: None,
+            resumed: None,
             queued_inputs: 0,
             max_steps: 12,
             plan_done: 0,
@@ -923,6 +948,31 @@ mod tests {
         situation.pending_failure = Some(String::from("shell.run"));
         let reading = read("再试一次");
         let selection = select(&situation, &reading);
+        assert_eq!(selection.stance, Stance::Repair);
+        assert_eq!(selection.rule, "stance/repair-failure");
+    }
+
+    /// A granted approval is the one case where "nothing readable in the words"
+    /// still has a posture: the call ran, and what is left is the work.
+    #[test]
+    fn a_granted_continuation_acts_even_when_the_words_say_nothing() {
+        let mut situation = a_situation();
+        situation.resumed = Some(String::from("granted"));
+        let reading = read("批准了，继续。");
+        assert_eq!(reading.act, SpeechAct::Unclear, "the words carry no cue");
+        let selection = select(&situation, &reading);
+        assert_eq!(selection.stance, Stance::Act);
+        assert_eq!(selection.rule, "stance/continuation-granted");
+    }
+
+    /// A failure on the resumed call outranks the continuation: the turn is
+    /// repairing, not continuing.
+    #[test]
+    fn a_failed_continuation_repairs_instead_of_acting() {
+        let mut situation = a_situation();
+        situation.resumed = Some(String::from("granted"));
+        situation.pending_failure = Some(String::from("shell.run"));
+        let selection = select(&situation, &read("批准了，继续。"));
         assert_eq!(selection.stance, Stance::Repair);
         assert_eq!(selection.rule, "stance/repair-failure");
     }

@@ -386,16 +386,24 @@ impl Scheduler {
         // A resume continuation opens on a turn that already closed: the held
         // call ran and may have failed there. The loop has no memory of that
         // turn, so the failure is read back from the log and handed to it.
-        let pending_failure =
-            if item.payload.get("resumed").and_then(|value| value.as_bool()).unwrap_or(false) {
-                judgment::pending_failure(&history).map(|pending| TurnFailureFacts {
-                    call_id: pending.call_id,
-                    tool: pending.tool,
-                    detail: pending.detail,
-                })
-            } else {
-                None
-            };
+        let resumed =
+            item.payload.get("resumed").and_then(|value| value.as_bool()).unwrap_or(false);
+        let pending_failure = if resumed {
+            judgment::pending_failure(&history).map(|pending| TurnFailureFacts {
+                call_id: pending.call_id,
+                tool: pending.tool,
+                detail: pending.detail,
+            })
+        } else {
+            None
+        };
+        // The continuation's words are often the person's own "go ahead", which
+        // reads as no cue at all; the decision the resume recorded is the fact
+        // the posture can come from.
+        let decision = resumed
+            .then(|| item.payload.get("decision").and_then(|value| value.as_str()))
+            .flatten()
+            .map(str::to_string);
         let state = TurnStateFacts {
             started_at: now,
             queued_inputs,
@@ -404,6 +412,7 @@ impl Scheduler {
                 _ => TurnInputKind::User,
             },
             previous_turn,
+            resumed: decision,
             max_steps: self.max_steps,
         };
         let ctx = TurnContext {
@@ -2404,7 +2413,7 @@ mod tests {
             .append(
                 &sid,
                 InboxKind::NextTurn,
-                serde_json::json!({"text": "continue", "resumed": true}),
+                serde_json::json!({"text": "continue", "resumed": true, "decision": "granted"}),
                 0,
                 Actor::User,
             )
@@ -2420,6 +2429,12 @@ mod tests {
                 tool: "shell.run".to_string(),
                 detail: "exit code 1: no such file".to_string(),
             })
+        );
+        // The decision rides the item so the loop can pick a posture from it:
+        // the continuation's own words are usually just "go ahead".
+        assert_eq!(
+            ctx.state.as_ref().and_then(|state| state.resumed.clone()),
+            Some(String::from("granted"))
         );
     }
 
