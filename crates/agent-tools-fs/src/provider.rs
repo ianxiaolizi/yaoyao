@@ -82,7 +82,10 @@ impl ToolProvider for FsToolProvider {
             ToolDefinition {
                 name: "fs.read".to_string(),
                 description: "Read a file from the workspace and return its contents as text. \
-                              `path` is resolved against the workspace root."
+                              `path` is resolved against the workspace root. `offset` and \
+                              `limit` select a range of lines (1-based): `offset` is the first \
+                              line, `limit` the most lines to return. Use them for a file too \
+                              large to read whole; without them the whole file comes back."
                     .to_string(),
                 source: ToolSource::Builtin,
                 side_effect: ToolSideEffect::Read,
@@ -92,7 +95,11 @@ impl ToolProvider for FsToolProvider {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "required": ["path"],
-                    "properties": { "path": { "type": "string" } }
+                    "properties": {
+                        "path": { "type": "string" },
+                        "offset": { "type": "integer", "minimum": 1 },
+                        "limit": { "type": "integer", "minimum": 1 }
+                    }
                 }),
             },
             ToolDefinition {
@@ -239,6 +246,8 @@ impl ToolProvider for FsToolProvider {
         match invocation.tool_name.as_str() {
             "fs.read" => {
                 let path = Self::required_str(invocation, "fs.read", "path")?;
+                let offset = line_argument(invocation, "offset")?.unwrap_or(1);
+                let limit = line_argument(invocation, "limit")?;
                 match self.env.read_file(path) {
                     // The line count is a fact about the file, not about the
                     // text the model reads: a reader that later decides
@@ -246,7 +255,26 @@ impl ToolProvider for FsToolProvider {
                     // when the content itself has been summarized away.
                     Ok(content) => {
                         let lines = content.lines().count() as u64;
-                        Ok(ToolResult::completed(content).with_line_count(lines))
+                        if offset == 1 && limit.is_none() {
+                            return Ok(ToolResult::completed(content).with_line_count(lines));
+                        }
+                        // A range is what a model asks for when the file is too
+                        // large to read whole: reading all of `default.rs` in
+                        // 2026-10-24's third dogfood round offloaded the text
+                        // and left it reaching for shell just to see 56 lines.
+                        let all: Vec<&str> = content.lines().collect();
+                        let start = usize::try_from(offset - 1).unwrap_or(usize::MAX);
+                        if start >= all.len() {
+                            return Ok(ToolResult::completed(format!(
+                                "offset {offset} is past the end: `{path}` has {lines} line(s)."
+                            ))
+                            .with_line_count(lines));
+                        }
+                        let take = limit.map_or(all.len() - start, |limit| {
+                            usize::try_from(limit).unwrap_or(usize::MAX)
+                        });
+                        let end = start.saturating_add(take).min(all.len());
+                        Ok(ToolResult::completed(all[start..end].join("\n")).with_line_count(lines))
                     }
                     Err(e) => environment_said("fs.read", "read", path, e),
                 }
@@ -724,6 +752,30 @@ fn environment_said(
     // system cannot find the file specified" answers a question nobody can act
     // on without being told which file.
     Ok(ToolResult::failed(format!("could not {verb} {path}: {error}")))
+}
+
+/// One of `fs.read`'s line arguments, when it was given.
+///
+/// Absent means "no bound". Zero is refused rather than clamped: a caller that
+/// wrote `limit: 0` asked for no lines, and answering with the whole file would
+/// answer a different question than the one asked.
+fn line_argument(
+    invocation: &ToolInvocation,
+    name: &str,
+) -> Result<Option<u64>, ToolProviderError> {
+    let Some(value) = invocation.arguments.get(name) else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_u64() else {
+        return Err(failed("fs.read", &format!("`{name}` must be a whole number of lines")));
+    };
+    if number == 0 {
+        return Err(failed(
+            "fs.read",
+            &format!("`{name}` must be at least 1: lines are counted from 1"),
+        ));
+    }
+    Ok(Some(number))
 }
 
 /// Whether the environment refused the call rather than failing at it.
@@ -1234,6 +1286,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(no_hit.content, "no matches");
+    }
+
+    /// The 2026-10-24 third dogfood round: a model that needs 56 lines of a
+    /// 300 KB file had only the whole read, which the loop offloaded, and fell
+    /// back to shell just to see a slice.
+    #[tokio::test]
+    async fn fs_read_returns_the_line_range_it_was_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let whole = provider(&dir)
+            .invoke(&inv("fs.read", serde_json::json!({"path": "big.rs"})))
+            .await
+            .unwrap();
+        assert_eq!(whole.content, "one\ntwo\nthree\nfour\n");
+
+        let range = provider(&dir)
+            .invoke(&inv("fs.read", serde_json::json!({"path": "big.rs", "offset": 2, "limit": 2})))
+            .await
+            .unwrap();
+        assert_eq!(range.content, "two\nthree");
+
+        // Offset without a limit runs to the end; limit without an offset
+        // starts at the first line.
+        let tail = provider(&dir)
+            .invoke(&inv("fs.read", serde_json::json!({"path": "big.rs", "offset": 3})))
+            .await
+            .unwrap();
+        assert_eq!(tail.content, "three\nfour");
+        let head = provider(&dir)
+            .invoke(&inv("fs.read", serde_json::json!({"path": "big.rs", "limit": 2})))
+            .await
+            .unwrap();
+        assert_eq!(head.content, "one\ntwo");
+
+        // Past the end is an answer about the file, not a failure to read it.
+        let past = provider(&dir)
+            .invoke(&inv("fs.read", serde_json::json!({"path": "big.rs", "offset": 9})))
+            .await
+            .unwrap();
+        assert!(past.content.contains("offset 9 is past the end"), "{:?}", past.content);
+        assert!(past.content.contains("4 line(s)"), "{:?}", past.content);
+
+        // Zero is refused rather than clamped to something else.
+        let zero = provider(&dir)
+            .invoke(&inv("fs.read", serde_json::json!({"path": "big.rs", "limit": 0})))
+            .await;
+        assert!(matches!(zero, Err(ToolProviderError::Failed { .. })), "{zero:?}");
     }
 
     #[test]
