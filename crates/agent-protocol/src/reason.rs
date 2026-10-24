@@ -387,6 +387,11 @@ pub const RULES: &[Rule] = &[
         version: 1,
         text: "the turn answered in the repair posture after a real failure, so the answer rests on the failed observation and on the posture that failure caused",
     },
+    Rule {
+        id: "verdict/action-unmet",
+        version: 1,
+        text: "the input read as an action and the turn stayed in the act posture, but no call was dispatched: the turn answered where it was expected to act",
+    },
 ];
 
 /// Look up a rule by id.

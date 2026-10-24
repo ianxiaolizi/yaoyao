@@ -35,13 +35,14 @@
 //! for the full ledger and `AGENT_JUDGMENT=off` for the baseline that predates
 //! the pipeline.
 //!
-//! Two more columns come from the reasoning chain the kernel writes beside the
-//! run: how often the posture switched inside a turn, and whether every answer
-//! can be walked back through its bases to the situation that opened the turn.
-//! Both count durable `reason/recorded` nodes, so they compare across arms
-//! without costing a request — the chain never enters one. A turn cut by the
-//! step budget before it records a verdict is reported as `no answer`, not as a
-//! broken walk: the world can be right about a turn that never concluded.
+//! Three more columns come from the reasoning chain the kernel writes beside
+//! the run: how often the posture switched inside a turn, whether every answer
+//! can be walked back through its bases to the situation that opened the turn,
+//! and how often an action reading ended without a single call. All three count
+//! durable `reason/recorded` nodes, so they compare across arms without costing
+//! a request — the chain never enters one. A turn cut by the step budget before
+//! it records a verdict is reported as `no answer`, not as a broken walk: the
+//! world can be right about a turn that never concluded.
 //!
 //! Four fixtures probe the second cut of the thinking pipeline. Two of its
 //! requirements are advice now — a sentence in the task layer, never a hold —
@@ -852,6 +853,7 @@ fn run_task(task: &Task, run: usize) -> TaskReport {
         }),
         turns: chain.turns,
         stance_switches: chain.switches,
+        unmet_actions: chain.unmet,
         chain_walk: chain.walk,
         chain_note: chain.note,
         episodes,
@@ -1449,11 +1451,14 @@ impl ChainWalk {
     }
 }
 
-/// What one run's reasoning chain says, in the two numbers the arms compare.
+/// What one run's reasoning chain says, in the numbers the arms compare.
 struct ChainReading {
     turns: u64,
     switches: u64,
     walk: ChainWalk,
+    /// Turns read as an action that dispatched no call: the measurable form of
+    /// a reading the turn did not bear out.
+    unmet: u64,
     note: String,
 }
 
@@ -1480,6 +1485,7 @@ fn chain_reading(events: &[Value]) -> ChainReading {
                     turns: 0,
                     switches: 0,
                     walk: ChainWalk::Broken,
+                    unmet: 0,
                     note: format!("a reason node is unreadable: {error}"),
                 };
             }
@@ -1490,6 +1496,7 @@ fn chain_reading(events: &[Value]) -> ChainReading {
             turns: 0,
             switches: 0,
             walk: ChainWalk::Broken,
+            unmet: 0,
             note: String::from("no reason nodes were recorded"),
         };
     }
@@ -1556,7 +1563,8 @@ fn chain_reading(events: &[Value]) -> ChainReading {
     } else {
         ChainWalk::Walks
     };
-    ChainReading { turns: by_turn.len() as u64, switches, walk, note }
+    let unmet = nodes.iter().filter(|node| node.rule == "verdict/action-unmet").count() as u64;
+    ChainReading { turns: by_turn.len() as u64, switches, walk, unmet, note }
 }
 
 /// Whether a verdict's basis edges lead to one of its turn's situations.
@@ -1620,6 +1628,8 @@ struct TaskReport {
     /// Durable nodes, not anything the model said about itself.
     turns: u64,
     stance_switches: u64,
+    /// Turns read as an action that dispatched no call.
+    unmet_actions: u64,
     /// Whether every answer walks back to the situation that opened its turn.
     chain_walk: ChainWalk,
     /// Which node broke the walk, or why there was none to walk from.
@@ -1633,7 +1643,7 @@ fn print_report(reports: &[TaskReport]) {
         println!(
             "{:<8} run {}  {:<6}  steps={:<3} models={:<3} tools={:<3} failed={:<2} \
              refused={:<2} gates={:<2} records={:<2} branches={:<2} turns={:<2} switches={:<2} \
-             chain={:<7}  tokens={}/{}/{}  wall={}ms",
+             unmet={:<2} chain={:<9}  tokens={}/{}/{}  wall={}ms",
             report.name,
             report.run,
             if report.solved { "solved" } else { "UNSOLVED" },
@@ -1647,6 +1657,7 @@ fn print_report(reports: &[TaskReport]) {
             report.branches,
             report.turns,
             report.stance_switches,
+            report.unmet_actions,
             report.chain_walk.as_str(),
             report.tokens_in,
             report.tokens_out,
@@ -1717,6 +1728,7 @@ fn print_report(reports: &[TaskReport]) {
     let broken = reports.iter().filter(|report| report.chain_walk == ChainWalk::Broken).count();
     let unanswered =
         reports.iter().filter(|report| report.chain_walk == ChainWalk::NoAnswer).count();
+    let unmet: u64 = reports.iter().map(|report| report.unmet_actions).sum();
     let judgment_arm = std::env::var("AGENT_JUDGMENT")
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_else(|_| String::from("gates"));
@@ -1730,7 +1742,7 @@ fn print_report(reports: &[TaskReport]) {
          adjusted-retry {adjusted}, identical-retry {identical}, stopped {stopped}; loops {loops}; \
          judgment {arm} with {gates} gate(s) and {reconciled} reconciled run(s); \
          chain {switches} posture switch(es), {broken} broken walk(s), {unanswered} run(s) with \
-         no answer to walk from"
+         no answer to walk from; reading: {unmet} action(s) answered without a call"
     );
 }
 
@@ -1773,6 +1785,9 @@ fn write_report(reports: &[TaskReport]) {
                 "walkable": report.chain_walk == ChainWalk::Walks,
                 "state": report.chain_walk.as_str(),
                 "note": report.chain_note,
+            },
+            "reading": {
+                "unmet_actions": report.unmet_actions,
             },
             "after_failures": report.episodes.iter().map(|episode| json!({
                 "tool": episode.tool,
@@ -2002,6 +2017,29 @@ fn a_posture_switch_is_counted_and_still_walks_back() {
     let reading = chain_reading(&events);
     assert_eq!(reading.switches, 1);
     assert_eq!(reading.walk, ChainWalk::Walks, "{}", reading.note);
+}
+
+#[test]
+fn an_action_reading_that_dispatched_no_call_is_counted() {
+    let events = vec![
+        reason_node(
+            "r/1/0",
+            "t1",
+            ReasonKind::Situation,
+            "situation/derive",
+            vec![Basis::fact("the input")],
+        ),
+        reason_node(
+            "r/1/1",
+            "t1",
+            ReasonKind::Verdict,
+            "verdict/action-unmet",
+            vec![Basis::node("r/1/0")],
+        ),
+    ];
+    let reading = chain_reading(&events);
+    assert_eq!(reading.unmet, 1);
+    assert_eq!(reading.walk, ChainWalk::Walks);
 }
 
 #[test]

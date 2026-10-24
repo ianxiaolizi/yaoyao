@@ -841,6 +841,9 @@ struct LoopTurn {
     criterion_observed: bool,
     /// The step ordinal within this turn, for the chain's own numbering.
     step_index: u32,
+    /// Calls dispatched so far in this turn. The verdict reads it to tell an
+    /// action that happened from an action the turn only talked about.
+    dispatched: u32,
     /// The most recent real failure the record has not reconciled yet. Approval
     /// pending is a wait, not a failure, and never lands here.
     pending_failure: Option<PendingFailure>,
@@ -1666,6 +1669,7 @@ impl AgentLoop for DefaultAgentLoop {
                 criterion_expects_check,
                 criterion_observed: false,
                 step_index: 0,
+                dispatched: 0,
                 // A resumed turn opens on a failure the previous turn left
                 // behind; the caller read it back from the log. An ordinary
                 // turn opens clean.
@@ -2249,22 +2253,34 @@ impl AgentLoop for DefaultAgentLoop {
                     }
                     None => {}
                 }
+                // An action the turn only talked about is a fact, not a tone:
+                // the reading named an action, the posture stayed act, and no
+                // call was dispatched. Naming it on the verdict lets `why` say
+                // so and the evaluation count it without reading prose.
+                let unmet_action = turn.dispatched == 0 && turn.mode.stance == Stance::Act;
+                let answer_summary = if answer_text.trim().is_empty() {
+                    String::from("(no text)")
+                } else {
+                    truncate(&answer_text, 160)
+                };
                 let verdict = turn.reason.node(
                     ReasonKind::Verdict,
                     step_index,
-                    format!(
-                        "answer: {}",
-                        if answer_text.trim().is_empty() {
-                            String::from("(no text)")
-                        } else {
-                            truncate(&answer_text, 160)
-                        }
-                    ),
+                    if unmet_action {
+                        format!(
+                            "answer (the reading asked for an action; no call was dispatched): \
+                             {answer_summary}"
+                        )
+                    } else {
+                        format!("answer: {answer_summary}")
+                    },
                     verdict_basis,
                     if turn.criterion_observed {
                         "verdict/criterion-observed"
                     } else if turn.stance_switched && turn.mode.stance == Stance::Repair {
                         "verdict/after-failure"
+                    } else if unmet_action {
+                        "verdict/action-unmet"
                     } else {
                         "verdict/answer"
                     },
@@ -2386,6 +2402,7 @@ impl AgentLoop for DefaultAgentLoop {
                     ReasonSource::Model,
                 );
                 let action_id = action.id.clone();
+                turn.dispatched += 1;
                 events.push(reason_event(ctx, Some(&step_id), &action));
                 let mut payload = serde_json::json!({
                     "tool_name": call.tool_name,
@@ -3426,6 +3443,64 @@ mod tests {
                 .any(|basis| basis.node.as_deref() == Some(observation.id.as_str())),
             "{verdict:?}"
         );
+        assert_eq!(verdict.rule, "verdict/answer");
+    }
+
+    /// A turn that was read as an action, stayed in the act posture, and
+    /// dispatched nothing is the measurable form of a misread: the posture
+    /// expected a call and the turn only talked. The verdict says so, so `why`
+    /// explains the stop and the evaluation can count it.
+    #[tokio::test]
+    async fn an_action_that_was_only_answered_is_named_on_the_verdict() {
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer(
+            "the tests look fine",
+        )]));
+        let tools = Arc::new(FakeToolProvider::new());
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.user_input = serde_json::json!({"text": "run the tests"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let stance = nodes.iter().find(|node| node.kind == ReasonKind::Stance).expect("a stance");
+        assert_eq!(stance.rule, "stance/act-request");
+        let verdict =
+            nodes.iter().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
+        assert_eq!(verdict.rule, "verdict/action-unmet");
+        assert!(verdict.claim.contains("no call was dispatched"), "{}", verdict.claim);
+    }
+
+    /// The same reading with a call dispatched is not a misread: the rule stays
+    /// the ordinary answer one. This is what keeps the column from counting
+    /// every action turn as unmet.
+    #[tokio::test]
+    async fn an_action_with_a_call_is_not_named_unmet() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({"s": "hi"})),
+            FakeModelProvider::answer("done"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.user_input = serde_json::json!({"text": "run the tests"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let verdict =
+            nodes.iter().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
         assert_eq!(verdict.rule, "verdict/answer");
     }
 
