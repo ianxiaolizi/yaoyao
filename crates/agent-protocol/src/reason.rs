@@ -363,6 +363,16 @@ pub const RULES: &[Rule] = &[
         text: "the world returned this result to the call that preceded it",
     },
     Rule {
+        id: "observation/refused",
+        version: 1,
+        text: "the gateway refused this call before the world saw it, so the call has an outcome but no result; the refusal is a decision, not a failure the turn repairs",
+    },
+    Rule {
+        id: "observation/awaiting-approval",
+        version: 1,
+        text: "the call was held for approval before it ran, so this turn ends with a decision pending; the result, if granted, belongs to the resumed turn",
+    },
+    Rule {
         id: "gate/stale-read",
         version: 1,
         text: "an earlier turn read a target this turn names again, and nothing has been looked at since the turn opened",
@@ -384,8 +394,8 @@ pub const RULES: &[Rule] = &[
     },
     Rule {
         id: "verdict/criterion-observed",
-        version: 1,
-        text: "a check the request named ran and completed after the work, so the answer rests on an observation rather than on prose",
+        version: 2,
+        text: "a call that runs a command naming a check completed after the work and no real failure has happened since, so the answer rests on that observation rather than on prose",
     },
     Rule {
         id: "verdict/after-failure",
@@ -632,9 +642,24 @@ pub fn read(text: &str) -> Reading {
     let lower = trimmed.to_lowercase();
     let mut cues = Vec::new();
 
-    let corrects = has_any(&lower, &["不对", "错了", "不是", "重新", "又错", "没成功", "还是不行"])
-        || has_any(&lower, &["wrong", "incorrect", "redo", "not what"]);
-    let acts = has_any(&lower, ACTION_WORDS);
+    // "不是" alone is not a correction: "这不是 bug" corrects the world, not the
+    // assistant. Only the forms that point at previous work are cues.
+    let corrects = has_any(
+        &lower,
+        &["不对", "错了", "不是这样", "不是这个", "不是那样", "重新", "又错", "没成功", "还是不行"],
+    ) || has_any(&lower, &["wrong", "incorrect", "redo", "not what"]);
+    // A clause that opens with a negation takes its action cues with it:
+    // "不要改任何文件" is a prohibition, not an instruction to change a file.
+    // Without this, a request that forbids an action reads as one.
+    let scan = scan_actions(&lower);
+    let acts = scan.active;
+    // "test" names a check as often as it asks for one. When the input also
+    // asks a question and no verb accompanies it, the question is what it is:
+    // "why does tests/test_calc.py expect this?" names a file, not an action.
+    let verbs = scan.verb;
+    if scan.negated {
+        cues.push("negation");
+    }
     let asks = has_any(&lower, QUESTION_WORDS) || trimmed.ends_with('?') || trimmed.ends_with('？');
     let greets = has_any(&lower, GREETING_WORDS);
     let reports = reports_state(&lower, acts, asks);
@@ -650,7 +675,7 @@ pub fn read(text: &str) -> Reading {
     } else if greets && !acts && trimmed.chars().count() <= 24 {
         cues.push("greeting");
         SpeechAct::Greeting
-    } else if acts {
+    } else if acts && !(asks && !verbs) {
         cues.push("action");
         if has_path {
             cues.push("path");
@@ -669,7 +694,11 @@ pub fn read(text: &str) -> Reading {
         SpeechAct::Unclear
     };
 
-    let criterion = if has_test {
+    // A criterion is something the turn could satisfy by acting. An input that
+    // only asks about a test names the test without asking for it to run, so it
+    // gets no criterion: otherwise reading `tests/…` to answer a question would
+    // look like the check the request named.
+    let criterion = if has_test && matches!(act, SpeechAct::Action | SpeechAct::Correction) {
         Some(String::from("the check or test named in the input passes"))
     } else if act == SpeechAct::Action && has_path {
         Some(String::from("the answer rests on the named target"))
@@ -781,11 +810,24 @@ const ACTION_WORDS: &[&str] = &[
     "安装",
     "生成",
     "读",
-    "查",
+    // "查" alone is also inside 检查, which is how questions about a check
+    // turned into action cues. The verb needs a complement to count.
+    "查看",
+    "查一下",
+    "查查",
     "搜",
     "打开",
     "弄",
     "重命名",
+    // The verbs real Chinese requests used and the first table missed: an
+    // overwrite, a value adjustment. A bare "调" is not listed — it is also a
+    // noun in 调查/调用 — so the direction is required.
+    "覆盖",
+    "调整",
+    "调长",
+    "调大",
+    "调小",
+    "替换",
     "test",
     "fix",
     "add",
@@ -837,6 +879,61 @@ const TEST_WORDS: &[&str] = &["测试", "test", "cargo test", "检查", "验证"
 
 fn has_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
+}
+
+/// The punctuation that ends a clause. Chinese negation scopes to its clause,
+/// so this is the window, not a character count: a fixed window would either
+/// miss "不要改任何文件" (seven characters in) or reach into the next request.
+const CLAUSE_BREAKS: &[char] = &['，', '。', '；', '！', '？', ',', ';', '!', '?', '\n', '：', ':'];
+
+const NEGATION_WORDS: &[&str] = &[
+    "不要", "不用", "不必", "无需", "不需", "请勿", "不准", "禁止", "不能", "不该", "don't",
+    "do not", "without",
+];
+
+/// What one input's action cues amount to, clause by clause.
+///
+/// Chinese negation scopes to the clause it opens, so "别老断，帮我调长一些"
+/// still carries a request: the prohibition governs the first half and the
+/// action lives in the second. A clause is counted only when it names an
+/// action; a negation elsewhere in the sentence does not reach it.
+struct ActionScan {
+    /// A clause named an action and did not negate it.
+    active: bool,
+    /// A clause named an action and negated it — the cue did not count.
+    negated: bool,
+    /// The active cues include a verb, not only a check's name. "test" is a
+    /// noun in "tests/test_calc.py"; a verb is what makes a request an action
+    /// even when it also asks something.
+    verb: bool,
+}
+
+fn scan_actions(text: &str) -> ActionScan {
+    let mut scan = ActionScan { active: false, negated: false, verb: false };
+    for clause in text.split(CLAUSE_BREAKS) {
+        if !has_any(clause, ACTION_WORDS) {
+            continue;
+        }
+        if clause_negates(clause) {
+            scan.negated = true;
+            continue;
+        }
+        scan.active = true;
+        if clause_has_verb(clause) {
+            scan.verb = true;
+        }
+    }
+    scan
+}
+
+fn clause_has_verb(clause: &str) -> bool {
+    ACTION_WORDS.iter().any(|word| *word != "test" && clause.contains(word))
+}
+
+fn clause_negates(clause: &str) -> bool {
+    has_any(clause, NEGATION_WORDS)
+        || clause.trim_start().starts_with('别')
+        || clause.split_whitespace().skip(1).any(|word| word.starts_with('别'))
 }
 
 fn reports_state(text: &str, acts: bool, asks: bool) -> bool {
@@ -894,6 +991,43 @@ mod tests {
         let reading = read("report.txt 里是什么？");
         assert_eq!(reading.act, SpeechAct::Question);
         assert_eq!(reading.rule(), "reading/question-cue");
+    }
+
+    /// The three inputs the 2026-10-24 real-use round misread, kept verbatim.
+    /// The kernel has to read them the way they were asked, or the chain
+    /// records an understanding nobody had.
+    #[test]
+    fn real_chinese_requests_are_read_the_way_they_were_asked() {
+        let overwrite = read("用一条 shell 命令把 app.log 的内容整体覆盖为一行 `rotated`。");
+        assert_eq!(overwrite.act, SpeechAct::Action, "{overwrite:?}");
+
+        let adjust = read("config.yaml 里的超时总是断，帮我调长一些，别老断。");
+        assert_eq!(adjust.act, SpeechAct::Action, "{adjust:?}");
+
+        let question = read(
+            "这不是 bug，是预期行为。请解释一下 tests/test_calc.py 里 test_rounds_half_up \
+             为什么期望 2.68，不要改任何文件。",
+        );
+        assert_eq!(question.act, SpeechAct::Question, "{question:?}");
+        assert!(question.cues.contains(&"negation"), "{question:?}");
+        assert!(question.criterion.is_none(), "a question about a test does not ask for it to run");
+    }
+
+    /// A negation governs its clause, not the sentence: the second half is a
+    /// request even though the first half forbids something.
+    #[test]
+    fn a_negated_clause_does_not_swallow_the_request_beside_it() {
+        assert_eq!(read("别老断，帮我调长一些。").act, SpeechAct::Action);
+        assert_eq!(read("不要改 tests/ 下的文件。").act, SpeechAct::Unclear);
+    }
+
+    /// "不是" corrects the world in "这不是 bug"; only the forms that point at
+    /// previous work are corrections. A bare "不是" used to outrank a question.
+    #[test]
+    fn a_statement_about_the_world_is_not_a_correction() {
+        assert_ne!(read("这不是 bug，是预期行为。").act, SpeechAct::Correction);
+        let reading = read("不对，你改错了，重新写一遍");
+        assert_eq!(reading.act, SpeechAct::Correction);
     }
 
     #[test]

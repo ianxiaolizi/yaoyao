@@ -2819,12 +2819,14 @@ impl AgentLoop for DefaultAgentLoop {
                             "observation/result",
                             ReasonSource::World,
                         );
+                        // A criterion is satisfied by a check *running*, so the
+                        // call has to carry a command that names one. A read
+                        // whose path contains "test" is looking at the check,
+                        // not performing it: counting it would let a request to
+                        // explain a test file end as "the check observed".
                         let check_like = turn.criterion_expects_check
-                            && (call.tool_name.to_lowercase().contains("test")
-                                || serde_json::to_string(&call.arguments)
-                                    .unwrap_or_default()
-                                    .to_lowercase()
-                                    .contains("test"));
+                            && check_command(call)
+                                .is_some_and(|command| is_check_command(&command));
                         if check_like && result.status == ToolStatus::Completed {
                             turn.criterion_observed = true;
                         }
@@ -2837,6 +2839,11 @@ impl AgentLoop for DefaultAgentLoop {
                             // answer until the record reconciles this call.
                             // The call that failed does not count as the check
                             // a stop needs — it is the question, not an answer.
+                            //
+                            // It also takes back any earlier check: the work
+                            // kept changing after the check ran, so the check
+                            // no longer covers what the answer would rest on.
+                            turn.criterion_observed = false;
                             turn.checked_since_failure = false;
                             turn.pending_failure = Some(PendingFailure {
                                 call_id: call.tool_call_id.clone(),
@@ -2891,7 +2898,7 @@ impl AgentLoop for DefaultAgentLoop {
                             let content = format!(
                                 "approval required: {approval_id}; the tool was not executed"
                             );
-                            events.push(draft(
+                            let held = draft(
                                 ctx,
                                 &step_id,
                                 EventType::TOOL_FAILED,
@@ -2904,7 +2911,27 @@ impl AgentLoop for DefaultAgentLoop {
                                     "approval_id": approval_id,
                                 }),
                                 Actor::Tool,
-                            ));
+                            );
+                            let held_event_id = held.event_id.as_str().to_string();
+                            events.push(held);
+                            // The turn ends here, but the call does not become
+                            // a root: the chain records that it was held before
+                            // it ran. The result, if a person grants it, happens
+                            // between turns and belongs to the next turn's
+                            // situation (#78) — this node claims no result.
+                            let observation = turn.reason.node(
+                                ReasonKind::Observation,
+                                step_index,
+                                format!(
+                                    "{} held for approval: {approval_id}; not executed",
+                                    call.tool_name
+                                ),
+                                vec![Basis::node(action_id.clone()), Basis::event(held_event_id)],
+                                "observation/awaiting-approval",
+                                ReasonSource::Kernel,
+                            );
+                            turn.reason_last_observation = Some(observation.id.clone());
+                            events.push(reason_event(ctx, Some(&step_id), &observation));
                             turn.messages.push(ModelMessage::tool_for_call(
                                 &step_id,
                                 call.tool_call_id.clone(),
@@ -2923,7 +2950,7 @@ impl AgentLoop for DefaultAgentLoop {
                         // log keeps: a gateway failure that lives only in
                         // memory could never be rebuilt into this message.
                         let content = e.to_string();
-                        events.push(draft(
+                        let refused = draft(
                             ctx,
                             &step_id,
                             EventType::TOOL_FAILED,
@@ -2938,12 +2965,25 @@ impl AgentLoop for DefaultAgentLoop {
                                 "outcome": GATEWAY_REFUSED_OUTCOME,
                             }),
                             Actor::Tool,
-                        ));
+                        );
+                        let refused_event_id = refused.event_id.as_str().to_string();
+                        events.push(refused);
                         // A gateway refusal (policy, resource, unknown tool)
-                        // is a decision with its own actionable text, not an
-                        // observation about the world: the gate is for a tool
-                        // that ran and failed, which is the class measured to
-                        // end in a silent stop.
+                        // is a decision, not a result from the world — but it
+                        // is the outcome of this call, and an action with no
+                        // outcome is a root `why` cannot explain. The rule
+                        // says which kind of outcome it is; the source is the
+                        // kernel because the gateway, not the tool, answered.
+                        let observation = turn.reason.node(
+                            ReasonKind::Observation,
+                            step_index,
+                            format!("{} refused: {}", call.tool_name, first_line(&content)),
+                            vec![Basis::node(action_id.clone()), Basis::event(refused_event_id)],
+                            "observation/refused",
+                            ReasonSource::Kernel,
+                        );
+                        turn.reason_last_observation = Some(observation.id.clone());
+                        events.push(reason_event(ctx, Some(&step_id), &observation));
                         turn.messages.push(ModelMessage::tool_for_call(
                             &step_id,
                             call.tool_call_id.clone(),
@@ -3016,6 +3056,24 @@ fn step_failed(ctx: &TurnContext, step_id: &StepId) -> EventDraft {
 /// The first line of a tool result, bounded — what the gate quotes back.
 fn first_line(text: &str) -> String {
     truncate(text.lines().next().unwrap_or_default(), 200)
+}
+
+/// The command a call carries, when the call is one that runs a command.
+///
+/// This is the difference between looking at a check and running one. Only a
+/// call that carries a command can observe a criterion; a tool whose arguments
+/// name a file (`fs.read tests/…`) has no command and therefore cannot.
+fn check_command(call: &ToolCall) -> Option<String> {
+    ["command", "cmd", "script"]
+        .iter()
+        .find_map(|key| call.arguments.get(*key).and_then(|value| value.as_str()))
+        .map(str::to_string)
+}
+
+/// Whether a command is a check: it names a test or a verification.
+fn is_check_command(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    ["test", "check", "verify", "测试", "检查", "验证"].iter().any(|word| lower.contains(*word))
 }
 
 /// What the model is told when it answers after recording a retry without
@@ -3503,6 +3561,137 @@ mod tests {
         let verdict =
             nodes.iter().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
         assert_eq!(verdict.rule, "verdict/answer");
+    }
+
+    /// Looking at a test is not running it. The 2026-10-24 real-use round found
+    /// an `fs.read tests/...` completing a criterion, so a request to explain a
+    /// test file ended with "the check observed" while the suite was red.
+    #[tokio::test]
+    async fn reading_a_test_file_does_not_observe_the_check() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call(
+                "fs.read",
+                serde_json::json!({"path": "tests/test_calc.py"}),
+            ),
+            FakeModelProvider::answer("2.68 is what the spec expects."),
+        ]));
+        let tools = Arc::new(FakeToolProvider::new().with_tool(
+            "fs.read",
+            "def test_rounds_half_up(): ...",
+            ToolSideEffect::Read,
+        ));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.user_input =
+            serde_json::json!({"text": "跑一下测试，看看 tests/test_calc.py 里的期望"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let verdict =
+            nodes.iter().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
+        assert_eq!(verdict.rule, "verdict/answer", "{}", verdict.claim);
+    }
+
+    /// A completed command that names a check is the observation the answer
+    /// rests on — the case the rule was written for, kept working.
+    #[tokio::test]
+    async fn a_completed_check_command_is_the_observation_the_answer_rests_on() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call(
+                "shell.run",
+                serde_json::json!({"command": "python -m unittest discover -s tests"}),
+            ),
+            FakeModelProvider::answer("the tests pass"),
+        ]));
+        let tools = Arc::new(FakeToolProvider::new().with_tool(
+            "shell.run",
+            "all tests passed",
+            ToolSideEffect::Pure,
+        ));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.user_input = serde_json::json!({"text": "跑一下测试"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let verdict =
+            nodes.iter().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
+        assert_eq!(verdict.rule, "verdict/criterion-observed", "{}", verdict.claim);
+    }
+
+    /// A check that passed before a later failure no longer covers the work:
+    /// the answer may not keep resting on it.
+    #[tokio::test]
+    async fn a_failure_after_the_check_takes_back_the_criterion() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("shell.run", serde_json::json!({"command": "cargo test"})),
+            FakeModelProvider::tool_call("explode", serde_json::json!({})),
+            FakeModelProvider::answer("stopped after the failure"),
+        ]));
+        let tools = Arc::new(
+            FakeToolProvider::new().with_tool("shell.run", "ok", ToolSideEffect::Pure).with_result(
+                "explode",
+                ToolResult::failed("boom: it did not work"),
+                ToolSideEffect::Pure,
+            ),
+        );
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.user_input = serde_json::json!({"text": "跑一下测试"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let verdict =
+            nodes.iter().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
+        assert_eq!(verdict.rule, "verdict/after-failure", "{}", verdict.claim);
+    }
+
+    /// A gateway refusal is not a result from the world, but it is the outcome
+    /// of the call: without it the action is a root `why` cannot explain.
+    #[tokio::test]
+    async fn a_gateway_refusal_is_an_outcome_of_its_action() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("nope", serde_json::json!({})),
+            FakeModelProvider::answer("that tool does not exist here"),
+        ]));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
+            no_context(),
+            one_model_router(),
+        );
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let refused = nodes
+            .iter()
+            .find(|node| node.rule == "observation/refused")
+            .expect("the refusal is an outcome");
+        let action = nodes.iter().find(|node| node.kind == ReasonKind::Action).expect("an action");
+        assert!(
+            refused.basis.iter().any(|basis| basis.node.as_deref() == Some(action.id.as_str())),
+            "{refused:?}"
+        );
+        assert!(refused.claim.contains("refused"), "{}", refused.claim);
     }
 
     /// A real failure is the event that changes what the turn is for. The turn
@@ -5055,6 +5244,20 @@ mod tests {
         assert_eq!(held.len(), 1, "exactly one tool/failed for the held call");
         assert_eq!(held[0].payload["outcome"], serde_json::json!(APPROVAL_PENDING_OUTCOME));
         assert_eq!(held[0].payload["approval_id"], serde_json::json!("ap-42"));
+
+        // Chain layer: the held call is not a root. The node says it was held
+        // before it ran and claims no result — the result, if granted, belongs
+        // to the resumed turn (#78).
+        let nodes = reason_nodes(&outcome.events);
+        let held_node = nodes
+            .iter()
+            .find(|node| node.rule == "observation/awaiting-approval")
+            .expect("the hold is an outcome");
+        let action = nodes.iter().find(|node| node.kind == ReasonKind::Action).expect("an action");
+        assert!(
+            held_node.basis.iter().any(|basis| basis.node.as_deref() == Some(action.id.as_str())),
+            "{held_node:?}"
+        );
 
         // And it is *not* the "decidedly did not run" encoding — the two are the
         // exit-code difference of §3, so they must not be conflated.
