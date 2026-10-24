@@ -35,6 +35,14 @@
 //! for the full ledger and `AGENT_JUDGMENT=off` for the baseline that predates
 //! the pipeline.
 //!
+//! Two more columns come from the reasoning chain the kernel writes beside the
+//! run: how often the posture switched inside a turn, and whether every answer
+//! can be walked back through its bases to the situation that opened the turn.
+//! Both count durable `reason/recorded` nodes, so they compare across arms
+//! without costing a request — the chain never enters one. A turn cut by the
+//! step budget before it records a verdict is reported as `no answer`, not as a
+//! broken walk: the world can be right about a turn that never concluded.
+//!
 //! Four fixtures probe the second cut of the thinking pipeline. Two of its
 //! requirements are advice now — a sentence in the task layer, never a hold —
 //! and only the repeat requirement still refuses. Each fixture is accepted on
@@ -61,7 +69,7 @@
 //! another path. The analysis below has its own offline tests, so the
 //! classifier is checked by the default gate even though the live run is not.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -72,6 +80,9 @@ use std::time::{Duration, Instant};
 use agent_ports::event_store::EventStore;
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{EventId, EventSeq, SchemaVersion, SessionId};
+#[cfg(test)]
+use agent_protocol::reason::{Basis, ReasonSource};
+use agent_protocol::reason::{ReasonKind, ReasonNode, rule};
 use agent_store_jsonl::JsonlEventStore;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -811,6 +822,7 @@ fn run_task(task: &Task, run: usize) -> TaskReport {
     let calls = started_calls(&drive.events);
     let episodes = episodes(&drive.events);
     let (tokens_in, tokens_out, tokens_total) = tokens(&drive.events);
+    let chain = chain_reading(&drive.events);
     TaskReport {
         name: task.name,
         run,
@@ -838,6 +850,10 @@ fn run_task(task: &Task, run: usize) -> TaskReport {
             event["type"] == EventType::JUDGMENT_UPDATED
                 && event["payload"]["judgment"]["stage"] == "reconcile"
         }),
+        turns: chain.turns,
+        stance_switches: chain.switches,
+        chain_walk: chain.walk,
+        chain_note: chain.note,
         episodes,
     }
 }
@@ -1411,6 +1427,162 @@ fn tokens(events: &[Value]) -> (u64, u64, u64) {
     (input, output, total)
 }
 
+/// How a run's chain ends.
+///
+/// `NoAnswer` is not a broken derivation: a turn can be cut by the step budget
+/// before it records a verdict, and the world can still be right. The report
+/// keeps the two apart so a healthy run is not read as a defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainWalk {
+    Walks,
+    NoAnswer,
+    Broken,
+}
+
+impl ChainWalk {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Walks => "walks",
+            Self::NoAnswer => "no answer",
+            Self::Broken => "BROKEN",
+        }
+    }
+}
+
+/// What one run's reasoning chain says, in the two numbers the arms compare.
+struct ChainReading {
+    turns: u64,
+    switches: u64,
+    walk: ChainWalk,
+    note: String,
+}
+
+/// Read the chain out of the events: the turns it covers, how often the posture
+/// switched, and whether every answer walks back to a situation.
+///
+/// The walk is the same question `agent why` answers for a person: from the
+/// verdict, follow the node bases until the turn's own input is reached. A
+/// verdict that cannot get there is a broken derivation — not a wrong answer,
+/// which this file never judges from the chain.
+///
+/// The check is repeated here rather than reused from `agent_kernel::reason`:
+/// these events are the exported JSON lines, not `StoredEvent`s, and a harness
+/// that had to rebuild the store to read its own report would be measuring the
+/// reader as much as the run. The rules it enforces are the ones `agent why`
+/// prints.
+fn chain_reading(events: &[Value]) -> ChainReading {
+    let mut nodes = Vec::new();
+    for event in events.iter().filter(|event| event["type"] == EventType::REASON_RECORDED) {
+        match serde_json::from_value::<ReasonNode>(event["payload"]["node"].clone()) {
+            Ok(node) => nodes.push(node),
+            Err(error) => {
+                return ChainReading {
+                    turns: 0,
+                    switches: 0,
+                    walk: ChainWalk::Broken,
+                    note: format!("a reason node is unreadable: {error}"),
+                };
+            }
+        }
+    }
+    if nodes.is_empty() {
+        return ChainReading {
+            turns: 0,
+            switches: 0,
+            walk: ChainWalk::Broken,
+            note: String::from("no reason nodes were recorded"),
+        };
+    }
+
+    let mut problems = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for node in &nodes {
+        if !seen.insert(node.id.as_str()) {
+            problems.push(format!("{} appears twice", node.id));
+        }
+        if node.basis.is_empty() {
+            problems.push(format!("{} has no basis", node.id));
+        }
+        if rule(&node.rule).is_none() {
+            problems.push(format!("{} names unknown rule `{}`", node.id, node.rule));
+        }
+        for basis in &node.basis {
+            if let Some(edge) = basis.node.as_deref()
+                && !seen.contains(edge)
+            {
+                problems.push(format!("{} cites {edge}, which is not an earlier node", node.id));
+            }
+        }
+    }
+
+    let mut by_turn: BTreeMap<&str, Vec<&ReasonNode>> = BTreeMap::new();
+    for node in &nodes {
+        by_turn.entry(node.turn_id.as_str()).or_default().push(node);
+    }
+
+    let mut switches = 0u64;
+    let mut answers = 0usize;
+    let mut unwalkable = Vec::new();
+    for (turn, turn_nodes) in &by_turn {
+        switches +=
+            turn_nodes.iter().filter(|node| node.rule.starts_with("switch/")).count() as u64;
+        let situations: BTreeSet<&str> = turn_nodes
+            .iter()
+            .filter(|node| node.kind == ReasonKind::Situation)
+            .map(|node| node.id.as_str())
+            .collect();
+        let by_id: BTreeMap<&str, &ReasonNode> =
+            turn_nodes.iter().map(|node| (node.id.as_str(), *node)).collect();
+        for verdict in turn_nodes.iter().filter(|node| node.kind == ReasonKind::Verdict) {
+            answers += 1;
+            if !reaches_situation(&by_id, &situations, verdict) {
+                unwalkable.push(format!("{} ({turn})", verdict.id));
+            }
+        }
+    }
+
+    let mut note = problems.join("; ");
+    if !unwalkable.is_empty() {
+        if !note.is_empty() {
+            note.push_str("; ");
+        }
+        note.push_str(&format!("no answer reaches its situation: {}", unwalkable.join(", ")));
+    }
+    let walk = if !note.is_empty() {
+        ChainWalk::Broken
+    } else if answers == 0 {
+        note = String::from("the turn ended before a verdict: no answer to walk back from");
+        ChainWalk::NoAnswer
+    } else {
+        ChainWalk::Walks
+    };
+    ChainReading { turns: by_turn.len() as u64, switches, walk, note }
+}
+
+/// Whether a verdict's basis edges lead to one of its turn's situations.
+fn reaches_situation(
+    by_id: &BTreeMap<&str, &ReasonNode>,
+    situations: &BTreeSet<&str>,
+    verdict: &ReasonNode,
+) -> bool {
+    let mut stack = vec![verdict];
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    while let Some(node) = stack.pop() {
+        if situations.contains(node.id.as_str()) {
+            return true;
+        }
+        if !seen.insert(node.id.as_str()) {
+            continue;
+        }
+        for basis in &node.basis {
+            if let Some(next) = basis.node.as_deref().and_then(|id| by_id.get(id).copied()) {
+                stack.push(next);
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
@@ -1444,6 +1616,14 @@ struct TaskReport {
     branches: u64,
     /// Whether any of those records was a reconcile.
     reconciled: bool,
+    /// Turns the chain covers, and how often the posture switched inside one.
+    /// Durable nodes, not anything the model said about itself.
+    turns: u64,
+    stance_switches: u64,
+    /// Whether every answer walks back to the situation that opened its turn.
+    chain_walk: ChainWalk,
+    /// Which node broke the walk, or why there was none to walk from.
+    chain_note: String,
     episodes: Vec<Episode>,
 }
 
@@ -1452,7 +1632,8 @@ fn print_report(reports: &[TaskReport]) {
     for report in reports {
         println!(
             "{:<8} run {}  {:<6}  steps={:<3} models={:<3} tools={:<3} failed={:<2} \
-             refused={:<2} gates={:<2} records={:<2} branches={:<2}  tokens={}/{}/{}  wall={}ms",
+             refused={:<2} gates={:<2} records={:<2} branches={:<2} turns={:<2} switches={:<2} \
+             chain={:<7}  tokens={}/{}/{}  wall={}ms",
             report.name,
             report.run,
             if report.solved { "solved" } else { "UNSOLVED" },
@@ -1464,6 +1645,9 @@ fn print_report(reports: &[TaskReport]) {
             report.judgment_required,
             report.judgment_records,
             report.branches,
+            report.turns,
+            report.stance_switches,
+            report.chain_walk.as_str(),
             report.tokens_in,
             report.tokens_out,
             report.tokens_total,
@@ -1476,6 +1660,9 @@ fn print_report(reports: &[TaskReport]) {
                 report.judgment_records,
                 if report.reconciled { "a reconcile was written" } else { "no reconcile" }
             );
+        }
+        if report.chain_walk != ChainWalk::Walks {
+            println!("  ! chain: {}", report.chain_note);
         }
         if report.longest_identical_streak >= 3 {
             println!(
@@ -1526,6 +1713,10 @@ fn print_report(reports: &[TaskReport]) {
     let loops = reports.iter().filter(|report| report.longest_identical_streak >= 3).count();
     let gates: u64 = reports.iter().map(|report| report.judgment_required).sum();
     let reconciled = reports.iter().filter(|report| report.reconciled).count();
+    let switches: u64 = reports.iter().map(|report| report.stance_switches).sum();
+    let broken = reports.iter().filter(|report| report.chain_walk == ChainWalk::Broken).count();
+    let unanswered =
+        reports.iter().filter(|report| report.chain_walk == ChainWalk::NoAnswer).count();
     let judgment_arm = std::env::var("AGENT_JUDGMENT")
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_else(|_| String::from("gates"));
@@ -1537,7 +1728,9 @@ fn print_report(reports: &[TaskReport]) {
     println!(
         "summary: solved {solved}/{total}; failures {episodes}; evidence-first {evidence}, \
          adjusted-retry {adjusted}, identical-retry {identical}, stopped {stopped}; loops {loops}; \
-         judgment {arm} with {gates} gate(s) and {reconciled} reconciled run(s)"
+         judgment {arm} with {gates} gate(s) and {reconciled} reconciled run(s); \
+         chain {switches} posture switch(es), {broken} broken walk(s), {unanswered} run(s) with \
+         no answer to walk from"
     );
 }
 
@@ -1573,6 +1766,13 @@ fn write_report(reports: &[TaskReport]) {
                 "records": report.judgment_records,
                 "branches": report.branches,
                 "reconciled": report.reconciled,
+            },
+            "chain": {
+                "turns": report.turns,
+                "switches": report.stance_switches,
+                "walkable": report.chain_walk == ChainWalk::Walks,
+                "state": report.chain_walk.as_str(),
+                "note": report.chain_note,
             },
             "after_failures": report.episodes.iter().map(|episode| json!({
                 "tool": episode.tool,
@@ -1709,4 +1909,134 @@ fn an_approval_pause_is_not_a_failure() {
         }),
     ];
     assert!(episodes(&events).is_empty());
+}
+
+#[cfg(test)]
+fn reason_node(id: &str, turn: &str, kind: ReasonKind, rule: &str, basis: Vec<Basis>) -> Value {
+    let node = ReasonNode {
+        id: id.to_string(),
+        turn_id: turn.to_string(),
+        step: 0,
+        kind,
+        claim: format!("the claim of {id}"),
+        basis,
+        rule: rule.to_string(),
+        source: ReasonSource::Kernel,
+    };
+    json!({
+        "type": EventType::REASON_RECORDED,
+        "payload": { "node": node },
+    })
+}
+
+#[test]
+fn an_answer_that_walks_back_to_its_situation_is_walkable() {
+    let events = vec![
+        reason_node(
+            "r/1/0",
+            "t1",
+            ReasonKind::Situation,
+            "situation/derive",
+            vec![Basis::fact("the input")],
+        ),
+        reason_node(
+            "r/1/1",
+            "t1",
+            ReasonKind::Reading,
+            "reading/action-cue",
+            vec![Basis::node("r/1/0")],
+        ),
+        reason_node(
+            "r/1/2",
+            "t1",
+            ReasonKind::Stance,
+            "stance/act-request",
+            vec![Basis::node("r/1/0"), Basis::node("r/1/1")],
+        ),
+        reason_node(
+            "r/1/3",
+            "t1",
+            ReasonKind::Verdict,
+            "verdict/answer",
+            vec![Basis::node("r/1/2")],
+        ),
+    ];
+    let reading = chain_reading(&events);
+    assert_eq!(reading.turns, 1);
+    assert_eq!(reading.switches, 0);
+    assert_eq!(reading.walk, ChainWalk::Walks, "{}", reading.note);
+}
+
+#[test]
+fn a_posture_switch_is_counted_and_still_walks_back() {
+    let events = vec![
+        reason_node(
+            "r/1/0",
+            "t1",
+            ReasonKind::Situation,
+            "situation/derive",
+            vec![Basis::fact("the input")],
+        ),
+        reason_node(
+            "r/1/1",
+            "t1",
+            ReasonKind::Stance,
+            "stance/act-guarded",
+            vec![Basis::node("r/1/0")],
+        ),
+        reason_node(
+            "r/1/2",
+            "t1",
+            ReasonKind::Stance,
+            "switch/failure-repair",
+            vec![Basis::node("r/1/0"), Basis::node("r/1/1")],
+        ),
+        reason_node(
+            "r/1/3",
+            "t1",
+            ReasonKind::Verdict,
+            "verdict/after-failure",
+            vec![Basis::node("r/1/2")],
+        ),
+    ];
+    let reading = chain_reading(&events);
+    assert_eq!(reading.switches, 1);
+    assert_eq!(reading.walk, ChainWalk::Walks, "{}", reading.note);
+}
+
+#[test]
+fn a_verdict_that_cannot_reach_its_situation_is_reported() {
+    let events = vec![
+        reason_node(
+            "r/1/0",
+            "t1",
+            ReasonKind::Situation,
+            "situation/derive",
+            vec![Basis::fact("the input")],
+        ),
+        reason_node(
+            "r/1/1",
+            "t1",
+            ReasonKind::Verdict,
+            "verdict/answer",
+            vec![Basis::node("r/1/9")],
+        ),
+    ];
+    let reading = chain_reading(&events);
+    assert_eq!(reading.walk, ChainWalk::Broken);
+    assert!(reading.note.contains("no answer reaches its situation"), "{}", reading.note);
+}
+
+#[test]
+fn a_chain_with_no_answer_has_nothing_to_walk_back_from() {
+    let events = vec![reason_node(
+        "r/1/0",
+        "t1",
+        ReasonKind::Situation,
+        "situation/derive",
+        vec![Basis::fact("the input")],
+    )];
+    let reading = chain_reading(&events);
+    assert_eq!(reading.walk, ChainWalk::NoAnswer);
+    assert!(reading.note.contains("ended before a verdict"), "{}", reading.note);
 }
