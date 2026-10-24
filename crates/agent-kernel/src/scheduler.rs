@@ -773,6 +773,11 @@ impl Ending {
                 "cause": "user_interrupt",
                 "inbox_item": item_id,
             }),
+            // The one terminal payload that would otherwise be empty. A budget
+            // stop writes no final content, and `turn/completed {}` cannot be
+            // told from a turn that ended with nothing to say: on 2026-10-24's
+            // real use the log gave no reason and only stdout did.
+            Ending::Budget => serde_json::json!({ "stop_reason": &reason }),
             _ => match &final_content {
                 Some(content) => serde_json::json!({ "final_content": content }),
                 None => serde_json::json!({}),
@@ -1591,6 +1596,14 @@ mod tests {
         let types = event_types(&store, &sid).await;
         assert!(types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
         assert!(types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
+        // A budget stop says so in the log, not only on stdout: without it the
+        // event is indistinguishable from a turn that ended with nothing to say.
+        let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let completed = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
+            .expect("the turn completed");
+        assert_eq!(completed.event.payload["stop_reason"], serde_json::json!("max_steps"));
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
     }
 

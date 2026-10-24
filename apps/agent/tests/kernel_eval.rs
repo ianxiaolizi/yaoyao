@@ -1558,13 +1558,29 @@ fn chain_reading(events: &[Value]) -> ChainReading {
     let walk = if !note.is_empty() {
         ChainWalk::Broken
     } else if answers == 0 {
-        note = String::from("the turn ended before a verdict: no answer to walk back from");
+        note = if cut_by_budget(events) {
+            String::from(
+                "the step budget ended the turn before a verdict: no answer to walk back from",
+            )
+        } else {
+            String::from("the turn ended before a verdict: no answer to walk back from")
+        };
         ChainWalk::NoAnswer
     } else {
         ChainWalk::Walks
     };
     let unmet = nodes.iter().filter(|node| node.rule == "verdict/action-unmet").count() as u64;
     ChainReading { turns: by_turn.len() as u64, switches, walk, unmet, note }
+}
+
+/// Whether the step budget, rather than the loop, ended a turn in this run.
+///
+/// The kernel writes `stop_reason: "max_steps"` on the terminal event since
+/// 2026-10-24; before that the log said nothing and only stdout did.
+fn cut_by_budget(events: &[Value]) -> bool {
+    events.iter().any(|event| {
+        event["type"] == EventType::TURN_COMPLETED && event["payload"]["stop_reason"] == "max_steps"
+    })
 }
 
 /// Whether a verdict's basis edges lead to one of its turn's situations.
@@ -2077,4 +2093,16 @@ fn a_chain_with_no_answer_has_nothing_to_walk_back_from() {
     let reading = chain_reading(&events);
     assert_eq!(reading.walk, ChainWalk::NoAnswer);
     assert!(reading.note.contains("ended before a verdict"), "{}", reading.note);
+
+    // When the budget ended the turn, the note says so: the log records it as
+    // `stop_reason: "max_steps"` on the terminal event, and a reader should not
+    // have to guess whether the turn finished or was cut.
+    let mut cut = events.clone();
+    cut.push(json!({
+        "type": EventType::TURN_COMPLETED,
+        "payload": { "stop_reason": "max_steps" },
+    }));
+    let reading = chain_reading(&cut);
+    assert_eq!(reading.walk, ChainWalk::NoAnswer);
+    assert!(reading.note.contains("step budget ended the turn"), "{}", reading.note);
 }
