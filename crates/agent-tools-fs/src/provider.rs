@@ -316,7 +316,16 @@ impl ToolProvider for FsToolProvider {
                 let overflow = found.len() > MAX_GLOB_MATCHES;
                 found.truncate(MAX_GLOB_MATCHES);
                 if found.is_empty() {
-                    return Ok(ToolResult::completed("no matches".to_string()));
+                    // A bare name is matched against the whole relative path, so
+                    // it cannot match a file under a subdirectory. "no matches"
+                    // over a pattern that named nothing at all is what sent the
+                    // 2026-10-24 dogfood run to the shell.
+                    let body = if bare_pattern(pattern) {
+                        glob_named_nothing("`pattern`", pattern)
+                    } else {
+                        String::from("no matches")
+                    };
+                    return Ok(ToolResult::completed(body));
                 }
                 let mut body = found.join("\n");
                 if overflow {
@@ -356,6 +365,7 @@ impl ToolProvider for FsToolProvider {
                 };
                 let mut matches = Vec::new();
                 let mut skipped = 0usize;
+                let mut considered = 0usize;
                 let mut capped = false;
                 'files: for (path, kind) in entries {
                     if kind != DirEntryKind::File {
@@ -364,6 +374,7 @@ impl ToolProvider for FsToolProvider {
                     if glob.is_some_and(|pattern| !glob_match(pattern, &path)) {
                         continue;
                     }
+                    considered += 1;
                     let content = match self.env.read_file(&path) {
                         Ok(content) => content,
                         // A file that cannot be read, is too large, or is not
@@ -397,8 +408,16 @@ impl ToolProvider for FsToolProvider {
                     }
                 }
 
-                let mut body =
-                    if matches.is_empty() { "no matches".to_string() } else { matches.join("\n") };
+                let mut body = match (matches.is_empty(), glob) {
+                    (true, Some(pattern)) if considered == 0 && bare_pattern(pattern) => {
+                        // The glob named no file at all, which is a different
+                        // answer from "the files were searched and nothing hit":
+                        // it sent the 2026-10-24 dogfood run to the shell twice.
+                        glob_named_nothing("`glob`", pattern)
+                    }
+                    (true, _) => String::from("no matches"),
+                    (false, _) => matches.join("\n"),
+                };
                 if capped {
                     body.push_str(&format!(
                         "\n... stopped at {MAX_GREP_MATCHES} matches; narrow the pattern"
@@ -590,6 +609,31 @@ fn walk(
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     Ok((entries, truncated))
+}
+
+/// Whether a pattern is a bare name rather than a path.
+///
+/// [`glob_match`] matches the whole workspace-relative path, so a pattern with
+/// no separator can only name a file at the root; one that carries a separator
+/// already says where it expects the file to be.
+fn bare_pattern(pattern: &str) -> bool {
+    !pattern.contains(['/', '\\'])
+}
+
+/// The answer when a glob-shaped pattern named no file at all.
+///
+/// "no matches" is true but says nothing about why, and the why is a rule: the
+/// pattern is matched against the workspace-relative path, so `default.rs`
+/// says nothing about `crates/agent-loop/src/default.rs`. On 2026-10-24 the
+/// model made that call twice, read the two "no matches" as "the file is not
+/// there", and spent the rest of the turn on shell probes. Naming the rule and
+/// the spelling that would have matched ends that loop in one call.
+fn glob_named_nothing(field: &str, pattern: &str) -> String {
+    format!(
+        "no matches: {field} is matched against the workspace-relative path, so a bare name \
+         only names a file at the workspace root. If the file is under a subdirectory, \
+         `**/{pattern}` is the spelling that matches it."
+    )
 }
 
 /// Whether the workspace-relative `path` matches `pattern`.
@@ -1066,7 +1110,10 @@ mod tests {
             .invoke(&inv("fs.glob", serde_json::json!({ "pattern": "*.rs" })))
             .await
             .unwrap();
-        assert_eq!(flat.content, "no matches");
+        // `*.rs` names no file at the root, and the answer says why: the bare
+        // pattern is matched against the whole relative path.
+        assert!(flat.content.starts_with("no matches"), "{:?}", flat.content);
+        assert!(flat.content.contains("`**/*.rs`"), "{:?}", flat.content);
 
         // The walk starts at `src`, but the pattern is still matched against
         // the full workspace-relative path.
@@ -1146,6 +1193,47 @@ mod tests {
             .unwrap();
         assert!(root_level.content.contains("path: \".\""), "{:?}", root_level.content);
         assert!(root_level.content.contains("glob: \"top.md\""), "{:?}", root_level.content);
+    }
+
+    /// The 2026-10-24 failure: a bare `glob` never matches a nested file, and
+    /// the old "no matches" read as "the file is not there". The answer now
+    /// names the rule and the spelling that works.
+    #[tokio::test]
+    async fn fs_grep_says_when_a_glob_named_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("notes")).unwrap();
+        std::fs::write(dir.path().join("notes").join("config.md"), "port: 7001\n").unwrap();
+
+        let bare = provider(&dir)
+            .invoke(&inv(
+                "fs.grep",
+                serde_json::json!({ "pattern": "7001", "path": "notes", "glob": "config.md" }),
+            ))
+            .await
+            .unwrap();
+        assert!(bare.content.starts_with("no matches"), "{:?}", bare.content);
+        assert!(bare.content.contains("`**/config.md`"), "{:?}", bare.content);
+
+        // The spelling the answer names is the one that finds it.
+        let fixed = provider(&dir)
+            .invoke(&inv(
+                "fs.grep",
+                serde_json::json!({ "pattern": "7001", "path": "notes", "glob": "**/config.md" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fixed.content, "notes/config.md:1: port: 7001");
+
+        // A glob that named the file but matched no line keeps the plain
+        // answer: the files were searched, and nothing hit.
+        let no_hit = provider(&dir)
+            .invoke(&inv(
+                "fs.grep",
+                serde_json::json!({ "pattern": "nothing", "path": "notes", "glob": "**/*.md" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_hit.content, "no matches");
     }
 
     #[test]
