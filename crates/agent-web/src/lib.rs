@@ -13,10 +13,16 @@
 
 #![deny(unsafe_code)]
 
+mod sessions;
+
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
+use agent_ports::event_store::EventStore;
+use agent_protocol::ids::SessionId;
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -71,10 +77,22 @@ impl FailureKind {
     }
 }
 
+/// What the server needs from the process it runs in.
+pub struct Config {
+    pub port: u16,
+    pub meta: Meta,
+    pub store: Arc<dyn EventStore>,
+    /// Where session directories live. The read model enumerates this directory;
+    /// the store is the reader, so nothing here appends.
+    pub data_dir: PathBuf,
+}
+
 /// The state every request shares.
 struct AppState {
     token: String,
     meta: Meta,
+    store: Arc<dyn EventStore>,
+    data_dir: PathBuf,
 }
 
 /// A bound, not-yet-serving server.
@@ -92,16 +110,17 @@ pub struct Server {
 impl Server {
     /// Bind the loopback interface and build the router.
     ///
-    /// `port` 0 lets the operating system pick, which is what tests use. The
+    /// A port of 0 lets the operating system pick, which is what tests use. The
     /// address is never `0.0.0.0`: a GUI that answers the network is a different
     /// product with a different threat model.
-    pub async fn bind(port: u16, meta: Meta) -> Result<Self, WebError> {
+    pub async fn bind(config: Config) -> Result<Self, WebError> {
+        let Config { port, meta, store, data_dir } = config;
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|source| WebError::Bind { port, source })?;
         let addr = listener.local_addr().map_err(|source| WebError::Bind { port, source })?;
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let app = router(Arc::new(AppState { token: token.clone(), meta }));
+        let app = router(Arc::new(AppState { token: token.clone(), meta, store, data_dir }));
         Ok(Self { listener, addr, token, app })
     }
 
@@ -131,6 +150,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/api/meta", get(meta))
+        .route("/api/sessions", get(sessions))
+        .route("/api/sessions/{id}/transcript", get(transcript))
         .layer(middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
 }
@@ -155,6 +176,98 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "judgment": state.meta.judgment,
         "capabilities": state.meta.capabilities,
     }))
+}
+
+/// `GET /api/sessions`: every session under the data directory, newest first.
+async fn sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiFailure> {
+    let list =
+        sessions::list(state.store.as_ref(), &state.data_dir).await.map_err(ApiFailure::read)?;
+    Ok(Json(serde_json::json!({ "v": PROTOCOL, "sessions": list })))
+}
+
+/// `GET /api/sessions/{id}/transcript?since=<seq>`.
+///
+/// `since` is compared against each item's **last** change, not its first: a
+/// tool that started before the cursor and finished after it is part of the
+/// answer.
+async fn transcript(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiFailure> {
+    if !sessions::safe_session_id(&id) {
+        return Err(ApiFailure::bad_request(format!("'{id}' is not a session id")));
+    }
+    let since = match query.get("since") {
+        Some(value) => Some(value.parse::<u64>().map_err(|_| {
+            ApiFailure::bad_request(format!("since must be a whole number, not '{value}'"))
+        })?),
+        None => None,
+    };
+    if !state.data_dir.join(&id).join("events.jsonl").is_file() {
+        return Err(ApiFailure::not_found(format!("no session '{id}'")));
+    }
+    let payload = sessions::transcript(state.store.as_ref(), &SessionId::from_string(&id), since)
+        .await
+        .map_err(ApiFailure::read)?;
+    Ok(Json(payload))
+}
+
+/// A handler's refusal, in the same envelope as the gate's.
+struct ApiFailure {
+    status: StatusCode,
+    kind: &'static str,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiFailure {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "bad_request",
+            code: "bad_request",
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            kind: "not_found",
+            code: "not_found",
+            message: message.into(),
+        }
+    }
+
+    /// A read that could not be answered. Never "an empty list": the view would
+    /// be shorter than the log, which is the one thing C2.5 forbids.
+    fn read(error: sessions::ReadError) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            kind: "internal",
+            code: "read_failed",
+            message: error.to_string(),
+        }
+    }
+}
+
+impl IntoResponse for ApiFailure {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "v": PROTOCOL,
+                "ok": false,
+                "kind": self.kind,
+                "code": self.code,
+                "message": self.message,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// The two gates every request passes: where it came from, and who it is.

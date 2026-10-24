@@ -341,8 +341,14 @@ dependencies = [
 name = "agent-web"
 version = "0.1.0"
 dependencies = [
+ "agent-ports",
+ "agent-projection",
+ "agent-protocol",
+ "agent-store-jsonl",
  "axum",
+ "chrono",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "uuid",

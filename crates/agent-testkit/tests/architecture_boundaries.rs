@@ -176,10 +176,10 @@ fn dependency_direction_matches_spec() {
         ("crates/agent-index-sqlite", &["agent-protocol", "agent-ports"]),
         ("crates/agent-testkit", &["agent-protocol", "agent-ports"]),
         ("crates/agent-cli", &["agent-protocol", "agent-ports", "agent-kernel"]),
-        // The front door: a transport, and nothing above it. Every endpoint it
-        // grows must go through the command layer rather than name the kernel,
-        // so the empty set is the boundary this crate is meant to hold.
-        ("crates/agent-web", &[]),
+        // The front door: a transport and the read model over the log. It may
+        // fold projections (the transcript is a view, not a second source) but
+        // never names the kernel — writes go through the command layer.
+        ("crates/agent-web", &["agent-protocol", "agent-ports", "agent-projection"]),
         (
             "apps/agent",
             &[
@@ -274,9 +274,9 @@ const DEV_MATRIX: &[(&str, &[&str])] = &[
     ("crates/agent-testkit", &[]),
     // End-to-end CLI tests run through the real loop.
     ("crates/agent-cli", &["agent-testkit", "agent-loop"]),
-    // The surface is tested over a real socket; reqwest is not an agent crate,
-    // so nothing above this layer is climbed by these tests.
-    ("crates/agent-web", &[]),
+    // The read endpoints are tested against a real log on disk: listing sessions
+    // is a filesystem question, and a fake store cannot answer it.
+    ("crates/agent-web", &["agent-store-jsonl"]),
     ("apps/agent", &["agent-testkit"]),
 ];
 

@@ -948,7 +948,11 @@ async fn web(args: &Args) {
         capabilities: vec!["meta".to_string()],
     };
 
-    let server = match agent_web::Server::bind(port, meta).await {
+    let data_dir = PathBuf::from(data_dir());
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(&data_dir));
+    let config = agent_web::Config { port, meta, store, data_dir };
+
+    let server = match agent_web::Server::bind(config).await {
         Ok(server) => server,
         Err(error) => fail(args, &error.to_string()),
     };

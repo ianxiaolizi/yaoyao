@@ -133,6 +133,10 @@ pub struct TranscriptItem {
     pub id: String,
     /// The event that first created the item; ordering is by first appearance.
     pub seq: EventSeq,
+    /// The event that last changed the item. An incremental reader compares
+    /// this against its cursor: a tool that started at 10 and ended at 11 is
+    /// still the item from 10, but it is news as of 11.
+    pub updated_seq: EventSeq,
     pub turn_id: Option<TurnId>,
     pub step_id: Option<StepId>,
     pub body: ItemBody,
@@ -192,6 +196,7 @@ fn upsert(
         // The first seq is the item's place in the timeline; a later update
         // must not move it after the rows it was already before.
         existing.body = body;
+        existing.updated_seq = seq;
         if existing.turn_id.is_none() {
             existing.turn_id = turn;
         }
@@ -200,7 +205,14 @@ fn upsert(
         }
         return;
     }
-    state.items.push(TranscriptItem { id, seq, turn_id: turn, step_id: step, body });
+    state.items.push(TranscriptItem {
+        id,
+        seq,
+        updated_seq: seq,
+        turn_id: turn,
+        step_id: step,
+        body,
+    });
 }
 
 /// The text blocks of a response, in order.
@@ -247,7 +259,9 @@ impl ProjectionDefinition for TranscriptProjection {
     }
 
     fn state_version(&self) -> u64 {
-        1
+        // 2: items carry `updated_seq`, so an incremental reader can tell a
+        // changed row from an old one without refolding the log.
+        2
     }
 
     fn init(&self) -> Self::State {

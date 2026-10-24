@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+agent-protocol = { path = "../agent-protocol" }
+agent-ports = { path = "../agent-ports" }
+agent-projection = { path = "../agent-projection" }
+chrono = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
@@ -13,4 +17,6 @@ axum = { workspace = true }
 tokio = { version = "1", features = ["net", "rt", "macros"] }
 
 [dev-dependencies]
+agent-store-jsonl = { path = "../agent-store-jsonl" }
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
