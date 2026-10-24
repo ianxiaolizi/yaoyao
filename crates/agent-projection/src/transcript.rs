@@ -663,11 +663,14 @@ impl ProjectionDefinition for TranscriptProjection {
                     }
                 }
 
-                // A completed turn's `final_content` is the answer, not a hint:
-                // it replaces whatever the model response wrote, because the
-                // turn is the thing that decided what the answer was.
-                if let Some(content) =
-                    event.event.payload.get("final_content").and_then(|value| value.as_str())
+                // Only a completed turn has an answer in `final_content`. A
+                // yielded turn carries "approval pending: <id>" there and a
+                // cancelled or failed one carries a status line; none of those
+                // is something the model said, and putting one in the answer
+                // position is how a page ends up showing a UUID as an answer.
+                if event.event.event_type.as_str() == EventType::TURN_COMPLETED
+                    && let Some(content) =
+                        event.event.payload.get("final_content").and_then(|value| value.as_str())
                 {
                     upsert(
                         &mut next,
@@ -838,6 +841,34 @@ mod tests {
             }
             other => panic!("expected a user item, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_yielded_turn_does_not_show_its_placeholder_as_an_answer() {
+        let state = apply(
+            &TranscriptProjection::new().init(),
+            &stored(
+                1,
+                EventType::TURN_YIELDED,
+                Some(TurnId::from_string("t1")),
+                None,
+                json!({ "final_content": "approval pending: ap-1" }),
+            ),
+        );
+
+        assert!(
+            !state.items.iter().any(|item| matches!(item.body, ItemBody::Answer { .. })),
+            "the approval id is a placeholder, not something the model said"
+        );
+        let end = state
+            .items
+            .iter()
+            .find_map(|item| match &item.body {
+                ItemBody::TurnEnd { ending, .. } => Some(*ending),
+                _ => None,
+            })
+            .expect("the turn still ends");
+        assert_eq!(end, TurnEnding::Yielded);
     }
 
     #[test]
