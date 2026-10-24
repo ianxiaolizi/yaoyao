@@ -47,7 +47,11 @@ use agent_protocol::judgment::{self, Judgment, JudgmentStage};
 use agent_protocol::ledger::Ledger;
 use agent_protocol::model::{ToolCall, estimate_message, estimate_text};
 use agent_protocol::permissions::ArtifactRef;
-use agent_protocol::plan::{self, Plan};
+use agent_protocol::plan::{self, Plan, PlanItemStatus};
+use agent_protocol::reason::{
+    self as reason_record, Basis, Mode, ReasonKind, ReasonNode, ReasonSource, Recorder, Situation,
+    SpeechAct, Stance,
+};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::{
     APPROVAL_PENDING_OUTCOME, GATE_REFUSED_OUTCOME, GATEWAY_REFUSED_OUTCOME, ToolSideEffect,
@@ -807,6 +811,36 @@ struct LoopTurn {
     /// Every accepted `judgment.update` replaces it with the merged record, so
     /// the task layer the next step reads is the one the log now holds.
     judgment: Option<Judgment>,
+    /// The posture this turn runs in. It opens from the situation and the
+    /// reading; a real failure or a steering correction can switch it mid-turn.
+    /// Every action and gate cites the stance node current at that moment.
+    mode: Mode,
+    /// Mints this turn's reason-node ids. One counter per turn, so an id is
+    /// stable across a rebuild and unique in the session.
+    reason: Recorder,
+    /// The stance node the next action hangs from. Replaced when the posture
+    /// switches, so the chain shows which posture a later call was made under.
+    stance_node: String,
+    /// What the current posture asks the next step to do, when it changed
+    /// mid-turn. It goes into the task layer, so the switch is visible to the
+    /// model as well as to a reader.
+    stance_note: Option<String>,
+    /// Whether the posture changed after the turn opened. The verdict cites the
+    /// stance node only when it did, so a switch is never an orphan root.
+    stance_switched: bool,
+    /// The plan the task layer shows: the opening plan, replaced in place when
+    /// `plan.update` lands. Kept here so a later rewrite (a stance switch) does
+    /// not fall back to the plan the turn opened with.
+    plan_view: Option<Plan>,
+    /// The latest observation node, so the answer can cite what it rests on.
+    reason_last_observation: Option<String>,
+    /// Whether the kernel's reading named a checkable criterion, so a completed
+    /// check can satisfy it.
+    criterion_expects_check: bool,
+    /// Whether such a check has completed since the turn opened.
+    criterion_observed: bool,
+    /// The step ordinal within this turn, for the chain's own numbering.
+    step_index: u32,
     /// The most recent real failure the record has not reconciled yet. Approval
     /// pending is a wait, not a failure, and never lands here.
     pending_failure: Option<PendingFailure>,
@@ -909,6 +943,68 @@ fn tool_advice(turn: &LoopTurn) -> ToolAdvice {
     ToolAdvice::new(&turn.irreversible_tools, &turn.write_tools, &turn.read_tools)
 }
 
+/// What a repair posture asks the next step to do.
+///
+/// The note is derived, not generic: it names the call that failed and what the
+/// tool said, so "change one variable" is a sentence about this failure rather
+/// than a maxim. It goes into the task layer only after the posture switches,
+/// and it is bounded like every other line in that layer.
+fn repair_note(failure: Option<&PendingFailure>, because: &str) -> String {
+    let opening = match failure {
+        Some(failure) => format!(
+            "Repair posture: `{}` failed ({}).",
+            failure.tool,
+            truncate(&failure.detail, 100)
+        ),
+        None => format!("Repair posture: {because}."),
+    };
+    format!("{opening} Change one variable in the next call; if you stop, say what you checked.")
+}
+
+/// Enter a posture that differs from the one the turn opened in.
+///
+/// The mode changes, the note the task layer carries is derived from the reason
+/// for the switch, and the turn remembers that it switched so the verdict can
+/// cite the new stance. The node itself is minted by the caller, which is the
+/// only place that knows what evidence caused the switch.
+fn enter_stance(turn: &mut LoopTurn, stance: Stance, because: &str) {
+    turn.mode = reason_record::switched_mode(turn.mode, stance);
+    let note =
+        (stance == Stance::Repair).then(|| repair_note(turn.pending_failure.as_ref(), because));
+    turn.stance_note = note;
+    turn.stance_switched = true;
+}
+
+/// Rewrite the task layer this turn already placed, in place.
+///
+/// The layer describes the plan and the posture, and both can move while the
+/// turn runs; the next step must read the state the log now holds, not the one
+/// the turn opened with. The plan is `plan_view` rather than `ctx.plan` for the
+/// same reason: a plan written mid-turn would otherwise be reverted by a later
+/// stance switch.
+fn refresh_task_layer(turn: &mut LoopTurn, ledger: bool) {
+    let Some(facts) = turn.ctx.state.as_ref() else { return };
+    let advice = tool_advice(turn);
+    let text = task_text(
+        &turn.ctx.user_input,
+        facts,
+        turn.plan_view.as_ref(),
+        turn.judgment.as_ref(),
+        turn.stale.as_ref(),
+        ledger.then_some(&advice),
+        turn.stance_note.as_deref(),
+    );
+    if let Some(layers) = turn.context_layers.as_mut() {
+        layers.task = text.clone();
+    }
+    let uid = format!("msg/task/{}", turn.ctx.turn_id);
+    if let Some(message) =
+        turn.messages.iter_mut().find(|message| message.message_uid.as_str() == uid)
+    {
+        *message = ModelMessage::task_for_turn(&turn.ctx.turn_id, text);
+    }
+}
+
 /// The two per-turn leading messages: where the turn stands, and what it is
 /// for. Neither is history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -968,6 +1064,7 @@ fn task_text(
     judgment: Option<&Judgment>,
     stale: Option<&StaleRead>,
     advice: Option<&ToolAdvice>,
+    stance_note: Option<&str>,
 ) -> String {
     let task = truncate(&user_text(input), MAX_TASK_CHARS);
     let input_kind = match facts.input_kind {
@@ -1008,6 +1105,10 @@ fn task_text(
     }
     if let Some(advice) = advice {
         text.push_str(&advice.text());
+    }
+    if let Some(note) = stance_note {
+        text.push('\n');
+        text.push_str(note);
     }
     text
 }
@@ -1355,6 +1456,77 @@ impl AgentLoop for DefaultAgentLoop {
         // call this turn makes later is never mistaken for an old one.
         let stale = stale_read(&derived_messages, &user_text(&ctx.user_input), &read_tools);
 
+        // The situation is derived, not narrated: every field comes from the
+        // turn context, the frozen tool set and the settled history. The
+        // reading is a cue-based first pass, and the stance is selected by a
+        // named rule. All three are recorded before the first request, so
+        // `why` can walk from every later call back to the input that opened
+        // the turn.
+        let input_text = user_text(&ctx.user_input);
+        let reading = reason_record::read(&input_text);
+        let turn_facts = ctx.state.as_ref();
+        let situation = Situation {
+            input_kind: match turn_facts.map(|facts| facts.input_kind) {
+                Some(TurnInputKind::Scheduled) => String::from("scheduled"),
+                Some(TurnInputKind::User) | None => String::from("user"),
+            },
+            previous_turn: turn_facts.and_then(|facts| facts.previous_turn).map(ending_word),
+            queued_inputs: turn_facts.map(|facts| facts.queued_inputs).unwrap_or(0),
+            max_steps: turn_facts.map(|facts| facts.max_steps).unwrap_or(0),
+            plan_done: ctx.plan.as_ref().map_or(0, |plan| {
+                plan.items.iter().filter(|item| item.status == PlanItemStatus::Done).count()
+            }),
+            plan_total: ctx.plan.as_ref().map_or(0, |plan| plan.items.len()),
+            pending_failure: ctx.pending_failure.as_ref().map(|failure| failure.tool.clone()),
+            stale_read: stale.as_ref().map(|stale| stale.target.clone()),
+            read_tools: read_tools.len(),
+            write_tools: write_tools.len(),
+            irreversible: irreversible_tools.clone(),
+            sandbox: ctx.capability.as_ref().map(|facts| sandbox_word(facts.sandbox).to_string()),
+            network_allowed: ctx.capability.as_ref().map(|facts| facts.network_allowed),
+            judgment_stage: ctx
+                .judgment
+                .as_ref()
+                .and_then(|judgment| judgment.stage)
+                .map(|stage| stage.as_str().to_string()),
+        };
+        let selection = reason_record::select(&situation, &reading);
+        let criterion_expects_check = reading
+            .criterion
+            .as_deref()
+            .is_some_and(|criterion| criterion.contains("test") || criterion.contains("check"));
+        let mut recorder = Recorder::new(ctx.turn_id.as_str());
+        let input_fact = if input_text.trim().is_empty() {
+            String::from("the turn opened with no text")
+        } else {
+            format!("the input: {}", truncate(&input_text, 120))
+        };
+        let situation_node = recorder.node(
+            ReasonKind::Situation,
+            0,
+            situation.render(),
+            vec![Basis::fact(input_fact)],
+            "situation/derive",
+            ReasonSource::Kernel,
+        );
+        let reading_node = recorder.node(
+            ReasonKind::Reading,
+            0,
+            reading.render(),
+            vec![Basis::node(situation_node.id.clone())],
+            reading.rule(),
+            ReasonSource::Kernel,
+        );
+        let stance_node = recorder.node(
+            ReasonKind::Stance,
+            0,
+            selection.render(),
+            vec![Basis::node(situation_node.id.clone()), Basis::node(reading_node.id.clone())],
+            selection.rule,
+            ReasonSource::Kernel,
+        );
+        let stance_node_id = stance_node.id.clone();
+
         // The world around this turn, then what this turn is for. Both are
         // properties of the turn, not replies in the conversation: they sit
         // after settled history and before this turn's input, so every request
@@ -1372,6 +1544,7 @@ impl AgentLoop for DefaultAgentLoop {
                     if self.judgment_ledger { ctx.judgment.as_ref() } else { None },
                     stale.as_ref(),
                     if self.judgment_ledger { Some(&advice) } else { None },
+                    None,
                 ),
             };
             messages.push(ModelMessage::state_for_turn(&ctx.turn_id, layers.state.clone()));
@@ -1448,6 +1621,14 @@ impl AgentLoop for DefaultAgentLoop {
             ));
         }
 
+        // The turn's opening chain: situation, reading, stance. They come after
+        // the frozen tool set because the situation names what that set offers;
+        // they come before the first request because the stance decides what
+        // that request's task layer carries.
+        for node in [&situation_node, &reading_node, &stance_node] {
+            events.push(reason_event(ctx, None, node));
+        }
+
         Ok(TurnStart {
             state: TurnState::new(LoopTurn {
                 ctx: ctx.clone(),
@@ -1475,6 +1656,16 @@ impl AgentLoop for DefaultAgentLoop {
                 in_flight_compactions: 0,
                 in_flight_newest: None,
                 judgment: ctx.judgment.clone(),
+                mode: selection.mode,
+                reason: recorder,
+                stance_node: stance_node_id,
+                stance_note: None,
+                stance_switched: false,
+                plan_view: ctx.plan.clone(),
+                reason_last_observation: None,
+                criterion_expects_check,
+                criterion_observed: false,
+                step_index: 0,
                 // A resumed turn opens on a failure the previous turn left
                 // behind; the caller read it back from the log. An ordinary
                 // turn opens clean.
@@ -1509,7 +1700,10 @@ impl AgentLoop for DefaultAgentLoop {
         let ctx = turn.ctx.clone();
         let ctx = &ctx;
         let context_revision = turn.context_revision;
+        turn.step_index += 1;
+        let step_index = turn.step_index;
         let mut events: Vec<EventDraft> = Vec::new();
+        let step_id = StepId::new();
 
         // Steering goes in before anything else this step does: it was injected
         // at the boundary this step begins at, so it precedes the request that
@@ -1520,9 +1714,49 @@ impl AgentLoop for DefaultAgentLoop {
                 &input.item_id,
                 input.text.clone(),
             ));
+            // A steer is the person changing the turn while it runs. The kernel
+            // re-reads it and switches the posture when the steer changes what
+            // the turn is for; the node records why, so a switch is a decision
+            // with a reason rather than a mood.
+            let steer_reading = reason_record::read(&input.text);
+            let target = match steer_reading.act {
+                SpeechAct::Correction => Some((
+                    Stance::Repair,
+                    "switch/steer-correction",
+                    "the user corrected the running turn",
+                )),
+                SpeechAct::Action if turn.mode.stance != Stance::Act => Some((
+                    Stance::Act,
+                    "switch/steer-request",
+                    "the user steered a new request into the running turn",
+                )),
+                _ => None,
+            };
+            if let Some((stance, rule, because)) = target
+                && turn.mode.stance != stance
+            {
+                let node = turn.reason.node(
+                    ReasonKind::Stance,
+                    step_index,
+                    format!(
+                        "stance switched: {} -> {} ({because})",
+                        turn.mode.stance.as_str(),
+                        stance.as_str()
+                    ),
+                    vec![
+                        Basis::node(turn.stance_node.clone()),
+                        Basis::fact(format!("user steer: {}", truncate(&input.text, 120))),
+                    ],
+                    rule,
+                    ReasonSource::Kernel,
+                );
+                turn.stance_node = node.id.clone();
+                enter_stance(turn, stance, because);
+                events.push(reason_event(ctx, Some(&step_id), &node));
+                refresh_task_layer(turn, self.judgment_ledger);
+            }
         }
 
-        let step_id = StepId::new();
         {
             events.push(draft(
                 ctx,
@@ -1737,58 +1971,64 @@ impl AgentLoop for DefaultAgentLoop {
 
             let sink = self.sink(ctx);
             let redactor = Redactor::new();
-            let response = match self.model.stream(&request, sink.as_ref()).await {
-                Ok(response) => {
-                    // The durable copy is scrubbed: a proposal's arguments are
-                    // the model's, and a secret copied into them must not sit in
-                    // a long-lived log (§7 row 4). `response` keeps its raw
-                    // arguments — the live turn shows the model what it actually
-                    // asked for, and only the record is redacted.
-                    let durable = redacted_proposal(&response, &redactor);
-                    events.push(draft(
-                        ctx,
-                        &step_id,
-                        EventType::MODEL_RESPONSE_COMPLETED,
-                        serde_json::json!({
-                            "attempt_id": attempt_id,
-                            "response": serde_json::to_value(&durable)?,
-                        }),
-                        Actor::Agent,
-                    ));
-                    response
-                }
-                Err(error) => {
-                    // The attempt's deltas stayed live-only; no partial response
-                    // is written, and the failure is a first-class fact.
-                    let cancelled = error.is_cancelled();
-                    events.push(draft(
-                        ctx,
-                        &step_id,
-                        if cancelled {
-                            EventType::MODEL_ATTEMPT_CANCELLED
-                        } else {
-                            EventType::MODEL_ATTEMPT_FAILED
-                        },
-                        serde_json::json!({
-                            "attempt_id": attempt_id,
-                            "error_kind": error.kind(),
-                            "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
-                        }),
-                        Actor::Agent,
-                    ));
-                    events.push(step_failed(ctx, &step_id));
-                    return Ok(StepOutcome {
-                        step_id,
-                        events,
-                        stop: Some(if cancelled {
-                            StopReason::UserCancelled
-                        } else {
-                            StopReason::FatalError
-                        }),
-                        final_content: None,
-                    });
-                }
-            };
+            let (response, response_event_id) =
+                match self.model.stream(&request, sink.as_ref()).await {
+                    Ok(response) => {
+                        // The durable copy is scrubbed: a proposal's arguments are
+                        // the model's, and a secret copied into them must not sit in
+                        // a long-lived log (§7 row 4). `response` keeps its raw
+                        // arguments — the live turn shows the model what it actually
+                        // asked for, and only the record is redacted.
+                        let durable = redacted_proposal(&response, &redactor);
+                        let recorded = draft(
+                            ctx,
+                            &step_id,
+                            EventType::MODEL_RESPONSE_COMPLETED,
+                            serde_json::json!({
+                                "attempt_id": attempt_id,
+                                "response": serde_json::to_value(&durable)?,
+                            }),
+                            Actor::Agent,
+                        );
+                        // Kept so an action can cite the response that proposed it:
+                        // the model's choice is a node in the chain, not an
+                        // unrecorded gap between two kernel decisions.
+                        let recorded_id = recorded.event_id.as_str().to_string();
+                        events.push(recorded);
+                        (response, recorded_id)
+                    }
+                    Err(error) => {
+                        // The attempt's deltas stayed live-only; no partial response
+                        // is written, and the failure is a first-class fact.
+                        let cancelled = error.is_cancelled();
+                        events.push(draft(
+                            ctx,
+                            &step_id,
+                            if cancelled {
+                                EventType::MODEL_ATTEMPT_CANCELLED
+                            } else {
+                                EventType::MODEL_ATTEMPT_FAILED
+                            },
+                            serde_json::json!({
+                                "attempt_id": attempt_id,
+                                "error_kind": error.kind(),
+                                "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
+                            }),
+                            Actor::Agent,
+                        ));
+                        events.push(step_failed(ctx, &step_id));
+                        return Ok(StepOutcome {
+                            step_id,
+                            events,
+                            stop: Some(if cancelled {
+                                StopReason::UserCancelled
+                            } else {
+                                StopReason::FatalError
+                            }),
+                            final_content: None,
+                        });
+                    }
+                };
 
             // The assistant turn — its text and any tool proposals — enters the
             // conversation before its tool results. That is the order every
@@ -1867,6 +2107,27 @@ impl AgentLoop for DefaultAgentLoop {
                 {
                     let text = gate_text(&failure, listing_hint(&turn.manifest));
                     turn.gate_fired_for = Some(failure.call_id.clone());
+                    let gate_basis = vec![
+                        Basis::node(turn.stance_node.clone()),
+                        Basis::fact(format!(
+                            "`{}` failed and no call has looked at the world since",
+                            failure.tool
+                        )),
+                    ];
+                    let gate = turn.reason.node(
+                        ReasonKind::Gate,
+                        step_index,
+                        format!(
+                            "held the answer under stance {}: `{}` failed and nothing has \
+                             looked since",
+                            turn.mode.stance.as_str(),
+                            failure.tool
+                        ),
+                        gate_basis,
+                        "gate/failure-check",
+                        ReasonSource::Kernel,
+                    );
+                    events.push(reason_event(ctx, Some(&step_id), &gate));
                     events.push(draft(
                         ctx,
                         &step_id,
@@ -1914,6 +2175,27 @@ impl AgentLoop for DefaultAgentLoop {
                 {
                     let text = stale_text(&stale);
                     turn.stale_gate_fired = true;
+                    let gate_basis = vec![
+                        Basis::node(turn.stance_node.clone()),
+                        Basis::fact(format!(
+                            "this turn names `{}` and has made no call yet",
+                            stale.target
+                        )),
+                    ];
+                    let gate = turn.reason.node(
+                        ReasonKind::Gate,
+                        step_index,
+                        format!(
+                            "held the answer under stance {}: `{}` was read in an earlier \
+                             turn, not in this one",
+                            turn.mode.stance.as_str(),
+                            stale.target
+                        ),
+                        gate_basis,
+                        "gate/stale-read",
+                        ReasonSource::Kernel,
+                    );
+                    events.push(reason_event(ctx, Some(&step_id), &gate));
                     events.push(draft(
                         ctx,
                         &step_id,
@@ -1946,6 +2228,49 @@ impl AgentLoop for DefaultAgentLoop {
                     ));
                     return Ok(StepOutcome { step_id, events, stop: None, final_content: None });
                 }
+                // The answer is the end of the derivation: it rests on the
+                // last observation this turn made (if any) and on how the
+                // request was read. When a check the request named has
+                // completed, the stop names that observation rather than
+                // treating the model's prose as its own evidence.
+                let answer_text = response.text_content();
+                let mut verdict_basis = Vec::new();
+                // A switched posture is the immediate reason the answer is this
+                // one, so it is the first edge. The observation it rests on
+                // follows; both are the same failed observation in a repair
+                // turn, and the renderer says so rather than printing it twice.
+                if turn.stance_switched {
+                    verdict_basis.push(Basis::node(turn.stance_node.clone()));
+                }
+                match &turn.reason_last_observation {
+                    Some(observation) => verdict_basis.push(Basis::node(observation.clone())),
+                    None if !turn.stance_switched => {
+                        verdict_basis.push(Basis::node(turn.stance_node.clone()));
+                    }
+                    None => {}
+                }
+                let verdict = turn.reason.node(
+                    ReasonKind::Verdict,
+                    step_index,
+                    format!(
+                        "answer: {}",
+                        if answer_text.trim().is_empty() {
+                            String::from("(no text)")
+                        } else {
+                            truncate(&answer_text, 160)
+                        }
+                    ),
+                    verdict_basis,
+                    if turn.criterion_observed {
+                        "verdict/criterion-observed"
+                    } else if turn.stance_switched && turn.mode.stance == Stance::Repair {
+                        "verdict/after-failure"
+                    } else {
+                        "verdict/answer"
+                    },
+                    ReasonSource::Model,
+                );
+                events.push(reason_event(ctx, Some(&step_id), &verdict));
                 events.push(draft(
                     ctx,
                     &step_id,
@@ -1957,7 +2282,7 @@ impl AgentLoop for DefaultAgentLoop {
                     step_id,
                     events,
                     stop: Some(StopReason::FinalAnswer),
-                    final_content: Some(response.text_content()),
+                    final_content: Some(answer_text),
                 });
             }
 
@@ -1978,6 +2303,27 @@ impl AgentLoop for DefaultAgentLoop {
                 let text = repeat_text(&call.tool_name, turn.identical_streak);
                 let trigger = call.tool_name.clone();
                 turn.repeat_refused = true;
+                let gate_basis = vec![
+                    Basis::node(turn.stance_node.clone()),
+                    Basis::fact(format!(
+                        "`{}` has run {} times in a row with byte-identical arguments",
+                        call.tool_name, turn.identical_streak
+                    )),
+                ];
+                let gate = turn.reason.node(
+                    ReasonKind::Gate,
+                    step_index,
+                    format!(
+                        "held `{}` under stance {}: the same call already ran {} times in a row",
+                        call.tool_name,
+                        turn.mode.stance.as_str(),
+                        turn.identical_streak
+                    ),
+                    gate_basis,
+                    "gate/repeat-call",
+                    ReasonSource::Kernel,
+                );
+                events.push(reason_event(ctx, Some(&step_id), &gate));
                 events.push(draft(
                     ctx,
                     &step_id,
@@ -2022,6 +2368,25 @@ impl AgentLoop for DefaultAgentLoop {
                 // invocation below still runs with the raw arguments — only the
                 // record is redacted.
                 let (arguments, redaction) = redactor.redact_value(&call.arguments);
+                // The call is a decision, so it gets a node before it is
+                // dispatched. Its bases are the stance it was made under and
+                // the response that proposed it: the kernel did not choose the
+                // tool, but it can say which posture the choice was made in and
+                // where the proposal came from.
+                let action_basis = vec![
+                    Basis::node(turn.stance_node.clone()),
+                    Basis::event(response_event_id.clone()),
+                ];
+                let action = turn.reason.node(
+                    ReasonKind::Action,
+                    step_index,
+                    format!("{} {}", call.tool_name, summarize_arguments(&arguments)),
+                    action_basis,
+                    "action/dispatch",
+                    ReasonSource::Model,
+                );
+                let action_id = action.id.clone();
+                events.push(reason_event(ctx, Some(&step_id), &action));
                 let mut payload = serde_json::json!({
                     "tool_name": call.tool_name,
                     "provider_tool_call_id": call.tool_call_id,
@@ -2075,28 +2440,8 @@ impl AgentLoop for DefaultAgentLoop {
                             // already placed, so that message is rewritten
                             // in place: the next step of this turn reads
                             // it without waiting for a new turn to open.
-                            if let Some(facts) = turn.ctx.state.as_ref() {
-                                let advice = tool_advice(turn);
-                                let text = task_text(
-                                    &turn.ctx.user_input,
-                                    facts,
-                                    Some(&plan),
-                                    turn.judgment.as_ref(),
-                                    turn.stale.as_ref(),
-                                    self.judgment_ledger.then_some(&advice),
-                                );
-                                if let Some(layers) = turn.context_layers.as_mut() {
-                                    layers.task = text.clone();
-                                }
-                                let uid = format!("msg/task/{}", ctx.turn_id);
-                                if let Some(message) = turn
-                                    .messages
-                                    .iter_mut()
-                                    .find(|message| message.message_uid.as_str() == uid)
-                                {
-                                    *message = ModelMessage::task_for_turn(&ctx.turn_id, text);
-                                }
-                            }
+                            turn.plan_view = Some(plan.clone());
+                            refresh_task_layer(turn, self.judgment_ledger);
                             let content = format!(
                                 "plan recorded: {} step(s), {} fact(s)",
                                 plan.items.len(),
@@ -2110,7 +2455,7 @@ impl AgentLoop for DefaultAgentLoop {
                             format!("plan not recorded: {error}"),
                         ),
                     };
-                    events.push(draft(
+                    let result_event = draft(
                         ctx,
                         &step_id,
                         event_type,
@@ -2118,10 +2463,26 @@ impl AgentLoop for DefaultAgentLoop {
                             "tool_name": call.tool_name,
                             "provider_tool_call_id": call.tool_call_id,
                             "status": status,
-                            "content": content,
+                            "content": &content,
                         }),
                         Actor::Tool,
-                    ));
+                    );
+                    let result_event_id = result_event.event_id.as_str().to_string();
+                    events.push(result_event);
+                    // The loop's own tool is still a call the model made, so
+                    // its answer is an observation in the chain like any other:
+                    // a ledger write with no recorded result would be an action
+                    // a reader could not follow to its outcome.
+                    let observation = turn.reason.node(
+                        ReasonKind::Observation,
+                        step_index,
+                        format!("{} {}: {}", call.tool_name, status_word(status), content),
+                        vec![Basis::node(action_id.clone()), Basis::event(result_event_id)],
+                        "observation/result",
+                        ReasonSource::World,
+                    );
+                    turn.reason_last_observation = Some(observation.id.clone());
+                    events.push(reason_event(ctx, Some(&step_id), &observation));
                     turn.messages.push(ModelMessage::tool_for_call(
                         &step_id,
                         call.tool_call_id.clone(),
@@ -2219,7 +2580,6 @@ impl AgentLoop for DefaultAgentLoop {
                                             Some(current) => current.merged_with(&update),
                                             None => update.clone(),
                                         };
-                                        turn.judgment = Some(merged.clone());
                                         // The ledger is model-authored text
                                         // and the log outlives the run, so it
                                         // is stored scrubbed like the plan —
@@ -2228,6 +2588,11 @@ impl AgentLoop for DefaultAgentLoop {
                                         let (value, redaction) =
                                             redactor.redact_value(&serde_json::to_value(&merged)?);
                                         let merged: Judgment = serde_json::from_value(value)?;
+                                        // The task layer is rebuilt from this
+                                        // record below, so it must be the
+                                        // scrubbed copy: the model must see
+                                        // exactly what the log keeps.
+                                        turn.judgment = Some(merged.clone());
                                         let mut payload = serde_json::json!({
                                             "provider_tool_call_id": call.tool_call_id,
                                             "judgment": &merged,
@@ -2262,29 +2627,7 @@ impl AgentLoop for DefaultAgentLoop {
                                                 turn.checked_since_failure = false;
                                             }
                                         }
-                                        if let Some(facts) = turn.ctx.state.as_ref() {
-                                            let advice = tool_advice(turn);
-                                            let text = task_text(
-                                                &turn.ctx.user_input,
-                                                facts,
-                                                turn.ctx.plan.as_ref(),
-                                                Some(&merged),
-                                                turn.stale.as_ref(),
-                                                self.judgment_ledger.then_some(&advice),
-                                            );
-                                            if let Some(layers) = turn.context_layers.as_mut() {
-                                                layers.task = text.clone();
-                                            }
-                                            let uid = format!("msg/task/{}", ctx.turn_id);
-                                            if let Some(message) = turn
-                                                .messages
-                                                .iter_mut()
-                                                .find(|message| message.message_uid.as_str() == uid)
-                                            {
-                                                *message =
-                                                    ModelMessage::task_for_turn(&ctx.turn_id, text);
-                                            }
-                                        }
+                                        refresh_task_layer(turn, self.judgment_ledger);
                                         let stage =
                                             update.stage.map(|stage| stage.as_str()).unwrap_or("");
                                         Ok(format!("judgment recorded: {stage}"))
@@ -2297,7 +2640,7 @@ impl AgentLoop for DefaultAgentLoop {
                     let content = match accepted {
                         Ok(text) | Err(text) => text,
                     };
-                    events.push(draft(
+                    let result_event = draft(
                         ctx,
                         &step_id,
                         if status == ToolStatus::Completed {
@@ -2309,10 +2652,22 @@ impl AgentLoop for DefaultAgentLoop {
                             "tool_name": call.tool_name,
                             "provider_tool_call_id": call.tool_call_id,
                             "status": status,
-                            "content": content,
+                            "content": &content,
                         }),
                         Actor::Tool,
-                    ));
+                    );
+                    let result_event_id = result_event.event_id.as_str().to_string();
+                    events.push(result_event);
+                    let observation = turn.reason.node(
+                        ReasonKind::Observation,
+                        step_index,
+                        format!("{} {}: {}", call.tool_name, status_word(status), content),
+                        vec![Basis::node(action_id.clone()), Basis::event(result_event_id)],
+                        "observation/result",
+                        ReasonSource::World,
+                    );
+                    turn.reason_last_observation = Some(observation.id.clone());
+                    events.push(reason_event(ctx, Some(&step_id), &observation));
                     turn.messages.push(ModelMessage::tool_for_call(
                         &step_id,
                         call.tool_call_id.clone(),
@@ -2399,6 +2754,10 @@ impl AgentLoop for DefaultAgentLoop {
                             ));
                         }
 
+                        // Read before the payload takes ownership: the chain's
+                        // observation needs the first line of what the world
+                        // said, and the result itself can be large.
+                        let outcome_line = first_line(&result.content);
                         let mut payload = serde_json::json!({
                             "tool_name": call.tool_name,
                             "provider_tool_call_id": call.tool_call_id,
@@ -2423,7 +2782,36 @@ impl AgentLoop for DefaultAgentLoop {
                             ToolStatus::Failed => EventType::TOOL_FAILED,
                             ToolStatus::Cancelled => EventType::TOOL_CANCELLED,
                         };
-                        events.push(draft(ctx, &step_id, event_type, payload, Actor::Tool));
+                        let result_event = draft(ctx, &step_id, event_type, payload, Actor::Tool);
+                        let result_event_id = result_event.event_id.as_str().to_string();
+                        events.push(result_event);
+                        // What the world said, tied to the call that asked. A
+                        // result whose call is missing from the chain would be
+                        // an observation with no question behind it.
+                        let observation = turn.reason.node(
+                            ReasonKind::Observation,
+                            step_index,
+                            format!(
+                                "{} {}: {}",
+                                call.tool_name,
+                                status_word(result.status),
+                                outcome_line
+                            ),
+                            vec![Basis::node(action_id.clone()), Basis::event(result_event_id)],
+                            "observation/result",
+                            ReasonSource::World,
+                        );
+                        let check_like = turn.criterion_expects_check
+                            && (call.tool_name.to_lowercase().contains("test")
+                                || serde_json::to_string(&call.arguments)
+                                    .unwrap_or_default()
+                                    .to_lowercase()
+                                    .contains("test"));
+                        if check_like && result.status == ToolStatus::Completed {
+                            turn.criterion_observed = true;
+                        }
+                        turn.reason_last_observation = Some(observation.id.clone());
+                        events.push(reason_event(ctx, Some(&step_id), &observation));
                         let is_error = result.status != ToolStatus::Completed;
                         if is_error {
                             // A real failure is one the next step could act
@@ -2437,6 +2825,32 @@ impl AgentLoop for DefaultAgentLoop {
                                 tool: call.tool_name.clone(),
                                 detail: first_line(&result.content),
                             });
+                            // A failure is the one event that changes what the
+                            // turn is for. The posture switches to repair, and
+                            // the next request's task layer says why; the node
+                            // points at the failed observation, so a reader can
+                            // see what caused the switch.
+                            if turn.mode.stance != Stance::Repair {
+                                let node = turn.reason.node(
+                                    ReasonKind::Stance,
+                                    step_index,
+                                    format!(
+                                        "stance switched: {} -> repair (`{}` failed)",
+                                        turn.mode.stance.as_str(),
+                                        call.tool_name
+                                    ),
+                                    vec![
+                                        Basis::node(observation.id.clone()),
+                                        Basis::node(turn.stance_node.clone()),
+                                    ],
+                                    "switch/failure-repair",
+                                    ReasonSource::Kernel,
+                                );
+                                turn.stance_node = node.id.clone();
+                                enter_stance(turn, Stance::Repair, "a call failed");
+                                events.push(reason_event(ctx, Some(&step_id), &node));
+                                refresh_task_layer(turn, self.judgment_ledger);
+                            }
                         }
                         turn.messages.push(ModelMessage::tool_for_call(
                             &step_id,
@@ -2757,6 +3171,60 @@ fn draft_scoped(
     }
 }
 
+/// One node of the turn's reasoning chain.
+///
+/// Turn-level nodes carry no `step_id`; a step's nodes carry the step they were
+/// decided in. The actor is the agent in both cases: the node was written by
+/// this loop, whatever the source it records.
+fn reason_event(ctx: &TurnContext, step_id: Option<&StepId>, node: &ReasonNode) -> EventDraft {
+    draft_scoped(
+        ctx,
+        step_id,
+        EventType::REASON_RECORDED,
+        serde_json::json!({ "node": node }),
+        Actor::Agent,
+    )
+}
+
+/// The tool arguments as one bounded line for a node's claim.
+///
+/// The arguments are the redacted ones: the chain is durable, and a secret the
+/// model copied into a call must not sit in it.
+fn summarize_arguments(arguments: &serde_json::Value) -> String {
+    let text = serde_json::to_string(arguments).unwrap_or_default();
+    truncate(&text, 100)
+}
+
+/// The word a tool status is shown with in an observation.
+fn status_word(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Completed => "completed",
+        ToolStatus::Failed => "failed",
+        ToolStatus::Cancelled => "cancelled",
+    }
+}
+
+/// The word a turn ending is shown with in a situation.
+fn ending_word(ending: TurnEnding) -> String {
+    String::from(match ending {
+        TurnEnding::Completed => "completed",
+        TurnEnding::Failed => "failed",
+        TurnEnding::Cancelled => "cancelled",
+        TurnEnding::Interrupted => "interrupted",
+        TurnEnding::Yielded => "yielded",
+    })
+}
+
+/// The word a sandbox mode is shown with in a situation.
+fn sandbox_word(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::LocalProcess => "local",
+        SandboxMode::WorkspaceSandbox => "app-container",
+        SandboxMode::Container => "container",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2893,13 +3361,155 @@ mod tests {
         let outcome = run_turn(&loop_, &ctx()).await;
 
         let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
-        // Two steps: the first proposes a tool call, the second answers.
-        let mut expected = vec!["model/tools.frozen"];
+        // Two steps: the first proposes a tool call, the second answers. The
+        // three opening nodes are the situation, the reading and the stance.
+        let mut expected =
+            vec!["model/tools.frozen", "reason/recorded", "reason/recorded", "reason/recorded"];
         expected.extend(expected_successful_step(true));
         expected.extend(expected_successful_step(false));
         assert_eq!(types, expected);
         assert_eq!(outcome.stop_reason, StopReason::FinalAnswer);
         assert_eq!(outcome.final_content.as_deref(), Some("done"));
+    }
+
+    /// Every reason node a turn recorded, in order.
+    fn reason_nodes(events: &[EventDraft]) -> Vec<ReasonNode> {
+        events
+            .iter()
+            .filter(|event| event.event_type.as_str() == EventType::REASON_RECORDED)
+            .map(|event| {
+                serde_json::from_value(event.payload["node"].clone())
+                    .expect("a recorded node reads back")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_step_of_a_turn_has_a_reason_node_that_validates() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({"s": "hi"})),
+            FakeModelProvider::answer("done"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let gateway = Arc::new(FakeToolGateway::new(tools));
+        let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        for node in &nodes {
+            node.validate().unwrap_or_else(|error| panic!("{}", error));
+        }
+        let kinds: Vec<&str> = nodes.iter().map(|node| node.kind.as_str()).collect();
+        assert_eq!(kinds, ["situation", "reading", "stance", "action", "observation", "verdict"]);
+
+        // The action hangs from the stance; the observation from the action; the
+        // verdict from the observation. That is the chain a reader follows
+        // backwards.
+        let stance = &nodes[2];
+        let action = &nodes[3];
+        let observation = &nodes[4];
+        let verdict = &nodes[5];
+        assert!(
+            action.basis.iter().any(|basis| basis.node.as_deref() == Some(stance.id.as_str())),
+            "{action:?}"
+        );
+        assert!(
+            observation.basis.iter().any(|basis| basis.node.as_deref() == Some(action.id.as_str())),
+            "{observation:?}"
+        );
+        assert!(
+            verdict
+                .basis
+                .iter()
+                .any(|basis| basis.node.as_deref() == Some(observation.id.as_str())),
+            "{verdict:?}"
+        );
+        assert_eq!(verdict.rule, "verdict/answer");
+    }
+
+    /// A real failure is the event that changes what the turn is for. The turn
+    /// switches to repair, the next request says why, and the switch is a node
+    /// with the failed observation as its basis — not a mood.
+    #[tokio::test]
+    async fn a_failed_call_switches_the_turn_to_repair_and_the_next_request_says_so() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("explode", serde_json::json!({})),
+            FakeModelProvider::answer("stopped after the failure"),
+        ]));
+        let tools = Arc::new(FakeToolProvider::new().with_result(
+            "explode",
+            ToolResult::failed("boom: it did not work"),
+            ToolSideEffect::Read,
+        ));
+        let gateway = Arc::new(FakeToolGateway::new(tools));
+        // The ledger is off so the failure gate does not consume the second
+        // scripted answer: this test is about the posture, not about the gate.
+        let loop_ = DefaultAgentLoop::new(model.clone(), gateway, no_context(), one_model_router())
+            .without_ledger();
+        let mut ctx = ctx();
+        ctx.state = Some(facts());
+
+        let outcome = run_turn(&loop_, &ctx).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let switch = nodes
+            .iter()
+            .find(|node| node.rule == "switch/failure-repair")
+            .expect("the failure switched the posture");
+        assert_eq!(switch.kind, ReasonKind::Stance);
+        assert!(switch.claim.contains("-> repair"), "{}", switch.claim);
+        let observation =
+            nodes.iter().find(|node| node.kind == ReasonKind::Observation).expect("an observation");
+        assert!(
+            switch.basis.iter().any(|basis| basis.node.as_deref() == Some(observation.id.as_str())),
+            "the switch must cite the failure it followed: {switch:?}"
+        );
+
+        // The next request carries the posture, derived from the failure.
+        let task = task_message(&model.requests()[1], &ctx.turn_id);
+        assert!(task.contains("Repair posture"), "{task}");
+        assert!(task.contains("`explode` failed"), "{task}");
+
+        // The answer does not leave the switch as an orphan: the verdict cites
+        // the stance it was made under.
+        let verdict =
+            nodes.iter().rev().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
+        assert!(
+            verdict.basis.iter().any(|basis| basis.node.as_deref() == Some(switch.id.as_str())),
+            "{verdict:?}"
+        );
+        assert_eq!(verdict.rule, "verdict/after-failure");
+    }
+
+    /// A steer is the person changing the turn while it runs. A correction
+    /// switches the posture before the next request, and that request says so.
+    #[tokio::test]
+    async fn a_steering_correction_switches_the_running_turn_to_repair() {
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("redone")]));
+        let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+        let loop_ = DefaultAgentLoop::new(model.clone(), gateway, no_context(), one_model_router());
+        let mut ctx = ctx();
+        ctx.state = Some(facts());
+
+        let start = loop_.begin_turn(&ctx).await.expect("the turn opens");
+        let mut state = start.state;
+        let steer = SteeringInput {
+            item_id: agent_protocol::ids::InboxItemId::from_string("steer-1"),
+            text: String::from("不对，重做"),
+        };
+        let outcome = loop_.step(&mut state, &[steer]).await.expect("the step runs");
+
+        let nodes = reason_nodes(&outcome.events);
+        let switch = nodes
+            .iter()
+            .find(|node| node.rule == "switch/steer-correction")
+            .expect("the correction switched the posture");
+        assert!(switch.claim.contains("-> repair"), "{}", switch.claim);
+        let task = task_message(&model.requests()[0], &ctx.turn_id);
+        assert!(task.contains("Repair posture"), "{task}");
+        assert!(task.contains("corrected"), "{task}");
     }
 
     /// The `model/request.prepared` payload of the first step.
@@ -3004,7 +3614,11 @@ mod tests {
         // start and the completion. No `tool/failed` means the empty gateway
         // was never asked.
         let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
-        assert_eq!(&types[5..8], ["tool/started", "plan/updated", "tool/completed"], "{types:?}");
+        assert_eq!(
+            &types[8..12],
+            ["reason/recorded", "tool/started", "plan/updated", "tool/completed"],
+            "{types:?}"
+        );
         let update = outcome
             .events
             .iter()
@@ -3117,8 +3731,8 @@ mod tests {
 
         let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
         assert_eq!(
-            &types[5..8],
-            ["tool/started", "judgment/updated", "tool/completed"],
+            &types[8..12],
+            ["reason/recorded", "tool/started", "judgment/updated", "tool/completed"],
             "{types:?}"
         );
         let update = outcome
@@ -4185,15 +4799,16 @@ mod tests {
         // is about to be committed, and a log read top-down has to learn that
         // the content was cut before it is told the call completed.
         assert_eq!(
-            types[5..10],
+            types[8..13],
             [
+                "reason/recorded",
                 "tool/started",
                 "tool/result.artifact_offloaded",
                 "tool/result.truncated",
                 "tool/result.redacted",
-                "tool/completed",
             ]
         );
+        assert_eq!(types[13], "tool/completed", "{types:?}");
 
         let completed = outcome
             .events
@@ -4369,6 +4984,10 @@ mod tests {
 
     /// The event stream of one successful step: tool-less (`false`) or with a
     /// single tool round trip (`true`).
+    ///
+    /// Every step starts with its request and ends with an observation or a
+    /// verdict. The tool round trip adds two nodes: the call, recorded before
+    /// it is dispatched, and the result, recorded with it.
     fn expected_successful_step(with_tool: bool) -> Vec<&'static str> {
         let mut types = vec![
             "step/started",
@@ -4377,7 +4996,9 @@ mod tests {
             "model/response.completed",
         ];
         if with_tool {
-            types.extend(["tool/started", "tool/completed"]);
+            types.extend(["reason/recorded", "tool/started", "tool/completed", "reason/recorded"]);
+        } else {
+            types.push("reason/recorded");
         }
         types.push("step/completed");
         types
@@ -4418,12 +5039,16 @@ mod tests {
             types,
             [
                 "model/tools.frozen",
+                "reason/recorded",
+                "reason/recorded",
+                "reason/recorded",
                 "step/started",
                 "context/compaction.started",
                 "context/compacted",
                 "model/request.prepared",
                 "model/attempt.started",
                 "model/response.completed",
+                "reason/recorded",
                 "step/completed",
             ]
         );
@@ -4780,16 +5405,25 @@ mod tests {
             types,
             [
                 "model/tools.frozen",
+                "reason/recorded",
+                "reason/recorded",
+                "reason/recorded",
                 "step/started",
                 "context/compaction.started",
                 "context/compaction.failed",
                 "model/request.prepared",
                 "model/attempt.started",
                 "model/response.completed",
+                "reason/recorded",
                 "step/completed",
             ]
         );
-        let failed = &outcome.events[3].payload;
+        let failed = &outcome
+            .events
+            .iter()
+            .find(|event| event.event_type.as_str() == EventType::CONTEXT_COMPACTION_FAILED)
+            .expect("the compaction failure was recorded")
+            .payload;
         assert_eq!(failed["error_kind"], "http");
         assert!(failed["message"].as_str().is_some_and(|m| !m.is_empty()));
 
@@ -5024,7 +5658,8 @@ mod tests {
             !durable.iter().any(|t| t.starts_with("model/stream.")),
             "stream deltas leaked into durable events: {durable:?}"
         );
-        let mut expected = vec!["model/tools.frozen"];
+        let mut expected =
+            vec!["model/tools.frozen", "reason/recorded", "reason/recorded", "reason/recorded"];
         expected.extend(expected_successful_step(false));
         assert_eq!(durable, expected);
     }
@@ -5064,6 +5699,9 @@ mod tests {
             types,
             vec![
                 "model/tools.frozen",
+                "reason/recorded",
+                "reason/recorded",
+                "reason/recorded",
                 "step/started",
                 "model/request.prepared",
                 "model/attempt.started",
@@ -5078,7 +5716,12 @@ mod tests {
         assert_eq!(bus.len(), 3);
         assert!(!types.contains(&"model/response.completed"));
 
-        let failure = &outcome.events[4].payload;
+        let failure = &outcome
+            .events
+            .iter()
+            .find(|event| event.event_type.as_str() == EventType::MODEL_ATTEMPT_FAILED)
+            .expect("the attempt failure was recorded")
+            .payload;
         assert_eq!(failure["error_kind"], "stream_interrupted");
         assert_eq!(failure["message"], "model stream interrupted after 3 deltas");
     }
@@ -5138,6 +5781,9 @@ mod tests {
             types,
             vec![
                 "model/tools.frozen",
+                "reason/recorded",
+                "reason/recorded",
+                "reason/recorded",
                 "step/started",
                 "model/request.prepared",
                 "model/attempt.started",
@@ -5145,7 +5791,12 @@ mod tests {
                 "step/failed",
             ]
         );
-        let failure = &outcome.events[4].payload;
+        let failure = &outcome
+            .events
+            .iter()
+            .find(|event| event.event_type.as_str() == EventType::MODEL_ATTEMPT_FAILED)
+            .expect("the attempt failure was recorded")
+            .payload;
         assert_eq!(failure["error_kind"], "capability_missing");
         assert_eq!(failure["missing_capabilities"][0], "streaming");
     }
@@ -5368,7 +6019,12 @@ mod tests {
 
         let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
         assert_eq!(types[1], EventType::DECISION_TRACE, "the route was decided before any step");
-        assert_eq!(types[2], "step/started");
+        assert_eq!(
+            &types[2..5],
+            ["reason/recorded", "reason/recorded", "reason/recorded"],
+            "the opening chain follows the route and precedes the first step"
+        );
+        assert_eq!(types[5], "step/started");
 
         let trace_event = &outcome.events[1];
         assert!(trace_event.step_id.is_none(), "no step was running when the route was chosen");
@@ -5575,7 +6231,7 @@ mod tests {
             messages[3],
             ModelMessage::task_for_turn(
                 &turn.turn_id,
-                task_text(&turn.user_input, &facts(), None, None, None, None),
+                task_text(&turn.user_input, &facts(), None, None, None, None, None),
             )
         );
         assert_eq!(messages[4], ModelMessage::user_for_turn(&turn.turn_id, "hi"));
@@ -5829,7 +6485,8 @@ mod tests {
         let facts =
             TurnStateFacts { input_kind: TurnInputKind::Scheduled, max_steps: 1, ..facts() };
         let long = "x".repeat(MAX_TASK_CHARS + 10);
-        let text = task_text(&serde_json::json!({ "text": long }), &facts, None, None, None, None);
+        let text =
+            task_text(&serde_json::json!({ "text": long }), &facts, None, None, None, None, None);
 
         assert!(text.contains("Task for this turn: \"xxx"), "{text}");
         assert!(text.contains("...\""), "cut text is marked: {text}");

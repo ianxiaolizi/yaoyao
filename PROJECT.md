@@ -59,10 +59,10 @@ workspace 现有 **22 个成员**（21 个 lib crate + `apps/agent` 一个 bin�
 
 | crate | 职责 |
 |---|---|
-| `agent-protocol` | IDs, Event, DTO, schema 版本（零业务依赖）；请求面是 `InboxItem` |
+| `agent-protocol` | IDs, Event, DTO, schema 版本（零业务依赖）；请求面是 `InboxItem`；`reason` 是推理链节点与具名规则表 |
 | `agent-ports` | EventStore / ModelProvider / ToolProvider / AgentLoop / ToolGateway / ContextEngine 等 trait 缝 |
 | `agent-config` | 配置分层与解析 |
-| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded |
+| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded、reason 链折叠 |
 | `agent-loop` | `DefaultAgentLoop`（model → tool → model → answer） |
 | `agent-projection` | 投影引擎 + SessionProjection + ModelContextProjection（纯 fold + checkpoint） |
 | `agent-context` | `ProjectionContextEngine`（唯一同时看见 projection 引擎与 loop 面向的端口 `agent-ports` 的 crate；运行期不依赖 `agent-loop`，那是 dev 依赖） |
@@ -79,7 +79,7 @@ workspace 现有 **22 个成员**（21 个 lib crate + `apps/agent` 一个 bin�
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |
 | `agent-index-sqlite` | `SqliteMemoryIndex`（可丢弃的 SQLite 读模型：从日志重建、词面子串检索；版本不符拒绝，只由 `reindex` 重建）+ `memory.search` 工具（装配时绑定当前 session，能力 `memory.read`） |
 | `agent-testkit` | FakeEventStore / FakeModel·Tool·Gateway / FakeSecret / FakeDoctorCheck + 架构守卫 |
-| `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `memory search\|reindex` `context inspect` `artifact get` |
+| `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `why` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `memory search\|reindex` `context inspect` `artifact get` |
 | `apps/agent` | 唯一具体组装入口（二进制）；`instructions` 模块把工作区根部的 `AGENTS.md` + 内置前言组成每次运行的系统指令 |
 
 `agent-kernel` 一个 crate 占 src 的约四分之一；`agent-loop`、`agent-cli` 是单文件大模块。
@@ -98,6 +98,7 @@ workspace 现有 **22 个成员**（21 个 lib crate + `apps/agent` 一个 bin�
 | 审计 | 持久化事件是事实源；请求、工具定义、审批和 artifact 均可回读 |
 | 执行边界 | 默认 `local`；Windows 可选 `app-container`，选中后失败关闭 |
 | 决策中枢 | shadow 模式起步，只记录 trace，不改变主链 |
+| 可倒推 | 内核在决策点写 `reason` 节点（situation / reading / stance / action / observation / gate / verdict），每个节点引用具名规则与依据；真实失败或用户纠正会在回合内切位并写 `switch` 节点；`why` 反向展开到事实与用户原话；链不进入模型请求 |
 | 项目范围 | 优先服务个人，不按多租户或通用发布平台设计 |
 
 具体裁决、理由和当前约束见 `CONTRACT.md` §7。
@@ -149,6 +150,10 @@ cargo run -p agent -- memory reindex            # 丢弃并重建 <data_dir>/<se
 # 上下文检查：下一条请求会带什么（大小 / 分类 / 预算 / 最大消息 / 上次请求的实录）
 cargo run -p agent -- context inspect            # 空会话也是答案（0）；配置/日志读不了 2
 cargo run -p agent -- context inspect --json --top 10   # 一条 JSON；--top 控制最大消息条数
+
+# 倒推一轮的每一步为什么：从答复沿依据走到用户原话（无链时退 2）
+cargo run -p agent -- why
+cargo run -p agent -- why --turn <turn_id> --json
 
 # 取回日志里出现的 artifact（大工具输出 / MCP 二进制）；locator 或裸 hash 都收
 cargo run -p agent -- artifact get artifact://sha256/<hash> --out blob.bin  # 0 = 取到；1 = 没有或已损坏

@@ -871,10 +871,14 @@ mod tests {
                 "run/started",
                 "turn/started",
                 "model/tools.frozen",
+                "reason/recorded",
+                "reason/recorded",
+                "reason/recorded",
                 "step/started",
                 "model/request.prepared",
                 "model/attempt.started",
                 "model/response.completed",
+                "reason/recorded",
                 "step/completed",
                 "turn/completed",
                 "run/completed",
@@ -1242,17 +1246,14 @@ mod tests {
         // is no step to name as the one it came after.
         let (event, position) = steer_event(&store, &sid).await;
         let types = event_types(&store, &sid).await;
-        assert_eq!(
-            types[position - 3..position + 2],
-            [
-                EventType::TURN_STARTED,
-                EventType::MODEL_TOOLS_FROZEN,
-                EventType::INBOX_CLAIMED,
-                EventType::TURN_STEERED,
-                EventType::STEP_STARTED,
-            ],
-            "{types:?}"
-        );
+        assert_eq!(types[position - 1], EventType::INBOX_CLAIMED, "{types:?}");
+        assert_eq!(types[position + 1], EventType::REASON_RECORDED, "{types:?}");
+        assert_eq!(types[position + 2], EventType::STEP_STARTED, "{types:?}");
+        let turn_started = types
+            .iter()
+            .position(|kind| kind == EventType::TURN_STARTED)
+            .expect("the turn opened before anything else");
+        assert!(turn_started < position, "the steer landed before the turn opened: {types:?}");
         assert!(event.event.payload["after_step_id"].is_null(), "{:?}", event.event.payload);
         assert!(event.event.step_id.is_none(), "nothing runs at a boundary");
 
@@ -1485,11 +1486,12 @@ mod tests {
         let types = event_types(&store, &sid).await;
         assert_eq!(types.iter().filter(|t| *t == EventType::TURN_STEERED).count(), 1, "{types:?}");
         assert_eq!(
-            types[position - 2..position + 2],
+            types[position - 2..position + 3],
             [
                 EventType::STEP_COMPLETED,
                 EventType::INBOX_CLAIMED,
                 EventType::TURN_STEERED,
+                EventType::REASON_RECORDED,
                 EventType::STEP_STARTED,
             ],
             "{types:?}"
@@ -1605,17 +1607,23 @@ mod tests {
                 EventType::RUN_STARTED,
                 EventType::TURN_STARTED,
                 EventType::MODEL_TOOLS_FROZEN,
+                "reason/recorded",
+                "reason/recorded",
+                "reason/recorded",
                 EventType::STEP_STARTED,
                 EventType::MODEL_REQUEST_PREPARED,
                 EventType::MODEL_ATTEMPT_STARTED,
                 EventType::MODEL_RESPONSE_COMPLETED,
+                "reason/recorded",
                 EventType::TOOL_STARTED,
                 EventType::TOOL_COMPLETED,
+                "reason/recorded",
                 EventType::STEP_COMPLETED,
                 EventType::STEP_STARTED,
                 EventType::MODEL_REQUEST_PREPARED,
                 EventType::MODEL_ATTEMPT_STARTED,
                 EventType::MODEL_RESPONSE_COMPLETED,
+                "reason/recorded",
                 EventType::STEP_COMPLETED,
                 EventType::TURN_COMPLETED,
                 EventType::RUN_COMPLETED,

@@ -26,6 +26,7 @@ pub mod permissions;
 pub mod plan;
 pub mod plugin;
 pub mod profile;
+pub mod reason;
 pub mod redactor;
 pub mod tool;
 pub mod usertext;

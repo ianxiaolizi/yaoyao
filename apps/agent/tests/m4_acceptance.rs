@@ -401,17 +401,23 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
         EventType::TURN_STARTED,
         EventType::MODEL_TOOLS_FROZEN,
         EventType::DECISION_TRACE,
+        EventType::REASON_RECORDED,
+        EventType::REASON_RECORDED,
+        EventType::REASON_RECORDED,
         EventType::STEP_STARTED,
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::REASON_RECORDED,
         EventType::TOOL_STARTED,
         EventType::TOOL_COMPLETED,
+        EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
         EventType::STEP_STARTED,
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
         EventType::TURN_COMPLETED,
     ];
@@ -447,6 +453,55 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
         m.content.iter().any(|b| matches!(b, agent_protocol::model::ContentBlock::ToolUse { .. }))
     }));
     assert_eq!(text_of(derived.last().expect("an answer")), "the file says rhubarb");
+
+    // The log explains itself: `why` walks from the answer back through the
+    // observation, the call, the stance, the reading and the turn's input.
+    let outcome = agent_cli::reason::run_why(h.stack.store.as_ref(), &h.session_id, None, false)
+        .await
+        .expect("the chain reads back");
+    assert_eq!(outcome.verdict, agent_cli::Verdict::Answered);
+    let agent_cli::CliOutput::Text(text) = outcome.output else {
+        panic!("why rendered as JSON without being asked");
+    };
+    assert!(text.contains("[action] fs.read"), "{text}");
+    assert!(text.contains("[observation] fs.read completed"), "{text}");
+    assert!(text.contains("because action/dispatch:"), "{text}");
+    assert!(text.contains("because observation/result:"), "{text}");
+    assert!(text.contains("chain check: every node names a rule"), "{text}");
+}
+
+/// A real failure changes the posture mid-turn. The next request must carry the
+/// repair posture, and `why` must show the switch as a node with the failed
+/// observation behind it — not a silent change of heart.
+#[tokio::test]
+async fn a_failed_call_switches_the_turn_and_why_says_so() {
+    let h = harness(
+        vec![
+            Scripted::Ok(tool_call_body(
+                "call_1",
+                &to_wire_name("fs.read"),
+                serde_json::json!({ "path": "missing.txt" }),
+            )),
+            Scripted::Ok(answer_body("I could not read it")),
+        ],
+        false,
+    )
+    .await;
+
+    let report = h.ask("read missing.txt").await;
+    assert_eq!(report.stop_reason, StopReason::FinalAnswer);
+    assert_eq!(report.final_content.as_deref(), Some("I could not read it"));
+
+    let outcome = agent_cli::reason::run_why(h.stack.store.as_ref(), &h.session_id, None, false)
+        .await
+        .expect("the chain reads back");
+    let agent_cli::CliOutput::Text(text) = outcome.output else {
+        panic!("why rendered as JSON without being asked");
+    };
+    assert!(text.contains("[stance] stance switched:"), "{text}");
+    assert!(text.contains("-> repair"), "{text}");
+    assert!(text.contains("because switch/failure-repair:"), "{text}");
+    assert!(text.contains("because verdict/after-failure:"), "{text}");
 }
 
 /// Older history is summarized before the first request of the turn that would
@@ -586,18 +641,24 @@ async fn a_plan_recorded_by_the_loop_reaches_the_next_request_and_the_log() {
     let expected = [
         EventType::TURN_STARTED,
         EventType::MODEL_TOOLS_FROZEN,
+        EventType::REASON_RECORDED,
+        EventType::REASON_RECORDED,
+        EventType::REASON_RECORDED,
         EventType::STEP_STARTED,
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::REASON_RECORDED,
         EventType::TOOL_STARTED,
         EventType::PLAN_UPDATED,
         EventType::TOOL_COMPLETED,
+        EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
         EventType::STEP_STARTED,
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
         EventType::TURN_COMPLETED,
     ];

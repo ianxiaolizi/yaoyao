@@ -5,6 +5,7 @@
 pub mod args;
 pub mod context;
 pub mod memory;
+pub mod reason;
 pub mod schedule;
 
 use agent_kernel::approval::ApprovalService;

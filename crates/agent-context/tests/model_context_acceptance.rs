@@ -936,13 +936,17 @@ async fn a_note_changes_a_turn_by_exactly_the_events_it_accounts_for() {
         types[at..].to_vec()
     };
     let mut expected = tail(&plain.types().await);
-    // The claim and the injection land at the turn boundary, after whatever
-    // the loop records when it opens the turn (the frozen tool set) and before
-    // the first step.
+    // The claim, the injection, and the posture switch the note caused land at
+    // the turn boundary, after whatever the loop records when it opens the turn
+    // (the frozen tool set) and before the first step.
     let first_step = expected.iter().position(|t| t == EventType::STEP_STARTED).unwrap();
     expected.splice(
         first_step..first_step,
-        [EventType::INBOX_CLAIMED.to_string(), EventType::TURN_STEERED.to_string()],
+        [
+            EventType::INBOX_CLAIMED.to_string(),
+            EventType::TURN_STEERED.to_string(),
+            EventType::REASON_RECORDED.to_string(),
+        ],
     );
     assert_eq!(tail(&steered.types().await), expected);
 

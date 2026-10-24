@@ -16,6 +16,7 @@ pub mod live_bus;
 pub mod plan;
 pub mod plugin;
 pub mod policy;
+pub mod reason;
 pub mod recovery;
 pub mod resource_guard;
 pub mod resume;

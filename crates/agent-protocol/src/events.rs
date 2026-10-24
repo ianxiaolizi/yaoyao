@@ -126,6 +126,10 @@ impl EventType {
     /// run a third time. The payload names the call involved and carries the
     /// text the model was given instead of ending.
     pub const JUDGMENT_REQUIRED: &'static str = "judgment/required";
+    /// One node of the turn's reasoning chain: a claim, the rule that produced
+    /// it, and the nodes, events or facts it follows from. Written by the loop
+    /// as it opens a turn and as it decides each step; never sent to a model.
+    pub const REASON_RECORDED: &'static str = "reason/recorded";
     /// A model request asking for a handover summary of older history. Written
     /// by the loop at the first step of a turn, before the normal request.
     /// It records the exact messages being summarized by reference, so the
@@ -241,6 +245,7 @@ impl EventType {
         Self::PLAN_UPDATED,
         Self::JUDGMENT_UPDATED,
         Self::JUDGMENT_REQUIRED,
+        Self::REASON_RECORDED,
         Self::CONTEXT_COMPACTION_STARTED,
         Self::CONTEXT_COMPACTION_FAILED,
         Self::CONTEXT_COMPACTED,

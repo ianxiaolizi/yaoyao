@@ -20,6 +20,7 @@ use std::time::Duration;
 use agent_cli::args::{self, Args, DEFAULT_SESSION};
 use agent_cli::context::run_context_inspect;
 use agent_cli::memory::{DEFAULT_SEARCH_LIMIT, run_memory_reindex, run_memory_search};
+use agent_cli::reason::run_why;
 use agent_cli::schedule::{
     SERVE_POLL, Tick, earliest_due, next_wait, render_did_not_run, render_ran, run_schedule_at,
     run_schedule_cancel, run_schedule_list, run_tick, tick_once,
@@ -142,6 +143,7 @@ async fn main() {
         "interrupt" => interrupt(&args).await,
         "export" => export(&args).await,
         "status" => status(&args).await,
+        "why" => why(&args).await,
         "approve" => approve(&args).await,
         "deny" => deny(&args).await,
         "tool" => tool(&args).await,
@@ -173,6 +175,7 @@ fn usage() {
          interrupt                  Stop the run in flight at its next step boundary\n  \
          export [--out <dir>]       Write the session as session.md + bundle.json (or stdout)\n  \
          export --redacted          Same, with secret-shaped tokens replaced by ***\n  \
+         why [--turn <id>]          Explain that turn's reasoning chain, backwards\n  \
          status                     Show session state\n  \
          approve <id> [scope]       Approve a pending request [once|turn|session|always]\n  \
          deny <id> [--only]         Deny a pending request (cascades to the session's pending)\n  \
@@ -441,6 +444,26 @@ async fn status(args: &Args) {
     let from = chain_start(runtime.store.as_ref(), args).await;
     let outcome =
         watch(&runtime, args, from, run_status(&runtime.scheduler, &args.session, args.json)).await;
+    exit_on(outcome.verdict);
+}
+
+/// `why`: read the latest turn's reasoning chain back from the log.
+///
+/// A reader like `memory` and `context`: no model, no tool surface, no sandbox
+/// is assembled, so it still answers when the configuration that ran the turn
+/// has since broken. It writes nothing, so `--events` has nothing to stream.
+async fn why(args: &Args) {
+    if args.events {
+        eprintln!("why writes no events; --events has nothing to stream");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
+    let turn = option(args, "--turn");
+    let outcome = match run_why(store.as_ref(), &args.session, turn.as_deref(), args.json).await {
+        Ok(outcome) => outcome,
+        Err(error) => fail(args, &error),
+    };
+    print(&outcome.output);
     exit_on(outcome.verdict);
 }
 
