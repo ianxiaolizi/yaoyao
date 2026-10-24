@@ -352,7 +352,7 @@ impl ToolProvider for FsToolProvider {
 
                 let (entries, truncated) = match walk(self.env.as_ref(), &root) {
                     Ok(walked) => walked,
-                    Err(e) => return environment_said("fs.grep", "walk", &root, e),
+                    Err(e) => return grep_walk_failure(self.env.as_ref(), &root, e),
                 };
                 let mut matches = Vec::new();
                 let mut skipped = 0usize;
@@ -673,19 +673,77 @@ fn environment_said(
     path: &str,
     error: ExecutionEnvironmentError,
 ) -> Result<ToolResult, ToolProviderError> {
-    let refused = matches!(
-        error,
-        ExecutionEnvironmentError::PathOutsideWorkspace { .. }
-            | ExecutionEnvironmentError::NotPermitted { .. }
-            | ExecutionEnvironmentError::ProtectedPath(_)
-    );
-    if refused {
+    if refused(&error) {
         return Err(failed(tool, &error.to_string()));
     }
     // The path is named because this is now the answer, and "IO error: the
     // system cannot find the file specified" answers a question nobody can act
     // on without being told which file.
     Ok(ToolResult::failed(format!("could not {verb} {path}: {error}")))
+}
+
+/// Whether the environment refused the call rather than failing at it.
+fn refused(error: &ExecutionEnvironmentError) -> bool {
+    matches!(
+        error,
+        ExecutionEnvironmentError::PathOutsideWorkspace { .. }
+            | ExecutionEnvironmentError::NotPermitted { .. }
+            | ExecutionEnvironmentError::ProtectedPath(_)
+    )
+}
+
+/// Why `fs.grep` could not start walking at `root`, said so the next call can
+/// use it.
+///
+/// The common mistake is naming a file where the tool wants the directory to
+/// search: the OS answer is "the directory name is invalid", which names
+/// neither the argument nor the fix. In 2026-10-24's real use the model passed
+/// a file twice, then fell back to `shell.run` — which needs an approval — to
+/// do what `fs.grep` would have done. When the parent lists `root` as a file,
+/// the answer names the two arguments to change and the call that ends the
+/// loop.
+fn grep_walk_failure(
+    env: &dyn ExecutionEnvironment,
+    root: &str,
+    error: ExecutionEnvironmentError,
+) -> Result<ToolResult, ToolProviderError> {
+    if refused(&error) {
+        return Err(failed("fs.grep", &error.to_string()));
+    }
+    if let Some((parent, name)) = split_last_segment(root)
+        && let Ok(entries) = env.list_dir(parent)
+        && entries.iter().any(|entry| entry.name == name && entry.kind == DirEntryKind::File)
+    {
+        let hint = if name.contains('*') || name.contains('?') || name.contains('[') {
+            format!(
+                "Pass `path: \"{parent}\"` and read it with fs.read — `glob` cannot name this \
+                 file."
+            )
+        } else {
+            format!("Pass `path: \"{parent}\"` with `glob: \"{name}\"`, or read it with fs.read.")
+        };
+        return Ok(ToolResult::failed(format!(
+            "`{root}` is a file, and `path` names the directory to search. {hint}"
+        )));
+    }
+    Ok(ToolResult::failed(format!("could not walk {root}: {error}")))
+}
+
+/// The directory and last segment of a workspace-relative path.
+fn split_last_segment(path: &str) -> Option<(&str, &str)> {
+    match path.rfind(['/', '\\']) {
+        Some(index) => {
+            let (parent, rest) = path.split_at(index);
+            let name = rest.trim_start_matches(['/', '\\']);
+            if name.is_empty() {
+                None
+            } else {
+                Some((if parent.is_empty() { "." } else { parent }, name))
+            }
+        }
+        None if !path.is_empty() && path != "." => Some((".", path)),
+        None => None,
+    }
 }
 
 /// The `shell.run` description, in terms of the shell the backend actually uses.
@@ -1058,6 +1116,36 @@ mod tests {
             .unwrap();
         assert!(out.content.starts_with("text.txt:1: needle"), "{:?}", out.content);
         assert!(out.content.contains("1 file(s) could not be searched"), "{:?}", out.content);
+    }
+
+    /// The 2026-10-24 failure: a file where the tool wants the directory to
+    /// search. The answer has to name the argument and the fix, or the model
+    /// repeats the same call and then reaches for a shell.
+    #[tokio::test]
+    async fn fs_grep_on_a_file_names_the_arguments_to_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("notes")).unwrap();
+        std::fs::write(dir.path().join("notes").join("config.md"), "port: 7001\n").unwrap();
+        std::fs::write(dir.path().join("top.md"), "needle\n").unwrap();
+
+        let nested = provider(&dir)
+            .invoke(&inv(
+                "fs.grep",
+                serde_json::json!({ "pattern": "7001", "path": "notes/config.md" }),
+            ))
+            .await
+            .unwrap();
+        assert!(nested.content.contains("is a file"), "{:?}", nested.content);
+        assert!(nested.content.contains("path: \"notes\""), "{:?}", nested.content);
+        assert!(nested.content.contains("glob: \"config.md\""), "{:?}", nested.content);
+
+        // A file at the workspace root has no separator to split on either.
+        let root_level = provider(&dir)
+            .invoke(&inv("fs.grep", serde_json::json!({ "pattern": "needle", "path": "top.md" })))
+            .await
+            .unwrap();
+        assert!(root_level.content.contains("path: \".\""), "{:?}", root_level.content);
+        assert!(root_level.content.contains("glob: \"top.md\""), "{:?}", root_level.content);
     }
 
     #[test]
