@@ -10,6 +10,9 @@
 # Reference code (separate project)
 laya/
 
+# Node (Playwright GUI smoke)
+node_modules/
+
 # IDE
 .idea/
 .vscode/
@@ -44,3 +47,6 @@ credentials.*
 # Local kernel-eval output (reports and transcripts from live runs)
 /apps/agent/kernel-eval-*.json
 /apps/agent/target/
+
+# 本机的启动配置（可能含密钥），不要提交
+scripts/gui/start.local.ps1

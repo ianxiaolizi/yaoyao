@@ -28,7 +28,47 @@
 
 当前版本只以 Windows 为主要运行目标。其他平台尚未纳入 CI。
 
-## 快速开始
+## 双击启动
+
+仓库根目录有：
+
+```text
+启动爻爻.cmd
+start-yaoyao.cmd
+```
+
+双击任意一个即可：
+
+- 自动构建 `target\debug\agent.exe`；
+- 使用 `G:\yaoyao-work` 作为工作区（存在时），数据目录用 `G:\yaoyao-work\.agent`；
+- 在 `7441` 起服务；
+- 读到带一次性令牌的 URL 后自动打开默认浏览器；
+- 控制台保留服务日志，Ctrl+C 停止。
+
+它不做的事：不创建新会话、不写事件、不把令牌写进日志或 localStorage。
+
+想改成本机配置时：
+
+```powershell
+Copy-Item scripts\gui\start.local.ps1.example scripts\gui\start.local.ps1
+notepad scripts\gui\start.local.ps1
+```
+
+`start.local.ps1` 已在 `.gitignore` 里，可以放模型 key，不要提交。示例里给了
+DeepSeek / OpenAI-compatible 的四个环境变量。
+
+启动器参数（直接跑 PowerShell 脚本时）：
+
+```powershell
+.\scripts\gui\start.ps1 -Port 7442
+.\scripts\gui\start.ps1 -NoBrowser
+.\scripts\gui\start.ps1 -SkipBuild
+.\scripts\gui\start.ps1 -DryRun -NoPause
+```
+
+端口被占用时启动器会直接报出占用进程，不会把第二个服务叠上去。
+
+## 手动启动 / 开发
 
 ```powershell
 cargo build --workspace
@@ -53,6 +93,54 @@ $env:AGENT_MODEL_API_KEY = '<your-key>'
 ```
 
 凭据只通过环境变量传入，不写入仓库、事件日志或模型上下文。
+
+## 本地 Web GUI
+
+`agent web` 在同一个进程、同一个二进制里起一个只绑 `127.0.0.1` 的页面：
+
+```powershell
+cargo run -p agent -- web
+# 爻爻 · web  http://127.0.0.1:7431/#t=<one-time-token>
+```
+
+- 终端打印的 URL 里带一次性令牌；页面从 `#t=` 读它，之后每个 API 请求走
+  `Authorization: Bearer`。令牌不进日志，也不进 `localStorage`。
+- 左侧列出 `<data_dir>/*/events.jsonl` 折出的会话；中间是同一条时间线上的提问、
+  工具调用、审批与回答；右侧是这一轮的推理链和真实用量。
+- 页面通过 SSE 接收 **durable item**（按 id upsert）与 **live 文本**（只是预览）；
+  刷新后从日志整块重建，不依赖前端缓存。
+- 写操作只有起轮、回答审批、插话、中断。它们和 CLI 走同一套命令：
+  `agent-web` 只负责 HTTP，装配在 `apps/agent` 的 `WebBackend` 里。
+- 审批会用红色标出；允许一次 / 本回合 / 本会话 / 拒绝之后，被挂起的回合通过
+  `Resume` 继续。审批卡有 24h TTL 倒计时；过期后出现「继续这一轮」，由
+  `POST /resume` 让内核把过期记为「没有派发」并续跑。刷新页面不会丢状态。
+- 右栏「改动」读的是日志里最近一次 `git.diff` 的**观察结果**，不现场跑 git；
+  「推理链」来自 `/why`；「上下文」来自最近一次 `model/request.prepared` 的历史 /
+  工具定义 / 本轮层与输入分项。
+- 顶部「导出」可下载 Markdown 或 JSON；工具结果里的 `artifact://sha256/<hash>` 可以
+  直接在页面打开，服务端读取时会重新校验摘要。图片 artifact 会按 blob 在页内预览，
+  其他类型仍按原样打开。
+- 侧栏、右侧面板、正文宽度与输入框高度都可拖动，双击复原；深浅色切换在左下角。
+  这些只存在 `localStorage`，不属于会话事实。
+- 1080px 以下侧栏收成抽屉，用 ☰ 打开，点遮罩或按 Escape 关闭。
+- 顶部「分叉」从最近的闭合回合边界建子会话；侧栏会标出子会话的
+  `↳ 分叉自 <parent>`。
+- 右栏「子代理」显示父会话通过 `subagent.run` 委派出的 child、provider、目标和状态；
+  点 child id 打开对应会话。
+- 右栏「定时」列出、创建、取消 Inbox 里的定时条目；实际运行仍由 `tick` / `serve`
+  驱动，Web 不会自己起轮。
+
+`agent web` 也遵守 `AGENT_WORKSPACE_DIR`、`AGENT_DATA_DIR`、`AGENT_SANDBOX` 与
+`AGENT_MODEL_PROVIDER`；没有配置时默认使用离线 `echo` 模型和当前目录。
+一个会话同时只应有一个驱动进程：另一个驱动者会被内核租约挡在 append 之外；
+Web 端点不会因此写第二份日志，而是把这次拒绝作为运行提示送回页面。
+
+浏览器冒烟脚本会自己起一个临时服务、种出带 `thinking` / `git.diff` / 审批的会话：
+
+```powershell
+npm ci --prefix scripts/gui
+node scripts/gui/smoke.mjs
+```
 
 ## 文档
 

@@ -1,0 +1,11 @@
+# 复制为 scripts\gui\start.local.ps1（已在 .gitignore 里），按机器改。
+# 例如接真实模型：
+#
+# $env:AGENT_MODEL_PROVIDER = 'openai'
+# $env:AGENT_MODEL_BASE_URL = 'https://api.deepseek.com'
+# $env:AGENT_MODEL_NAME     = 'deepseek-flash'
+# $env:AGENT_MODEL_API_KEY  = '<your-key>'
+#
+# 也可以改端口 / 工作区：
+# $env:AGENT_WORKSPACE_DIR = 'G:\yaoyao-work'
+# $env:AGENT_DATA_DIR      = 'G:\yaoyao-work\.agent'

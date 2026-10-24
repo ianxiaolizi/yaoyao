@@ -75,6 +75,44 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  gui-smoke:
+    # The page is a real projection of a real server, so its smoke test builds
+    # the binary and drives Edge over a throwaway data directory. It is separate
+    # from `check` because Playwright and a browser are not needed for the Rust
+    # gate, and a GUI failure should name itself.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-gui-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-gui-
+
+      - name: Build the agent
+        run: cargo build -p agent
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the browser harness
+        run: npm ci --prefix scripts/gui
+
+      - name: Drive the GUI
+        run: node scripts/gui/smoke.mjs
+
   coverage:
     # The line-coverage gate from stage 5.6, run where its result can be seen
     # by someone other than the developer's machine. It repeats the test suite
