@@ -7,17 +7,23 @@ license.workspace = true
 
 [dependencies]
 agent-cli = { path = "../agent-cli" }
+agent-kernel = { path = "../agent-kernel" }
 agent-protocol = { path = "../agent-protocol" }
 agent-ports = { path = "../agent-ports" }
 agent-projection = { path = "../agent-projection" }
+agent-store-artifact = { path = "../agent-store-artifact" }
 chrono = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
 axum = { workspace = true }
-tokio = { version = "1", features = ["net", "rt", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "sync", "time"] }
 
 [dev-dependencies]
 agent-store-jsonl = { path = "../agent-store-jsonl" }
+async-trait = { workspace = true }
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

@@ -44,9 +44,25 @@ pub enum ItemBody {
         /// turn that later claims it; not part of the wire shape.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inbox_item: Option<String>,
+        /// True when the kernel wrote this "turn" to carry a decision back to
+        /// the model (a resume). The text is an instruction to the model, not
+        /// something the person typed, so a reader must not show it as their
+        /// message.
+        #[serde(default, skip_serializing_if = "is_false")]
+        resumed: bool,
     },
     /// A steering note injected at a step boundary.
     Note { text: String },
+    /// The kernel's durable reasoning for a turn: one line per decision node.
+    ///
+    /// Live model reasoning is a preview and disappears; these nodes are in the
+    /// log and survive a refresh. Tool actions and their observations are
+    /// deliberately not folded in — they already have rows of their own.
+    Thinking {
+        text: String,
+        /// Highest step this thinking touched, plus one (0 for turn-level).
+        steps: u32,
+    },
     /// One tool call.
     Action {
         tool: String,
@@ -69,6 +85,11 @@ pub enum ItemBody {
         /// The already-redacted summary the request carried.
         summary: String,
         state: ApprovalState,
+        /// When the request was made. Kept so a reader can derive the TTL
+        /// without re-reading the event; the projection itself never reads the
+        /// clock.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at: Option<DateTime<Utc>>,
     },
     /// What the model said.
     Answer { text: String },
@@ -183,6 +204,11 @@ impl Default for TranscriptProjection {
     }
 }
 
+/// `skip_serializing_if` for a flag that is only present when true.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Insert or replace an item, keeping the order of first appearance.
 fn upsert(
     state: &mut TranscriptState,
@@ -284,6 +310,11 @@ impl ProjectionDefinition for TranscriptProjection {
                     .to_string();
                 match item.kind {
                     InboxKind::NextTurn | InboxKind::Scheduled if !text.trim().is_empty() => {
+                        let resumed = item
+                            .payload
+                            .get("resumed")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
                         upsert(
                             &mut next,
                             user_id(event.seq),
@@ -293,6 +324,7 @@ impl ProjectionDefinition for TranscriptProjection {
                             ItemBody::User {
                                 text,
                                 inbox_item: Some(item.item_id.as_str().to_string()),
+                                resumed,
                             },
                         );
                     }
@@ -323,6 +355,11 @@ impl ProjectionDefinition for TranscriptProjection {
                         matches!(&item.body, ItemBody::User { inbox_item: Some(id), .. } if id == inbox_id)
                     }) {
                         message.turn_id = turn;
+                        // Linking the prompt to its turn is a change to the
+                        // row: an incremental reader (the GUI's SSE cursor)
+                        // must be shown it, or the message would stay
+                        // ungrouped until a full refresh.
+                        message.updated_seq = event.seq;
                     }
                 }
             }
@@ -342,6 +379,53 @@ impl ProjectionDefinition for TranscriptProjection {
                         event.event.turn_id.clone(),
                         None,
                         ItemBody::Note { text: text.to_string() },
+                    );
+                }
+            }
+
+            EventType::REASON_RECORDED => {
+                let node_value = event
+                    .event
+                    .payload
+                    .get("node")
+                    .cloned()
+                    .ok_or_else(|| ApplyError::malformed(event, "no node"))?;
+                let node: agent_protocol::reason::ReasonNode =
+                    serde_json::from_value(node_value)
+                        .map_err(|e| ApplyError::malformed(event, e))?;
+                // Actions and observations already have their own rows, and a
+                // verdict repeats the answer. What is left is the decision
+                // trail a person would otherwise have to open `why` to read.
+                let label = match node.kind.as_str() {
+                    "situation" => "情境",
+                    "reading" => "读法",
+                    "stance" => "立场",
+                    "gate" => "闸门",
+                    _ => return Ok(next),
+                };
+                let Some(turn) = event.event.turn_id.clone().or_else(|| {
+                    (!node.turn_id.is_empty()).then(|| TurnId::from_string(&node.turn_id))
+                }) else {
+                    return Ok(next);
+                };
+                let id = format!("think:{}", turn.as_str());
+                let line = format!("{label}：{}", node.claim);
+                let steps = node.step + 1;
+                if let Some(existing) = next.items.iter_mut().find(|item| item.id == id) {
+                    if let ItemBody::Thinking { text, steps: current } = &mut existing.body {
+                        text.push_str("\n\n");
+                        text.push_str(&line);
+                        *current = (*current).max(steps);
+                        existing.updated_seq = event.seq;
+                    }
+                } else {
+                    upsert(
+                        &mut next,
+                        id,
+                        event.seq,
+                        Some(turn),
+                        event.event.step_id.clone(),
+                        ItemBody::Thinking { text: line, steps },
                     );
                 }
             }
@@ -492,6 +576,7 @@ impl ProjectionDefinition for TranscriptProjection {
                         tool: request.tool_name,
                         summary: request.args_summary,
                         state: ApprovalState::Pending,
+                        created_at: Some(request.created_at),
                     },
                 );
             }
@@ -522,6 +607,11 @@ impl ProjectionDefinition for TranscriptProjection {
                     && let ItemBody::Approval { state: current, .. } = &mut existing.body
                 {
                     *current = state;
+                    // A decision is news. Without this the approval row would
+                    // keep its pending sequence forever, and `?since=` would
+                    // never deliver the answer that a pending card needs to
+                    // stop asking.
+                    existing.updated_seq = event.seq;
                 }
             }
 
@@ -548,6 +638,30 @@ impl ProjectionDefinition for TranscriptProjection {
                     EventType::TURN_FAILED => TurnEnding::Failed,
                     _ => TurnEnding::Cancelled,
                 };
+
+                // The scheduler writes `approval/requested` without a turn id:
+                // the request is a session-level fact and the writer does not
+                // carry the turn that prompted it. The event that yielded the
+                // turn does name the turn, and a pending approval is the only
+                // thing a turn yields for, so this is where the two facts meet.
+                // Without this the page has no group to put the card in and the
+                // person sees "等待批准" with no button to press.
+                if event.event.event_type.as_str() == EventType::TURN_YIELDED {
+                    for item in next.items.iter_mut() {
+                        if item.turn_id.is_none()
+                            && matches!(
+                                item.body,
+                                ItemBody::Approval { state: ApprovalState::Pending, .. }
+                            )
+                        {
+                            item.turn_id = Some(turn.clone());
+                            // Attaching the turn is news to an incremental
+                            // reader: it is what turns the loose item into a
+                            // card in this turn.
+                            item.updated_seq = event.seq;
+                        }
+                    }
+                }
 
                 // A completed turn's `final_content` is the answer, not a hint:
                 // it replaces whatever the model response wrote, because the
@@ -577,10 +691,10 @@ impl ProjectionDefinition for TranscriptProjection {
             }
 
             // Core traffic this fold has nothing to say about — the model's
-            // request bookkeeping, reason nodes, policy, stream deltas, inbox
-            // claims. Skipped as ordinary traffic, exactly as the session fold
-            // does; a fold that failed on every core type could not read a real
-            // session (C2.5 keeps the two refusals apart).
+            // request bookkeeping, policy, stream deltas, inbox claims. Skipped
+            // as ordinary traffic, exactly as the session fold does; a fold
+            // that failed on every core type could not read a real session
+            // (C2.5 keeps the two refusals apart).
             _ if event.event.event_type.is_core() => {}
 
             _ => return Err(ApplyError::UnknownEventType(event.event.event_type.clone())),
@@ -614,6 +728,7 @@ mod tests {
     use agent_protocol::permissions::{
         ApprovalDecision, ApprovalReply, ApprovalRequest, ApprovalScope, ApprovalStatus, Capability,
     };
+    use agent_protocol::reason::{Basis, ReasonKind, ReasonNode, ReasonSource};
     use serde_json::json;
 
     fn stored(
@@ -689,6 +804,40 @@ mod tests {
             ),
         );
         assert_eq!(state.items[0].turn_id, Some(turn), "the message now belongs to the turn");
+        assert_eq!(
+            state.items[0].updated_seq,
+            EventSeq::new(1),
+            "a reader watching changes has to be told the message was linked"
+        );
+    }
+
+    #[test]
+    fn a_resume_prompt_is_marked_as_a_continuation_not_a_persons_message() {
+        let item = InboxItem {
+            item_id: agent_protocol::ids::InboxItemId::from_string("i2"),
+            session_id: SessionId::from_string("transcript-test"),
+            kind: InboxKind::NextTurn,
+            payload: json!({
+                "resumed": true,
+                "decision": "granted",
+                "text": "The approval for `shell.run` ended the wait: it has run.",
+            }),
+            priority: 0,
+            created_at: Utc::now(),
+            status: InboxItemStatus::Pending,
+        };
+
+        let state = apply(
+            &TranscriptProjection::new().init(),
+            &stored(0, EventType::INBOX_APPENDED, None, None, serde_json::to_value(&item).unwrap()),
+        );
+        match &state.items[0].body {
+            ItemBody::User { resumed, text, .. } => {
+                assert!(*resumed, "the page must not show this as something the person typed");
+                assert!(text.contains("ended the wait"), "the model still gets the real text");
+            }
+            other => panic!("expected a user item, got {other:?}"),
+        }
     }
 
     #[test]
@@ -856,12 +1005,135 @@ mod tests {
         );
 
         let item = state.items.iter().find(|item| item.id == "ap:ap-1").unwrap();
+        assert_eq!(
+            item.updated_seq,
+            EventSeq::new(2),
+            "a decision is news, not a state the incremental reader already has"
+        );
         match &item.body {
-            ItemBody::Approval { state, summary, .. } => {
+            ItemBody::Approval { state, summary, created_at, .. } => {
                 assert_eq!(*state, ApprovalState::Granted);
                 assert_eq!(summary, "cargo test");
+                assert_eq!(*created_at, Some(request.created_at));
             }
             other => panic!("expected an approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_yielded_turn_claims_the_approval_that_stopped_it() {
+        let request = ApprovalRequest {
+            approval_id: agent_protocol::ids::ApprovalId::from_string("ap-1"),
+            session_id: SessionId::from_string("transcript-test"),
+            capability: Capability::new(Capability::PROCESS_SPAWN),
+            tool_name: "shell.run".to_string(),
+            args_summary: "cargo test".to_string(),
+            status: ApprovalStatus::Pending,
+            created_at: Utc::now(),
+        };
+        // This is the shape the scheduler actually writes: the approval has no
+        // turn of its own.
+        let state = apply(
+            &TranscriptProjection::new().init(),
+            &stored(
+                1,
+                EventType::APPROVAL_REQUESTED,
+                None,
+                None,
+                serde_json::to_value(&request).unwrap(),
+            ),
+        );
+        assert!(
+            state.items.iter().find(|item| item.id == "ap:ap-1").unwrap().turn_id.is_none(),
+            "the request alone does not name a turn"
+        );
+
+        let turn = TurnId::from_string("t1");
+        let state = apply(
+            &state,
+            &stored(
+                2,
+                EventType::TURN_YIELDED,
+                Some(turn.clone()),
+                None,
+                json!({ "final_content": "approval pending: ap-1" }),
+            ),
+        );
+
+        let item = state.items.iter().find(|item| item.id == "ap:ap-1").unwrap();
+        assert_eq!(item.turn_id, Some(turn), "the yielded turn owns its approval");
+        assert_eq!(
+            item.updated_seq,
+            EventSeq::new(2),
+            "attaching the turn is news to the page that already has the item"
+        );
+    }
+
+    fn reason_node(kind: ReasonKind, id: &str, step: u32, claim: &str) -> ReasonNode {
+        ReasonNode {
+            id: id.to_string(),
+            turn_id: "t1".to_string(),
+            step,
+            kind,
+            claim: claim.to_string(),
+            basis: vec![Basis { node: None, event: None, fact: Some("the log".to_string()) }],
+            rule: "test/rule".to_string(),
+            source: ReasonSource::Kernel,
+        }
+    }
+
+    #[test]
+    fn a_reason_trail_folds_to_one_thinking_item() {
+        let turn = TurnId::from_string("t1");
+        let step = StepId::from_string("s1");
+        let state = apply(
+            &TranscriptProjection::new().init(),
+            &stored(
+                1,
+                EventType::REASON_RECORDED,
+                Some(turn.clone()),
+                Some(step.clone()),
+                json!({ "node": reason_node(ReasonKind::Situation, "r/1", 0, "the person asked") }),
+            ),
+        );
+        let state = apply(
+            &state,
+            &stored(
+                2,
+                EventType::REASON_RECORDED,
+                Some(turn.clone()),
+                Some(step.clone()),
+                json!({ "node": reason_node(ReasonKind::Reading, "r/2", 1, "they want a read") }),
+            ),
+        );
+        // An action node belongs to the action row, not the thinking fold.
+        let state = apply(
+            &state,
+            &stored(
+                3,
+                EventType::REASON_RECORDED,
+                Some(turn),
+                Some(step),
+                json!({ "node": reason_node(ReasonKind::Action, "r/3", 1, "fs.read {}") }),
+            ),
+        );
+
+        let thinking: Vec<&TranscriptItem> = state
+            .items
+            .iter()
+            .filter(|item| matches!(item.body, ItemBody::Thinking { .. }))
+            .collect();
+        assert_eq!(thinking.len(), 1);
+        let item = thinking[0];
+        assert_eq!(item.updated_seq, EventSeq::new(2));
+        match &item.body {
+            ItemBody::Thinking { text, steps } => {
+                assert!(text.contains("情境：the person asked"), "{text}");
+                assert!(text.contains("读法：they want a read"), "{text}");
+                assert!(!text.contains("fs.read"), "actions stay out of the thinking fold");
+                assert_eq!(*steps, 2);
+            }
+            other => panic!("expected thinking, got {other:?}"),
         }
     }
 

@@ -23,3 +23,4 @@ pub mod providers;
 pub mod sandbox;
 pub mod stack;
 pub mod subagents;
+pub mod web_runtime;

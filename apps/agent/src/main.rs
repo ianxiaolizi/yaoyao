@@ -922,9 +922,9 @@ async fn tick(args: &Args) {
 /// the same command layer `ask` does, so the browser cannot reach a state the
 /// terminal could not.
 ///
-/// An invalid `AGENT_SANDBOX` is reported in `/api/meta` rather than refusing to
-/// start the page: the page itself runs no tools, and the first turn is where
-/// that boundary has to hold.
+/// An invalid `AGENT_SANDBOX` refuses to start, exactly as `ask` does: the page
+/// accepts turns, and a boundary that cannot be built must be said before the
+/// first click rather than only in `/api/meta` afterward.
 async fn web(args: &Args) {
     let port = match option(args, "--port") {
         Some(value) => value
@@ -939,18 +939,76 @@ async fn web(args: &Args) {
         .and_then(|name| name.to_str())
         .unwrap_or("workspace")
         .to_string();
+
+    // Resolve the configuration before the page is served. The page itself runs
+    // nothing, but every turn it accepts will run under this profile, and a
+    // configuration that does not resolve is better said now than on the first
+    // click. It is also what `/api/meta` reports, so the page cannot claim a
+    // model or sandbox the first turn would not use.
+    let resolved = config::load(&root, args).unwrap_or_else(|e| {
+        eprintln!("configuration: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+    for note in &resolved.notes {
+        eprintln!("configuration: {note}");
+    }
+    let sandbox_mode = sandbox::from_environment().unwrap_or_else(|e| {
+        eprintln!("execution sandbox: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+    let network_allowed = sandbox::network_from_environment().unwrap_or_else(|e| {
+        eprintln!("execution sandbox: {e}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    });
+
     let meta = agent_web::Meta {
         workspace,
-        model: std::env::var(agent_model_openai::ENV_MODEL_NAME)
-            .unwrap_or_else(|_| "echo".to_string()),
-        sandbox: sandbox::from_environment().map(sandbox::label).unwrap_or("invalid").to_string(),
+        model: resolved
+            .model
+            .clone()
+            .or_else(|| std::env::var(agent_model_openai::ENV_MODEL_NAME).ok())
+            .unwrap_or_else(|| "echo".to_string()),
+        sandbox: sandbox::label(sandbox_mode).to_string(),
         judgment: std::env::var("AGENT_JUDGMENT").unwrap_or_else(|_| "gates".to_string()),
-        capabilities: vec!["meta".to_string()],
+        budget: resolved.budget.max_input_tokens,
+        capabilities: [
+            "meta",
+            "sessions",
+            "transcript",
+            "why",
+            "diff",
+            "context",
+            "plan",
+            "subagents",
+            "schedule",
+            "export",
+            "artifact",
+            "events",
+            "turn",
+            "approval",
+            "resume",
+            "fork",
+            "steer",
+            "interrupt",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect(),
     };
 
     let data_dir = PathBuf::from(data_dir());
     let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(&data_dir));
-    let config = agent_web::Config { port, meta, store, data_dir };
+    let sessions = Arc::new(agent::web_runtime::WebBackend::new(agent::web_runtime::WebInputs {
+        workspace_root: PathBuf::from(&root),
+        data_dir: data_dir.clone(),
+        resolved,
+        sandbox: sandbox_mode,
+        network_allowed,
+        judgment: true,
+    }));
+    sessions.start_reaper();
+    let backend: Arc<dyn agent_web::Backend> = sessions;
+    let config = agent_web::Config { port, meta, store, data_dir, backend: Some(backend) };
 
     let server = match agent_web::Server::bind(config).await {
         Ok(server) => server,

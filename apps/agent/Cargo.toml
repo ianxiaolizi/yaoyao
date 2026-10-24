@@ -33,7 +33,7 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures-util = { workspace = true }
 chrono = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 
 [dev-dependencies]
 agent-testkit = { path = "../../crates/agent-testkit" }
