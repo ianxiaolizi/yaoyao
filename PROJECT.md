@@ -53,7 +53,7 @@ protocol → 尽量零依赖    ports → protocol    kernel → ports/protocol/
 2. **`loop`（与 `kernel`）不依赖 `projection`**——loop 只认 `agent-ports` 的 `ContextEngine` 端口，实现由 apps 层注入。否则投影引擎会反转依赖方向。
 3. **依赖方向由测试把守**，不靠自觉：`crates/agent-testkit/tests/architecture_boundaries.rs` 用集合相等双向钉住**两张**矩阵——运行期 `[dependencies]` 与测试期 `[dev-dependencies]`。清单用 `toml` **解析**而不是逐行扫，所以点表写法、重命名与不含斜杠的成员都看得见；另有一条守卫要求每个 `agent-*` 依赖必须是 workspace 内的 `path`。
 
-workspace 现有 **22 个成员**（21 个 lib crate + `apps/agent` 一个 bin）。测试期允许跨层（适配器要对着真调用方测，而不是对着它的假替身），但每一处都必须在矩阵里注明理由，不得悄悄发生。
+workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin）。测试期允许跨层（适配器要对着真调用方测，而不是对着它的假替身），但每一处都必须在矩阵里注明理由，不得悄悄发生。
 
 ## crate 地图
 
@@ -79,7 +79,8 @@ workspace 现有 **22 个成员**（21 个 lib crate + `apps/agent` 一个 bin�
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |
 | `agent-index-sqlite` | `SqliteMemoryIndex`（可丢弃的 SQLite 读模型：从日志重建、词面子串检索；版本不符拒绝，只由 `reindex` 重建）+ `memory.search` 工具（装配时绑定当前 session，能力 `memory.read`） |
 | `agent-testkit` | FakeEventStore / FakeModel·Tool·Gateway / FakeSecret / FakeDoctorCheck + 架构守卫 |
-| `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `why` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `memory search\|reindex` `context inspect` `artifact get` |
+| `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `why` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `web` `memory search\|reindex` `context inspect` `artifact get` |
+| `agent-web` | 本地回环 HTTP 入口：静态页、一次性令牌、`/api/meta`；每个端点只调 `agent-cli` 的命令层，不直连内核 |
 | `apps/agent` | 唯一具体组装入口（二进制）；`instructions` 模块把工作区根部的 `AGENTS.md` + 内置前言组成每次运行的系统指令 |
 
 `agent-kernel` 一个 crate 占 src 的约四分之一；`agent-loop`、`agent-cli` 是单文件大模块。

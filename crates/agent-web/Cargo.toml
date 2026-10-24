@@ -1,0 +1,16 @@
+[package]
+name = "agent-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+tokio = { version = "1", features = ["net", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }

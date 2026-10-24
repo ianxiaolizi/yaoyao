@@ -22,6 +22,7 @@ members = [
     "crates/agent-index-sqlite",
     "crates/agent-testkit",
     "crates/agent-cli",
+    "crates/agent-web",
     "apps/agent",
 ]
 
@@ -67,3 +68,7 @@ git2 = { version = "0.21", default-features = false }
 # API, which keeps the captured failure text readable without relaxing the
 # `deny(unsafe_code)` every crate except the sandbox backend carries.
 encoding_rs = "0.8"
+# The web front end is a local surface, not a service: one loopback listener,
+# one router, no TLS, no proxy. Axum is hyper + routing and nothing else, which
+# is exactly the amount of HTTP this needs.
+axum = "0.8"

@@ -12,6 +12,7 @@ agent-config = { path = "../../crates/agent-config" }
 agent-kernel = { path = "../../crates/agent-kernel" }
 agent-projection = { path = "../../crates/agent-projection" }
 agent-cli = { path = "../../crates/agent-cli" }
+agent-web = { path = "../../crates/agent-web" }
 agent-loop = { path = "../../crates/agent-loop" }
 agent-store-jsonl = { path = "../../crates/agent-store-jsonl" }
 agent-store-artifact = { path = "../../crates/agent-store-artifact" }

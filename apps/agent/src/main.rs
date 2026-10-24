@@ -69,6 +69,9 @@ const EXIT_ANSWERED_NO: i32 = 1;
 /// things next.
 const EXIT_DID_NOT_RUN: i32 = 2;
 
+/// The port `agent web` listens on unless `--port` names another.
+const DEFAULT_WEB_PORT: u16 = 7431;
+
 /// The exit status a verdict calls for — the whole alphabet, in one place.
 ///
 /// One place, because a second one would be a second answer to the same
@@ -151,6 +154,7 @@ async fn main() {
         "schedule" => schedule(&args).await,
         "tick" => tick(&args).await,
         "serve" => serve(&args).await,
+        "web" => web(&args).await,
         "memory" => memory(&args).await,
         "context" => context(&args).await,
         "artifact" => artifact(&args).await,
@@ -188,6 +192,7 @@ fn usage() {
          schedule cancel <id>       Withdraw a scheduled turn before it runs\n  \
          tick                       Run at most one pending or due turn\n  \
          serve                      Keep running turns as they become due (one per session)\n  \
+         web [--port <n>]           Serve the GUI on loopback, token printed once\n  \
          memory search <text>       Find events whose text contains <text>\n  \
          memory reindex             Rebuild the searchable index from the session log\n  \
          context inspect            Show what the next request would carry (size, kinds, budget)\n  \
@@ -908,6 +913,50 @@ async fn tick(args: &Args) {
     };
     print(&outcome.output);
     exit_on(outcome.verdict);
+}
+
+/// `web`: serve the GUI on loopback.
+///
+/// The server binds `127.0.0.1` and prints its URL with a one-time token in the
+/// fragment. Nothing about the run is decided here: the turn endpoints will call
+/// the same command layer `ask` does, so the browser cannot reach a state the
+/// terminal could not.
+///
+/// An invalid `AGENT_SANDBOX` is reported in `/api/meta` rather than refusing to
+/// start the page: the page itself runs no tools, and the first turn is where
+/// that boundary has to hold.
+async fn web(args: &Args) {
+    let port = match option(args, "--port") {
+        Some(value) => value
+            .parse::<u16>()
+            .unwrap_or_else(|_| fail(args, &format!("--port needs a port number, not '{value}'"))),
+        None => DEFAULT_WEB_PORT,
+    };
+
+    let root = workspace_root();
+    let workspace = Path::new(&root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    let meta = agent_web::Meta {
+        workspace,
+        model: std::env::var(agent_model_openai::ENV_MODEL_NAME)
+            .unwrap_or_else(|_| "echo".to_string()),
+        sandbox: sandbox::from_environment().map(sandbox::label).unwrap_or("invalid").to_string(),
+        judgment: std::env::var("AGENT_JUDGMENT").unwrap_or_else(|_| "gates".to_string()),
+        capabilities: vec!["meta".to_string()],
+    };
+
+    let server = match agent_web::Server::bind(port, meta).await {
+        Ok(server) => server,
+        Err(error) => fail(args, &error.to_string()),
+    };
+    println!("爻爻 · web  {}", server.url());
+    println!("按 Ctrl-C 停止");
+    if let Err(error) = server.serve().await {
+        fail(args, &error.to_string());
+    }
 }
 
 /// `serve`: keep running turns as their time arrives.

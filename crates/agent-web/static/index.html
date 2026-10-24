@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>爻爻 · web</title>
+<style>
+  :root{
+    --ink:#151517;--ink-2:#55555e;--ink-3:#7c7c86;
+    --line:rgba(17,17,20,.10);--red:#D63A3A;
+    --mono:"Cascadia Code","JetBrains Mono",Consolas,monospace;
+    --sans:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased;
+    display:grid;place-items:center;padding:32px;
+    background:
+      radial-gradient(70% 60% at 12% 0%, #fff 0%, rgba(255,255,255,0) 60%),
+      radial-gradient(55% 55% at 88% 10%, #dcdce6 0%, rgba(220,220,230,0) 60%),
+      linear-gradient(155deg,#f2f2f6,#d4d4de);
+  }
+  .card{
+    width:min(560px,100%);padding:28px 30px 26px;border-radius:14px;
+    background:rgba(255,255,255,.55);border:1px solid rgba(255,255,255,.7);
+    box-shadow:0 24px 60px rgba(20,20,30,.16),inset 0 1px 0 rgba(255,255,255,.8);
+    backdrop-filter:blur(26px) saturate(150%);-webkit-backdrop-filter:blur(26px) saturate(150%);
+  }
+  .ico{
+    width:34px;height:34px;border-radius:8px;display:grid;place-items:center;
+    background:#151517;color:#fff;margin-bottom:14px;
+  }
+  h1{font-size:18px;font-weight:600;letter-spacing:.02em}
+  .sub{color:var(--ink-3);font-size:12px;margin-top:2px}
+  .status{
+    display:inline-flex;align-items:center;gap:7px;margin:18px 0 4px;
+    font-size:12px;color:var(--ink-3);
+  }
+  .status::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ink-3)}
+  .status.ok{color:#2f7d5a}
+  .status.ok::before{background:#2f9e64}
+  .status.bad{color:var(--red)}
+  .status.bad::before{background:var(--red)}
+  .note{font-size:12px;line-height:1.8;color:var(--ink-2);margin-top:10px}
+  .note code{font-family:var(--mono);font-size:11px;background:rgba(17,17,20,.06);border-radius:3px;padding:0 4px}
+  pre{
+    margin-top:16px;padding:12px 14px;border-radius:8px;
+    background:rgba(255,255,255,.45);border:1px solid var(--line);
+    font-family:var(--mono);font-size:10.5px;line-height:1.7;color:var(--ink-2);
+    max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="ico">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+        <path d="M5 3.8 19 10.6M19 3.8 5 10.6M5 13.4 19 20.2M19 13.4 5 20.2"/>
+      </svg>
+    </div>
+    <h1>爻爻</h1>
+    <div class="sub">本地 web 入口</div>
+
+    <div class="status" id="status">正在连接…</div>
+
+    <p class="note">
+      骨架已经起来了：这张页面、一次性令牌、<code>/api/meta</code> 都是真的。
+      对话界面在下一步接进来。
+      如果显示 401，请用终端里打印的、带 <code>#t=</code> 的那条地址打开。
+    </p>
+
+    <pre id="out">—</pre>
+  </main>
+
+<script>
+  const token = location.hash.startsWith('#t=') ? decodeURIComponent(location.hash.slice(3)) : '';
+  const status = document.getElementById('status');
+  const out = document.getElementById('out');
+  fetch('/api/meta', { headers: token ? { Authorization: 'Bearer ' + token } : {} })
+    .then(async (response) => {
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(response.status + ' ' + body.slice(0, 160));
+      }
+      return response.json();
+    })
+    .then((meta) => {
+      status.textContent = '已连接 · ' + meta.workspace + ' · ' + meta.model;
+      status.classList.add('ok');
+      out.textContent = JSON.stringify(meta, null, 2);
+    })
+    .catch((error) => {
+      status.textContent = '未连接 · ' + error.message;
+      status.classList.add('bad');
+    });
+</script>
+</body>
+</html>
