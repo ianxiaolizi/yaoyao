@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 
 pub mod args;
+pub mod commands;
 pub mod context;
 pub mod memory;
 pub mod reason;
@@ -20,9 +21,8 @@ use agent_ports::event_store::EventStore;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolInvocation;
 use agent_protocol::diagnostics::HealthStatus;
-use agent_protocol::events::{Actor, EventType, StoredEvent};
-use agent_protocol::ids::{ApprovalId, EventSeq, SchemaVersion, SessionId, TurnId};
-use agent_protocol::inbox::InboxKind;
+use agent_protocol::events::{EventType, StoredEvent};
+use agent_protocol::ids::{EventSeq, SchemaVersion, SessionId, TurnId};
 use agent_protocol::permissions::{ApprovalScope, ArtifactRef};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::ToolStatus;
@@ -304,22 +304,11 @@ pub async fn run_ask(
     now: DateTime<Utc>,
     json: bool,
 ) -> Result<CliOutcome, String> {
-    scheduler
-        .inbox()
-        .append(
-            session_id,
-            InboxKind::NextTurn,
-            serde_json::json!({ "text": text }),
-            0,
-            Actor::User,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let started =
+        commands::start_turn(scheduler, session_id, text, now).await.map_err(|e| e.to_string())?;
 
-    let report = scheduler.run_pending(session_id, now).await.map_err(|e| e.to_string())?;
-
-    match report {
-        Some(r) => {
+    match started {
+        commands::TurnStart::Ran(r) => {
             if json {
                 let value = serde_json::json!({
                     "run_id": r.run_id.as_str(),
@@ -338,7 +327,7 @@ pub async fn run_ask(
                 }
             }
         }
-        None => Ok(CliOutcome::did_not_run(if json {
+        commands::TurnStart::NotStarted => Ok(CliOutcome::did_not_run(if json {
             let value = serde_json::json!({ "run": null, "reason": "busy_or_no_input" });
             CliOutput::Json(json_output(&value)?)
         } else {
@@ -538,12 +527,11 @@ pub async fn run_status(
     session_id: &SessionId,
     json: bool,
 ) -> Result<CliOutput, String> {
-    let lifecycle = scheduler.lifecycle(session_id).await.map_err(|e| e.to_string())?;
-    let pending = scheduler.inbox().pending(session_id).await.map_err(|e| e.to_string())?;
+    let report = commands::status(scheduler, session_id).await.map_err(|e| e.to_string())?;
 
-    let open_run = lifecycle.open_run.as_ref().map(|id| id.as_str());
-    let open_turn = lifecycle.open_turn.as_ref().map(|id| id.as_str());
-    let open_step = lifecycle.open_step.as_ref().map(|id| id.as_str());
+    let open_run = report.open_run.as_ref().map(|id| id.as_str());
+    let open_turn = report.open_turn.as_ref().map(|id| id.as_str());
+    let open_step = report.open_step.as_ref().map(|id| id.as_str());
 
     if json {
         let value = serde_json::json!({
@@ -551,7 +539,7 @@ pub async fn run_status(
             "open_run": open_run,
             "open_turn": open_turn,
             "open_step": open_step,
-            "pending": pending.len(),
+            "pending": report.pending,
         });
         Ok(CliOutput::Json(json_output(&value)?))
     } else {
@@ -559,7 +547,7 @@ pub async fn run_status(
         lines.push(format!("open run:  {}", open_run.unwrap_or("none")));
         lines.push(format!("open turn: {}", open_turn.unwrap_or("none")));
         lines.push(format!("open step: {}", open_step.unwrap_or("none")));
-        lines.push(format!("pending:   {}", pending.len()));
+        lines.push(format!("pending:   {}", report.pending));
         Ok(CliOutput::Text(lines.join("\n")))
     }
 }
@@ -580,34 +568,12 @@ pub async fn run_approve(
     scope: &str,
     json: bool,
 ) -> Result<CliOutput, String> {
-    let approval_id = ApprovalId::from_string(approval_id);
-    let replies = if scope == "always" {
-        approvals.grant_always(session_id, &approval_id, "user").await.map_err(|e| e.to_string())?
-    } else {
-        let scope = parse_scope(scope)?;
-        let reply = approvals
-            .grant(session_id, &approval_id, scope, "user")
+    let grant = commands::Grant::from_name(scope).map_err(|e| e.to_string())?;
+    let receipt =
+        commands::grant_approval(approvals, inbox, session_id, approval_id, grant, "user")
             .await
             .map_err(|e| e.to_string())?;
-        vec![reply]
-    };
-
-    for reply in &replies {
-        inbox
-            .append(
-                session_id,
-                InboxKind::Wakeup,
-                serde_json::json!({
-                    "approval_id": reply.approval_id.as_str(),
-                    "decision": reply.decision,
-                    "scope": reply.scope,
-                }),
-                0,
-                Actor::User,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    let replies = receipt.replies;
 
     let settled = replies.iter().map(|r| r.approval_id.as_str()).collect::<Vec<_>>();
     let Some(first) = replies.first() else {
@@ -647,30 +613,10 @@ pub async fn run_deny(
     only: bool,
     json: bool,
 ) -> Result<CliOutput, String> {
-    let approval_id = ApprovalId::from_string(approval_id);
-    let replies = if only {
-        let reply =
-            approvals.deny(session_id, &approval_id, "user").await.map_err(|e| e.to_string())?;
-        vec![reply]
-    } else {
-        approvals.deny_cascade(session_id, &approval_id, "user").await.map_err(|e| e.to_string())?
-    };
-
-    for reply in &replies {
-        inbox
-            .append(
-                session_id,
-                InboxKind::Wakeup,
-                serde_json::json!({
-                    "approval_id": reply.approval_id.as_str(),
-                    "decision": reply.decision,
-                }),
-                0,
-                Actor::User,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    let receipt = commands::deny_approval(approvals, inbox, session_id, approval_id, only, "user")
+        .await
+        .map_err(|e| e.to_string())?;
+    let replies = receipt.replies;
 
     let settled = replies.iter().map(|r| r.approval_id.as_str()).collect::<Vec<_>>();
     let Some(first) = replies.first() else {
@@ -707,22 +653,13 @@ pub async fn run_steer(
     text: &str,
     json: bool,
 ) -> Result<CliOutput, String> {
-    if text.trim().is_empty() {
-        return Err("steer needs text: agent steer \"<text>\"".to_string());
-    }
-    let target = scheduler.lifecycle(session_id).await.map_err(|e| e.to_string())?.open_turn;
-    let item = scheduler
-        .inbox()
-        .steer(session_id, text, target.as_ref())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let turn = target.as_ref().map(|id| id.as_str().to_string());
+    let receipt = commands::steer(scheduler, session_id, text).await.map_err(|e| e.to_string())?;
+    let turn = receipt.expected_turn.as_ref().map(|id| id.as_str().to_string());
     if json {
         let value = serde_json::json!({
             "session": session_id.as_str(),
-            "item_id": item.item_id.as_str(),
-            "text": text,
+            "item_id": receipt.item_id.as_str(),
+            "text": receipt.text,
             "expected_turn_id": turn,
         });
         Ok(CliOutput::Json(json_output(&value)?))
@@ -763,9 +700,9 @@ pub async fn run_interrupt(
     session_id: &SessionId,
     json: bool,
 ) -> Result<CliOutcome, String> {
-    let lifecycle = scheduler.lifecycle(session_id).await.map_err(|e| e.to_string())?;
-    if lifecycle.open_run.is_none() && lifecycle.yielded_turn.is_none() {
-        return Ok(CliOutcome::did_not_run(if json {
+    let outcome = commands::interrupt(scheduler, session_id).await.map_err(|e| e.to_string())?;
+    match outcome {
+        commands::InterruptOutcome::NothingToInterrupt => Ok(CliOutcome::did_not_run(if json {
             CliOutput::Json(json_output(&serde_json::json!({
                 "queued": null,
                 "reason": "no_run",
@@ -774,30 +711,25 @@ pub async fn run_interrupt(
             CliOutput::Text(
                 "no run to interrupt: no run is in flight and no turn is waiting".to_string(),
             )
-        }));
-    }
-
-    let item = scheduler
-        .inbox()
-        .interrupt(session_id, "user_interrupt")
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if json {
-        let value = serde_json::json!({
-            "queued": {
-                "item_id": item.item_id.as_str(),
-                "kind": "interrupt",
-                "applies_at": "the next step boundary",
-            },
-        });
-        Ok(CliOutcome::ok(CliOutput::Json(json_output(&value)?)))
-    } else {
-        Ok(CliOutcome::ok(CliOutput::Text(format!(
-            "queued: the run will stop at the next step boundary (item {})\n\
-             this command only asks; the process driving the session applies it",
-            item.item_id.as_str()
-        ))))
+        })),
+        commands::InterruptOutcome::Queued(item_id) => {
+            if json {
+                let value = serde_json::json!({
+                    "queued": {
+                        "item_id": item_id.as_str(),
+                        "kind": "interrupt",
+                        "applies_at": "the next step boundary",
+                    },
+                });
+                Ok(CliOutcome::ok(CliOutput::Json(json_output(&value)?)))
+            } else {
+                Ok(CliOutcome::ok(CliOutput::Text(format!(
+                    "queued: the run will stop at the next step boundary (item {})\n\
+                     this command only asks; the process driving the session applies it",
+                    item_id.as_str()
+                ))))
+            }
+        }
     }
 }
 
@@ -1256,15 +1188,6 @@ fn compact(value: &serde_json::Value, limit: usize) -> String {
     }
     let end = text.char_indices().nth(limit).map(|(i, _)| i).unwrap_or(text.len());
     format!("{}… ({} bytes total)", &text[..end], text.len())
-}
-
-fn parse_scope(scope: &str) -> Result<ApprovalScope, String> {
-    match scope {
-        "once" => Ok(ApprovalScope::AllowOnce),
-        "turn" => Ok(ApprovalScope::AllowForTurn),
-        "session" => Ok(ApprovalScope::AllowForSession),
-        other => Err(format!("unknown scope '{other}'; expected once|turn|session|always")),
-    }
 }
 
 fn scope_label(scope: ApprovalScope) -> &'static str {
