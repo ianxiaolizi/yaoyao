@@ -839,6 +839,10 @@ struct LoopTurn {
     criterion_expects_check: bool,
     /// Whether such a check has completed since the turn opened.
     criterion_observed: bool,
+    /// The observation node of the check that satisfied the criterion. The
+    /// verdict cites this rather than whichever call happened to be last: "the
+    /// answer rests on the check" must point at the check.
+    criterion_observation: Option<String>,
     /// The step ordinal within this turn, for the chain's own numbering.
     step_index: u32,
     /// Calls dispatched so far in this turn. The verdict reads it to tell an
@@ -1669,6 +1673,7 @@ impl AgentLoop for DefaultAgentLoop {
                 reason_last_observation: None,
                 criterion_expects_check,
                 criterion_observed: false,
+                criterion_observation: None,
                 step_index: 0,
                 dispatched: 0,
                 // A resumed turn opens on a failure the previous turn left
@@ -2247,7 +2252,16 @@ impl AgentLoop for DefaultAgentLoop {
                 if turn.stance_switched {
                     verdict_basis.push(Basis::node(turn.stance_node.clone()));
                 }
-                match &turn.reason_last_observation {
+                // A criterion-observed stop rests on the check itself. Citing
+                // whichever call came last would put a read under a claim about
+                // a check, and a reader following the verdict's edges would
+                // never reach the observation the rule names.
+                let rests_on = if turn.criterion_observed {
+                    turn.criterion_observation.as_ref().or(turn.reason_last_observation.as_ref())
+                } else {
+                    turn.reason_last_observation.as_ref()
+                };
+                match rests_on {
                     Some(observation) => verdict_basis.push(Basis::node(observation.clone())),
                     None if !turn.stance_switched => {
                         verdict_basis.push(Basis::node(turn.stance_node.clone()));
@@ -2630,6 +2644,11 @@ impl AgentLoop for DefaultAgentLoop {
                                         ));
                                         if update.stage == Some(JudgmentStage::Reconcile) {
                                             turn.pending_failure = None;
+                                            // The record has answered the
+                                            // failure; the note asking the next
+                                            // step to repair it is spent. The
+                                            // posture itself does not return.
+                                            turn.stance_note = None;
                                             // A retry is a promise until a
                                             // tool call makes it; the answer
                                             // gate holds the turn to it. The
@@ -2829,6 +2848,7 @@ impl AgentLoop for DefaultAgentLoop {
                                 .is_some_and(|command| is_check_command(&command));
                         if check_like && result.status == ToolStatus::Completed {
                             turn.criterion_observed = true;
+                            turn.criterion_observation = Some(observation.id.clone());
                         }
                         turn.reason_last_observation = Some(observation.id.clone());
                         events.push(reason_event(ctx, Some(&step_id), &observation));
@@ -2844,6 +2864,7 @@ impl AgentLoop for DefaultAgentLoop {
                             // kept changing after the check ran, so the check
                             // no longer covers what the answer would rest on.
                             turn.criterion_observed = false;
+                            turn.criterion_observation = None;
                             turn.checked_since_failure = false;
                             turn.pending_failure = Some(PendingFailure {
                                 call_id: call.tool_call_id.clone(),
@@ -2875,7 +2896,29 @@ impl AgentLoop for DefaultAgentLoop {
                                 enter_stance(turn, Stance::Repair, "a call failed");
                                 events.push(reason_event(ctx, Some(&step_id), &node));
                                 refresh_task_layer(turn, self.judgment_ledger);
+                            } else {
+                                // Already repairing: no second switch node —
+                                // the posture did not change — but the advice
+                                // must name the failure that just happened, not
+                                // the one that first opened the posture.
+                                turn.stance_note = Some(repair_note(
+                                    turn.pending_failure.as_ref(),
+                                    "a call failed",
+                                ));
+                                refresh_task_layer(turn, self.judgment_ledger);
                             }
+                        } else if turn.mode.stance == Stance::Repair
+                            && turn
+                                .pending_failure
+                                .as_ref()
+                                .is_some_and(|pending| pending.tool == call.tool_name)
+                        {
+                            // The call that went wrong has now gone right. The
+                            // posture stays repair (a stance does not return
+                            // inside a turn, #77), but the note that told the
+                            // next step to repair it is no longer true.
+                            turn.stance_note = None;
+                            refresh_task_layer(turn, self.judgment_ledger);
                         }
                         turn.messages.push(ModelMessage::tool_for_call(
                             &step_id,
@@ -3631,6 +3674,54 @@ mod tests {
         assert_eq!(verdict.rule, "verdict/criterion-observed", "{}", verdict.claim);
     }
 
+    /// The check, not the call that happened to run last, is what the answer
+    /// rests on. A verdict citing a later read would say "the check observed"
+    /// while its own edges lead to something that checked nothing.
+    #[tokio::test]
+    async fn a_check_followed_by_another_call_still_rests_on_the_check() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("shell.run", serde_json::json!({"command": "cargo test"})),
+            FakeModelProvider::tool_call("fs.read", serde_json::json!({"path": "notes.txt"})),
+            FakeModelProvider::answer("the tests pass; the notes say so"),
+        ]));
+        let tools =
+            Arc::new(
+                FakeToolProvider::new()
+                    .with_tool("shell.run", "ok", ToolSideEffect::Pure)
+                    .with_tool("fs.read", "notes", ToolSideEffect::Read),
+            );
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.user_input = serde_json::json!({"text": "跑一下测试，再读 notes.txt"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let verdict =
+            nodes.iter().find(|node| node.kind == ReasonKind::Verdict).expect("a verdict");
+        assert_eq!(verdict.rule, "verdict/criterion-observed", "{}", verdict.claim);
+        let cited: Vec<&ReasonNode> = verdict
+            .basis
+            .iter()
+            .filter_map(|basis| basis.node.as_deref())
+            .filter_map(|id| nodes.iter().find(|node| node.id == id))
+            .collect();
+        assert!(
+            cited.iter().any(|node| node.kind == ReasonKind::Observation
+                && node.claim.contains("shell.run completed")),
+            "the verdict must cite the check: {cited:?}"
+        );
+        assert!(
+            !cited.iter().any(|node| node.claim.contains("fs.read completed")),
+            "the later read is not what the answer rests on: {cited:?}"
+        );
+    }
+
     /// A check that passed before a later failure no longer covers the work:
     /// the answer may not keep resting on it.
     #[tokio::test]
@@ -3746,6 +3837,88 @@ mod tests {
             "{verdict:?}"
         );
         assert_eq!(verdict.rule, "verdict/after-failure");
+    }
+
+    /// A second failure while already repairing refreshes the note. The posture
+    /// did not change, so no second switch node — but advice naming the first
+    /// failure would send the next step after a call that is no longer the
+    /// problem.
+    #[tokio::test]
+    async fn a_second_failure_refreshes_the_repair_note() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("explode", serde_json::json!({})),
+            FakeModelProvider::tool_call("melt", serde_json::json!({})),
+            FakeModelProvider::answer("stopped after both failures"),
+        ]));
+        let tools = Arc::new(
+            FakeToolProvider::new()
+                .with_result("explode", ToolResult::failed("boom one: first"), ToolSideEffect::Read)
+                .with_result("melt", ToolResult::failed("boom two: second"), ToolSideEffect::Read),
+        );
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        )
+        .without_ledger();
+        let mut turn = ctx();
+        turn.state = Some(facts());
+
+        let outcome = run_turn(&loop_, &turn).await;
+
+        // Request 2 is the one prepared after the second failure.
+        let task = task_message(&model.requests()[2], &turn.turn_id);
+        assert!(task.contains("`melt` failed"), "{task}");
+        assert!(task.contains("boom two"), "{task}");
+        assert!(!task.contains("`explode` failed"), "the stale note is gone: {task}");
+        let switches = reason_nodes(&outcome.events)
+            .iter()
+            .filter(|node| node.rule == "switch/failure-repair")
+            .count();
+        assert_eq!(switches, 1, "the posture switched once, not twice");
+    }
+
+    /// A retry that goes right takes the repair note out of the task layer. The
+    /// posture does not return to act inside the turn (#77); the advice that
+    /// named the failure is spent and must not outlive it.
+    #[tokio::test]
+    async fn a_retry_that_succeeds_clears_the_repair_note() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("flaky", serde_json::json!({})),
+            FakeModelProvider::tool_call("flaky", serde_json::json!({})),
+            FakeModelProvider::answer("it worked on the retry"),
+        ]));
+        let tools = Arc::new(FakeToolProvider::new().with_scripted_results(
+            "flaky",
+            vec![ToolResult::failed("boom: transient"), ToolResult::completed("fixed")],
+            ToolSideEffect::Read,
+        ));
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        )
+        .without_ledger();
+        let mut turn = ctx();
+        turn.state = Some(facts());
+
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let after_failure = task_message(&model.requests()[1], &turn.turn_id);
+        assert!(after_failure.contains("Repair posture"), "{after_failure}");
+        let after_retry = task_message(&model.requests()[2], &turn.turn_id);
+        assert!(!after_retry.contains("Repair posture"), "{after_retry}");
+        assert_eq!(outcome.final_content.as_deref(), Some("it worked on the retry"));
+        // The failure itself is still in the chain: clearing the advice is not
+        // forgetting what happened.
+        assert!(
+            reason_nodes(&outcome.events).iter().any(|node| {
+                node.kind == ReasonKind::Observation && node.claim.contains("flaky failed")
+            }),
+            "the failed observation stays in the record"
+        );
     }
 
     /// A steer is the person changing the turn while it runs. A correction
@@ -4672,6 +4845,82 @@ mod tests {
             .count();
         assert_eq!(ran, 3, "the one retry and the changed call both ran");
         assert_eq!(outcome.final_content.as_deref(), Some("done"));
+
+        // The refusal is in the chain as a node, not only in the note the
+        // model read: `why` has to be able to name the rule that fired.
+        let gate = reason_nodes(&outcome.events)
+            .into_iter()
+            .find(|node| node.rule == "gate/repeat-call")
+            .expect("the repeat refusal is a gate node");
+        assert_eq!(gate.kind, ReasonKind::Gate);
+        assert!(gate.claim.contains("2 times"), "{}", gate.claim);
+        assert!(
+            gate.basis
+                .iter()
+                .any(|basis| basis.fact.as_deref().is_some_and(|f| f.contains("byte-identical"))),
+            "{gate:?}"
+        );
+    }
+
+    /// The stale-read gate fires on the turn that names an earlier turn's read
+    /// before looking itself. Its node has to exist for the same reason the
+    /// repeat gate's does: the refusal is a derivation, not a mood.
+    #[tokio::test]
+    async fn the_stale_read_gate_is_a_node_and_a_refusal() {
+        let earlier = ModelMessage::new(
+            MessageRole::Assistant,
+            vec![ContentBlock::tool_use(
+                "c-earlier",
+                "fs.read",
+                serde_json::json!({"path": "report.txt"}),
+            )],
+        );
+        let context = Arc::new(FakeContextEngine::new(vec![earlier], EventSeq::new(3)));
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::answer("it says rhubarb"),
+            FakeModelProvider::answer("it says rhubarb, read just now"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("fs.read", "rhubarb", ToolSideEffect::Read));
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools)),
+            context,
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.state = Some(facts());
+        turn.user_input = serde_json::json!({"text": "report.txt 里写了什么？"});
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let required: Vec<&EventDraft> = outcome
+            .events
+            .iter()
+            .filter(|e| e.event_type.as_str() == EventType::JUDGMENT_REQUIRED)
+            .collect();
+        assert_eq!(required.len(), 1, "the first answer was refused");
+        assert_eq!(required[0].payload["tool_name"], "fs.read");
+        assert!(
+            required[0].payload["content"].as_str().unwrap_or_default().contains("report.txt"),
+            "{}",
+            required[0].payload
+        );
+
+        let gate = reason_nodes(&outcome.events)
+            .into_iter()
+            .find(|node| node.rule == "gate/stale-read")
+            .expect("the stale refusal is a gate node");
+        assert_eq!(gate.kind, ReasonKind::Gate);
+        assert!(gate.claim.contains("report.txt"), "{}", gate.claim);
+        assert!(
+            gate.basis
+                .iter()
+                .any(|basis| basis.fact.as_deref().is_some_and(|f| f.contains("no call yet"))),
+            "{gate:?}"
+        );
+        assert_eq!(outcome.final_content.as_deref(), Some("it says rhubarb, read just now"));
+        assert_eq!(model.requests().len(), 2, "one refusal, then the second answer is taken");
     }
 
     /// The middle arm: the repeat gate still refuses, but the ledger's tool

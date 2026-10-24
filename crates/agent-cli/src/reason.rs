@@ -14,8 +14,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use agent_kernel::reason::Chain;
 use agent_ports::event_store::EventStore;
+use agent_protocol::events::{EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, SessionId};
-use agent_protocol::reason::{ReasonNode, rule};
+use agent_protocol::reason::{ReasonKind, ReasonNode, rule};
 
 use crate::{CliOutcome, CliOutput, json_output};
 
@@ -24,13 +25,18 @@ use crate::{CliOutcome, CliOutput, json_output};
 /// A cycle cannot be written by this build, but a log can be edited; a reader
 /// that hangs on a hand-made loop would be worse than one that says where it
 /// stopped.
-const MAX_DEPTH: usize = 64;
+pub const DEFAULT_DEPTH: usize = 64;
 
 /// Execute the `why` command: render the reasoning chain of one turn.
+///
+/// `depth` bounds how many levels of derivation are shown; `None` uses
+/// [`DEFAULT_DEPTH`]. It is a reader's knob, not a semantic one: the same nodes
+/// are read and checked either way.
 pub async fn run_why(
     store: &dyn EventStore,
     session_id: &SessionId,
     turn: Option<&str>,
+    depth: Option<usize>,
     json: bool,
 ) -> Result<CliOutcome, String> {
     let events = store
@@ -56,6 +62,8 @@ pub async fn run_why(
         ))));
     }
     let check = chain.check(&turn_id);
+    let end = TurnEnd::of(&events, &turn_id);
+    let verdict = verdict_node(&nodes);
     let event_index: BTreeMap<String, (String, u64)> = events
         .iter()
         .map(|stored| {
@@ -70,11 +78,87 @@ pub async fn run_why(
             "session": session_id.as_str(),
             "turn": turn_id,
             "nodes": nodes,
+            "verdict": verdict.map(|node| serde_json::json!({
+                "rule": node.rule,
+                "claim": node.claim,
+                "step": node.step,
+            })),
+            "stop": end.as_ref().map(TurnEnd::as_json),
             "check": check.as_ref().map_or_else(|error| error.to_string(), |_| String::from("ok")),
         });
         return Ok(CliOutcome::ok(CliOutput::Json(json_output(&value)?)));
     }
-    Ok(CliOutcome::ok(CliOutput::Text(render_turn(&turn_id, &chain, &nodes, &event_index))))
+    Ok(CliOutcome::ok(CliOutput::Text(render_turn(
+        &turn_id,
+        &chain,
+        &nodes,
+        &event_index,
+        end.as_ref(),
+        depth.unwrap_or(DEFAULT_DEPTH),
+    ))))
+}
+
+/// How a turn ended, when the log says so.
+///
+/// Most terminal events do not carry the reason in their payload: the event
+/// type *is* the reason. Only a budget stop needed a field, because
+/// `turn/completed {}` could not be told from a turn that ended with nothing to
+/// say. This reads both places so a reader does not have to know which.
+struct TurnEnd {
+    event: String,
+    stop: Option<String>,
+}
+
+impl TurnEnd {
+    fn of(events: &[StoredEvent], turn: &str) -> Option<Self> {
+        const TERMINAL: [&str; 4] = [
+            EventType::TURN_COMPLETED,
+            EventType::TURN_YIELDED,
+            EventType::TURN_FAILED,
+            EventType::TURN_CANCELLED,
+        ];
+        events.iter().rev().find_map(|stored| {
+            let event = &stored.event;
+            let event_type = event.event_type.as_str();
+            let same_turn = event.turn_id.as_ref().is_some_and(|id| id.as_str() == turn);
+            if !same_turn || !TERMINAL.contains(&event_type) {
+                return None;
+            }
+            Some(Self {
+                event: event_type.to_string(),
+                stop: event
+                    .payload
+                    .get("stop_reason")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            })
+        })
+    }
+
+    /// The stop reason as one machine word.
+    fn reason(&self) -> String {
+        match (self.event.as_str(), self.stop.as_deref()) {
+            (EventType::TURN_COMPLETED, Some(reason)) => reason.to_string(),
+            (EventType::TURN_COMPLETED, None) => String::from("final_answer"),
+            (EventType::TURN_YIELDED, _) => String::from("needs_user_input"),
+            (EventType::TURN_FAILED, _) => String::from("fatal_error"),
+            (EventType::TURN_CANCELLED, _) => String::from("user_cancelled"),
+            (other, _) => other.to_string(),
+        }
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({ "event": self.event, "reason": self.reason() })
+    }
+}
+
+/// The latest verdict the turn wrote, if it wrote one.
+///
+/// A turn cut by the step budget, held for approval, failed or cancelled never
+/// reached an answer; the summary has to say that rather than leave the reader
+/// wondering why the tree has no end.
+fn verdict_node<'a>(nodes: &[&'a ReasonNode]) -> Option<&'a ReasonNode> {
+    nodes.iter().rev().find(|node| node.kind == ReasonKind::Verdict).copied()
 }
 
 /// The human-readable half: a reverse tree from the turn's ends.
@@ -83,11 +167,26 @@ fn render_turn(
     chain: &Chain,
     nodes: &[&ReasonNode],
     event_index: &BTreeMap<String, (String, u64)>,
+    end: Option<&TurnEnd>,
+    max_depth: usize,
 ) -> String {
     let by_id: BTreeMap<&str, &ReasonNode> =
         nodes.iter().map(|node| (node.id.as_str(), *node)).collect();
 
-    let mut out = format!("turn {turn} has {} reason node(s)\n", nodes.len());
+    let mut out = format!("turn {turn}: {} reason node(s)\n", nodes.len());
+    match end {
+        Some(end) => out.push_str(&format!("turn end: {} ({})\n", end.reason(), end.event)),
+        None => out.push_str(
+            "turn end: not recorded — the turn is still running, or the log stops before it ended\n",
+        ),
+    }
+    match verdict_node(nodes) {
+        Some(node) => {
+            out.push_str(&format!("verdict: {} — {}\n", node.rule, one_line(&node.claim)))
+        }
+        None => out
+            .push_str("verdict: none — no answer node was written; see how the turn ended above\n"),
+    }
     match chain.check(turn) {
         Ok(()) => out.push_str("chain check: every node names a rule and every edge points back\n"),
         Err(error) => out.push_str(&format!("chain check: {error}\n")),
@@ -95,7 +194,7 @@ fn render_turn(
 
     let mut seen = HashSet::new();
     for root in chain.roots(turn).iter().rev() {
-        render_node(root, &by_id, event_index, 0, &mut seen, &mut out);
+        render_node(root, &by_id, event_index, 0, &mut seen, &mut out, max_depth);
     }
     out
 }
@@ -108,13 +207,14 @@ fn render_node(
     depth: usize,
     seen: &mut HashSet<String>,
     out: &mut String,
+    max_depth: usize,
 ) {
     let indent = "  ".repeat(depth);
     let step = if node.step == 0 { String::new() } else { format!(" (step {})", node.step) };
     let rule_text = rule(&node.rule).map_or("rule unknown in this build", |rule| rule.text);
 
-    if depth >= MAX_DEPTH {
-        out.push_str(&format!("{indent}... deeper than {MAX_DEPTH} levels, stopped here\n"));
+    if depth > max_depth {
+        out.push_str(&format!("{indent}... deeper than {max_depth} levels, stopped here\n"));
         return;
     }
     if !seen.insert(node.id.clone()) {
@@ -131,7 +231,9 @@ fn render_node(
     for basis in &node.basis {
         if let Some(id) = &basis.node {
             match by_id.get(id.as_str()) {
-                Some(parent) => render_node(parent, by_id, event_index, depth + 1, seen, out),
+                Some(parent) => {
+                    render_node(parent, by_id, event_index, depth + 1, seen, out, max_depth)
+                }
                 None => out.push_str(&format!("{indent}  <- node {id} (not in this turn)\n")),
             }
         } else if let Some(event) = &basis.event {
@@ -274,8 +376,12 @@ mod tests {
                 )
             })
             .collect();
-        let text = render_turn("t1", &chain, &nodes, &index);
+        let text = render_turn("t1", &chain, &nodes, &index, None, DEFAULT_DEPTH);
         assert!(text.contains("chain check: every node names a rule"));
+        assert!(
+            text.contains("verdict: verdict/after-failure — answer: stopped after the failure")
+        );
+        assert!(text.contains("turn end: not recorded"), "{text}");
         assert!(text.contains("[verdict] answer: stopped after the failure (step 2)"));
         assert!(text.contains("because verdict/after-failure:"));
         assert!(text.contains("[stance] stance switched: act -> repair"));
@@ -302,8 +408,64 @@ mod tests {
                 )
             })
             .collect();
-        let text = render_turn("t1", &chain, &nodes, &index);
+        let text = render_turn("t1", &chain, &nodes, &index, None, DEFAULT_DEPTH);
         assert!(text.contains("(cited above)"), "{text}");
+    }
+
+    /// A turn that never reached an answer says so, and says what stopped it:
+    /// "no tree end" and "the budget ran out" are different facts.
+    #[test]
+    fn a_turn_without_a_verdict_names_the_reason_it_stopped() {
+        let (_, mut events) = fixture();
+        // Drop the verdict: the turn stopped before writing one.
+        events.retain(|stored| {
+            let node = &stored.event.payload["node"];
+            node["kind"] != serde_json::json!("verdict")
+        });
+        let yielded = stored(events.len() as u64, EventType::TURN_YIELDED, serde_json::json!({}));
+        let mut yielded = yielded;
+        yielded.event.turn_id = Some(agent_protocol::ids::TurnId::from_string("t1"));
+        events.push(yielded);
+
+        let chain = Chain::parse(&events).expect("readable");
+        let nodes = chain.turn_nodes("t1");
+        let index: BTreeMap<String, (String, u64)> = events
+            .iter()
+            .map(|stored| {
+                (
+                    stored.event.event_id.as_str().to_string(),
+                    (stored.event.event_type.as_str().to_string(), stored.seq.as_u64()),
+                )
+            })
+            .collect();
+        let text = render_turn("t1", &chain, &nodes, &index, None, DEFAULT_DEPTH);
+        assert!(text.contains("verdict: none"), "{text}");
+        // The text renderer was handed no end, but the node count still holds.
+        assert!(text.contains("turn t1: 6 reason node(s)"), "{text}");
+
+        let end = TurnEnd::of(&events, "t1").expect("the yield is the turn's end");
+        let text = render_turn("t1", &chain, &nodes, &index, Some(&end), DEFAULT_DEPTH);
+        assert!(text.contains("turn end: needs_user_input (turn/yielded)"), "{text}");
+    }
+
+    /// `--depth` cuts the derivation, not the summary.
+    #[test]
+    fn a_depth_limit_stops_the_tree_but_keeps_the_verdict_line() {
+        let (chain, events) = fixture();
+        let nodes = chain.turn_nodes("t1");
+        let index: BTreeMap<String, (String, u64)> = events
+            .iter()
+            .map(|stored| {
+                (
+                    stored.event.event_id.as_str().to_string(),
+                    (stored.event.event_type.as_str().to_string(), stored.seq.as_u64()),
+                )
+            })
+            .collect();
+        let text = render_turn("t1", &chain, &nodes, &index, None, 0);
+        assert!(text.contains("[verdict] answer: stopped after the failure"), "{text}");
+        assert!(text.contains("... deeper than 0 levels, stopped here"), "{text}");
+        assert!(!text.contains("[observation] fs.write failed"), "{text}");
     }
 
     #[test]

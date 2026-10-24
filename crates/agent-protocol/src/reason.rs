@@ -1056,6 +1056,111 @@ mod tests {
         assert_eq!(reading.rule(), "reading/no-cue");
     }
 
+    /// One line per way a person asks for something: a request, a prohibition,
+    /// a question that names a check, a correction, a greeting. The table is
+    /// the contract the cue lists keep — each case used to be either a real
+    /// misreading, a risk beside one, or the sentence that keeps a fix honest.
+    /// A criterion is only claimed for an action or a correction.
+    #[test]
+    fn chinese_readings_hold_across_request_negation_and_question() {
+        struct Case {
+            text: &'static str,
+            act: SpeechAct,
+            criterion: bool,
+            cue: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                text: "把 app.log 的内容整体覆盖为一行 `rotated`。",
+                act: SpeechAct::Action,
+                criterion: false,
+                cue: Some("action"),
+            },
+            Case {
+                text: "跑一下 cargo test，把结果贴给我。",
+                act: SpeechAct::Action,
+                criterion: true,
+                cue: Some("test"),
+            },
+            Case {
+                text: "删掉 report.txt。",
+                act: SpeechAct::Action,
+                criterion: true,
+                cue: Some("path"),
+            },
+            Case {
+                text: "读 notes.txt 并告诉我里面的单词。",
+                act: SpeechAct::Action,
+                criterion: true,
+                cue: Some("path"),
+            },
+            Case {
+                text: "调长 config.yaml 里的超时。",
+                act: SpeechAct::Action,
+                criterion: true,
+                cue: Some("path"),
+            },
+            Case {
+                text: "update notes.txt with the new count",
+                act: SpeechAct::Action,
+                criterion: true,
+                cue: Some("path"),
+            },
+            Case {
+                text: "不要改 tests/ 下的文件。",
+                act: SpeechAct::Unclear,
+                criterion: false,
+                cue: Some("negation"),
+            },
+            Case {
+                text: "别删掉 report.txt，先备份一份再删。",
+                act: SpeechAct::Action,
+                criterion: true,
+                cue: Some("negation"),
+            },
+            Case {
+                text: "report.txt 里是什么？不要改它。",
+                act: SpeechAct::Question,
+                criterion: false,
+                cue: Some("negation"),
+            },
+            Case {
+                text: "tests/test_calc.py 为什么期望 2.68？",
+                act: SpeechAct::Question,
+                criterion: false,
+                cue: Some("question"),
+            },
+            Case {
+                text: "不对，刚才那次改错了，重新跑一遍测试。",
+                act: SpeechAct::Correction,
+                criterion: true,
+                cue: Some("correction"),
+            },
+            Case {
+                text: "你好",
+                act: SpeechAct::Greeting,
+                criterion: false,
+                cue: Some("greeting"),
+            },
+            Case {
+                text: "嗯，再看看。", act: SpeechAct::Unclear, criterion: false, cue: None
+            },
+        ];
+        for case in cases {
+            let reading = read(case.text);
+            assert_eq!(reading.act, case.act, "{:?}", case.text);
+            assert_eq!(
+                reading.criterion.is_some(),
+                case.criterion,
+                "criterion for {:?}: {reading:?}",
+                case.text
+            );
+            if let Some(cue) = case.cue {
+                assert!(reading.cues.contains(&cue), "{:?}: {:?}", case.text, reading.cues);
+            }
+        }
+    }
+
     fn a_situation() -> Situation {
         Situation {
             input_kind: String::from("user"),

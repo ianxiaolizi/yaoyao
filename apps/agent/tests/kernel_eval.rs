@@ -1545,6 +1545,47 @@ fn chain_reading(events: &[Value]) -> ChainReading {
             if !reaches_situation(&by_id, &situations, verdict) {
                 unwalkable.push(format!("{} ({turn})", verdict.id));
             }
+            // A rule is a claim; these are the facts it has to be true of.
+            // Reading only the walk would let a verdict say "the check
+            // observed" or "after a failure" without the turn containing
+            // either — the exact drift the rule text is meant to prevent.
+            match verdict.rule.as_str() {
+                "verdict/criterion-observed" => {
+                    if !rests_on_completed_check(events, &by_id, turn, verdict) {
+                        problems.push(format!(
+                            "{} ({turn}) claims a check it does not reach: no completed command \
+                             naming a test reaches it",
+                            verdict.id
+                        ));
+                    }
+                }
+                "verdict/after-failure"
+                    if !turn_nodes.iter().any(|node| node.rule.starts_with("switch/")) =>
+                {
+                    problems.push(format!(
+                        "{} ({turn}) claims a failure verdict but the turn has no switch",
+                        verdict.id
+                    ));
+                }
+                _ => {}
+            }
+        }
+        // The answer and the turn's end have to agree. Checked only when the
+        // exported log carries the turn's terminal event: a synthetic chain or
+        // a truncated log has no end to compare against, and guessing one
+        // would turn "not recorded" into "wrong".
+        if let Some(end) = terminal_event(events, turn) {
+            let final_answer = is_final_answer(end);
+            let has_verdict = turn_nodes.iter().any(|node| node.kind == ReasonKind::Verdict);
+            match (has_verdict, final_answer) {
+                (true, false) => problems.push(format!(
+                    "turn {turn} wrote a verdict but ended {}",
+                    end["type"].as_str().unwrap_or("without a terminal event")
+                )),
+                (false, true) => problems
+                    .push(format!("turn {turn} ended with a final answer but wrote no verdict")),
+                _ => {}
+            }
         }
     }
 
@@ -1605,6 +1646,88 @@ fn reaches_situation(
         }
     }
     false
+}
+
+/// The terminal event a turn wrote, if the exported lines carry one.
+fn terminal_event<'a>(events: &'a [Value], turn: &str) -> Option<&'a Value> {
+    const TERMINAL: [&str; 4] = [
+        EventType::TURN_COMPLETED,
+        EventType::TURN_YIELDED,
+        EventType::TURN_FAILED,
+        EventType::TURN_CANCELLED,
+    ];
+    events.iter().rev().find(|event| {
+        TERMINAL.contains(&event["type"].as_str().unwrap_or_default())
+            && event["turn_id"].as_str() == Some(turn)
+    })
+}
+
+/// A turn that ended with an answer, as opposed to a budget stop.
+fn is_final_answer(end: &Value) -> bool {
+    end["type"] == EventType::TURN_COMPLETED && end["payload"]["stop_reason"] != "max_steps"
+}
+
+/// Whether a `verdict/criterion-observed` reaches a completed command that
+/// names a check.
+///
+/// The rule says the answer rests on a check that ran. The walk from the
+/// verdict has to arrive at such an observation, and the observation's own
+/// event has to be a completion whose call carried a check command — not a
+/// read whose path happened to contain "test".
+fn rests_on_completed_check(
+    events: &[Value],
+    by_id: &BTreeMap<&str, &ReasonNode>,
+    turn: &str,
+    verdict: &ReasonNode,
+) -> bool {
+    let events_by_id: BTreeMap<&str, &Value> = events
+        .iter()
+        .filter_map(|event| event["event_id"].as_str().map(|id| (id, event)))
+        .collect();
+    let mut stack = vec![verdict];
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node.id.as_str()) {
+            continue;
+        }
+        if node.kind == ReasonKind::Observation {
+            for basis in &node.basis {
+                let Some(event) = basis.event.as_deref().and_then(|id| events_by_id.get(id)) else {
+                    continue;
+                };
+                if event["type"] != EventType::TOOL_COMPLETED {
+                    continue;
+                }
+                let call = event["payload"]["provider_tool_call_id"].as_str().unwrap_or_default();
+                if call_names_a_check(events, turn, call) {
+                    return true;
+                }
+            }
+        }
+        for basis in &node.basis {
+            if let Some(next) = basis.node.as_deref().and_then(|id| by_id.get(id).copied()) {
+                stack.push(next);
+            }
+        }
+    }
+    false
+}
+
+/// Whether the call this turn made under `call` ran a command naming a check.
+fn call_names_a_check(events: &[Value], turn: &str, call: &str) -> bool {
+    events.iter().any(|event| {
+        event["type"] == EventType::TOOL_STARTED
+            && event["turn_id"].as_str() == Some(turn)
+            && event["payload"]["provider_tool_call_id"].as_str() == Some(call)
+            && ["command", "cmd", "script"].iter().any(|key| {
+                event["payload"]["arguments"][key].as_str().is_some_and(|command| {
+                    let lower = command.to_lowercase();
+                    ["test", "check", "verify", "测试", "检查", "验证"]
+                        .iter()
+                        .any(|word| lower.contains(word))
+                })
+            })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1960,6 +2083,18 @@ fn reason_node(id: &str, turn: &str, kind: ReasonKind, rule: &str, basis: Vec<Ba
     })
 }
 
+/// One event in the shape `--events` exports: the id a reason node cites, the
+/// turn it belongs to, and its payload.
+#[cfg(test)]
+fn exported(kind: &str, turn: &str, event_id: &str, payload: Value) -> Value {
+    json!({
+        "type": kind,
+        "turn_id": turn,
+        "event_id": event_id,
+        "payload": payload,
+    })
+}
+
 #[test]
 fn an_answer_that_walks_back_to_its_situation_is_walkable() {
     let events = vec![
@@ -2079,6 +2214,150 @@ fn a_verdict_that_cannot_reach_its_situation_is_reported() {
     let reading = chain_reading(&events);
     assert_eq!(reading.walk, ChainWalk::Broken);
     assert!(reading.note.contains("no answer reaches its situation"), "{}", reading.note);
+}
+
+/// "After a failure" is a claim about the turn. Without a switch the claim is
+/// prose the chain cannot support.
+#[test]
+fn a_failure_verdict_without_a_switch_is_reported() {
+    let events = vec![
+        reason_node(
+            "r/1/0",
+            "t1",
+            ReasonKind::Situation,
+            "situation/derive",
+            vec![Basis::fact("the input")],
+        ),
+        reason_node(
+            "r/1/1",
+            "t1",
+            ReasonKind::Verdict,
+            "verdict/after-failure",
+            vec![Basis::node("r/1/0")],
+        ),
+    ];
+    let reading = chain_reading(&events);
+    assert_eq!(reading.walk, ChainWalk::Broken);
+    assert!(reading.note.contains("no switch"), "{}", reading.note);
+}
+
+/// A criterion-observed verdict must reach a completed command that names a
+/// check. The shape below is the good case; the two after it are the ways the
+/// claim has gone wrong in real use.
+#[test]
+fn a_check_verdict_is_held_to_a_completed_check_command() {
+    let chain = |command: Option<&str>, completed: bool| -> Vec<Value> {
+        let mut events = vec![
+            reason_node(
+                "r/1/0",
+                "t1",
+                ReasonKind::Situation,
+                "situation/derive",
+                vec![Basis::fact("the input")],
+            ),
+            reason_node(
+                "r/1/1",
+                "t1",
+                ReasonKind::Action,
+                "action/dispatch",
+                vec![Basis::node("r/1/0")],
+            ),
+            reason_node(
+                "r/1/2",
+                "t1",
+                ReasonKind::Observation,
+                "observation/result",
+                vec![Basis::node("r/1/1"), Basis::event("e-result")],
+            ),
+            reason_node(
+                "r/1/3",
+                "t1",
+                ReasonKind::Verdict,
+                "verdict/criterion-observed",
+                vec![Basis::node("r/1/2")],
+            ),
+        ];
+        let arguments = match command {
+            Some(command) => json!({ "command": command }),
+            None => json!({ "path": "tests/test_calc.py" }),
+        };
+        events.push(exported(
+            EventType::TOOL_STARTED,
+            "t1",
+            "e-start",
+            json!({ "provider_tool_call_id": "c1", "arguments": arguments }),
+        ));
+        events.push(exported(
+            if completed { EventType::TOOL_COMPLETED } else { EventType::TOOL_FAILED },
+            "t1",
+            "e-result",
+            json!({ "provider_tool_call_id": "c1" }),
+        ));
+        events.push(exported(
+            EventType::TURN_COMPLETED,
+            "t1",
+            "e-end",
+            json!({ "final_content": "done" }),
+        ));
+        events
+    };
+
+    let good = chain_reading(&chain(Some("cargo test"), true));
+    assert_eq!(good.walk, ChainWalk::Walks, "{}", good.note);
+
+    let read = chain_reading(&chain(None, true));
+    assert_eq!(read.walk, ChainWalk::Broken);
+    assert!(read.note.contains("claims a check it does not reach"), "{}", read.note);
+
+    let failed = chain_reading(&chain(Some("cargo test"), false));
+    assert_eq!(failed.walk, ChainWalk::Broken);
+    assert!(failed.note.contains("claims a check it does not reach"), "{}", failed.note);
+}
+
+/// The verdict and the turn's terminal event have to tell the same story.
+#[test]
+fn an_answer_and_a_turn_end_that_disagree_are_reported() {
+    let situation = || {
+        reason_node(
+            "r/1/0",
+            "t1",
+            ReasonKind::Situation,
+            "situation/derive",
+            vec![Basis::fact("the input")],
+        )
+    };
+    let verdict = || {
+        reason_node(
+            "r/1/1",
+            "t1",
+            ReasonKind::Verdict,
+            "verdict/answer",
+            vec![Basis::node("r/1/0")],
+        )
+    };
+
+    let answered_then_yielded =
+        vec![situation(), verdict(), exported(EventType::TURN_YIELDED, "t1", "e-end", json!({}))];
+    let reading = chain_reading(&answered_then_yielded);
+    assert_eq!(reading.walk, ChainWalk::Broken);
+    assert!(reading.note.contains("wrote a verdict but ended"), "{}", reading.note);
+
+    let ended_without_an_answer = vec![
+        situation(),
+        exported(EventType::TURN_COMPLETED, "t1", "e-end", json!({ "final_content": "x" })),
+    ];
+    let reading = chain_reading(&ended_without_an_answer);
+    assert_eq!(reading.walk, ChainWalk::Broken);
+    assert!(reading.note.contains("wrote no verdict"), "{}", reading.note);
+
+    // A budget cut is the one non-final end that is expected to have no
+    // verdict; it stays "no answer", not "broken".
+    let cut = vec![
+        situation(),
+        exported(EventType::TURN_COMPLETED, "t1", "e-end", json!({ "stop_reason": "max_steps" })),
+    ];
+    let reading = chain_reading(&cut);
+    assert_eq!(reading.walk, ChainWalk::NoAnswer, "{}", reading.note);
 }
 
 #[test]

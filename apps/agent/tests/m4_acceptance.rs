@@ -456,9 +456,10 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
 
     // The log explains itself: `why` walks from the answer back through the
     // observation, the call, the stance, the reading and the turn's input.
-    let outcome = agent_cli::reason::run_why(h.stack.store.as_ref(), &h.session_id, None, false)
-        .await
-        .expect("the chain reads back");
+    let outcome =
+        agent_cli::reason::run_why(h.stack.store.as_ref(), &h.session_id, None, None, false)
+            .await
+            .expect("the chain reads back");
     assert_eq!(outcome.verdict, agent_cli::Verdict::Answered);
     let agent_cli::CliOutput::Text(text) = outcome.output else {
         panic!("why rendered as JSON without being asked");
@@ -492,9 +493,10 @@ async fn a_failed_call_switches_the_turn_and_why_says_so() {
     assert_eq!(report.stop_reason, StopReason::FinalAnswer);
     assert_eq!(report.final_content.as_deref(), Some("I could not read it"));
 
-    let outcome = agent_cli::reason::run_why(h.stack.store.as_ref(), &h.session_id, None, false)
-        .await
-        .expect("the chain reads back");
+    let outcome =
+        agent_cli::reason::run_why(h.stack.store.as_ref(), &h.session_id, None, None, false)
+            .await
+            .expect("the chain reads back");
     let agent_cli::CliOutput::Text(text) = outcome.output else {
         panic!("why rendered as JSON without being asked");
     };

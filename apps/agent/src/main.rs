@@ -175,7 +175,7 @@ fn usage() {
          interrupt                  Stop the run in flight at its next step boundary\n  \
          export [--out <dir>]       Write the session as session.md + bundle.json (or stdout)\n  \
          export --redacted          Same, with secret-shaped tokens replaced by ***\n  \
-         why [--turn <id>]          Explain that turn's reasoning chain, backwards\n  \
+         why [--turn <id>] [--depth <n>]\n                              Explain that turn's reasoning chain, backwards\n                              (--help says what a turn's end and verdict mean)\n  \
          status                     Show session state\n  \
          approve <id> [scope]       Approve a pending request [once|turn|session|always]\n  \
          deny <id> [--only]         Deny a pending request (cascades to the session's pending)\n  \
@@ -453,18 +453,48 @@ async fn status(args: &Args) {
 /// is assembled, so it still answers when the configuration that ran the turn
 /// has since broken. It writes nothing, so `--events` has nothing to stream.
 async fn why(args: &Args) {
+    // Help is answered before the log is opened: asking what `why` does should
+    // work in a directory with no session at all.
+    if args.command_args().iter().any(|argument| argument == "--help" || argument == "-h") {
+        print_why_help();
+        std::process::exit(0);
+    }
     if args.events {
         eprintln!("why writes no events; --events has nothing to stream");
         std::process::exit(EXIT_DID_NOT_RUN);
     }
     let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
     let turn = option(args, "--turn");
-    let outcome = match run_why(store.as_ref(), &args.session, turn.as_deref(), args.json).await {
-        Ok(outcome) => outcome,
-        Err(error) => fail(args, &error),
-    };
+    let depth = option(args, "--depth").map(|value| {
+        value
+            .parse::<usize>()
+            .unwrap_or_else(|_| fail(args, &format!("--depth needs a whole number, not '{value}'")))
+    });
+    let outcome =
+        match run_why(store.as_ref(), &args.session, turn.as_deref(), depth, args.json).await {
+            Ok(outcome) => outcome,
+            Err(error) => fail(args, &error),
+        };
     print(&outcome.output);
     exit_on(outcome.verdict);
+}
+
+/// What `why` is and how to aim it.
+fn print_why_help() {
+    println!(
+        "Usage: agent why [--turn <id>] [--depth <n>] [--session <id>] [--json]\n\n\
+         Read a turn's reasoning chain back from the session log and render it\n\
+         backwards: the newest end first, then the nodes it was derived from.\n\
+         The chain is written by the kernel around the model's choices; it never\n\
+         enters a model request, so reading it costs no tokens.\n\n\
+         Options:\n  \
+         --turn <id>   Explain this turn (default: the latest turn with a chain)\n  \
+         --depth <n>   Levels of derivation to show (default: {depth}; 0 shows the ends)\n  \
+         --json        One structured object on stdout (nodes, verdict, stop, check)\n\
+         \nThe first lines name the turn's end and its verdict, if it wrote one:\n\
+         a turn cut by the step budget, held for approval or cancelled has no answer.",
+        depth = agent_cli::reason::DEFAULT_DEPTH,
+    );
 }
 
 /// `steer`: queue text for whatever turn is in flight in this session.

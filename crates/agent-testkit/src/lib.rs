@@ -2,7 +2,7 @@
 
 #![deny(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures_channel::mpsc;
@@ -700,6 +700,11 @@ impl ContextEngine for FakeContextEngine {
 /// asking of a provider is what it was handed, not only what it accepted.
 pub struct FakeToolProvider {
     tools: HashMap<String, (ToolResult, ToolSideEffect)>,
+    /// Results still to hand out before the frozen map applies, per tool. A
+    /// retry that succeeds after a failure is one tool with two outcomes, and
+    /// a test about what the loop does after the second one needs the provider
+    /// to say both.
+    queued: Mutex<HashMap<String, VecDeque<ToolResult>>>,
     /// Tools the provider declares as unsafe to retry. The judgment gates key
     /// on the declaration, not on the call, so a test that exercises them has
     /// to be able to say a tool is not idempotent.
@@ -717,6 +722,7 @@ impl FakeToolProvider {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            queued: Mutex::new(HashMap::new()),
             non_idempotent: HashSet::new(),
             calls: Mutex::new(Vec::new()),
         }
@@ -743,6 +749,24 @@ impl FakeToolProvider {
         side_effect: ToolSideEffect,
     ) -> Self {
         self.tools.insert(name.to_string(), (result, side_effect));
+        self
+    }
+
+    /// Register a tool whose outcomes are given in order: each call takes the
+    /// next result, and the last one answers every call after it. The frozen
+    /// map still names the tool, so it is offered in the manifest and has a
+    /// side effect class.
+    pub fn with_scripted_results(
+        mut self,
+        name: &str,
+        results: Vec<ToolResult>,
+        side_effect: ToolSideEffect,
+    ) -> Self {
+        let last = results.last().cloned().unwrap_or_else(|| ToolResult::completed(""));
+        self.tools.insert(name.to_string(), (last, side_effect));
+        if let Ok(mut queued) = self.queued.lock() {
+            queued.insert(name.to_string(), results.into());
+        }
         self
     }
 
@@ -789,6 +813,14 @@ impl ToolProvider for FakeToolProvider {
         // and a record that skipped it would answer a different question.
         if let Ok(mut calls) = self.calls.lock() {
             calls.push(invocation.clone());
+        }
+        // A scripted outcome comes first; a tool with none (or with its script
+        // spent) answers from the frozen map.
+        if let Ok(mut queued) = self.queued.lock()
+            && let Some(results) = queued.get_mut(&invocation.tool_name)
+            && let Some(result) = results.pop_front()
+        {
+            return Ok(result);
         }
         self.tools.get(&invocation.tool_name).map(|(result, _)| result.clone()).ok_or_else(|| {
             ToolProviderError::UnknownTool {
