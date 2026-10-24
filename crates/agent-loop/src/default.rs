@@ -3915,6 +3915,40 @@ mod tests {
         assert_eq!(required.payload["tool_name"], "shell.run");
     }
 
+    /// A call held by an approval runs between turns, so the failure it leaves
+    /// is not a mid-turn switch: the resumed turn opens in repair and says so
+    /// with `stance/repair-failure`. Writing a `switch/*` node here would record
+    /// a change of posture that did not happen inside the turn (CONTRACT #78).
+    #[tokio::test]
+    async fn a_resumed_turn_opens_in_repair_without_claiming_a_switch() {
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+        let tools = Arc::new(FakeToolProvider::new());
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.state = Some(facts());
+        turn.pending_failure = Some(TurnFailureFacts {
+            call_id: "call-1".to_string(),
+            tool: "shell.run".to_string(),
+            detail: "exit code 1: no such file".to_string(),
+        });
+        let outcome = run_turn(&loop_, &turn).await;
+
+        let nodes = reason_nodes(&outcome.events);
+        let stance = nodes.iter().find(|node| node.kind == ReasonKind::Stance).expect("a stance");
+        assert_eq!(stance.rule, "stance/repair-failure");
+        assert!(
+            !nodes.iter().any(|node| node.rule.starts_with("switch/")),
+            "the resume did not switch posture inside the turn"
+        );
+        assert_eq!(outcome.final_content.as_deref(), Some("done"));
+    }
+
     /// A reconcile that omits `reviewed` is completed with the call that
     /// actually failed, instead of costing the model a call to restate a fact
     /// the loop already holds.
