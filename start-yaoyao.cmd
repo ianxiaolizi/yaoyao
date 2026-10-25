@@ -1,4 +1,0 @@
-@echo off
-setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\gui\start.ps1" %*
-endlocal

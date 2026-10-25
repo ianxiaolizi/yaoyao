@@ -30,14 +30,7 @@
 
 ## 双击启动
 
-仓库根目录有：
-
-```text
-启动爻爻.cmd
-start-yaoyao.cmd
-```
-
-双击任意一个即可：
+双击仓库根目录的 `启动爻爻.cmd`（它只负责调 `scripts\gui\start.ps1`，真正的逻辑在那一个脚本里）：
 
 - 自动构建 `target\debug\agent.exe`；
 - 使用 `G:\yaoyao-work` 作为工作区（存在时），数据目录用 `G:\yaoyao-work\.agent`；
