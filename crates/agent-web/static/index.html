@@ -90,7 +90,10 @@
           <textarea id="input" placeholder="继续说…" rows="1" aria-label="给爻爻的消息"></textarea>
           <div class="inp-f">
             <button class="cbtn" id="attachBtn" disabled title="附件在 v1.1">＋</button>
-            <span class="cbtn" id="modelName" title="模型由启动时的配置决定">—</span>
+            <details class="menu-wrap menu-up" id="modelMenu">
+              <summary class="cbtn" id="modelName" title="这个会话用的模型 · 点此切换，下一轮生效">—</summary>
+              <div class="menu" id="modelOptions"></div>
+            </details>
             <span class="cbtn" title="审批策略由 profile / AGENT_JUDGMENT 决定；审批卡上可以按次、按回合或按会话授权">审批：逐次（配置）</span>
             <span class="sp"></span>
             <button class="stop" id="stopBtn" title="在下一个步骤边界停下"><span class="sq"></span>停止</button>

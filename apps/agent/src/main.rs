@@ -505,13 +505,15 @@ fn print_why_help() {
 /// `web --help`: what starting the server would do, without starting it.
 fn print_web_help() {
     println!(
-        "Usage: agent web [--port <n>]\n\n\
+        "Usage: agent web [--port <n>] [--provider <echo|openai>] [--model <name>]\n\n\
          Serve the web GUI on loopback. The URL is printed with its one-time\n\
          access token in the fragment; open it as printed, because a URL without\n\
          the token cannot talk to the API. The process stays in the foreground\n\
          until Ctrl-C.\n\n\
          Options:\n  \
-         --port <n>   Listen on this port (default: {port})\n\n\
+         --port <n>                    Listen on this port (default: {port})\n  \
+         --provider <echo|openai>      Model provider (default: AGENT_MODEL_PROVIDER, else echo)\n  \
+         --model <name>                Ask the provider for this model\n\n\
          The GUI is a view over the same session log the CLI writes: turns it\n\
          starts land in that log, and a session the CLI ran reads back here.",
         port = DEFAULT_WEB_PORT,
@@ -931,6 +933,32 @@ async fn tick(args: &Args) {
     exit_on(outcome.verdict);
 }
 
+/// The models a session may be switched to from the page.
+///
+/// Offered rather than hardcoded by the page: a provider is listed only when
+/// this process could actually build it, so the composer never shows a choice
+/// whose only possible outcome is an error. The echo stub is always available;
+/// the HTTP adapter is listed when its endpoint is configured.
+fn model_options(resolved_model: Option<&str>) -> Vec<agent_web::ModelOption> {
+    let mut options = vec![agent_web::ModelOption {
+        provider: "echo".to_string(),
+        model: None,
+        label: "echo".to_string(),
+    }];
+    if let Ok(config) = agent_model_openai::OpenAiCompatConfig::from_env() {
+        // The configuration's model wins over the environment's for the same
+        // reason it does in `providers::select_kind`: a run must have exactly
+        // one answer to "which model".
+        let model = resolved_model.map(str::to_string).unwrap_or(config.model);
+        options.push(agent_web::ModelOption {
+            provider: "openai".to_string(),
+            label: model.clone(),
+            model: Some(model),
+        });
+    }
+    options
+}
+
 /// `web`: serve the GUI on loopback.
 ///
 /// The server binds `127.0.0.1` and prints its URL with a one-time token in the
@@ -988,8 +1016,20 @@ async fn web(args: &Args) {
     // the environment happens to carry. The echo provider has no model of its
     // own, so a stale `AGENT_MODEL_NAME` (usually set for the OpenAI-compatible
     // endpoint) must not leak into the label and claim a model nothing runs.
-    let provider =
-        std::env::var(agent::providers::ENV_PROVIDER).unwrap_or_else(|_| "echo".to_string());
+    //
+    // `--provider` wins over the environment: one server can run the echo stub
+    // while another talks to a real endpoint, without either changing what a
+    // third one sees. The provider is built once here so a bad name or a
+    // missing credential stops the server before it prints a URL the page
+    // cannot honour.
+    let provider = match option(args, "--provider") {
+        Some(named) => named,
+        None => agent::providers::env_provider(),
+    };
+    if let Err(error) = agent::providers::select_kind(&provider, resolved.model.as_deref()) {
+        eprintln!("model provider: {error}");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
     let model_label = if provider == "echo" {
         "echo".to_string()
     } else {
@@ -1025,10 +1065,12 @@ async fn web(args: &Args) {
             "fork",
             "steer",
             "interrupt",
+            "model",
         ]
         .iter()
         .map(|name| name.to_string())
         .collect(),
+        models: model_options(resolved.model.as_deref()),
     };
 
     let data_dir = PathBuf::from(data_dir());
@@ -1040,10 +1082,19 @@ async fn web(args: &Args) {
         sandbox: sandbox_mode,
         network_allowed,
         judgment: true,
+        provider,
+        store: store.clone(),
     }));
     sessions.start_reaper();
     let backend: Arc<dyn agent_web::Backend> = sessions;
-    let config = agent_web::Config { port, meta, store, data_dir, backend: Some(backend) };
+    let config = agent_web::Config {
+        port,
+        meta,
+        store,
+        data_dir,
+        backend: Some(backend),
+        now: agent::clock::now,
+    };
 
     let server = match agent_web::Server::bind(config).await {
         Ok(server) => server,

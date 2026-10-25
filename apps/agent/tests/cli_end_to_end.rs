@@ -947,6 +947,28 @@ fn the_help_lists_the_commands_that_exist() {
 }
 
 #[test]
+fn web_names_the_model_provider_and_refuses_one_it_cannot_build() {
+    // Which model the page talks to is decided when the server starts, so a
+    // provider that cannot be built has to be refused there: serving a page
+    // whose every turn would fail is worse than not starting.
+    let (data, workspace) = dirs();
+
+    let help = ran(data.path(), workspace.path(), &["web", "--help"]);
+    assert!(help.ok, "{}", help.err);
+    assert!(help.out.contains("--provider <echo|openai>"), "{}", help.out);
+    assert!(help.out.contains("--model <name>"), "{}", help.out);
+
+    let refused = ran(data.path(), workspace.path(), &["web", "--provider", "nope"]);
+    assert_eq!(refused.code, Some(2), "{}", refused.err);
+    assert!(refused.err.contains("model provider:"), "{}", refused.err);
+    assert!(
+        !refused.out.contains("http://127.0.0.1"),
+        "a refused provider must not print a URL: {}",
+        refused.out
+    );
+}
+
+#[test]
 fn a_run_records_the_configuration_it_executed_under() {
     let (data, workspace, home) = dirs_with_config();
     let user = write_config(

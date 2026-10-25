@@ -14,6 +14,7 @@
 //! joins the same run, and a connection that is gone costs nothing but a failed
 //! `send`.
 
+use agent_kernel::model_selection::ModelChoice;
 use agent_protocol::ids::SessionId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -182,4 +183,17 @@ pub trait Backend: Send + Sync {
     /// Ask the turn in flight to stop. `Ok(false)` means there was nothing to
     /// stop; that is an answer, not a failure.
     async fn interrupt(&self, session: &SessionId) -> Result<bool, BackendError>;
+
+    /// Choose the provider and model this session's next turns should use.
+    ///
+    /// Not a turn: nothing runs, and a turn already in flight keeps the provider
+    /// it was assembled with. The answer is the choice as it was recorded, so
+    /// the page can label itself from the log instead of from what it hoped it
+    /// selected.
+    async fn set_model(
+        &self,
+        session: &SessionId,
+        provider: &str,
+        model: Option<&str>,
+    ) -> Result<ModelChoice, BackendError>;
 }

@@ -92,7 +92,25 @@ pub struct SelectedProvider {
 /// the name is still recorded in the route, because it is what was requested,
 /// and a log that quietly dropped it would make a `--model` invisible.
 pub fn select(model: Option<&str>) -> Result<SelectedProvider, ProviderConfigError> {
-    match std::env::var(ENV_PROVIDER).unwrap_or_else(|_| "echo".to_string()).as_str() {
+    select_kind(&env_provider(), model)
+}
+
+/// The provider named by `AGENT_MODEL_PROVIDER`, or `echo` when unset.
+pub fn env_provider() -> String {
+    std::env::var(ENV_PROVIDER).unwrap_or_else(|_| "echo".to_string())
+}
+
+/// The same, with the provider named by the caller rather than the environment.
+///
+/// `agent web --provider` passes a name here instead of writing one into the
+/// environment: by the time the server runs a turn the process has spawned
+/// threads, and a route should come from the decision the host made when it
+/// started, not from a variable that could still change underneath it.
+pub fn select_kind(
+    kind: &str,
+    model: Option<&str>,
+) -> Result<SelectedProvider, ProviderConfigError> {
+    match kind {
         "echo" => Ok(SelectedProvider {
             provider: Arc::new(EchoModelProvider),
             route: ModelRoute::new(ModelTier::Main, "echo", model.unwrap_or("echo")),

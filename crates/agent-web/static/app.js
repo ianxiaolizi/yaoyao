@@ -293,6 +293,67 @@
     return Number(state.meta?.budget || 0) || BUDGET_FALLBACK;
   }
 
+  // What the composer and the header call a session's model. A session that
+  // chose one shows the choice; otherwise the server's startup label applies.
+  function modelLabel(choice) {
+    if (!choice) return state.meta?.model || '—';
+    if (!choice.model) return choice.provider === 'echo' ? 'echo' : choice.provider;
+    return choice.model;
+  }
+
+  // The models this server can actually build. The host supplies the list, so
+  // the menu never offers a choice whose only outcome is an error.
+  function renderModelOptions() {
+    const host = $('modelOptions');
+    if (!host) return;
+    const options = state.meta?.models || [];
+    if (!options.length) {
+      host.innerHTML = '<div class="menu-note">这个服务没有可切换的模型</div>';
+      return;
+    }
+    const current = state.activeSummary?.model || null;
+    host.innerHTML = options
+      .map((option) => {
+        const chosen =
+          current &&
+          current.provider === option.provider &&
+          (current.model || '') === (option.model || '');
+        return `<button data-provider="${esc(option.provider)}" data-model="${esc(option.model || '')}">${chosen ? '✓ ' : ''}${esc(option.label)}</button>`;
+      })
+      .join('');
+  }
+
+  async function chooseModel(provider, model) {
+    $('modelMenu').open = false;
+    // A model can be chosen before the first word: the choice is what the
+    // session's first turn will be assembled with, so starting the session
+    // here is the same act as typing. The id is minted locally, exactly as the
+    // new-task button does it, and the choice creates the log.
+    if (!state.active) newSession();
+    try {
+      const result = await api(`/api/sessions/${encodeURIComponent(state.active)}/model`, {
+        method: 'POST',
+        body: { v: 1, provider, model: model || null },
+      });
+      const choice = result?.model || { provider, model: model || null };
+      // The label has to change on this click, not when the first turn lands.
+      // A fresh session has no summary yet, so stand one up around the choice;
+      // the first refresh replaces it with the server's own.
+      state.activeSummary = { ...(state.activeSummary || { id: state.active }), model: choice };
+      updateHeader();
+      // The switch belongs to the next turn: a turn already running keeps the
+      // model it was assembled with, and saying so avoids a "why no change" click.
+      toast(
+        state.running
+          ? `这个会话改用 ${modelLabel(choice)}；正在跑的这轮仍然用原来的模型，下一轮生效`
+          : `这个会话改用 ${modelLabel(choice)}；下一轮生效`,
+      );
+      scheduleSessionsRefresh();
+    } catch (error) {
+      toast(error.message || '模型没有切成', 'error');
+    }
+  }
+
   function renderSessions() {
     const host = $('threads');
     const query = state.search.trim().toLowerCase();
@@ -392,10 +453,12 @@
     $('sessionTag').textContent = state.active ? '会话' : '本地';
     $('sessionTag').title = state.active ? (summary?.id || state.active || '') : '';
     $('crumbSep').hidden = !state.active;
-    if (state.meta) {
-      $('modelName').textContent = state.meta.model || '—';
-      $('modelTag').innerHTML = `<i></i><span>${esc(state.meta.model || '—')} · ${esc(state.meta.sandbox || '—')}</span>`;
-    }
+    // The model belongs to the session once someone chose one; until then the
+    // server's startup label is what the next turn will use.
+    const model = modelLabel(summary?.model);
+    $('modelName').textContent = model;
+    $('modelTag').innerHTML = `<i></i><span>${esc(model)} · ${esc(state.meta?.sandbox || '—')}</span>`;
+    renderModelOptions();
     const usage = summary?.usage;
     if (usage) {
       const used = usedTokens(summary);
@@ -2140,6 +2203,16 @@
     });
     $('sendBtn').addEventListener('click', send);
     $('stopBtn').addEventListener('click', stop);
+    $('modelOptions').addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-provider]');
+      if (button) chooseModel(button.dataset.provider, button.dataset.model || null);
+    });
+    // A details element stays open until its summary is clicked again, which
+    // would leave the menu over the composer after a click anywhere else.
+    document.addEventListener('click', (event) => {
+      const menu = $('modelMenu');
+      if (menu && menu.open && !menu.contains(event.target)) menu.open = false;
+    });
     $('newTask').addEventListener('click', newSession);
     $('sideToggle').addEventListener('click', () => toggleSide(!document.body.classList.contains('side-open')));
     $('sideBackdrop').addEventListener('click', () => toggleSide(false));

@@ -39,7 +39,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -69,6 +69,24 @@ pub struct Meta {
     /// What this build can actually do. The UI greys out what is missing rather
     /// than offering a button that can only fail.
     pub capabilities: Vec<String>,
+    /// The models a session may be switched to. Assembled at startup from the
+    /// providers this process could actually build, so the page never offers a
+    /// choice that can only fail.
+    pub models: Vec<ModelOption>,
+}
+
+/// One model a session may be switched to.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelOption {
+    /// The provider name the host builds from — `echo` or `openai`.
+    pub provider: String,
+    /// The model name to ask it for. Absent means "the provider's own default",
+    /// which is a complete choice: naming a provider is enough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// What the composer shows. The host composes it because only it knows what
+    /// a given provider is called on screen; the page does not guess.
+    pub label: String,
 }
 
 /// Why the server could not start.
@@ -108,6 +126,14 @@ pub struct Config {
     /// still lists and reads sessions, and the write endpoints answer "this
     /// build cannot run turns" rather than pretending to accept one.
     pub backend: Option<Arc<dyn Backend>>,
+    /// The process edge's one clock reading, handed in rather than read here.
+    ///
+    /// Every decision that uses a time takes `now` as a parameter
+    /// (CONTRACT.md §7 裁决 #20), and this layer's decisions — has an approval
+    /// expired, is a schedule overdue, what a row's "now" is — are no exception.
+    /// The binary passes the process edge's clock in; a test passes a fixed
+    /// instant and gets a deterministic answer.
+    pub now: fn() -> DateTime<Utc>,
 }
 
 /// The state every request shares.
@@ -117,6 +143,8 @@ struct AppState {
     store: Arc<dyn EventStore>,
     data_dir: PathBuf,
     backend: Option<Arc<dyn Backend>>,
+    /// The clock every handler in this process reads, from [`Config::now`].
+    now: fn() -> DateTime<Utc>,
     /// Folded logs, keyed by `(size, mtime)`. The sidebar refresh and the
     /// transcript endpoint read through this; a turn that appends invalidates
     /// its entry by touching the file.
@@ -135,6 +163,11 @@ struct AppState {
 }
 
 impl AppState {
+    /// The instant this request is served at.
+    fn now(&self) -> DateTime<Utc> {
+        (self.now)()
+    }
+
     /// The live fan-out for one session, created on first use.
     fn live_sink(&self, session: &str) -> LiveSink {
         let mut channels = lock(&self.live);
@@ -236,18 +269,21 @@ impl Server {
     /// address is never `0.0.0.0`: a GUI that answers the network is a different
     /// product with a different threat model.
     pub async fn bind(config: Config) -> Result<Self, WebError> {
-        let Config { port, meta, store, data_dir, backend } = config;
+        let Config { port, meta, store, data_dir, backend, now } = config;
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|source| WebError::Bind { port, source })?;
         let addr = listener.local_addr().map_err(|source| WebError::Bind { port, source })?;
-        let token = uuid::Uuid::new_v4().simple().to_string();
+        // The token is an id, so it is drawn where every id is drawn: one mint
+        // site in the workspace, not a second reach for randomness.
+        let token = agent_protocol::ids::fresh_id();
         let app = router(Arc::new(AppState {
             token: token.clone(),
             meta,
             store,
             data_dir,
             backend,
+            now,
             reads: sessions::ReadModel::new(),
             live: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
@@ -303,6 +339,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/fork", post(fork))
         .route("/api/sessions/{id}/steer", post(steer))
         .route("/api/sessions/{id}/interrupt", post(interrupt))
+        .route("/api/sessions/{id}/model", post(select_model))
         .route("/api/sessions/{id}/why", get(why))
         .layer(middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state)
@@ -353,6 +390,7 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "judgment": state.meta.judgment,
         "budget": state.meta.budget,
         "capabilities": state.meta.capabilities,
+        "models": state.meta.models,
     }))
 }
 
@@ -360,7 +398,8 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
 async fn sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiFailure> {
-    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads)
+    let now = state.now();
+    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads, now)
         .await
         .map_err(ApiFailure::read)?;
     Ok(Json(serde_json::json!({ "v": PROTOCOL, "sessions": list })))
@@ -372,7 +411,8 @@ async fn session(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads)
+    let now = state.now();
+    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads, now)
         .await
         .map_err(ApiFailure::read)?;
     let found = list
@@ -410,6 +450,7 @@ async fn transcript(
         &SessionId::from_string(&id),
         since,
         &state.reads,
+        state.now(),
     )
     .await
     .map_err(ApiFailure::read)?;
@@ -453,7 +494,8 @@ async fn events(
                 message: error.to_string(),
             })
         })?;
-    let transcript = sessions::LiveTranscript::fold(&history).map_err(ApiFailure::read)?;
+    let transcript =
+        sessions::LiveTranscript::fold(&history, state.now()).map_err(ApiFailure::read)?;
     let head = transcript.head();
     let initial = transcript.snapshot(from);
     let live = state.live_sink(&id).subscribe();
@@ -570,7 +612,7 @@ async fn schedules(
     let inbox = Inbox::new(state.store.clone());
     let items =
         inbox.scheduled(&session).await.map_err(|error| ApiFailure::internal(error.to_string()))?;
-    let now = Utc::now();
+    let now = state.now();
     let rows: Vec<Value> = items
         .iter()
         .map(|item| {
@@ -613,7 +655,7 @@ async fn schedule(
     if when.is_empty() || text.is_empty() {
         return Err(ApiFailure::bad_request("when and text must both be present"));
     }
-    let now = Utc::now();
+    let now = state.now();
     let due_at = agent_kernel::schedule::parse_when(when, now)
         .map_err(|error| ApiFailure::bad_request(error.to_string()))?;
     let session = SessionId::from_string(&id);
@@ -897,7 +939,7 @@ async fn approve(
         .fold(state.store.as_ref(), &state.data_dir, &session)
         .await
         .map_err(ApiFailure::read)?;
-    let now = Utc::now();
+    let now = state.now();
     let pending = folded.transcript.items.iter().any(|item| {
         matches!(
             &item.body,
@@ -1046,6 +1088,53 @@ async fn steer(
     });
 
     Ok((StatusCode::ACCEPTED, Json(json!({ "v": PROTOCOL, "ok": true, "queued": true }))))
+}
+
+/// `POST /api/sessions/{id}/model`: choose the model this session's next turns
+/// use.
+///
+/// The choice is written into the session's log, so it survives a restart and
+/// a fork inherits it. It takes effect on the next turn: a turn already running
+/// keeps the model it was assembled with.
+async fn select_model(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiFailure> {
+    // Only the id is checked, not that a log exists yet: a model is chosen
+    // *before* the first message, so the honest home for the choice is a log
+    // this request creates. Refusing here would mean the first turn of every
+    // new session runs on whatever the server started with.
+    check_id(&id)?;
+    let body = json_body(body)?;
+    check_version(&body)?;
+    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if provider.is_empty() {
+        return Err(ApiFailure::bad_request("provider must not be empty"));
+    }
+    // An absent or null model means "the provider's own default"; an empty
+    // string is the page sending nothing, which is not a model name.
+    let model = match body.get("model").and_then(Value::as_str).map(str::trim) {
+        Some("") | None => None,
+        Some(named) => Some(named.to_string()),
+    };
+    let Some(backend) = state.backend.clone() else {
+        return Err(ApiFailure::unavailable("this build has no turn driver"));
+    };
+
+    let session = SessionId::from_string(&id);
+    match backend.set_model(&session, &provider, model.as_deref()).await {
+        Ok(choice) => {
+            Ok((StatusCode::OK, Json(json!({ "v": PROTOCOL, "ok": true, "model": choice }))))
+        }
+        // A name this build cannot build is the request's fault, not the
+        // server's: answer 400 with the host's own explanation of what it knows.
+        Err(error) if error.code == "invalid_model" => Err(ApiFailure::bad_request(error.message)),
+        Err(error) => Err(ApiFailure::internal(format!(
+            "模型选择没有写进日志（{}）：{}",
+            error.code, error.message
+        ))),
+    }
 }
 
 /// `POST /api/sessions/{id}/interrupt`: ask the turn in flight to stop.

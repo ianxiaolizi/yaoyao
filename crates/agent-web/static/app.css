@@ -671,6 +671,12 @@ body.turn-running .stop{display:inline-flex}
 .menu{position:absolute;right:0;top:calc(100% + 5px);z-index:20;min-width:120px;padding:4px;border-radius:7px;background:var(--panel-bg);border:1px solid var(--line-2);box-shadow:0 10px 30px rgba(0,0,0,.16)}
 .menu button{display:block;width:100%;text-align:left;border:0;background:none;font:inherit;font-size:11px;color:var(--ink-2);padding:6px 8px;border-radius:4px;cursor:pointer}
 .menu button:hover{background:var(--hover);color:var(--ink)}
+/* The composer sits at the bottom of the window: a menu below its anchor would
+   open off-screen, so this variant opens upward from the same anchor. */
+.menu-up>.menu{top:auto;bottom:calc(100% + 5px);left:0;right:auto;min-width:150px;background:#fafafc}
+[data-theme="dark"] .menu-up>.menu{background:#17171b}
+.menu-up>summary{cursor:pointer}
+.menu .menu-note{padding:6px 8px;font-size:11px;color:var(--ink-2)}
 .art-link{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line-2);background:none;color:var(--ink-2);font:inherit;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;margin-top:2px}
 .art-link:hover{background:var(--hover);color:var(--ink)}
 

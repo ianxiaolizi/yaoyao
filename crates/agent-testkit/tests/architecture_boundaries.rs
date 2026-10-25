@@ -177,10 +177,23 @@ fn dependency_direction_matches_spec() {
         ("crates/agent-testkit", &["agent-protocol", "agent-ports"]),
         ("crates/agent-cli", &["agent-protocol", "agent-ports", "agent-kernel"]),
         // The front door: a transport, the read model over the log, and the
-        // command layer's readers. It may fold projections and call `agent-cli`,
-        // but it never names the kernel — writes go through the same commands
-        // the terminal uses.
-        ("crates/agent-web", &["agent-cli", "agent-protocol", "agent-ports", "agent-projection"]),
+        // command layer's readers. It may fold projections and call `agent-cli`;
+        // every write still goes through the same commands the terminal uses.
+        // It names the kernel for the two things that live next to their writer
+        // rather than in a projection — the approval TTL a card counts down, and
+        // the session's recorded model choice — and the artifact store, whose
+        // bytes it serves.
+        (
+            "crates/agent-web",
+            &[
+                "agent-cli",
+                "agent-kernel",
+                "agent-protocol",
+                "agent-ports",
+                "agent-projection",
+                "agent-store-artifact",
+            ],
+        ),
         (
             "apps/agent",
             &[

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_kernel::inbox::Inbox;
+use agent_kernel::model_selection::ModelChoice;
 use agent_ports::event_store::EventStore;
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{
@@ -38,6 +39,11 @@ fn meta() -> Meta {
         judgment: "gates".to_string(),
         budget: Some(32_000),
         capabilities: vec!["meta".to_string()],
+        models: vec![agent_web::ModelOption {
+            provider: "echo".to_string(),
+            model: None,
+            label: "echo".to_string(),
+        }],
     }
 }
 
@@ -60,9 +66,14 @@ struct FakeBackend {
     decisions: Mutex<Vec<(String, String, Decision)>>,
     steers: Mutex<Vec<(String, String)>>,
     interrupts: Mutex<Vec<String>>,
+    /// Every `set_model` call, as `(session, provider, model)`.
+    models: Mutex<Vec<(String, String, Option<String>)>>,
     resumes: Mutex<Vec<String>>,
     forks: Mutex<Vec<(String, Option<String>, String)>>,
     hold_approval: AtomicBool,
+    /// Whether `set_model` accepts the name it was given. `true` unless a test
+    /// makes the provider unknown.
+    accept_model: AtomicBool,
     /// What `interrupt` reports back: `true` unless a test says there is no
     /// open turn to stop.
     interrupt_queued: AtomicBool,
@@ -73,6 +84,7 @@ impl FakeBackend {
     fn new() -> Arc<Self> {
         let backend = Arc::new(Self::default());
         backend.interrupt_queued.store(true, Ordering::SeqCst);
+        backend.accept_model.store(true, Ordering::SeqCst);
         backend
     }
 
@@ -90,6 +102,11 @@ impl FakeBackend {
 
     fn interrupt_queued(&self, queued: bool) {
         self.interrupt_queued.store(queued, Ordering::SeqCst);
+    }
+
+    /// Refuse every model name, the way the binary refuses one it cannot build.
+    fn refuse_models(&self) {
+        self.accept_model.store(false, Ordering::SeqCst);
     }
 }
 
@@ -150,6 +167,26 @@ impl Backend for FakeBackend {
     async fn interrupt(&self, session: &SessionId) -> Result<bool, BackendError> {
         self.interrupts.lock().unwrap().push(session.as_str().to_string());
         Ok(self.interrupt_queued.load(Ordering::SeqCst))
+    }
+
+    async fn set_model(
+        &self,
+        session: &SessionId,
+        provider: &str,
+        model: Option<&str>,
+    ) -> Result<ModelChoice, BackendError> {
+        if !self.accept_model.load(Ordering::SeqCst) {
+            return Err(BackendError::new(
+                "invalid_model",
+                "unknown provider 'nope': use 'echo' or 'openai'",
+            ));
+        }
+        self.models.lock().unwrap().push((
+            session.as_str().to_string(),
+            provider.to_string(),
+            model.map(str::to_string),
+        ));
+        Ok(ModelChoice::new(provider, model.map(str::to_string)))
     }
 }
 
@@ -668,9 +705,10 @@ async fn serve_over_with(
     data_dir: PathBuf,
     backend: Option<Arc<dyn Backend>>,
 ) -> (SocketAddr, String, tokio::task::JoinHandle<()>) {
-    let server = Server::bind(Config { port: 0, meta: meta(), store, data_dir, backend })
-        .await
-        .expect("bind loopback");
+    let server =
+        Server::bind(Config { port: 0, meta: meta(), store, data_dir, backend, now: Utc::now })
+            .await
+            .expect("bind loopback");
     let addr = server.addr();
     let token = server.token().to_string();
     let handle = tokio::spawn(async move {
@@ -1364,6 +1402,87 @@ async fn interrupt_says_so_when_the_turn_cannot_be_stopped() {
     // The page must not promise a stop that will never happen.
     assert_eq!(payload["interrupting"], false);
     assert!(payload["message"].as_str().map(|text| !text.is_empty()).unwrap_or(false));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn choosing_a_model_reaches_the_driver_and_is_named_in_the_reply() {
+    let (store, dir, _) = seeded().await;
+    let backend = FakeBackend::new();
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) = post(
+        addr,
+        "/api/sessions/s1/model",
+        &token,
+        &json!({ "v": 1, "provider": "openai", "model": "deepseek-flash" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["model"]["provider"], "openai");
+    assert_eq!(payload["model"]["model"], "deepseek-flash");
+
+    let calls = backend.models.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![("s1".to_string(), "openai".to_string(), Some("deepseek-flash".to_string()))]
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_model_the_build_cannot_make_is_the_requests_fault() {
+    let (store, dir, _) = seeded().await;
+    let backend = FakeBackend::new();
+    backend.refuse_models();
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/model", &token, &json!({ "v": 1, "provider": "nope" })).await;
+    // Not a 500: picking a provider this build does not have is a bad request,
+    // and the page shows the message beside the composer.
+    assert_eq!(status, 400, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert!(
+        payload["message"].as_str().unwrap_or("").contains("nope"),
+        "the refusal names what was asked for: {response}"
+    );
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/model", &token, &json!({ "v": 1, "provider": "" })).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(backend.models.lock().unwrap().is_empty(), "nothing was recorded");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_session_summary_reports_the_model_it_was_set_to() {
+    let (store, dir, session) = seeded().await;
+    store
+        .append(
+            &session,
+            EventSeq::new(5),
+            vec![draft(
+                &session,
+                EventType::SESSION_MODEL_SELECTED,
+                None,
+                None,
+                json!({ "provider": "openai", "model": "deepseek-flash" }),
+                Actor::User,
+            )],
+        )
+        .await
+        .expect("record the choice");
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["session"]["model"]["provider"], "openai");
+    assert_eq!(payload["session"]["model"]["model"], "deepseek-flash");
     handle.abort();
 }
 

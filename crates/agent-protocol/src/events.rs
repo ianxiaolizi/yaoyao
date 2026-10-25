@@ -50,6 +50,14 @@ impl EventType {
     /// files, which may since have changed — and a fork copies it into its
     /// header rather than re-deriving it, for the same reason.
     pub const PROFILE_RESOLVED: &'static str = "profile/resolved";
+    /// The model a session's next turns should use, chosen by the person
+    /// rather than by configuration. Payload: `model_route`.
+    ///
+    /// It lives in the log because a choice has to be readable by every entry
+    /// point and inherited by a fork, which copies the log. It never rewrites
+    /// what a past run says: each run still records the route it used in
+    /// `profile/resolved`.
+    pub const SESSION_MODEL_SELECTED: &'static str = "session/model.selected";
     pub const RUN_STARTED: &'static str = "run/started";
     pub const RUN_YIELDED: &'static str = "run/yielded";
     pub const RUN_COMPLETED: &'static str = "run/completed";
@@ -204,6 +212,7 @@ impl EventType {
         Self::SESSION_STARTED,
         Self::SESSION_FORKED,
         Self::PROFILE_RESOLVED,
+        Self::SESSION_MODEL_SELECTED,
         Self::RUN_STARTED,
         Self::RUN_YIELDED,
         Self::RUN_COMPLETED,

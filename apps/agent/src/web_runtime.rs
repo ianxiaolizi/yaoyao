@@ -25,9 +25,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_config::ResolvedProfile;
+use agent_kernel::model_selection::{self, ModelChoice};
+use agent_ports::event_store::EventStore;
 use agent_ports::execution_environment::SandboxMode;
 use agent_ports::live_event_bus::{LiveEventBus, LiveEventSubscription};
-use agent_protocol::ids::SessionId;
+use agent_protocol::events::Actor;
+use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::model::ModelStreamEvent;
 use agent_web::{Backend, BackendError, Decision, LiveChunk, LiveSink};
 use futures_util::FutureExt;
@@ -50,6 +53,14 @@ pub struct WebInputs {
     pub sandbox: SandboxMode,
     pub network_allowed: bool,
     pub judgment: bool,
+    /// The provider `agent web --provider` named, or the environment's default.
+    /// Kept as a name rather than an assembled provider so every session's
+    /// stack builds its own client from the same decision.
+    pub provider: String,
+    /// The log a session's own model choice is read from. The choice is a
+    /// decision about the next turn and lives in the session's log, so the
+    /// server only has to know how to read it back.
+    pub store: Arc<dyn EventStore>,
 }
 
 /// One cached runtime per session, plus the lock that serializes its work.
@@ -120,6 +131,25 @@ impl WebBackend {
             .clone()
     }
 
+    /// The model this session is set to use.
+    ///
+    /// Its own most recent choice wins; a session that never made one runs on
+    /// the decision the server started with. Reading the log for this is cheap
+    /// next to assembling a stack, and it happens only when a runtime is built.
+    async fn model_for(&self, session: &SessionId) -> Result<ModelChoice, BackendError> {
+        let events = self
+            .inputs
+            .store
+            .read_stream(session, EventSeq::ZERO, usize::MAX)
+            .await
+            .map_err(|error| BackendError::internal(error.to_string()))?;
+        let chosen = model_selection::current(&events)
+            .map_err(|error| BackendError::internal(format!("model selection: {error}")))?;
+        Ok(chosen.unwrap_or_else(|| {
+            ModelChoice::new(self.inputs.provider.clone(), self.inputs.resolved.model.clone())
+        }))
+    }
+
     /// Assemble this session's stack once, and reuse it while it stays warm.
     async fn runtime(&self, session: &SessionId) -> Result<Arc<Runtime>, BackendError> {
         // Held across assembly on purpose: two requests for the same session
@@ -130,13 +160,19 @@ impl WebBackend {
             return Ok(runtime.clone());
         }
 
+        // Read only when a stack is actually being built: a warm session must
+        // not pay a full log read on every turn for a choice that cannot have
+        // changed its cached runtime anyway (`set_model` drops the entry).
+        let choice = self.model_for(session).await?;
         let inputs = self.inputs.clone();
+        let model = crate::providers::select_kind(&choice.provider, choice.model.as_deref())
+            .map_err(|error| BackendError::internal(error.to_string()))?;
         let built = stack::assemble(stack::Inputs {
             session: session.clone(),
             workspace_root: inputs.workspace_root,
             data_dir: inputs.data_dir,
             resolved: inputs.resolved,
-            model: None,
+            model: Some(model),
             decisions: Decisions::FromConfiguration,
             sandbox: inputs.sandbox,
             network_allowed: inputs.network_allowed,
@@ -370,6 +406,33 @@ impl Backend for WebBackend {
             .await
             .map_err(|error| BackendError::internal(error.to_string()))?;
         Ok(matches!(outcome, agent_cli::commands::InterruptOutcome::Queued(_)))
+    }
+
+    async fn set_model(
+        &self,
+        session: &SessionId,
+        provider: &str,
+        model: Option<&str>,
+    ) -> Result<ModelChoice, BackendError> {
+        // Build it once before writing it down. A stored choice this process
+        // cannot honour would break every later turn on the session, so an
+        // unknown provider or an unreadable endpoint is refused here, where the
+        // person can still pick another one.
+        crate::providers::select_kind(provider, model)
+            .map_err(|error| BackendError::new("invalid_model", error.to_string()))?;
+
+        let choice = ModelChoice::new(provider, model.map(str::to_string));
+        model_selection::select(self.inputs.store.clone(), session, choice.clone(), Actor::User)
+            .await
+            .map_err(|error| {
+                BackendError::internal(format!("the model choice could not be recorded: {error}"))
+            })?;
+
+        // The cached stack was assembled around the old provider. Dropping the
+        // entry makes the next turn build a new one; a turn already in flight
+        // holds its own `Arc` and finishes on the model it started with.
+        self.runtimes.lock().await.remove(session.as_str());
+        Ok(choice)
     }
 }
 

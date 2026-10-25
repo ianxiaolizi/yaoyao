@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use agent_kernel::approval::PENDING_TTL;
+use agent_kernel::model_selection::ModelChoice;
 use agent_ports::event_store::EventStore;
 use agent_projection::{
     ActionStatus, ApprovalState, ItemBody, ProjectionDefinition, SessionProjection, TranscriptItem,
@@ -49,6 +50,9 @@ pub(crate) struct Folded {
     pub last_plan: Option<Value>,
     /// Children this session delegated to, in spawn order.
     pub subagents: Vec<Value>,
+    /// The model the session is set to use, if the person ever chose one. Absent
+    /// means the server's startup decision still applies.
+    pub model: Option<ModelChoice>,
 }
 
 /// A transcript that can be advanced one event at a time.
@@ -62,11 +66,16 @@ pub(crate) struct LiveTranscript {
     projection: TranscriptProjection,
     state: TranscriptState,
     sent: HashMap<String, Value>,
+    /// The instant the row shapes are answered at, handed in by the handler.
+    /// The page's clock is not the server's, and a row that expired while the
+    /// stream was open must be re-shaped against the same idea of "now" the
+    /// request was served at.
+    now: DateTime<Utc>,
 }
 
 impl LiveTranscript {
     /// Fold the log once and remember every row as already sent.
-    pub(crate) fn fold(events: &[StoredEvent]) -> Result<Self, ReadError> {
+    pub(crate) fn fold(events: &[StoredEvent], now: DateTime<Utc>) -> Result<Self, ReadError> {
         let projection = TranscriptProjection::new();
         let mut state = projection.init();
         for event in events {
@@ -75,8 +84,9 @@ impl LiveTranscript {
                 message: error.to_string(),
             })?;
         }
-        let sent = state.items.iter().map(|item| (item.id.clone(), wire_item(item))).collect();
-        Ok(Self { projection, state, sent })
+        let sent =
+            state.items.iter().map(|item| (item.id.clone(), wire_item_at(item, now))).collect();
+        Ok(Self { projection, state, sent, now })
     }
 
     /// The rows a client at the inclusive SSE cursor `from` has not seen yet.
@@ -90,7 +100,7 @@ impl LiveTranscript {
             .items
             .iter()
             .filter(|item| item.updated_seq.as_u64() >= from)
-            .map(wire_item)
+            .map(|item| wire_item_at(item, self.now))
             .collect()
     }
 
@@ -111,7 +121,7 @@ impl LiveTranscript {
         // keeps a long session linear in the number of *changes* rather than in
         // the number of rows times the number of events.
         for item in self.state.items.iter().filter(|item| item.updated_seq >= event.seq) {
-            let wire = wire_item(item);
+            let wire = wire_item_at(item, self.now);
             if self.sent.get(&item.id) == Some(&wire) {
                 continue;
             }
@@ -251,6 +261,14 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
         })?;
     }
 
+    // A payload that will not read back is a log anomaly, not "no choice": the
+    // page would label the session with the default and hide the damage.
+    let model =
+        agent_kernel::model_selection::current(&events).map_err(|error| ReadError::Session {
+            session: session.as_str().to_string(),
+            message: format!("model selection: {error}"),
+        })?;
+
     Ok(Folded {
         transcript,
         steps: session_state.steps_started,
@@ -261,6 +279,7 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
         last_request,
         last_plan,
         subagents,
+        model,
     })
 }
 
@@ -269,11 +288,12 @@ pub(crate) async fn list(
     store: &dyn EventStore,
     data_dir: &Path,
     reads: &ReadModel,
+    now: DateTime<Utc>,
 ) -> Result<Vec<Value>, ReadError> {
     let mut sessions: Vec<(Option<DateTime<Utc>>, String, Value)> = Vec::new();
     for id in session_ids(data_dir)? {
         let folded = reads.fold(store, data_dir, &id).await?;
-        let summary = summary(&id, &folded);
+        let summary = summary(&id, &folded, now);
         sessions.push((folded.last_activity_at, id.as_str().to_string(), summary));
     }
     // Newest first; ties (two sessions with the same second) break by id so the
@@ -289,6 +309,7 @@ pub(crate) async fn transcript(
     session: &SessionId,
     since: Option<u64>,
     reads: &ReadModel,
+    now: DateTime<Utc>,
 ) -> Result<Value, ReadError> {
     let folded = reads.fold(store, data_dir, session).await?;
     let items: Vec<Value> = folded
@@ -299,7 +320,7 @@ pub(crate) async fn transcript(
         // The first event is seq 0, so `> 0` would otherwise drop the opening
         // prompt from an unfiltered read.
         .filter(|item| since.is_none_or(|cursor| item.updated_seq.as_u64() > cursor))
-        .map(wire_item)
+        .map(|item| wire_item_at(item, now))
         .collect();
     Ok(json!({
         "v": 1,
@@ -462,7 +483,7 @@ pub(crate) async fn subagents(
 }
 
 /// The summary line for the sidebar.
-fn summary(session: &SessionId, folded: &Folded) -> Value {
+fn summary(session: &SessionId, folded: &Folded, now: DateTime<Utc>) -> Value {
     let title = folded
         .transcript
         .items
@@ -482,7 +503,6 @@ fn summary(session: &SessionId, folded: &Folded) -> Value {
             _ => None,
         })
         .unwrap_or_default();
-    let now = Utc::now();
     let pending = folded
         .transcript
         .items
@@ -510,16 +530,10 @@ fn summary(session: &SessionId, folded: &Folded) -> Value {
         "pending_approvals": pending,
         "yielded": folded.yielded,
         "forked_from": folded.forked_from,
+        // Absent until the person picks one: the page then falls back to the
+        // server's startup label rather than inventing a selection.
+        "model": folded.model,
     })
-}
-
-/// One item in the shape the page renders.
-///
-/// The projection's body is an enum with an internal tag; the wire flattens it
-/// so a row is one object with a `kind` and its own fields, which is what the
-/// component table consumes.
-fn wire_item(item: &TranscriptItem) -> Value {
-    wire_item_at(item, Utc::now())
 }
 
 /// Whether a pending request has outlived the kernel's `PENDING_TTL`.
@@ -533,6 +547,12 @@ pub(crate) fn approval_expired(created_at: Option<DateTime<Utc>>, now: DateTime<
 }
 
 /// One item in the shape the page renders, with the read instant supplied.
+///
+/// The projection's body is an enum with an internal tag; the wire flattens it
+/// so a row is one object with a `kind` and its own fields, which is what the
+/// component table consumes. The instant is a parameter because this layer does
+/// not read a clock: the process edge hands one in, and every row in one answer
+/// is shaped against the same one (CONTRACT.md §7 裁决 #20).
 fn wire_item_at(item: &TranscriptItem, now: DateTime<Utc>) -> Value {
     let mut row = serde_json::Map::new();
     row.insert("id".to_string(), item.id.clone().into());
