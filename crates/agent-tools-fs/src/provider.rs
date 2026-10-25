@@ -191,7 +191,10 @@ impl ToolProvider for FsToolProvider {
             },
             ToolDefinition {
                 name: "shell.run".to_string(),
-                description: shell_run_description(self.env.shell_language()),
+                description: shell_run_description(
+                    self.env.shell_language(),
+                    &self.env.shell_invocation("").program,
+                ),
                 source: ToolSource::Builtin,
                 side_effect: ToolSideEffect::Destructive,
                 capability_requirements: vec![Capability::new(Capability::PROCESS_SPAWN)],
@@ -849,22 +852,39 @@ fn split_last_segment(path: &str) -> Option<(&str, &str)> {
 /// invited a model to wrap the command in `powershell -Command` itself; under
 /// the AppContainer wrapper the outer PowerShell then expanded `$env:…` before
 /// the inner one saw it (2026-10-21 real use).
-fn shell_run_description(language: Option<&str>) -> String {
+fn shell_run_description(language: Option<&str>, shell_program: &str) -> String {
     let common = "On Windows an executable in the current directory is not found by bare name \
                   — write `.\\name`. A non-zero exit code comes back as a failed tool result \
                   whose first line is `exit code N`, followed by the command's output; the exit \
                   code is already reported, so there is no need to echo it. `cwd` defaults to \
                   the workspace root.";
+    // The host convention on Windows is `cmd`, and its syntax is close enough to
+    // POSIX to invite commands that exit 0 while doing something else: `;` is
+    // passed through inside the argument (so `ledger report; echo done` reaches
+    // the program as `report;`) and `mkdir -p x` creates a directory named `-p`.
+    // A pipeline's status is its last command's, so a check piped into `tail`
+    // reports the tail, not the check. Written as one sentence each — a model
+    // that already wrote the POSIX form will not reread a paragraph (2026-10-25
+    // long-task round: 13 of 22 failures, two of them silent mis-arguments).
+    let cmd_syntax = (shell_program == "cmd").then_some(
+        " `cmd` is not POSIX: `;` does not separate commands — it stays inside the argument \
+         (`tool report; echo x` passes `report;` to the program), and `mkdir -p x` creates a \
+         directory named `-p`; use `&&` or one call per command. `2>/dev/null` is not a cmd \
+         redirect — use `2>nul`. A pipeline's exit code is its last command's, so run the \
+         command you mean to judge unpiped, or redirect its output to a file.",
+    );
     match language {
         Some(language) => format!(
             "Run a {language} command and return its output. Commands run under {language}; \
              write the command in {language} syntax and pass it as {language} receives it — do \
-             not wrap it in `cmd /C`, `sh -c`, or another {language} invocation. {common}"
+             not wrap it in `cmd /C`, `sh -c`, or another {language} invocation. {common}{}",
+            cmd_syntax.unwrap_or("")
         ),
         None => format!(
             "Run a shell command and return its output. The backend wraps the command as \
              `cmd /C <command>` on Windows or `sh -c <command>` elsewhere, so pass the command \
-             as the shell receives it — do not add `cmd /C` or `sh -c` yourself. {common}"
+             as the shell receives it — do not add `cmd /C` or `sh -c` yourself. {common}{}",
+            cmd_syntax.unwrap_or("")
         ),
     }
 }
@@ -922,6 +942,35 @@ mod tests {
         let sandboxed = description(FsToolProvider::new(Arc::new(sandboxed)));
         assert!(sandboxed.contains("Commands run under PowerShell"));
         assert!(!sandboxed.contains("It is not PowerShell syntax"));
+
+        // The cmd syntax note is a host-shell fact: it belongs to the
+        // description the model reads before writing the command, and it must
+        // not follow the backend into a shell that does not have those traps.
+        #[cfg(windows)]
+        {
+            assert!(
+                host.contains("`cmd` is not POSIX"),
+                "host description should name cmd's syntax traps: {host}"
+            );
+            assert!(!sandboxed.contains("`cmd` is not POSIX"));
+        }
+    }
+
+    #[test]
+    fn the_cmd_syntax_note_names_the_traps_that_cost_the_long_task_round() {
+        // Each clause is a failure observed in the 2026-10-25 round; a note
+        // that loses one of them would let the same command through again.
+        let note = shell_run_description(None, "cmd");
+        assert!(note.contains("`;` does not separate commands"), "{note}");
+        assert!(note.contains("mkdir -p"), "{note}");
+        assert!(note.contains("2>nul"), "{note}");
+        assert!(note.contains("pipeline's exit code is its last command's"), "{note}");
+
+        // `sh` has the POSIX meaning of `;`, so the note would be wrong there.
+        assert!(!shell_run_description(None, "sh").contains("`cmd` is not POSIX"));
+        assert!(
+            !shell_run_description(Some("PowerShell"), "powershell").contains("`cmd` is not POSIX")
+        );
     }
 
     fn inv(tool: &str, args: serde_json::Value) -> ToolInvocation {
