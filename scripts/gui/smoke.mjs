@@ -319,7 +319,7 @@ function waitForUrl(timeoutMs = 20_000) {
   while (Date.now() < deadline) {
     if (existsSync(logPath)) {
       const text = readFileSync(logPath, 'utf8');
-      const match = text.match(/http:\/\/127\.0\.0\.1:\d+\/#t=[0-9a-f]+/);
+      const match = text.match(/http:\/\/127\.0\.0\.1:\d+\/#t=[0-9a-f-]+/);
       if (match) return match[0];
       if (text.includes('failed:') || text.includes('error')) {
         throw new Error(`server did not start:\n${text}`);

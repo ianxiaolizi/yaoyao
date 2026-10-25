@@ -118,10 +118,10 @@ try {
         $line = $_.ToString()
         Write-Host $line
         # 日志会被留下来分享；令牌只出现在控制台和浏览器的地址栏里。
-        $logLine = $line -replace '(#t=)[0-9a-f]+', '$1<redacted>'
+        $logLine = $line -replace '(#t=)[0-9a-f-]+', '$1<redacted>'
         Add-Content -Path $log -Value $logLine -Encoding UTF8
 
-        if (-not $urlSeen -and $line -match 'http://127\.0\.0\.1:\d+/\#t=[0-9a-f]+') {
+        if (-not $urlSeen -and $line -match 'http://127\.0\.0\.1:\d+/\#t=[0-9a-f-]+') {
             $url = $Matches[0]
             $urlSeen = $true
             Write-Host ''
