@@ -49,13 +49,13 @@
         <span class="cur" id="sessionTitle">正在连接…</span>
       </div>
       <span class="sp"></span>
-      <span class="conn" id="conn"><i></i><span id="connText">连接中</span></span>
+      <span class="conn idle" id="conn"><i></i><span id="connText">未开始</span></span>
       <span class="live" id="modelTag"><i></i><span>—</span></span>
       <details class="menu-wrap" id="exportMenu">
-        <summary class="ibtn" title="导出这个会话">导出</summary>
+        <summary class="ibtn" title="导出这个会话的事件日志">导出日志</summary>
         <div class="menu">
-          <button data-export="md">Markdown</button>
-          <button data-export="json">JSON</button>
+          <button data-export="md">Markdown 日志</button>
+          <button data-export="json">JSON 日志</button>
         </div>
       </details>
       <button class="ibtn" id="forkBtn" title="从最近的回合边界分叉一个会话">分叉</button>

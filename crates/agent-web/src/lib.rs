@@ -717,7 +717,8 @@ async fn artifact(
     })?;
     // The store is content-addressed, not type-addressed. Sniff the common
     // image signatures so the page can show a preview instead of downloading a
-    // `.blob`; everything else stays opaque.
+    // `.blob`; text gets a type a tab can render, and only real binary stays
+    // opaque.
     let content_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         "image/png"
     } else if bytes.starts_with(b"\xff\xd8\xff") {
@@ -726,6 +727,11 @@ async fn artifact(
         "image/gif"
     } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         "image/webp"
+    } else if is_plain_text(&bytes) {
+        // A tab pointed at `application/octet-stream` stays blank: the browser
+        // has nothing it can render. Text is common here (the model's own
+        // artifacts), so give it a type a tab can show.
+        "text/plain; charset=utf-8"
     } else {
         "application/octet-stream"
     };
@@ -738,6 +744,13 @@ async fn artifact(
         )
         .body(Body::from(bytes))
         .map_err(|error| ApiFailure::internal(error.to_string()))
+}
+
+/// The store is content-addressed, so a text artifact has no name to trust.
+/// Valid UTF-8 without NULs is the only signal available, and a false positive
+/// only means a binary blob displays as mojibake in a tab instead of downloading.
+fn is_plain_text(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
 /// `GET /api/sessions/{id}/why?turn=<turn>`.
@@ -1037,9 +1050,10 @@ async fn steer(
 
 /// `POST /api/sessions/{id}/interrupt`: ask the turn in flight to stop.
 ///
-/// The kernel decides whether there is anything to stop. The answer here is
-/// optimistic for the same reason the command's own is: stopping is a queued
-/// intent applied at the next step boundary, not an instant effect.
+/// The kernel decides whether there is anything to stop, and says so here:
+/// `interrupting: true` means the intent was queued and the turn will end at
+/// its next step boundary; `interrupting: false` means there was no open turn
+/// to stop, and the page must not promise a stop that will never happen.
 async fn interrupt(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -1056,23 +1070,24 @@ async fn interrupt(
     };
 
     let session = SessionId::from_string(&id);
-    let sink = state.live_sink(&id);
-    tokio::spawn(async move {
-        match backend.interrupt(&session).await {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = sink.send(LiveChunk::notice("没有正在运行的回合可以打断".to_string()));
-            }
-            Err(error) => {
-                let _ = sink.send(LiveChunk::notice(format!(
-                    "打断没有送到内核（{}）：{}",
-                    error.code, error.message
-                )));
-            }
+    match backend.interrupt(&session).await {
+        Ok(true) => {
+            Ok((StatusCode::OK, Json(json!({ "v": PROTOCOL, "ok": true, "interrupting": true }))))
         }
-    });
-
-    Ok((StatusCode::OK, Json(json!({ "v": PROTOCOL, "ok": true, "interrupting": true }))))
+        Ok(false) => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "v": PROTOCOL,
+                "ok": true,
+                "interrupting": false,
+                "message": "这一轮没有可打断的步骤，这次停止没有生效",
+            })),
+        )),
+        Err(error) => Err(ApiFailure::internal(format!(
+            "打断没有送到内核（{}）：{}",
+            error.code, error.message
+        ))),
+    }
 }
 
 /// A handler's refusal, in the same envelope as the gate's.

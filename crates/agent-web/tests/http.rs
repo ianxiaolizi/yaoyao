@@ -63,12 +63,17 @@ struct FakeBackend {
     resumes: Mutex<Vec<String>>,
     forks: Mutex<Vec<(String, Option<String>, String)>>,
     hold_approval: AtomicBool,
+    /// What `interrupt` reports back: `true` unless a test says there is no
+    /// open turn to stop.
+    interrupt_queued: AtomicBool,
     release: Notify,
 }
 
 impl FakeBackend {
     fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        let backend = Arc::new(Self::default());
+        backend.interrupt_queued.store(true, Ordering::SeqCst);
+        backend
     }
 
     fn turn_count(&self) -> usize {
@@ -81,6 +86,10 @@ impl FakeBackend {
 
     fn hold_approvals(&self, hold: bool) {
         self.hold_approval.store(hold, Ordering::SeqCst);
+    }
+
+    fn interrupt_queued(&self, queued: bool) {
+        self.interrupt_queued.store(queued, Ordering::SeqCst);
     }
 }
 
@@ -140,7 +149,7 @@ impl Backend for FakeBackend {
 
     async fn interrupt(&self, session: &SessionId) -> Result<bool, BackendError> {
         self.interrupts.lock().unwrap().push(session.as_str().to_string());
-        Ok(true)
+        Ok(self.interrupt_queued.load(Ordering::SeqCst))
     }
 }
 
@@ -959,7 +968,9 @@ async fn an_artifact_is_served_only_by_its_content_hash() {
     let (status, response) =
         request(addr, &format!("/api/artifacts/{hash}"), Some(&token), None).await;
     assert_eq!(status, 200, "{response}");
-    assert!(response.contains("content-type: application/octet-stream"), "{response}");
+    // A tab cannot render an opaque stream: text is served as text so clicking
+    // an artifact shows the bytes instead of opening a blank page.
+    assert!(response.contains("content-type: text/plain; charset=utf-8"), "{response}");
     assert_eq!(body(&response), "hello");
 
     let locator = format!("/api/artifacts/artifact%3A%2F%2Fsha256%2F{hash}");
@@ -968,6 +979,16 @@ async fn an_artifact_is_served_only_by_its_content_hash() {
 
     let (status, response) = request(addr, "/api/artifacts/not-a-hash", Some(&token), None).await;
     assert_eq!(status, 400, "{response}");
+
+    // Bytes that are not text stay opaque: a false "text" label would garble
+    // them in the tab rather than hand them over as a file.
+    let binary_hash = "b02a591131217cb579165aeccf0d94569acffb9934c84d6c813d77e3abedd233";
+    std::fs::write(artifacts.join(format!("{binary_hash}.blob")), [0x00u8, 0x9f, 0x92, 0x96])
+        .expect("binary blob");
+    let (status, response) =
+        request(addr, &format!("/api/artifacts/{binary_hash}"), Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    assert!(response.contains("content-type: application/octet-stream"), "{response}");
     handle.abort();
 }
 
@@ -1325,6 +1346,24 @@ async fn steer_and_interrupt_reach_the_driver() {
         post(addr, "/api/sessions/s1/interrupt", &token, &json!({ "v": 1 })).await;
     assert_eq!(status, 200, "{response}");
     assert!(eventually(|| backend.interrupts.lock().unwrap().len() == 1).await);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn interrupt_says_so_when_the_turn_cannot_be_stopped() {
+    let (store, dir, _) = seeded().await;
+    let backend = FakeBackend::new();
+    backend.interrupt_queued(false);
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/interrupt", &token, &json!({ "v": 1 })).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    // The page must not promise a stop that will never happen.
+    assert_eq!(payload["interrupting"], false);
+    assert!(payload["message"].as_str().map(|text| !text.is_empty()).unwrap_or(false));
     handle.abort();
 }
 

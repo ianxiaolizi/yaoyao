@@ -502,6 +502,22 @@ fn print_why_help() {
     );
 }
 
+/// `web --help`: what starting the server would do, without starting it.
+fn print_web_help() {
+    println!(
+        "Usage: agent web [--port <n>]\n\n\
+         Serve the web GUI on loopback. The URL is printed with its one-time\n\
+         access token in the fragment; open it as printed, because a URL without\n\
+         the token cannot talk to the API. The process stays in the foreground\n\
+         until Ctrl-C.\n\n\
+         Options:\n  \
+         --port <n>   Listen on this port (default: {port})\n\n\
+         The GUI is a view over the same session log the CLI writes: turns it\n\
+         starts land in that log, and a session the CLI ran reads back here.",
+        port = DEFAULT_WEB_PORT,
+    );
+}
+
 /// `steer`: queue text for whatever turn is in flight in this session.
 ///
 /// No recovery pass: steering is an append to a session another process may be
@@ -926,6 +942,13 @@ async fn tick(args: &Args) {
 /// accepts turns, and a boundary that cannot be built must be said before the
 /// first click rather than only in `/api/meta` afterward.
 async fn web(args: &Args) {
+    // Asking what `web` does must not start a server; `why --help` answers
+    // before it opens the log for the same reason.
+    if args.command_args().iter().any(|argument| argument == "--help" || argument == "-h") {
+        print_web_help();
+        std::process::exit(0);
+    }
+
     let port = match option(args, "--port") {
         Some(value) => value
             .parse::<u16>()
@@ -961,13 +984,25 @@ async fn web(args: &Args) {
         std::process::exit(EXIT_DID_NOT_RUN);
     });
 
-    let meta = agent_web::Meta {
-        workspace,
-        model: resolved
+    // `/api/meta` must describe what the first turn will actually use, not what
+    // the environment happens to carry. The echo provider has no model of its
+    // own, so a stale `AGENT_MODEL_NAME` (usually set for the OpenAI-compatible
+    // endpoint) must not leak into the label and claim a model nothing runs.
+    let provider =
+        std::env::var(agent::providers::ENV_PROVIDER).unwrap_or_else(|_| "echo".to_string());
+    let model_label = if provider == "echo" {
+        "echo".to_string()
+    } else {
+        resolved
             .model
             .clone()
             .or_else(|| std::env::var(agent_model_openai::ENV_MODEL_NAME).ok())
-            .unwrap_or_else(|| "echo".to_string()),
+            .unwrap_or_else(|| provider.clone())
+    };
+
+    let meta = agent_web::Meta {
+        workspace,
+        model: model_label,
         sandbox: sandbox::label(sandbox_mode).to_string(),
         judgment: std::env::var("AGENT_JUDGMENT").unwrap_or_else(|_| "gates".to_string()),
         budget: resolved.budget.max_input_tokens,

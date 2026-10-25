@@ -32,9 +32,10 @@
     pendingUser: '',
     forceRunningUntil: 0,
     settling: new Set(),
-    connection: 'closed',
+    connection: 'idle',
     why: null,
     whyFor: null,
+    whyWant: null,
     diff: null,
     diffFor: null,
     context: null,
@@ -125,6 +126,18 @@
     yesterday.setDate(now.getDate() - 1);
     if (dayKey(date) === dayKey(yesterday)) return '昨天';
     return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  }
+
+  // Ledger timestamps are UTC; a schedule's due time is worth reading in the
+  // clock the person is actually sitting in front of.
+  function whenText(value) {
+    const date = parseDate(value);
+    if (!date) return '';
+    const day = dayKey(date) === dayKey(new Date())
+      ? '今天'
+      : `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    return `${day} ${time}`;
   }
 
   function inline(text) {
@@ -374,7 +387,10 @@
   function updateHeader() {
     const summary = state.activeSummary;
     $('sessionTitle').textContent = state.active ? activeTitle() : '爻爻';
-    $('sessionTag').textContent = state.active ? (summary?.id || state.active || '新任务') : '本地';
+    // The id is a log key, not a title: keep it on hover instead of spending
+    // the header on it.
+    $('sessionTag').textContent = state.active ? '会话' : '本地';
+    $('sessionTag').title = state.active ? (summary?.id || state.active || '') : '';
     $('crumbSep').hidden = !state.active;
     if (state.meta) {
       $('modelName').textContent = state.meta.model || '—';
@@ -391,13 +407,16 @@
     $('stopBtn').disabled = !state.running;
     document.body.classList.toggle('turn-running', Boolean(state.running));
     const input = $('input');
+    const untouched = !state.running && !state.items.size && !state.pendingUser;
     input.placeholder = hasExpiredApproval() && !state.running
       ? '审批已过期，点上面的「继续这一轮」…'
       : state.waiting
         ? '先回答上面的审批，这一轮会从那里继续…'
         : state.running
           ? '插话：在下一个步骤边界生效…'
-          : '继续说…';
+          : untouched
+            ? '想做点什么？直接说给爻爻…'
+            : '继续说…';
     input.disabled = !state.token;
   }
 
@@ -457,7 +476,7 @@
     const controller = new AbortController();
     state.controller = controller;
     clearTimeout(state.reconnectTimer);
-    connection(attempt ? 'reconnecting' : 'closed', attempt ? `重连中 · ${Math.min(attempt, 5)}` : '连接中');
+    connection(attempt ? 'reconnecting' : 'idle', attempt ? `重连中 · ${Math.min(attempt, 5)}` : '连接中');
 
     // The server's SSE cursor is inclusive; ask for the event after the last
     // one we applied, or from 0 when there is no cursor yet.
@@ -681,9 +700,10 @@
 
   function turnState(group, isLast) {
     if (group.end) {
+      // Plain Chinese for the reader: `ending` values are kernel vocabulary.
       switch (group.end.ending) {
-        case 'answered': return { label: '停于答案', cls: 'done' };
-        case 'max_steps': return { label: '停于步数上限', cls: 'fail' };
+        case 'answered': return { label: '完成', cls: 'done' };
+        case 'max_steps': return { label: '到达步数上限', cls: 'fail' };
         case 'yielded':
           if (group.approvals.some((row) => row.state === 'pending')) {
             return { label: '等待批准', cls: 'yield' };
@@ -697,10 +717,10 @@
           if (group.approvals.some((row) => row.state === 'expired')) {
             return { label: '审批过期', cls: 'done' };
           }
-          return { label: '已停下', cls: 'done' };
+          return { label: '主动停下', cls: 'done' };
         case 'cancelled': return { label: '已停止', cls: 'done' };
         case 'failed': return { label: '失败', cls: 'fail' };
-        default: return { label: group.end.ending || '', cls: 'done' };
+        default: return { label: '已结束', cls: 'done' };
       }
     }
     if (group.approvals.some((row) => row.state === 'pending')) return { label: '等待批准', cls: 'yield' };
@@ -771,7 +791,7 @@
         </summary>
         <div class="bd">
           <div class="kv"><span class="k">参数</span><span class="v">${esc(pretty(action.arguments)) || '—'}</span></div>
-          ${content ? `<div class="kv"><span class="k">结果</span><span class="v">${esc(truncate(content, 160))}</span></div>${output}` : ''}
+          ${output}
           ${artifact ? `<button class="art-link" data-artifact="${esc(artifact)}">打开 artifact</button>` : ''}
         </div>
       </details>`;
@@ -949,9 +969,18 @@
     }
     empty.hidden = true;
 
+    // A steering sentence is in the log twice: once as the inbox item that
+    // queued it (no turn yet, so it lands loose) and once as the turn/steered
+    // note inside the turn. Render the grouped one only.
+    const groupedNotes = new Set();
+    for (const group of groups) {
+      for (const note of group.notes) groupedNotes.add((note.text || '').trim());
+    }
+
     const out = [];
     for (const item of loose) {
       if (item === looseUser && pendingText) continue;
+      if (item.kind === 'note' && groupedNotes.has((item.text || '').trim())) continue;
       if (item.kind === 'note') out.push(`<div class="end">${esc(truncate(item.text, 220))}</div>`);
       else if (item.kind === 'answer') out.push(`<div class="ans"><div class="md">${md(item.text)}</div></div>`);
     }
@@ -1030,6 +1059,9 @@
     });
     timeline.querySelectorAll('[data-why]').forEach((link) => {
       link.addEventListener('click', () => {
+        // Open the turn this link sits on, not whichever turn is newest.
+        state.whyWant = link.dataset.why || null;
+        state.why = null;
         state.whyFor = null;
         openPanel('why');
       });
@@ -1165,6 +1197,11 @@
   }
 
   async function openArtifact(locator) {
+    // Reserve the tab before awaiting: once the fetch awaits, the click's user
+    // activation is gone and window.open is blocked.
+    let tab = null;
+    try { tab = window.open('', '_blank'); } catch { tab = null; }
+    const abandonTab = () => { if (tab) { try { tab.close(); } catch { /* already gone */ } tab = null; } };
     try {
       const response = await fetch(`/api/artifacts/${encodeURIComponent(locator)}`, {
         headers: { Authorization: `Bearer ${state.token}` },
@@ -1176,15 +1213,40 @@
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       if (blob.type.startsWith('image/')) {
+        abandonTab();
         if (state.artifactUrl) URL.revokeObjectURL(state.artifactUrl);
         state.artifactUrl = url;
         $('artifactImage').src = url;
         $('artifactView').hidden = false;
         return;
       }
-      window.open(url, '_blank', 'noopener');
+      // A tab pointed at a type the browser cannot render (a zip, an opaque
+      // octet-stream) does not error: it stays blank. Only navigate to what a
+      // tab can actually show.
+      const displayable = blob.type.startsWith('image/') || blob.type.startsWith('text/')
+        || blob.type === 'application/json' || blob.type === 'application/pdf';
+      if (tab && displayable) {
+        tab.location.href = url;
+        tab.opener = null;
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        return;
+      }
+      // Popup blocked, or the bytes are not something a tab can show: hand the
+      // bytes over as a download instead of a dead tab.
+      const blocked = !tab;
+      abandonTab();
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'artifact';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      toast(blocked
+        ? '浏览器拦住了新标签页，已改为下载 artifact'
+        : `这种 artifact（${blob.type || '未知类型'}）不能在标签页里显示，已下载`);
     } catch (error) {
+      abandonTab();
       toast(error.message || 'artifact 打不开', 'error');
     }
   }
@@ -1237,11 +1299,17 @@
   async function stop() {
     if (!state.active) return;
     try {
-      await api(`/api/sessions/${encodeURIComponent(state.active)}/interrupt`, {
+      const result = await api(`/api/sessions/${encodeURIComponent(state.active)}/interrupt`, {
         method: 'POST',
         body: { v: 1 },
       });
-      toast('已请求停止；会在下一个步骤边界生效');
+      // The kernel says whether anything was actually queued; don't promise a
+      // stop the turn will never see.
+      if (result && result.interrupting) {
+        toast('已请求停止；会在下一个步骤边界生效');
+      } else {
+        toast((result && result.message) || '这一轮没有可打断的步骤，这次停止没有生效', 'error');
+      }
     } catch (error) {
       toast(error.message || '停止请求没有送达', 'error');
     }
@@ -1278,6 +1346,7 @@
     state.forceRunningUntil = 0;
     state.why = null;
     state.whyFor = null;
+    state.whyWant = null;
     state.diff = null;
     state.diffFor = null;
     state.context = null;
@@ -1291,14 +1360,13 @@
     state.pendingUser = '';
     state.connection = 'closed';
     localStorage.setItem(STORE.session, state.active);
-    connection('closed', '新任务');
+    connection('idle', '未开始');
     updateHeader();
     renderSessions();
     renderTimeline();
     $('empty').hidden = false;
     $('empty').querySelector('h2').textContent = '新任务';
-    $('sessionTitle').textContent = '新任务';
-    $('sessionTag').textContent = state.active;
+    $('sessionTag').title = state.active;
     $('input').focus();
     if (document.body.classList.contains('panel-open')) renderContext();
   }
@@ -1324,6 +1392,7 @@
     state.forceRunningUntil = 0;
     state.why = null;
     state.whyFor = null;
+    state.whyWant = null;
     state.diff = null;
     state.diffFor = null;
     state.context = null;
@@ -1340,7 +1409,7 @@
     $('empty').hidden = false;
     $('empty').querySelector('h2').textContent = '正在读取…';
     $('timeline').innerHTML = '';
-    connection('closed', '连接中');
+    connection('idle', '连接中');
 
     let payload;
     try {
@@ -1523,7 +1592,7 @@
     }
     const { groups } = groupTurns();
     const latest = groups[groups.length - 1];
-    const turn = latest?.turn || state.activeSummary?.open_turn || null;
+    const turn = state.whyWant || latest?.turn || state.activeSummary?.open_turn || null;
     if (!turn) {
       $('whyBody').innerHTML = '<div class="why-empty">这一轮还没有写推理链。<br>推理链由内核在运行中记录；有答案之后再看。</div>';
       return;
@@ -1538,7 +1607,8 @@
         state.why = data;
         state.whyFor = data.turn;
         renderWhy(data);
-        $('panelTitle').textContent = `第 ${Math.max(1, groups.length)} 轮 · 推理链`;
+        const index = groups.findIndex((group) => String(group.turn) === String(data.turn));
+        $('panelTitle').textContent = index >= 0 ? `第 ${index + 1} 轮 · 推理链` : '推理链';
       }
     } catch (error) {
       state.why = null;
@@ -1706,9 +1776,9 @@
       for (const item of items) {
         out.push(`
           <div class="sched-row ${item.overdue ? 'overdue' : ''}">
-            <div class="sched-when">${esc(item.due_at || '时间不可读')}${item.overdue ? ' · 已过期' : ''}</div>
+            <div class="sched-when" title="${esc(item.due_at || '')}">${esc(whenText(item.due_at) || '时间不可读')}${item.overdue ? ' · 已过期' : ''}</div>
             <div class="sched-text">${esc(item.text || '')}</div>
-            <button class="sub-link" data-cancel-schedule="${esc(item.item_id)}">取消 ${esc(item.item_id)}</button>
+            <button class="sub-link" data-cancel-schedule="${esc(item.item_id)}" title="取消 ${esc(item.item_id)}">取消</button>
           </div>`);
       }
       out.push('</div>');
@@ -2087,7 +2157,8 @@
       });
     });
     $('forkBtn').addEventListener('click', forkSession);
-    $('whyFoot').addEventListener('click', () => openPanel('why'));
+    // The footer entry means "the latest turn"; only a per-turn link pins a turn.
+    $('whyFoot').addEventListener('click', () => { state.whyWant = null; openPanel('why'); });
     $('panelBtn').addEventListener('click', () => {
       if (document.body.classList.contains('panel-open')) closePanel();
       else openPanel(root.dataset.panel || 'why');
@@ -2098,7 +2169,10 @@
       if (event.target === $('artifactView')) closeArtifact();
     });
     document.querySelectorAll('.p-tab').forEach((tab) => {
-      tab.addEventListener('click', () => showTab(tab.dataset.pv));
+      tab.addEventListener('click', () => {
+        if (tab.dataset.pv === 'why') state.whyWant = null;
+        showTab(tab.dataset.pv);
+      });
     });
     $('scroll').addEventListener('scroll', () => {
       const scroll = $('scroll');

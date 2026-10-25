@@ -904,8 +904,9 @@ impl ProcessLauncher for StdProcessLauncher {
             StdinMode::Closed => Stdio::inherit(),
             StdinMode::Pipe => Stdio::piped(),
         };
-        let child = Command::new(&request.program)
-            .args(&request.args)
+        let mut command = Command::new(&request.program);
+        set_program_args(&mut command, &request);
+        let child = command
             .current_dir(&request.cwd)
             .env_clear()
             .envs(request.env.iter().map(|(name, value)| (name, value)))
@@ -915,6 +916,32 @@ impl ProcessLauncher for StdProcessLauncher {
             .spawn()?;
         Ok(Box::new(StdProcess { child, env: request.env }))
     }
+}
+
+/// Hand `cmd /C <line>` the line unmodified.
+///
+/// `Command::args` re-quotes every argument for the MSVC parser, and `cmd` then
+/// parses that quoted text a second time: quotes disappear, `$vars` get eaten,
+/// and the exit code stays 0, so a broken command looks like a success. The
+/// second argument of `cmd /C` is a command line, not a value, so it goes in
+/// verbatim with [`CommandExt::raw_arg`] — the same bytes a person would type
+/// after `cmd /C`.
+fn set_program_args(command: &mut Command, request: &SpawnRequest) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let is_cmd = std::path::Path::new(&request.program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe"))
+            .unwrap_or(false);
+        if is_cmd && request.args.len() == 2 && request.args[0].eq_ignore_ascii_case("/c") {
+            command.args(&request.args[..1]);
+            command.raw_arg(&request.args[1]);
+            return;
+        }
+    }
+    command.args(&request.args);
 }
 
 impl RunningProcess for StdProcess {
@@ -1500,6 +1527,33 @@ mod tests {
         assert_eq!(output.exit_code, 3);
         assert!(output.stdout.contains("hello"), "stdout was {:?}", output.stdout);
         assert!(!output.truncated);
+    }
+
+    /// `cmd /C <line>` receives the line verbatim.
+    ///
+    /// `Command::args` re-quotes every argument for the MSVC parser, and `cmd`
+    /// then parses that text a second time: quotes vanish (or come back with
+    /// backslashes), `&` splits the line somewhere the caller never wrote, and
+    /// the exit code stays 0. The launcher therefore hands the second argument
+    /// over with `raw_arg`. This goes through `host_shell`, the same path a
+    /// `shell.run` takes.
+    #[cfg(windows)]
+    #[test]
+    fn the_host_shell_keeps_the_command_line_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalExecutionEnvironment::new(dir.path().to_path_buf());
+        let invocation = env.shell_invocation(r#"echo "a & b""#);
+        let spec = CommandSpec {
+            program: invocation.program,
+            args: invocation.args,
+            cwd: None,
+            timeout_ms: Some(30_000),
+        };
+
+        let output = env.run_command(&spec).unwrap();
+        assert_eq!(output.exit_code, 0, "stderr was {:?}", output.stderr);
+        // Quotes intact means `&` stayed inside them: the line was not split.
+        assert_eq!(output.stdout.trim(), "\"a & b\"", "stdout was {:?}", output.stdout);
     }
 
     #[test]
