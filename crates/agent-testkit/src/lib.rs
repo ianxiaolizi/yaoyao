@@ -240,6 +240,21 @@ impl EventStore for FakeEventStore {
         Ok(Box::new(FakeLease { leases: self.leases.clone(), key, session_id: session_id.clone() }))
     }
 
+    async fn delete_session(&self, session_id: &SessionId) -> Result<(), EventStoreError> {
+        if !is_safe_dir_name(session_id.as_str()) {
+            return Err(EventStoreError::unsafe_session_id());
+        }
+        let key = session_id.as_str().to_string();
+        let mut inner = self.inner.lock().unwrap();
+        inner.events.remove(&key);
+        inner.next_seq.remove(&key);
+        // Ids are unique within a log, so the index for a deleted log goes with
+        // it: leaving them would make a session that reuses the id read its
+        // first event as a duplicate of one nobody can see any more.
+        inner.seen.retain(|(session, _), _| session != &key);
+        Ok(())
+    }
+
     async fn flush(&self, session_id: &SessionId) -> Result<FlushReceipt, EventStoreError> {
         let inner = self.inner.lock().unwrap();
         let key = session_id.as_str().to_string();

@@ -69,6 +69,12 @@ struct FakeBackend {
     /// Every `set_model` call, as `(session, provider, model)`.
     models: Mutex<Vec<(String, String, Option<String>)>>,
     resumes: Mutex<Vec<String>>,
+    /// Every `delete_session` call, by id. The fake leaves the log alone so a
+    /// test can tell a refused request from one that went through.
+    deleted: Mutex<Vec<String>>,
+    /// Whether `delete_session` is accepted. `false` stands for a turn of this
+    /// server's own still running on the session.
+    accept_delete: AtomicBool,
     forks: Mutex<Vec<(String, Option<String>, String)>>,
     hold_approval: AtomicBool,
     /// Whether `set_model` accepts the name it was given. `true` unless a test
@@ -85,7 +91,13 @@ impl FakeBackend {
         let backend = Arc::new(Self::default());
         backend.interrupt_queued.store(true, Ordering::SeqCst);
         backend.accept_model.store(true, Ordering::SeqCst);
+        backend.accept_delete.store(true, Ordering::SeqCst);
         backend
+    }
+
+    /// Refuse a delete the way the driver does while a turn is running.
+    fn refuse_delete(&self) {
+        self.accept_delete.store(false, Ordering::SeqCst);
     }
 
     fn turn_count(&self) -> usize {
@@ -187,6 +199,14 @@ impl Backend for FakeBackend {
             model.map(str::to_string),
         ));
         Ok(ModelChoice::new(provider, model.map(str::to_string)))
+    }
+
+    async fn delete_session(&self, session: &SessionId) -> Result<(), BackendError> {
+        if !self.accept_delete.load(Ordering::SeqCst) {
+            return Err(BackendError::busy("a turn is running in this session"));
+        }
+        self.deleted.lock().unwrap().push(session.as_str().to_string());
+        Ok(())
     }
 }
 
@@ -1483,6 +1503,80 @@ async fn a_session_summary_reports_the_model_it_was_set_to() {
     let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
     assert_eq!(payload["session"]["model"]["provider"], "openai");
     assert_eq!(payload["session"]["model"]["model"], "deepseek-flash");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn archiving_a_session_is_an_event_its_log_keeps() {
+    let (store, dir, session) = seeded().await;
+    let (addr, token, handle) = serve_over(store.clone(), dir.path().to_path_buf()).await;
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/archive", &token, &json!({ "v": 1, "archived": true })).await;
+    assert_eq!(status, 200, "{response}");
+
+    // The list says it is archived; the transcript is untouched — archiving is
+    // a decision about the list, not a change to what happened.
+    let (_, listed) = request(addr, "/api/sessions", Some(&token), None).await;
+    let listed: Value = serde_json::from_str(body(&listed)).expect("a JSON body");
+    assert_eq!(listed["sessions"][0]["archived"], true);
+    let (status, transcript) =
+        request(addr, "/api/sessions/s1/transcript", Some(&token), None).await;
+    assert_eq!(status, 200, "{transcript}");
+
+    // Taking it back out is one more event, and the log still remembers both.
+    let (status, response) =
+        post(addr, "/api/sessions/s1/archive", &token, &json!({ "v": 1, "archived": false })).await;
+    assert_eq!(status, 200, "{response}");
+    let (_, listed) = request(addr, "/api/sessions", Some(&token), None).await;
+    let listed: Value = serde_json::from_str(body(&listed)).expect("a JSON body");
+    assert_eq!(listed["sessions"][0]["archived"], false);
+
+    let events = store.read_stream(&session, EventSeq::ZERO, usize::MAX).await.expect("reads");
+    let archive_events: Vec<&str> = events
+        .iter()
+        .map(|event| event.event.event_type.as_str())
+        .filter(|name| {
+            name.starts_with("session/archived") || name.starts_with("session/unarchived")
+        })
+        .collect();
+    assert_eq!(archive_events, vec![EventType::SESSION_ARCHIVED, EventType::SESSION_UNARCHIVED]);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn deleting_a_session_removes_its_log_from_the_disk() {
+    let (store, dir, _session) = seeded().await;
+    let log = dir.path().join("s1").join("events.jsonl");
+    assert!(log.is_file(), "the seed wrote a log");
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = delete(addr, "/api/sessions/s1", &token).await;
+    assert_eq!(status, 200, "{response}");
+    assert!(!log.exists(), "the log is gone, not hidden");
+    assert!(!dir.path().join("s1").exists(), "the session directory goes with it");
+
+    // And the id is no longer a session to anyone: the endpoints say so.
+    let (status, response) = request(addr, "/api/sessions/s1", Some(&token), None).await;
+    assert_eq!(status, 404, "{response}");
+    let (_, listed) = request(addr, "/api/sessions", Some(&token), None).await;
+    let listed: Value = serde_json::from_str(body(&listed)).expect("a JSON body");
+    assert_eq!(listed["sessions"].as_array().map(Vec::len), Some(0));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn deleting_a_session_under_a_running_turn_is_refused() {
+    let (store, dir) = seeded_open_turn().await;
+    let backend = FakeBackend::new();
+    backend.refuse_delete();
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) = delete(addr, "/api/sessions/s1", &token).await;
+    assert_eq!(status, 409, "{response}");
+    assert!(dir.path().join("s1").join("events.jsonl").is_file(), "the log survives a refusal");
+    assert!(backend.deleted.lock().unwrap().is_empty(), "a refused delete records nothing");
     handle.abort();
 }
 

@@ -60,6 +60,16 @@ const LEASE_APPEND_WAIT: Duration = Duration::from_millis(200);
 /// How often a wait looks again while a peer holds the lease.
 const LEASE_RETRY: Duration = Duration::from_millis(20);
 
+/// How long a delete keeps trying to remove a directory whose files are still
+/// open elsewhere.
+///
+/// The usual holder is this process's own stream for the session being deleted:
+/// the client is told to go away by the same request, but the socket closes a
+/// moment later. A second is long enough for that and short enough that a real
+/// sharing violation is still reported instead of hidden behind a wait.
+const DELETE_RETRY: Duration = Duration::from_millis(50);
+const DELETE_RETRIES: usize = 20;
+
 /// How long a live subscription waits for a signal before re-reading the log
 /// anyway.
 ///
@@ -767,6 +777,61 @@ impl EventStore for JsonlEventStore {
         }
         fs::create_dir_all(self.session_dir(key))?;
         Ok(Box::new(self.leases.acquire(session_id, self.lease_wait)?))
+    }
+
+    async fn delete_session(&self, session_id: &SessionId) -> Result<(), EventStoreError> {
+        let key = session_id.as_str();
+        if !is_safe_dir_name(key) {
+            return Err(EventStoreError::unsafe_session_id());
+        }
+        let dir = self.session_dir(key);
+        // A session that was never written is already gone: the caller asked
+        // for it not to be there, and it is not. Left as a success so deleting
+        // twice, or deleting a session another page just deleted, is not an
+        // error the person has to interpret.
+        if !dir.exists() {
+            self.sessions.lock().map_err(|_| Self::poisoned())?.remove(key);
+            return Ok(());
+        }
+        // The lease is taken so no append lands between the cache drop and the
+        // removal. `lease_wait` (rather than the short append wait) because the
+        // holder may be a granted tool call that runs for minutes, and waiting
+        // for it to finish is what the delete is asking to do anyway.
+        //
+        // `acquire` creates the lock file, so the directory has to be there for
+        // it: this recreates one a peer removed between the check above and
+        // here, and the removal below takes it away again. Only reached when
+        // the directory existed a moment ago, so a delete that fails on the
+        // lease does not leave an empty session behind.
+        fs::create_dir_all(&dir)?;
+        let _lease = self.leases.acquire(session_id, self.lease_wait)?;
+
+        // Drop this process's handles before the directory goes. On Windows an
+        // open handle is what makes a removal fail, and a cached session would
+        // otherwise let an id that is created again read a log that is gone.
+        self.sessions.lock().map_err(|_| Self::poisoned())?.remove(key);
+
+        // A live subscription holds its own `Arc<Session>`, so the files can
+        // stay open a moment after the cache entry goes — an SSE stream ends
+        // when its client disconnects, which is not synchronous with this call.
+        // Retry briefly rather than reporting a sharing violation the caller
+        // cannot act on.
+        let mut last = None;
+        for attempt in 0..DELETE_RETRIES {
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+            if attempt + 1 < DELETE_RETRIES {
+                // A blocking sleep, for the same reason `acquire` waits with
+                // one: this crate has no runtime of its own, and the whole
+                // store treats a wait as "the calling thread is busy" rather
+                // than "the executor may run something else".
+                std::thread::sleep(DELETE_RETRY);
+            }
+        }
+        last.map_or(Ok(()), |error| Err(error.into()))
     }
 
     async fn flush(&self, session_id: &SessionId) -> Result<FlushReceipt, EventStoreError> {

@@ -21,6 +21,9 @@
     token: TOKEN,
     meta: null,
     sessions: [],
+    /// Whether the archived section is unfolded. Folded by default: archived
+    /// sessions are out of the way until someone asks for them.
+    showArchived: false,
     active: null,
     activeSummary: null,
     items: new Map(),
@@ -354,6 +357,42 @@
     }
   }
 
+  // One row. A row is a container rather than a button because the archive and
+  // delete actions are buttons themselves, and a button inside a button is not
+  // something a browser will parse.
+  function sessionRow(summary) {
+    const used = usedTokens(summary);
+    const share = Math.max(2, Math.min(100, (used / budgetTokens()) * 100));
+    const pending = Number(summary.pending_approvals || 0);
+    const badge = pending
+      ? '<span class="badge ask">待批</span>'
+      : summary.open_turn
+        ? '<span class="badge">进行中</span>'
+        : summary.yielded
+          ? '<span class="badge">待续</span>'
+          : '';
+    const active = summary.id === state.active ? ' on' : '';
+    const id = esc(summary.id);
+    return `
+      <div class="t${active}" data-row="${id}" title="${id}">
+        <button class="tmain" data-session="${id}">
+          <div class="r1"><span class="ti">${esc(sessionTitle(summary))}</span>${badge}</div>
+          <div class="snip">${esc(summary.snippet || '—')}</div>
+          <div class="r2">
+            <span>${Number(summary.steps || 0)} 步</span><i class="dotsep"></i>
+            <span>${esc(timeShort(summary.last_activity_at))}</span><i class="dotsep"></i>
+            <span>${fmtTokens(used)}</span>
+            <span class="ctxbar" title="本轮用量 / 上下文预算"><i style="width:${share.toFixed(0)}%"></i></span>
+          </div>
+          ${summary.forked_from ? `<div class="forkline">↳ 分叉自 ${esc(summary.forked_from)}</div>` : ''}
+        </button>
+        <div class="tact">
+          <button data-act="${summary.archived ? 'restore' : 'archive'}" data-for="${id}">${summary.archived ? '恢复' : '归档'}</button>
+          <button class="danger" data-act="delete" data-for="${id}">删除</button>
+        </div>
+      </div>`;
+  }
+
   function renderSessions() {
     const host = $('threads');
     const query = state.search.trim().toLowerCase();
@@ -374,7 +413,11 @@
       { label: '昨天', rows: [] },
       { label: '更早', rows: [] },
     ];
+    // Archived sessions are not "older", they are put away: they get their own
+    // section at the bottom, folded by default, and never count towards a day.
+    const archived = rows.filter((summary) => summary.archived);
     for (const summary of rows) {
+      if (summary.archived) continue;
       const at = parseDate(summary.last_activity_at);
       let index = 2;
       if (at && dayKey(at) === dayKey(now)) index = 0;
@@ -386,36 +429,91 @@
     for (const group of groups) {
       if (!group.rows.length) continue;
       html.push(`<div class="grp"><span>${group.label}</span><span>${group.rows.length}</span></div>`);
-      for (const summary of group.rows) {
-        const used = usedTokens(summary);
-        const share = Math.max(2, Math.min(100, (used / budgetTokens()) * 100));
-        const pending = Number(summary.pending_approvals || 0);
-        const badge = pending
-          ? '<span class="badge ask">待批</span>'
-          : summary.open_turn
-            ? '<span class="badge">进行中</span>'
-            : summary.yielded
-              ? '<span class="badge">待续</span>'
-              : '';
-        const active = summary.id === state.active ? ' on' : '';
-        html.push(`
-          <button class="t${active}" data-session="${esc(summary.id)}" title="${esc(summary.id)}">
-            <div class="r1"><span class="ti">${esc(sessionTitle(summary))}</span>${badge}</div>
-            <div class="snip">${esc(summary.snippet || '—')}</div>
-            <div class="r2">
-              <span>${Number(summary.steps || 0)} 步</span><i class="dotsep"></i>
-              <span>${esc(timeShort(summary.last_activity_at))}</span><i class="dotsep"></i>
-              <span>${fmtTokens(used)}</span>
-              <span class="ctxbar" title="本轮用量 / 上下文预算"><i style="width:${share.toFixed(0)}%"></i></span>
-            </div>
-            ${summary.forked_from ? `<div class="forkline">↳ 分叉自 ${esc(summary.forked_from)}</div>` : ''}
-          </button>`);
-      }
+      html.push(group.rows.map(sessionRow).join(''));
+    }
+    if (archived.length) {
+      html.push(
+        `<button class="grp grpbtn" data-archived-toggle title="归档的会话日志完整，随时可以恢复">` +
+          `<span>已归档 ${state.showArchived ? '▾' : '▸'}</span><span>${archived.length}</span></button>`,
+      );
+      if (state.showArchived) html.push(archived.map(sessionRow).join(''));
     }
     host.innerHTML = html.join('');
     host.querySelectorAll('[data-session]').forEach((button) => {
       button.addEventListener('click', () => openSession(button.dataset.session));
     });
+    host.querySelectorAll('[data-archived-toggle]').forEach((button) => {
+      button.addEventListener('click', () => {
+        state.showArchived = !state.showArchived;
+        renderSessions();
+      });
+    });
+    host.querySelectorAll('[data-act]').forEach((button) => {
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const id = button.dataset.for;
+        if (button.dataset.act === 'archive') setArchived(id, true);
+        else if (button.dataset.act === 'restore') setArchived(id, false);
+        else armDelete(button, id);
+      });
+    });
+  }
+
+  // Archiving and deleting are next to each other in a menu the cursor is
+  // already on, so delete asks twice: the first click turns the label into the
+  // question, and it goes back to "删除" if the question is ignored.
+  let deleteArmTimer = 0;
+  function armDelete(button, id) {
+    if (button.dataset.armed === '1') {
+      clearTimeout(deleteArmTimer);
+      deleteSession(id);
+      return;
+    }
+    button.dataset.armed = '1';
+    button.textContent = '确认删除？';
+    clearTimeout(deleteArmTimer);
+    deleteArmTimer = setTimeout(() => {
+      button.dataset.armed = '0';
+      button.textContent = '删除';
+    }, 4000);
+  }
+
+  async function setArchived(id, archived) {
+    try {
+      await api(`/api/sessions/${encodeURIComponent(id)}/archive`, {
+        method: 'POST',
+        body: { v: 1, archived },
+      });
+      const row = state.sessions.find((summary) => summary.id === id);
+      if (row) row.archived = archived;
+      if (state.activeSummary?.id === id) state.activeSummary.archived = archived;
+      renderSessions();
+      updateHeader();
+      toast(archived ? '已归档：日志完整，随时可以恢复' : '已恢复到会话列表');
+    } catch (error) {
+      toast(error.message || '归档没有改成', 'error');
+    }
+  }
+
+  async function deleteSession(id) {
+    // Leaving first matters: this page's own stream holds the log open, and a
+    // log that is still being read cannot be removed on Windows.
+    const leaving = state.active === id;
+    if (leaving && state.controller) state.controller.abort();
+    try {
+      await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.sessions = state.sessions.filter((summary) => summary.id !== id);
+      if (leaving) newSession();
+      renderSessions();
+      toast('会话已删除');
+    } catch (error) {
+      // The stream was dropped on the way out, and the delete did not happen:
+      // the session is still here and so is its turn, so take the stream back.
+      if (leaving) connectStream(id);
+      const busy = error instanceof ApiError && error.status === 409;
+      toast(busy ? '这一轮还在跑，停下来再删' : error.message || '没有删掉', 'error');
+      renderSessions();
+    }
   }
 
   function applySummary(summary) {
@@ -453,6 +551,7 @@
     $('sessionTag').textContent = state.active ? '会话' : '本地';
     $('sessionTag').title = state.active ? (summary?.id || state.active || '') : '';
     $('crumbSep').hidden = !state.active;
+    $('archBadge').hidden = !summary?.archived;
     // The model belongs to the session once someone chose one; until then the
     // server's startup label is what the next turn will use.
     const model = modelLabel(summary?.model);

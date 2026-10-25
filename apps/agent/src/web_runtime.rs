@@ -434,6 +434,31 @@ impl Backend for WebBackend {
         self.runtimes.lock().await.remove(session.as_str());
         Ok(choice)
     }
+
+    async fn delete_session(&self, session: &SessionId) -> Result<(), BackendError> {
+        // The session lock is tried, not taken: a delete that waited for a
+        // ten-minute turn would look like a hung button, and a delete that
+        // removed the log under a running turn would leave that turn appending
+        // to a session nobody can see. Refusing is the honest answer, and the
+        // page can say so.
+        let lock = self.session_lock(session).await;
+        let Ok(_guard) = lock.try_lock() else {
+            return Err(BackendError::busy("a turn is running in this session"));
+        };
+
+        // Drop the stack before the log: it owns this session's MCP children,
+        // and they must not keep running for a session that no longer exists.
+        // Its file handles are what would otherwise keep the directory from
+        // being removed on Windows.
+        let dropped = self.runtimes.lock().await.remove(session.as_str());
+        drop(dropped);
+
+        self.inputs.store.delete_session(session).await.map_err(|error| {
+            BackendError::internal(format!("the session log could not be removed: {error}"))
+        })?;
+        self.sessions.lock().await.remove(session.as_str());
+        Ok(())
+    }
 }
 
 /// Watch a turn's live text while it runs, then drain what was already queued.

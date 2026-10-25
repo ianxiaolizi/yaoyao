@@ -170,7 +170,16 @@
     border:0;background:transparent;transition:background .14s ease;
   }
   .t:hover{background:var(--hover)}
-  .t:active{background:rgba(0,0,0,.06)}
+  /* The row is a container so its archive/delete actions can be buttons of
+     their own; the whole rest of it is still one click target. */
+  .t .tmain{display:block;width:100%;padding:0;border:0;background:none;font:inherit;text-align:left;color:inherit;cursor:pointer}
+  .t .tact{position:absolute;right:8px;bottom:5px;display:none;gap:2px}
+  .t:hover .tact,.t.on .tact{display:flex}
+  .t .tact button{border:0;border-radius:4px;background:var(--panel-bg);color:var(--ink-4);font:inherit;font-size:9.5px;padding:1px 5px;cursor:pointer}
+  .t .tact button:hover{background:var(--field-hover);color:var(--ink)}
+  .t .tact button.danger:hover{color:var(--red)}
+  .grpbtn{width:100%;border:0;background:none;font:inherit;cursor:pointer}
+  .grpbtn:hover{color:var(--ink-2)}
   .t.on{background:var(--raise);box-shadow:0 1px 3px rgba(0,0,0,.06)}
   .t .r1{display:flex;align-items:center;gap:6px}
   .t .ti{font-size:12px;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

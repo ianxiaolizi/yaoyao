@@ -53,6 +53,9 @@ pub(crate) struct Folded {
     /// The model the session is set to use, if the person ever chose one. Absent
     /// means the server's startup decision still applies.
     pub model: Option<ModelChoice>,
+    /// Whether the session is put away. Archived sessions keep their whole log
+    /// and stay openable; they are only moved out of the working list.
+    pub archived: bool,
 }
 
 /// A transcript that can be advanced one event at a time.
@@ -280,6 +283,7 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
         last_plan,
         subagents,
         model,
+        archived: agent_kernel::session_archive::current(&events),
     })
 }
 
@@ -533,6 +537,7 @@ fn summary(session: &SessionId, folded: &Folded, now: DateTime<Utc>) -> Value {
         // Absent until the person picks one: the page then falls back to the
         // server's startup label rather than inventing a selection.
         "model": folded.model,
+        "archived": folded.archived,
     })
 }
 

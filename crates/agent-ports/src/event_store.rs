@@ -184,6 +184,37 @@ pub trait EventStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<StoredEvent>, EventStoreError>;
 
+    /// Remove the session's log for good.
+    ///
+    /// This is the one operation in the port that destroys facts, and it exists
+    /// because "hide it" already has an answer: a person who deletes a session
+    /// expects the transcript to be gone from the disk, not hidden behind a
+    /// tombstone that a backup, an editor or `read_stream` would still find.
+    ///
+    /// What it must do, in order: take the session's lease, so no write
+    /// interleaves; drop whatever this instance cached for the session, so its
+    /// file handles are closed before the directory goes and a later session
+    /// that reuses the id cannot read the old log out of a cache; then remove
+    /// the log. A session that is not there is not an error — the caller asked
+    /// for it to be gone, and it is.
+    ///
+    /// A turn running in *another* process is not visible to this call beyond
+    /// the lease it takes for each write. Callers that can see their own turns
+    /// must refuse to delete under one; the port cannot know about them.
+    ///
+    /// The default refusal exists so a double that only gates or refuses writes
+    /// does not have to spell out a destruction it would never perform. A store
+    /// that can hold events is expected to answer this one.
+    async fn delete_session(&self, session_id: &SessionId) -> Result<(), EventStoreError> {
+        Err(EventStoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "this store cannot delete session {}: it is a test double",
+                session_id.as_str()
+            ),
+        )))
+    }
+
     /// Subscribe to events from `from_seq` onward, `from_seq` included.
     ///
     /// The bound is inclusive because it is the same kind of number

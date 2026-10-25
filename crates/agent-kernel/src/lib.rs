@@ -23,6 +23,7 @@ pub mod resource_guard;
 pub mod resume;
 pub mod schedule;
 pub mod scheduler;
+pub mod session_archive;
 pub mod subagent;
 pub mod tools;
 pub mod workspace;

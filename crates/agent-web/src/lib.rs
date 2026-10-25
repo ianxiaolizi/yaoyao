@@ -322,7 +322,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/app.js", get(app_js))
         .route("/api/meta", get(meta))
         .route("/api/sessions", get(sessions))
-        .route("/api/sessions/{id}", get(session))
+        .route("/api/sessions/{id}", get(session).delete(delete_session))
+        .route("/api/sessions/{id}/archive", post(archive))
         .route("/api/sessions/{id}/transcript", get(transcript))
         .route("/api/sessions/{id}/events", get(events))
         .route("/api/sessions/{id}/diff", get(diff))
@@ -420,6 +421,68 @@ async fn session(
         .find(|row| row["id"].as_str() == Some(id.as_str()))
         .ok_or_else(|| ApiFailure::not_found(format!("no session '{id}'")))?;
     Ok(Json(json!({ "v": PROTOCOL, "session": found })))
+}
+
+/// `POST /api/sessions/{id}/archive`: put the session away, or take it back out.
+///
+/// A body of `{"v":1,"archived":true|false}` picks the direction, because the
+/// two are one decision with two answers rather than two resources. Archiving is
+/// an event in the session's own log — the session keeps every event it had, and
+/// taking it back is one more — so this endpoint never touches the transcript.
+async fn archive(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, ApiFailure> {
+    check_session(&state, &id)?;
+    let body = json_body(body)?;
+    check_version(&body)?;
+    let Some(archived) = body.get("archived").and_then(Value::as_bool) else {
+        return Err(ApiFailure::bad_request("archived must be true or false"));
+    };
+    let session = SessionId::from_string(&id);
+    agent_kernel::session_archive::set(state.store.clone(), &session, archived, Actor::User)
+        .await
+        .map_err(|error| ApiFailure::internal(format!("归档状态没有写进日志：{error}")))?;
+    Ok(Json(json!({ "v": PROTOCOL, "ok": true, "archived": archived })))
+}
+
+/// `DELETE /api/sessions/{id}`: remove the session's log from the disk.
+///
+/// Unlike [`archive`] this destroys the transcript. It goes through the driver
+/// so the session's cached stack (and any MCP child processes) goes with it, and
+/// so a turn of this server's own that is still running can refuse: a log
+/// removed under a live turn would leave that turn appending to nothing.
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiFailure> {
+    check_session(&state, &id)?;
+    let session = SessionId::from_string(&id);
+    match state.backend.clone() {
+        Some(backend) => {
+            if let Err(error) = backend.delete_session(&session).await {
+                if error.code == "busy" {
+                    return Err(ApiFailure::conflict("busy", error.message));
+                }
+                return Err(ApiFailure::internal(format!(
+                    "会话没有删掉（{}）：{}",
+                    error.code, error.message
+                )));
+            }
+        }
+        // A build with no driver has no stack to drop either; the log is still
+        // this process's to remove, and leaving a delete endpoint that only says
+        // "unavailable" would be a button that never works.
+        None => {
+            state
+                .store
+                .delete_session(&session)
+                .await
+                .map_err(|error| ApiFailure::internal(format!("会话没有删掉：{error}")))?;
+        }
+    }
+    Ok(Json(json!({ "v": PROTOCOL, "ok": true, "session": id })))
 }
 
 /// `GET /api/sessions/{id}/transcript?since=<seq>`.

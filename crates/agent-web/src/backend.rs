@@ -196,4 +196,13 @@ pub trait Backend: Send + Sync {
         provider: &str,
         model: Option<&str>,
     ) -> Result<ModelChoice, BackendError>;
+
+    /// Remove a session's log for good.
+    ///
+    /// Goes through the driver rather than straight to the store because the
+    /// driver is what knows a session may have a live stack behind it — MCP child
+    /// processes that belong to this session and must not outlive it — and
+    /// because only the driver can tell that a turn of its own is running and
+    /// refuse.
+    async fn delete_session(&self, session: &SessionId) -> Result<(), BackendError>;
 }

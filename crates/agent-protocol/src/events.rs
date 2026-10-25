@@ -58,6 +58,16 @@ impl EventType {
     /// what a past run says: each run still records the route it used in
     /// `profile/resolved`.
     pub const SESSION_MODEL_SELECTED: &'static str = "session/model.selected";
+    /// The session was put away: it is hidden from the working list, and
+    /// nothing about its log changes. Payload: `{ "archived": true }`.
+    ///
+    /// A pair rather than one event with a boolean, because each event is a
+    /// thing that happened — "this was archived" stays true even after it is
+    /// taken back out, and the latest of the two is the current answer.
+    pub const SESSION_ARCHIVED: &'static str = "session/archived";
+    /// The session was taken back out of the archive. Payload:
+    /// `{ "archived": false }`.
+    pub const SESSION_UNARCHIVED: &'static str = "session/unarchived";
     pub const RUN_STARTED: &'static str = "run/started";
     pub const RUN_YIELDED: &'static str = "run/yielded";
     pub const RUN_COMPLETED: &'static str = "run/completed";
@@ -213,6 +223,8 @@ impl EventType {
         Self::SESSION_FORKED,
         Self::PROFILE_RESOLVED,
         Self::SESSION_MODEL_SELECTED,
+        Self::SESSION_ARCHIVED,
+        Self::SESSION_UNARCHIVED,
         Self::RUN_STARTED,
         Self::RUN_YIELDED,
         Self::RUN_COMPLETED,

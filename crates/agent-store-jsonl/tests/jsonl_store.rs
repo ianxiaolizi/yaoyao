@@ -395,3 +395,38 @@ async fn rejects_unsafe_session_id() {
         other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn delete_removes_the_directory_and_a_reused_id_starts_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonlEventStore::new(dir.path().to_path_buf());
+    let sid = SessionId::from_string("doomed");
+
+    store
+        .append(
+            &sid,
+            EventSeq::ZERO,
+            vec![draft("doomed", EventType::TURN_STARTED), draft("doomed", EventType::RUN_STARTED)],
+        )
+        .await
+        .unwrap();
+    assert!(dir.path().join("doomed").join("events.jsonl").is_file());
+
+    store.delete_session(&sid).await.unwrap();
+    assert!(!dir.path().join("doomed").exists(), "the session directory is gone");
+
+    // The same id, written again, is a new log: the cache that held the old one
+    // went with it, so seq starts at zero instead of continuing a dead history.
+    store
+        .append(&sid, EventSeq::ZERO, vec![draft("doomed", EventType::TURN_STARTED)])
+        .await
+        .unwrap();
+    let events = store.read_stream(&sid, EventSeq::ZERO, 10).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, EventSeq::ZERO);
+
+    // Deleting twice, or deleting a session that never existed, is not an error:
+    // what was asked for is that it not be there.
+    store.delete_session(&sid).await.unwrap();
+    store.delete_session(&SessionId::from_string("never-written")).await.unwrap();
+}
