@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -49,7 +49,7 @@ impl Server {
             .env_remove(ENV_MANAGED_POLICY)
             .env_remove("AGENT_SANDBOX")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn agent web");
 
@@ -65,13 +65,34 @@ impl Server {
                 }
             }
         });
+        // The stderr is collected rather than sent to NUL: a server that refuses
+        // to start explains itself there, and that explanation belongs in the
+        // failure instead of a bare "exited". (It also keeps the child off the
+        // NUL device, which not every machine lets a parent open.)
+        let note = Arc::new(Mutex::new(String::new()));
+        let sink = note.clone();
+        let mut stderr = child.stderr.take().expect("stderr");
+        std::thread::spawn(move || {
+            let mut buffer = String::new();
+            let _ = stderr.read_to_string(&mut buffer);
+            if let Ok(mut sink) = sink.lock() {
+                sink.push_str(&buffer);
+            }
+        });
 
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "the server never printed its URL");
+            assert!(
+                !left.is_zero(),
+                "the server never printed its URL: {}",
+                note.lock().map(|note| note.clone()).unwrap_or_default()
+            );
             let Ok(line) = printed.recv_timeout(left) else {
-                panic!("the server exited before printing its URL");
+                panic!(
+                    "the server exited before printing its URL: {}",
+                    note.lock().map(|note| note.clone()).unwrap_or_default()
+                );
             };
             let Some((addr, token)) = parse_url(&line) else { continue };
             return Server { child, addr, token, data, _workspace: workspace };
@@ -123,16 +144,51 @@ impl Server {
         self.call("DELETE", path, None)
     }
 
+    /// The beginning of an event stream: whatever arrives before it goes quiet
+    /// or the read times out, which is the replay of the session and nothing
+    /// more. An SSE response never ends on its own, so it is read in pieces
+    /// rather than to EOF, and the socket is what closes it.
+    fn stream_head(&self, path: &str) -> String {
+        let mut stream = TcpStream::connect(self.addr).expect("connect");
+        stream.set_read_timeout(Some(Duration::from_secs(3))).expect("read timeout");
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
+             Accept: text/event-stream\r\nConnection: close\r\n\r\n",
+            self.addr, self.token
+        );
+        stream.write_all(request.as_bytes()).expect("write");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 4096];
+        while let Ok(read) = stream.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+            if bytes.windows(7).any(|window| window == b"event: ") && bytes.ends_with(b"\n\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
     /// The transcript, once it says what the test is waiting for.
     ///
     /// Polling the projection rather than sleeping a fixed time: a turn ends
     /// when its log says so, and that is the only moment the answer is there.
+    ///
+    /// A turn is accepted before its first append lands, so for a moment the
+    /// session has no log and the read is a 404. That is the race this waits
+    /// out: the failure worth reporting is a turn that never writes, not one
+    /// that has not written yet.
     fn transcript_until(&self, id: &str, wanted: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let (status, text) = self.get(&format!("/api/sessions/{id}/transcript"));
-            assert_eq!(status, 200, "the transcript read failed: {text}");
-            if text.contains(wanted) {
+            assert!(
+                status == 200 || status == 404,
+                "the transcript read answered {status}: {text}"
+            );
+            if status == 200 && text.contains(wanted) {
                 return text;
             }
             assert!(
@@ -191,6 +247,14 @@ fn a_session_lives_through_the_web_surface() {
         server.data_dir().join(id).join("events.jsonl").is_file(),
         "the turn wrote the same log the terminal reads"
     );
+
+    // The summary the page lists, and the event stream it keeps open: the same
+    // session, read the two other ways the page reads it.
+    let (status, text) = server.get(&format!("/api/sessions/{id}"));
+    assert_eq!(status, 200, "the session summary failed: {text}");
+    assert!(body(&text).contains("\"id\":\"web-e2e-1\""), "the summary names it: {text}");
+    let replay = server.stream_head(&format!("/api/sessions/{id}/events?from=0"));
+    assert!(replay.contains("event: item"), "the stream replays the session: {replay}");
 
     // The read surface the page opens next. The three that have nothing to show
     // for an echo turn say so by name — a session that never planned has no

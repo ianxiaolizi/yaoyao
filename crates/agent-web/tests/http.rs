@@ -23,7 +23,7 @@ use agent_protocol::model::ModelResponse;
 use agent_protocol::permissions::{ApprovalRequest, ApprovalStatus, Capability};
 use agent_protocol::reason::{Basis, ReasonKind, ReasonNode, ReasonSource};
 use agent_store_jsonl::JsonlEventStore;
-use agent_web::{Backend, BackendError, Config, Decision, LiveSink, Meta, Server};
+use agent_web::{Backend, BackendError, Config, Decision, LiveChunk, LiveSink, Meta, Server};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -83,6 +83,8 @@ struct FakeBackend {
     /// What `interrupt` reports back: `true` unless a test says there is no
     /// open turn to stop.
     interrupt_queued: AtomicBool,
+    /// The live previews `run_turn` publishes while it runs, in order.
+    previews: Mutex<Vec<LiveChunk>>,
     release: Notify,
 }
 
@@ -120,6 +122,11 @@ impl FakeBackend {
     fn refuse_models(&self) {
         self.accept_model.store(false, Ordering::SeqCst);
     }
+
+    /// What the next turn will publish as live text, before it finishes.
+    fn previews(&self, chunks: Vec<LiveChunk>) {
+        self.previews.lock().unwrap().extend(chunks);
+    }
 }
 
 #[async_trait::async_trait]
@@ -128,9 +135,12 @@ impl Backend for FakeBackend {
         &self,
         session: &SessionId,
         text: &str,
-        _live: &LiveSink,
+        live: &LiveSink,
     ) -> Result<(), BackendError> {
         self.turns.lock().unwrap().push((session.as_str().to_string(), text.to_string()));
+        for chunk in self.previews.lock().unwrap().drain(..) {
+            let _ = live.send(chunk);
+        }
         Ok(())
     }
 
@@ -793,11 +803,26 @@ async fn delete(addr: SocketAddr, path: &str, token: &str) -> (u16, String) {
 
 /// One POST with a JSON body, read to EOF.
 async fn post(addr: SocketAddr, path: &str, token: &str, payload: &Value) -> (u16, String) {
+    post_raw(addr, path, token, Some("application/json"), &payload.to_string()).await
+}
+
+/// One POST whose body is written out by the caller.
+///
+/// A body that is not JSON cannot be built from a [`Value`], and a request the
+/// surface has to refuse for its shape is exactly what these tests need.
+async fn post_raw(
+    addr: SocketAddr,
+    path: &str,
+    token: &str,
+    content_type: Option<&str>,
+    body: &str,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("connect");
-    let body = payload.to_string();
+    let content_type =
+        content_type.map(|value| format!("Content-Type: {value}\r\n")).unwrap_or_default();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         {content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.expect("write");
@@ -1594,5 +1619,264 @@ async fn the_event_stream_replays_history_before_it_waits() {
     // The replay is complete enough that the connection is open for more, not
     // closed after a snapshot.
     assert!(response.contains("HTTP/1.1 200"), "{response}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_build_with_no_driver_reads_but_does_not_run() {
+    // `agent web` without a driver still serves the log: reading is this
+    // process's own business. What it cannot do is start work, and every verb
+    // that would says which capability is missing in the same envelope rather
+    // than failing silently or pretending to have queued something.
+    let (store, dir, _session) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/transcript", Some(&token), None).await;
+    assert_eq!(status, 200, "the log is still readable: {response}");
+
+    let verbs = [
+        ("turns", json!({ "v": 1, "text": "hola" })),
+        ("resume", json!({ "v": 1 })),
+        ("fork", json!({ "v": 1, "reason": "another way" })),
+        ("steer", json!({ "v": 1, "text": "not that" })),
+        ("interrupt", json!({ "v": 1 })),
+        ("model", json!({ "v": 1, "provider": "echo" })),
+        ("approvals/ap-1", json!({ "v": 1, "decision": "once" })),
+    ];
+    for (endpoint, payload) in verbs {
+        let (status, response) =
+            post(addr, &format!("/api/sessions/s1/{endpoint}"), &token, &payload).await;
+        assert_eq!(status, 501, "{endpoint} answered {status}: {response}");
+        assert!(
+            body(&response).contains("\"code\":\"no_backend\""),
+            "{endpoint} names the missing driver: {response}"
+        );
+    }
+
+    // Deleting is the exception: the log is this process's to remove even when
+    // nothing can run in it, and an endpoint that only ever said "no driver"
+    // would leave a person unable to clear a broken session.
+    let (status, response) = delete(addr, "/api/sessions/s1", &token).await;
+    assert_eq!(status, 200, "{response}");
+    assert!(!dir.path().join("s1").exists(), "the log is gone");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn live_text_reaches_an_open_stream_with_its_kind() {
+    // A preview is not part of the log, so the only place it can be seen is a
+    // stream that was already open when the turn spoke. Each kind travels with
+    // its own label: the page draws the model's reasoning differently from its
+    // prose, and a note from the host differently from both.
+    let (store, dir, _) = seeded().await;
+    let backend = FakeBackend::new();
+    backend.previews(vec![
+        LiveChunk::text("thinking about it"),
+        LiveChunk::reasoning("because the file is there"),
+        LiveChunk::notice("the shell was refused"),
+    ]);
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend)).await;
+
+    // The stream is read on its own task: it stays open for the length of the
+    // turn, which is the only way to be subscribed when the turn speaks.
+    let seen = Arc::new(Mutex::new(String::new()));
+    let sink = seen.clone();
+    let reader_token = token.clone();
+    let reader = tokio::spawn(async move {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "GET /api/sessions/s1/events?from=0 HTTP/1.1\r\nHost: {addr}\r\n\
+             Authorization: Bearer {reader_token}\r\nAccept: text/event-stream\r\n\
+             Connection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        loop {
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).await.expect("read");
+            if read == 0 {
+                break;
+            }
+            let mut sink = sink.lock().unwrap();
+            sink.push_str(&String::from_utf8_lossy(&buffer[..read]));
+            if sink.contains("the shell was refused") {
+                break;
+            }
+        }
+    });
+
+    // Subscribed before the turn starts: the replay is what says so.
+    assert!(eventually(|| seen.lock().unwrap().contains("event: item")).await);
+    let (status, response) =
+        post(addr, "/api/sessions/s1/turns", &token, &json!({ "v": 1, "text": "go" })).await;
+    assert_eq!(status, 202, "{response}");
+    assert!(eventually(|| seen.lock().unwrap().contains("the shell was refused")).await);
+
+    let text = seen.lock().unwrap().clone();
+    for (kind, words) in [
+        ("text", "thinking about it"),
+        ("reasoning", "because the file is there"),
+        ("notice", "the shell was refused"),
+    ] {
+        assert!(text.contains("event: live"), "the previews arrive as live events: {text}");
+        assert!(text.contains(&format!("\"kind\":\"{kind}\"")), "the {kind} label: {text}");
+        assert!(text.contains(words), "the {kind} text: {text}");
+    }
+    reader.abort();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn the_transcript_shows_the_rows_a_turn_produces() {
+    // A turn that reasoned, ran a tool and ended: the three rows the page
+    // draws beyond the prompt and the answer. Each comes from its own event,
+    // and the fold is what turns them into the shape the page reads.
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let step = StepId::from_string("s1");
+    let node = ReasonNode {
+        id: "r/t1/1".to_string(),
+        turn_id: "t1".to_string(),
+        step: 0,
+        kind: ReasonKind::Situation,
+        claim: "the person asked for a file".to_string(),
+        basis: vec![Basis { node: None, event: None, fact: Some("their words".to_string()) }],
+        rule: "situation/derive".to_string(),
+        source: ReasonSource::Kernel,
+    };
+    let drafts = vec![
+        draft(
+            &session,
+            EventType::TURN_STARTED,
+            Some(&turn),
+            None,
+            json!({ "inbox_item": "i1" }),
+            Actor::Scheduler,
+        ),
+        draft(
+            &session,
+            EventType::REASON_RECORDED,
+            Some(&turn),
+            None,
+            json!({ "node": node }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::TOOL_STARTED,
+            Some(&turn),
+            Some(&step),
+            json!({
+                "tool_name": "read_file",
+                "provider_tool_call_id": "c1",
+                "arguments": { "path": "a.txt" },
+            }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::TOOL_COMPLETED,
+            Some(&turn),
+            Some(&step),
+            json!({ "tool_name": "read_file", "provider_tool_call_id": "c1", "content": "hello" }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::TURN_COMPLETED,
+            Some(&turn),
+            None,
+            json!({ "final_content": "there it is" }),
+            Actor::Scheduler,
+        ),
+    ];
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the log");
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/transcript", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let transcript: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    let items = transcript["items"].as_array().expect("a list of rows");
+    let row = |kind: &str| {
+        items
+            .iter()
+            .find(|item| item["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} row in {}", body(&response)))
+    };
+
+    // The reasoning line carries how many steps it took to get there.
+    let thinking = row("thinking");
+    assert!(thinking["text"].as_str().unwrap_or_default().contains("asked for a file"));
+    assert_eq!(thinking["steps"], 1);
+
+    // The tool row is one row for both halves: what it was asked and what it
+    // said back, under the same id so the page upserts rather than appends.
+    let action = row("action");
+    assert_eq!(action["tool"], "read_file");
+    assert_eq!(action["status"], "completed");
+    assert_eq!(action["content"], "hello");
+    assert_eq!(action["arguments"]["path"], "a.txt");
+    assert!(action["duration_ms"].is_number(), "the tool row is timed: {action}");
+
+    // And the turn says how it ended, separately from what it answered.
+    assert_eq!(row("turn_end")["ending"], "answered");
+    assert_eq!(row("answer")["text"], "there it is");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_request_the_surface_cannot_answer_is_refused_by_name() {
+    let (store, dir, _session) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    // A cursor that is not a whole number: answering with an empty transcript
+    // would say the turn was empty, which is not what the log holds.
+    let (status, response) =
+        request(addr, "/api/sessions/s1/transcript?since=yesterday", Some(&token), None).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("\"code\":\"bad_request\""), "{response}");
+    assert!(body(&response).contains("since"), "the refusal names the cursor: {response}");
+    let (status, response) =
+        request(addr, "/api/sessions/s1/events?from=soon", Some(&token), None).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("cursor"), "the refusal names the cursor: {response}");
+
+    // An id that is not a session id is refused before it becomes a path, on
+    // every verb that takes one.
+    for path in ["/api/sessions/a%2Fb/transcript", "/api/sessions/a%2Fb/events"] {
+        let (status, response) = request(addr, path, Some(&token), None).await;
+        assert_eq!(status, 400, "{path}: {response}");
+    }
+    let (status, response) = delete(addr, "/api/sessions/a%2Fb", &token).await;
+    assert_eq!(status, 400, "{response}");
+    let (status, response) =
+        post(addr, "/api/sessions/a%2Fb/archive", &token, &json!({ "v": 1, "archived": true }))
+            .await;
+    assert_eq!(status, 400, "{response}");
+
+    // A body that is not JSON is the request's fault, not a 500.
+    let (status, response) =
+        post_raw(addr, "/api/sessions/s1/turns", &token, Some("application/json"), "{\"v\":1,")
+            .await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("\"code\":\"bad_request\""), "{response}");
+
+    // Archiving without saying which way is refused rather than guessed.
+    let (status, response) =
+        post(addr, "/api/sessions/s1/archive", &token, &json!({ "v": 1 })).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("archived"), "{response}");
+
+    // The icon the browser asks for on every load, answered without a body.
+    let (status, response) = request(addr, "/favicon.ico", Some(&token), None).await;
+    assert_eq!(status, 204, "{response}");
+
+    // A stream for a session no turn has written yet waits for the write, then
+    // names the id it could not find.
+    let (status, response) =
+        request(addr, "/api/sessions/ghost/events?from=0", Some(&token), None).await;
+    assert_eq!(status, 404, "{response}");
+    assert!(body(&response).contains("ghost"), "{response}");
     handle.abort();
 }
