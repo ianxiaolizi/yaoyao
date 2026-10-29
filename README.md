@@ -65,10 +65,10 @@ DeepSeek / OpenAI-compatible 的四个环境变量。
 
 ```powershell
 cargo build --workspace
-powershell -File scripts\test.ps1   # fmt + clippy + 全量测试
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全量测试
 ```
 
-`scripts\test.ps1` 是跑门的唯一入口：仓库根可能带 Low 完整性标签，测试二进制继承后打不开 `NUL`，普通 `cargo test` 会假失败；脚本在构建后把测试二进制提到 Medium integrity，并把 `TEMP/TMP` 指到 `%TEMP%\yaoyao-test-tmp`。环境报错时先跑 `powershell -File scripts\preflight.ps1`，它报告 TEMP / NUL / 完整性 / 工具链四项事实。
+`-ExecutionPolicy Bypass` 是本机必需的：默认策略拦未签名脚本。`scripts\test.ps1` 是跑门的唯一入口：仓库根可能带 Low 完整性标签，测试二进制继承后打不开 `NUL`，普通 `cargo test` 会假失败；脚本在构建后把测试二进制提到 Medium integrity，并把 `TEMP/TMP` 指到 `%TEMP%\yaoyao-test-tmp`。环境报错时先跑 `powershell -ExecutionPolicy Bypass -File scripts\preflight.ps1`，它报告 TEMP / NUL / 完整性 / 工具链四项事实。
 
 默认使用离线回显模型，不需要网络或凭据：
 

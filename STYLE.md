@@ -7,16 +7,16 @@
 门只有一个入口：
 
 ```powershell
-powershell -File scripts\test.ps1
+powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 ```
 
-脚本依次跑 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`（本地默认 `-j 1`：并行偶发 `0xc0000409`）、`cargo test --workspace`。三门全绿才谈得上「改完了」。
+本机执行策略会拦未签名脚本（`UnauthorizedAccess`），所以文档里的调用一律带 `-ExecutionPolicy Bypass`；只想看一次也不改策略时可以照抄这一行。脚本依次跑 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`（本地默认 `-j 1`：并行偶发 `0xc0000409`）、`cargo test --workspace`。三门全绿才谈得上「改完了」。
 
 普通 `cargo test --workspace` 在这台机器上会假失败，原因是环境而不是代码：仓库根带 Low 完整性标签，构建出的测试二进制继承 Low，而 CLI 集成测试要把 `NUL` 作为子进程 stdin 打开。`scripts\test.ps1` 在 `--no-run` 之后把 `target\debug` 下的二进制提到 Medium integrity，并把 `TEMP/TMP` 指到 `%TEMP%\yaoyao-test-tmp`；`scripts\preflight.ps1` 在跑门前报告 TEMP / NUL / 完整性 / 工具链四项事实。该修复本身由 `crates/agent-testkit/tests/environment_gate.rs` 把守。
 
 **CI 跑的是同一脚本**（`.github/workflows/ci.yml`，push / PR 到 `main`，可 `workflow_dispatch` 手动重跑）：`check` job 分步跑 fmt、clippy，Test 步调 `scripts/test.ps1 -SkipFormat -SkipClippy`。另外两个 job：`coverage`（`scripts/coverage.ps1`，阈值在 `scripts/coverage-baseline.json`；设 `AGENT_APPCONTAINER_TEST=1` 时合并 AppContainer 真跑测量，否则本机会低于阈值）与 `perf-smoke`（release 跑性能示例的正确性哨兵，不与单机基线比对）。CI 的 Rust 版本钉在 workspace 的 `rust-version`（`1.99.0`）。
 
-**当前基线（2026-10-29）：1552 passed / 0 failed / 14 ignored**（经 `scripts\test.ps1` 全量跑出，105 个 test result 行）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
+**当前基线（2026-10-29）：1563 passed / 0 failed / 14 ignored**（经 `scripts\test.ps1` 全量跑出，105 个 test result 行）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
 
 ## 1. Rust 工程规则（硬）
 
