@@ -9,7 +9,7 @@
 //! gate that cries wolf gets ignored. `--strict` opts into the gate when a
 //! caller wants one.
 //!
-//! What is measured, and why these five:
+//! What is measured, and why these six:
 //!
 //! - `append_batch_10k` — one `append` of 10,000 events. Serialization, the
 //!   single write, and the store's in-memory bookkeeping all happen here.
@@ -21,6 +21,11 @@
 //! - `fold_10k` — `Projection::build_full` folds that log into model context.
 //!   The fold clones its state per event, so this is the workload whose cost
 //!   grows with both event count and transcript size.
+//! - `fold_10k_checkpointed` — `Projection::build` on the same log with a
+//!   checkpoint written at the tail: what a restart pays once the state is
+//!   cached. Compare it with `fold_10k` on the same host in the same run; the
+//!   ratio is the checkpoint's whole justification, and the two share their
+//!   correctness sentinels so a fast wrong answer fails.
 //! - `export_10k` — `run_export` renders both halves of the diagnostic bundle.
 //!   It reads the whole stream and writes `session.md` and `bundle.json`.
 //!
@@ -227,6 +232,7 @@ async fn run(root: &Path, options: &Options) -> Result<(), Box<dyn Error>> {
     ];
     readings.push(replay(&log_root, &session, options).await?);
     readings.push(fold(&log_root, root, &session, options).await?);
+    readings.push(fold_from_checkpoint(&log_root, root, &session, options).await?);
     readings.push(export(&log_root, root, &session, options).await?);
 
     println!(
@@ -494,6 +500,78 @@ async fn fold(
         }
     }
     Ok(Reading::new("fold_10k", SESSION_EVENTS as u64, samples))
+}
+
+/// The same fold, starting from a checkpoint a previous derivation wrote.
+///
+/// The pair with `fold_10k` is the measurement: that one is what a restart pays
+/// when the only thing it has is the log, this one is what it pays when the
+/// state was cached. The checkpoint is produced by `Projection::checkpoint` —
+/// the same call `ProjectionContextEngine` refreshes with — and copied into each
+/// run's own directory, so every sample reads it from a cold store exactly as a
+/// new process would. The checkpoint is written at the tail of the log, which is
+/// the best case for the read side and the case a live session is in after any
+/// derivation that just refreshed it.
+async fn fold_from_checkpoint(
+    log_root: &Path,
+    root: &Path,
+    session: &SessionId,
+    options: &Options,
+) -> Result<Reading, Box<dyn Error>> {
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(log_root));
+    let source =
+        Projection::new(ModelContextProjection::new(), store, root.join("checkpoint-source"));
+    let folded = source.build_full(session).await?;
+    source.checkpoint(session, &folded).await?;
+    let saved = root
+        .join("checkpoint-source")
+        .join(session.as_str())
+        .join("checkpoints")
+        .join("model-context.json");
+    if !saved.exists() {
+        return Err(format!("no checkpoint at {}", saved.display()).into());
+    }
+
+    let mut samples = Vec::with_capacity(options.iterations);
+    for run in 0..options.warmups + options.iterations {
+        let dir = root.join(format!("checkpointed-{run}"));
+        let target = dir.join(session.as_str()).join("checkpoints");
+        std::fs::create_dir_all(&target)?;
+        std::fs::copy(&saved, target.join("model-context.json"))?;
+
+        // A store built here has parsed nothing: the first read inside `build`
+        // parses the whole log, which is what a restarted process pays too. The
+        // checkpoint removes the fold, not the parse.
+        let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(log_root));
+        let projection = Projection::new(ModelContextProjection::new(), store, dir);
+        let start = Instant::now();
+        let projected = projection.build(session).await?;
+        let elapsed = start.elapsed();
+
+        // The same sentinels as `fold_10k`: the shortcut has to arrive at the
+        // same answer, or the number means nothing.
+        let messages = projection.view(&projected.state);
+        let expected_messages = (SESSION_EVENTS / 3) * 2;
+        if messages.len() != expected_messages {
+            return Err(format!(
+                "checkpointed fold produced {} messages, expected {expected_messages}",
+                messages.len()
+            )
+            .into());
+        }
+        let expected_seq = EventSeq::new(SESSION_EVENTS as u64 - 1);
+        if projected.as_of_seq != Some(expected_seq) {
+            return Err(format!(
+                "checkpointed fold stopped at {:?}, expected {expected_seq:?}",
+                projected.as_of_seq
+            )
+            .into());
+        }
+        if run >= options.warmups {
+            samples.push(elapsed);
+        }
+    }
+    Ok(Reading::new("fold_10k_checkpointed", SESSION_EVENTS as u64, samples))
 }
 
 async fn export(

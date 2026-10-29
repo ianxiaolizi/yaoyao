@@ -133,6 +133,16 @@ impl<D: ProjectionDefinition> Projection<D> {
     }
 
     /// Persist a checkpoint for the given projected state.
+    ///
+    /// Written to a staging name and renamed into place, so a concurrent reader
+    /// sees either the previous checkpoint or this one and never a torn file.
+    /// A torn file would be `Unusable`, which costs a full fold and nothing
+    /// else, but a write that a reader can observe half-done turns a background
+    /// refresh into a visible stall for whoever reads next. The staging name
+    /// carries the writer's pid for the same reason: two processes refreshing
+    /// one session must not interleave their bytes into one file. A process that
+    /// dies mid-write leaves its staging file behind; nothing reads it, and the
+    /// next successful refresh replaces the checkpoint proper.
     pub async fn checkpoint(
         &self,
         session_id: &SessionId,
@@ -150,7 +160,10 @@ impl<D: ProjectionDefinition> Projection<D> {
             state: projected.state.clone(),
         };
         let bytes = serde_json::to_vec(&cp)?;
-        std::fs::write(self.checkpoint_path(session_id)?, bytes)?;
+        let path = self.checkpoint_path(session_id)?;
+        let staging = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&staging, bytes)?;
+        std::fs::rename(&staging, &path)?;
         Ok(())
     }
 
