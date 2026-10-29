@@ -16,7 +16,7 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 
 **CI 跑的是同一脚本**（`.github/workflows/ci.yml`，push / PR 到 `main`，可 `workflow_dispatch` 手动重跑）：`check` job 分步跑 fmt、clippy，Test 步调 `scripts/test.ps1 -SkipFormat -SkipClippy`。另外两个 job：`coverage`（`scripts/coverage.ps1`，阈值在 `scripts/coverage-baseline.json`；设 `AGENT_APPCONTAINER_TEST=1` 时合并 AppContainer 真跑测量，否则本机会低于阈值）与 `perf-smoke`（release 跑性能示例的正确性哨兵，不与单机基线比对）。CI 的 Rust 版本钉在 workspace 的 `rust-version`（`1.99.0`）。
 
-**当前基线（2026-10-29）：1578 passed / 0 failed / 14 ignored**（经 `scripts\test.ps1` 全量跑出，106 个 test result 行）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
+**当前基线（2026-10-29）：1581 passed / 0 failed / 15 ignored**（经 `scripts\test.ps1` 全量跑出，107 个 test result 行）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
 
 ## 1. Rust 工程规则（硬）
 
@@ -68,6 +68,7 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 - **测试名必须与它真正检查的东西一致**。
 - **替身（Fake）放 `agent-testkit`，且必须与真实现行为一致、差异要写下来。** 「写下来」不是注释里提一句：**凡 port 的契约可机器判定，替身就得给出与真实现相同的答案**。差异**消除不掉**的，写进替身自己的注释、并用一条断言那个差异本身的测试钉住。忠实度测试在 `tests/fakes.rs`、`fakes_artifacts.rs`、`fakes_ports.rs`；由 `crates/agent-testkit/tests/fake_coverage.rs` 把守：文本闸门，`src/lib.rs` 里每个**被实现了某个 trait 的 `pub` 类型**都必须在 `tests/` 下某个文件里被提到。盲区：只查「有测试提到这个名字」，不查测试断言了什么；只管本 crate 的替身，别处手搓的够不着；名字嵌在更长的词里不算。
 - **跨进程的替身（假服务器）是 `examples/` 目标，不住 `src/bin/`**：Cargo 为 `cargo test` 构建 examples、**不**为 `cargo build --workspace` 构建，所以 `src/bin/` 下的文件会被自动发现成**产品二进制**。测试端自己定位：`CARGO_BIN_EXE_*` 对 example **不生效**，按 `current_exe()` 推 `<target>/<profile>/examples/`，缺了就 `cargo build -p <pkg> --example <name>`（范式见 `agent-tools-mcp/tests` 与 `apps/agent/tests` 的定位函数）。由 `crates/agent-testkit/tests/fixture_target_boundaries.rs` 把守。
+- **「进程死了」用重执行自己的测试二进制来造**（范式：`apps/agent/tests/crash_matrix.rs`）：父进程 `current_exe()` + `--exact <子测试名> --ignored` 起子进程，子进程按环境变量装配产品栈并跑一轮，父进程等子进程写出信号（或日志里读得到 `tool/started`）后 `Child::kill` ——Windows 上是 `TerminateProcess`，无析构、无收尾、无最后一次写。子进程跑完没死就以固定非零码退出，父进程据此报「崩溃点没打中」：一条什么都没崩的崩溃测试不许静默通过。`Stdio::null()` 在这台机器上不可用（NUL 设备被 Low 完整性拦），子进程的 stdio 用管道。
 - **验收套件驱动产品自己的装配，不另造一份**：`m4` / `m5` / `m6` 三套验收必须调用 `agent::stack::assemble`（bin 也调它），套件只把环境供不出的两件事注进去——文件在哪、模型是谁（`stack::Inputs`）。`apps/agent` 因此有 lib target 与 bin target 同名：bin 的模块默认私有，装配要能被测试调就不能住在 bin 里。由 `crates/agent-testkit/tests/acceptance_assembly_boundaries.rs` 把守：文本闸门，只认 `Scheduler::new(` / `DefaultAgentLoop::new(` / `GuardedToolProvider::new(` 三个构造器（三个凑齐才是「造了一份装配」）。
 - **闸门之外要反向实测**：文本闸门只能拦写法，拦不住「装配改对了、套件没跟上」这类真问题——抽查方式是**改产品、看套件红不红**（例如 `stack.rs` 里不挂 advisor、composite 里摘掉 git 家族、摘掉 registry 面）。这类抽查不进 CI，做没做记在工作记录里。
 - **架构守卫解析 `[dependencies]` 与 `[dev-dependencies]`**：运行期方向与测试期方向各有一张逐 crate 封闭的矩阵，新加一条 `agent-*` 边必须同时改矩阵，否则测试红。
