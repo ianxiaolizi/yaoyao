@@ -16,7 +16,7 @@ use agent_ports::agent_loop::{
     TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
 };
 use agent_ports::control::{ControlError, ControlHandler, ControlOutcome, ControlRequest};
-use agent_ports::event_store::{EventStore, EventStoreError};
+use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
 use agent_ports::instructions::{InstructionError, InstructionSource};
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{
@@ -94,6 +94,12 @@ pub enum SchedulerError {
         "turn {turn_id} is waiting on a decision; settle it with `resume` before starting another"
     )]
     AwaitingDecision { turn_id: TurnId },
+    /// Another caller holds the session's driver claim: it is running a turn
+    /// there. Not a store failure — nothing was read or written — and not
+    /// `Gate::Busy`, which means an open run in the log: this one is about a
+    /// driver that has not written anything yet.
+    #[error("session {session_id} is already being driven ({})", holder.as_ref().map_or("holder did not record itself".to_string(), DriverRecord::to_string))]
+    SessionBusy { session_id: SessionId, holder: Option<DriverRecord> },
     #[error(
         "control '{control}' is claimed by two handlers, '{first}' and '{second}'; a control name \
          has to reach exactly one implementation, or which one answers turns on assembly order"
@@ -262,6 +268,11 @@ impl Scheduler {
         session_id: &SessionId,
         now: DateTime<Utc>,
     ) -> Result<Option<RunReport>, SchedulerError> {
+        // Before the gate and before anything is read. The gate answers "is a
+        // run open *in the log*", and two callers that have not written yet
+        // both answer "no" — that is the race the driver claim exists for, and
+        // it has to be closed before the reads that race, not after.
+        let _driver = self.drive(session_id).await?;
         if self.gate(session_id).await? == Gate::Busy {
             return Ok(None);
         }
@@ -304,6 +315,9 @@ impl Scheduler {
         session_id: &SessionId,
         now: DateTime<Utc>,
     ) -> Result<Option<RunReport>, SchedulerError> {
+        // Same claim as `run_pending`, for the same reason: a scheduled item is
+        // just as easy for two drivers to find due at once.
+        let _driver = self.drive(session_id).await?;
         if self.gate(session_id).await? == Gate::Busy {
             return Ok(None);
         }
@@ -320,6 +334,23 @@ impl Scheduler {
                 Due::Due(item) => return Ok(Some(self.run_item(session_id, item, now).await?)),
             }
         }
+    }
+
+    /// Claim the right to drive this session until the returned guard drops.
+    ///
+    /// The two run entry points hold it for the whole call — the reads, the
+    /// model and tool work, and the terminal batch — because every one of those
+    /// steps is something a second driver must not be doing at the same time.
+    /// A refusal is a [`SessionBusy`](SchedulerError::SessionBusy) and not an
+    /// `Ok(None)`: "another caller is running this session" is a fact the
+    /// caller has to be told, while `Ok(None)` already means "nothing to do".
+    async fn drive(&self, session_id: &SessionId) -> Result<Box<dyn SessionLease>, SchedulerError> {
+        self.store.driver_lease(session_id).await.map_err(|error| match error {
+            EventStoreError::ConcurrentDriver { session_id, holder } => {
+                SchedulerError::SessionBusy { session_id, holder }
+            }
+            other => SchedulerError::Store(other),
+        })
     }
 
     /// The lifecycle gate both run entry points share.
@@ -2798,5 +2829,98 @@ mod tests {
         assert!(matches!(error, SchedulerError::Payload(_)));
         assert!(error.to_string().starts_with("payload error:"), "{error}");
         assert!(error.to_string().contains("no text form"), "{error}");
+    }
+
+    /// One session, two callers about to drive it.
+    ///
+    /// The gate in front of a run answers "is a run open in the log", and two
+    /// callers that have not written yet both answer "no". The driver claim is
+    /// taken before that read for exactly this: the second caller has to be
+    /// told it is second, not race the first into the same pending item and
+    /// discover it at the terminal append, after the model calls and tool runs
+    /// have already happened.
+    #[tokio::test]
+    async fn a_session_another_caller_is_driving_is_refused_before_anything_runs() {
+        let (scheduler, store, sid) = scheduler();
+        scheduler
+            .inbox
+            .append(&sid, InboxKind::NextTurn, serde_json::json!({"text": "hi"}), 0, Actor::User)
+            .await
+            .unwrap();
+
+        // The other terminal: it got the claim and is somewhere inside its turn.
+        let elsewhere = store.driver_lease(&sid).await.expect("the fake hands out one claim");
+
+        let refused = scheduler.run_pending(&sid, Utc::now()).await;
+        assert!(
+            matches!(refused, Err(SchedulerError::SessionBusy { ref session_id, .. }) if session_id == &sid),
+            "expected a busy refusal, got {refused:?}"
+        );
+        assert_eq!(
+            event_types(&store, &sid).await,
+            vec!["inbox/appended"],
+            "a refused start writes nothing at all"
+        );
+        assert_eq!(
+            scheduler.inbox.pending(&sid).await.unwrap().len(),
+            1,
+            "the queued text is still there for whoever ends up driving"
+        );
+
+        // Steering is an append and not a turn, so it stays writable while
+        // somebody else drives — the reason the claim is its own file.
+        scheduler.inbox.steer(&sid, "keep going", None).await.unwrap();
+
+        // The claim was held for the length of one call and no longer.
+        drop(elsewhere);
+        let report = scheduler.run_pending(&sid, Utc::now()).await.unwrap().expect("a run");
+        assert_eq!(report.stop_reason, StopReason::FinalAnswer);
+    }
+
+    /// The same claim guards the scheduled path, which finds its item the same
+    /// way and so races the same way.
+    #[tokio::test]
+    async fn a_due_item_is_not_started_while_another_caller_drives() {
+        let (scheduler, store, sid) = scheduler();
+        let due = Utc::now() - chrono::Duration::seconds(1);
+        scheduler.inbox.schedule(&sid, due, "wake up", 0, Actor::User).await.unwrap();
+
+        let elsewhere = store.driver_lease(&sid).await.expect("the fake hands out one claim");
+        let refused = scheduler.run_due(&sid, Utc::now()).await;
+        assert!(
+            matches!(refused, Err(SchedulerError::SessionBusy { .. })),
+            "expected a busy refusal, got {refused:?}"
+        );
+        drop(elsewhere);
+
+        let report = scheduler.run_due(&sid, Utc::now()).await.unwrap().expect("a due run");
+        assert_eq!(report.final_content.as_deref(), Some("hello"));
+    }
+
+    /// A turn that ends is a turn whose claim is given back.
+    ///
+    /// The claim is a guard, and a guard that leaked would make the session
+    /// drivable exactly once per process — a failure that would look like the
+    /// second message of every session silently never running.
+    #[tokio::test]
+    async fn a_finished_turn_leaves_the_session_drivable_again() {
+        let (scheduler, store, sid) = scheduler();
+        for text in ["first", "second"] {
+            scheduler
+                .inbox
+                .append(
+                    &sid,
+                    InboxKind::NextTurn,
+                    serde_json::json!({"text": text}),
+                    0,
+                    Actor::User,
+                )
+                .await
+                .unwrap();
+            let report = scheduler.run_pending(&sid, Utc::now()).await.unwrap().expect("a run");
+            assert_eq!(report.stop_reason, StopReason::FinalAnswer);
+        }
+        let claim = store.driver_lease(&sid).await.expect("the claim is free between turns");
+        drop(claim);
     }
 }

@@ -16,7 +16,7 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 
 **CI 跑的是同一脚本**（`.github/workflows/ci.yml`，push / PR 到 `main`，可 `workflow_dispatch` 手动重跑）：`check` job 分步跑 fmt、clippy，Test 步调 `scripts/test.ps1 -SkipFormat -SkipClippy`。另外两个 job：`coverage`（`scripts/coverage.ps1`，阈值在 `scripts/coverage-baseline.json`；设 `AGENT_APPCONTAINER_TEST=1` 时合并 AppContainer 真跑测量，否则本机会低于阈值）与 `perf-smoke`（release 跑性能示例的正确性哨兵，不与单机基线比对）。CI 的 Rust 版本钉在 workspace 的 `rust-version`（`1.99.0`）。
 
-**当前基线（2026-10-29）：1563 passed / 0 failed / 14 ignored**（经 `scripts\test.ps1` 全量跑出，105 个 test result 行）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
+**当前基线（2026-10-29）：1575 passed / 0 failed / 14 ignored**（经 `scripts\test.ps1` 全量跑出，106 个 test result 行）；新增用例应让 passed 变大，failed 保持 0。覆盖率门槛读的是行覆盖率（`cargo llvm-cov report` 的 TOTAL 行第 9 列，与 `coverage-baseline.json` 的 `measured.lines` 同一列）。
 
 ## 1. Rust 工程规则（硬）
 
@@ -25,7 +25,7 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 - **运行路径禁 `unwrap` / `expect`**：kernel / store / policy / approval / resume / plugin 等可被外部输入触达的路径。**锁中毒必须返回 `Err`，不得 panic**。测试与 `#[cfg(test)]` 里随便用。
 - **错误类型按 crate 定义**（`thiserror`），**不用 `anyhow` 穿过公共协议边界**。
 - **外部 I/O 只出现在 adapter**：`agent-protocol` 与 `agent-ports` 不含 I/O、不含业务逻辑；`agent-kernel` 不依赖具体 OpenAI / SQLite / MCP / shell。依赖方向见 `PROJECT.md`，由 `crates/agent-testkit/tests/architecture_boundaries.rs` 把守。
-- **时间是输入，不是环境**：**参与判断**的时刻必须由调用方传入——`ApprovalService::fold_at(session, now)` 与 `LeaseSpecExt::is_expired(now)` 是范式，判定函数里不读时钟。直读 `Utc::now()` 只允许出现在**盖章位置**（`created_at:` / `recorded_at:` 字段初始化）和那**一处**把时刻递给 `fold_at` 的边界。**单调钟**（`Instant::now()`）用于超时/deadline 属正确实践，不在本条射程。
+- **时间是输入，不是环境**：**参与判断**的时刻必须由调用方传入——`ApprovalService::fold_at(session, now)` 与 `LeaseSpecExt::is_expired(now)` 是范式，判定函数里不读时钟。直读 `Utc::now()` 只允许出现在**盖章位置**（`created_at:` / `recorded_at:` 字段初始化，以及 `DriverRecord` 的 `started_at:` / `heartbeat_at:`）和那**一处**把时刻递给 `fold_at` 的边界。**单调钟**（`Instant::now()`）用于超时/deadline 属正确实践，不在本条射程。
 - **ID 从一处铸造**：`agent-protocol::ids::fresh_id()` 是全仓唯一取随机的地方——要类型走 `id_newtype!` 的 `new()`，要**跨重建稳定**走 `from_string` 从 durable id 派生。随机 ID 必须**每次唯一**：store 拿 `EventId` 做幂等去重键，一个能重复的生成器会静默丢事件。
 - 上面两条由 `crates/agent-testkit/tests/clock_and_id_boundaries.rs` 把守；它是**文本**闸门，盲区（函数指针、跨行拆开的调用）在该测试里有探针钉住。
 - **schema 版本从一处铸造**：事件信封与 `doctor` 报的版本只有一个家——`agent_protocol::ids::SchemaVersion::current()`（`SchemaVersion::CURRENT`，见 `CONTRACT.md` C6.1）。生产路径不得再写 `SchemaVersion::from_string("…")` 字面量。它**故意不与码库版本联动**——不改日志形状的代码改动不该动它。export bundle 的 `EXPORT_SCHEMA_VERSION` 与 MCP 客户端自报版本是**别的** artifact 的版本，各自独立。由 `crates/agent-testkit/tests/schema_version_boundaries.rs` 把守。

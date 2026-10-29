@@ -638,6 +638,72 @@ fn resume_with_nothing_to_resume_exits_two() {
     }
 }
 
+/// Two processes, one session: the second is told the first is driving.
+///
+/// The first process is stood in for by this test holding the claim file
+/// itself — the same path, the same OS lock, a different process. Racing two
+/// real `ask` runs would test the echo provider's speed rather than the claim:
+/// the lock is the whole mechanism, and whoever else takes it looks identical
+/// to the store.
+#[test]
+fn a_second_process_asking_the_same_session_is_told_it_is_busy() {
+    let (data, workspace) = dirs();
+    let session_dir = data.path().join("contended");
+
+    // A first turn, so the session — and the claim file — exist exactly as the
+    // product makes them. The file has to be the product's own: one created
+    // here would be labelled with this process's integrity and not the
+    // sandboxed binary's, which is a property of the test host and not of the
+    // claim.
+    let first = ran(data.path(), workspace.path(), &["ask", "hello", "--session", "contended"]);
+    assert!(first.ok, "{}", first.err);
+    let before = std::fs::read_to_string(session_dir.join("events.jsonl")).expect("the log");
+
+    // The stand-in for the process that is mid-turn: same file, same OS lock,
+    // a different process. Racing two real `ask` runs would test the echo
+    // provider's speed rather than the claim.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(session_dir.join("driver.lock"))
+        .expect("the claim file the product made");
+    held.try_lock().expect("the stand-in driver gets the claim first");
+
+    let refused =
+        ran(data.path(), workspace.path(), &["ask", "and again", "--session", "contended"]);
+    assert!(!refused.ok, "a second driver must not run the turn: {}", refused.out);
+    assert_eq!(refused.code, Some(2), "a refusal is a command that did not happen");
+    assert!(
+        refused.err.contains("already being driven"),
+        "the refusal has to say what it is: stdout={:?} stderr={:?}",
+        refused.out,
+        refused.err
+    );
+
+    // The text was appended before the run was refused — a queued prompt and a
+    // turn are separate facts — and nothing else was: no run opened on a
+    // session another process is driving.
+    let after = std::fs::read_to_string(session_dir.join("events.jsonl")).expect("the log");
+    assert_eq!(
+        after.lines().count(),
+        before.lines().count() + 1,
+        "only the queued text may be written: {}",
+        after
+    );
+    assert_eq!(after.matches("run/started").count(), before.matches("run/started").count());
+
+    // With the claim released the queued text runs, so this was a refusal and
+    // not a command that never works.
+    drop(held);
+    let later = ran(data.path(), workspace.path(), &["ask", "third", "--session", "contended"]);
+    assert!(later.ok, "{}", later.err);
+    assert!(
+        later.out.contains("echo: and again"),
+        "the text queued during the refusal runs first: {}",
+        later.out
+    );
+}
+
 #[test]
 fn ask_is_run_under_another_name() {
     let (data, workspace) = dirs();

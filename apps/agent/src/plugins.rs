@@ -966,6 +966,16 @@ mod tests {
             self.inner.lease(session_id).await
         }
 
+        async fn driver_lease(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<
+            Box<dyn agent_ports::event_store::SessionLease>,
+            agent_ports::event_store::EventStoreError,
+        > {
+            self.inner.driver_lease(session_id).await
+        }
+
         async fn flush(
             &self,
             session_id: &SessionId,

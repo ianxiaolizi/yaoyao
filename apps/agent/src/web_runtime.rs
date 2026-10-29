@@ -11,7 +11,9 @@
 //! Two locks live here, and neither is a new authority:
 //!
 //! - one `async` mutex per session, held across a turn or a resume, so this
-//!   process cannot start two of them;
+//!   process cannot start two of them. It is a fast path, not the rule: the
+//!   rule is the driver claim the Scheduler and `Resume` take, which is what
+//!   keeps *another process* from starting a second turn on the same session;
 //! - the store's own lease, opened by `Resume`, which is what keeps another
 //!   process out while a granted call runs.
 //!
@@ -37,6 +39,36 @@ use futures_util::FutureExt;
 use tokio::sync::Mutex;
 
 use crate::stack::{self, Decisions, Runtime};
+
+/// Classify a command failure for the page.
+///
+/// One refusal is not this request's failure: another caller is already
+/// driving the session. The page shows that as "busy" — the same answer a
+/// second `agent ask` gets on the terminal — rather than as a broken server,
+/// and the message names the other driver's pid so a person can go and look.
+fn failure(error: agent_cli::commands::CommandError) -> BackendError {
+    match error {
+        agent_cli::commands::CommandError::Scheduler(
+            busy @ agent_kernel::scheduler::SchedulerError::SessionBusy { .. },
+        ) => BackendError::busy(busy.to_string()),
+        other => BackendError::internal(other.to_string()),
+    }
+}
+
+/// A resume's failure, keeping "somebody else is driving" a class of its own.
+fn resume_failure(
+    context: &str,
+    error: agent_kernel::resume::ResumeError,
+) -> agent_cli::commands::CommandError {
+    match error {
+        agent_kernel::resume::ResumeError::SessionBusy { session_id, holder } => {
+            agent_cli::commands::CommandError::Scheduler(
+                agent_kernel::scheduler::SchedulerError::SessionBusy { session_id, holder },
+            )
+        }
+        other => agent_cli::commands::CommandError::Invalid(format!("{context}: {other}")),
+    }
+}
 
 /// What every session's stack shares.
 ///
@@ -216,7 +248,7 @@ impl Backend for WebBackend {
             Ok(agent_cli::commands::TurnStart::NotStarted) => Err(BackendError::busy(
                 "a run is already active, or the prompt was claimed elsewhere",
             )),
-            Err(error) => Err(BackendError::internal(error.to_string())),
+            Err(error) => Err(failure(error)),
         }
     }
 
@@ -272,9 +304,10 @@ impl Backend for WebBackend {
             }
 
             let resumed = runtime.resume.resume(session, "").await.map_err(|error| {
-                agent_cli::commands::CommandError::Invalid(format!(
-                    "the approval was recorded, but the turn could not be resumed: {error}"
-                ))
+                resume_failure(
+                    "the approval was recorded, but the turn could not be resumed",
+                    error,
+                )
             })?;
             match resumed {
                 agent_kernel::resume::ResumeOutcome::Settled { .. } => {
@@ -311,6 +344,9 @@ impl Backend for WebBackend {
         match drive(work, subscription, live).await {
             Ok(()) => Ok(()),
             Err(error) => {
+                if error.is_busy() {
+                    return Err(BackendError::busy(error.to_string()));
+                }
                 let message = error.to_string();
                 if message.contains("no yielded turn")
                     || message.contains("no longer waiting")
@@ -339,11 +375,10 @@ impl Backend for WebBackend {
             .map_err(|error| BackendError::internal(error.to_string()))?;
 
         let work = async {
-            let resumed = runtime.resume.resume(session, "").await.map_err(|error| {
-                agent_cli::commands::CommandError::Invalid(format!(
-                    "the yielded turn could not be resumed: {error}"
-                ))
-            })?;
+            let resumed =
+                runtime.resume.resume(session, "").await.map_err(|error| {
+                    resume_failure("the yielded turn could not be resumed", error)
+                })?;
             match resumed {
                 agent_kernel::resume::ResumeOutcome::Settled { .. } => {
                     runtime.scheduler.run_pending(session, crate::clock::now()).await.map_err(
@@ -372,7 +407,7 @@ impl Backend for WebBackend {
 
         match drive(work, subscription, live).await {
             Ok(()) => Ok(()),
-            Err(error) => Err(BackendError::internal(error.to_string())),
+            Err(error) => Err(failure(error)),
         }
     }
 

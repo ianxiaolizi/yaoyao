@@ -1163,6 +1163,13 @@ mod tests {
             self.inner.lease(session_id).await
         }
 
+        async fn driver_lease(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<Box<dyn SessionLease>, EventStoreError> {
+            self.inner.driver_lease(session_id).await
+        }
+
         async fn flush(&self, session_id: &SessionId) -> Result<FlushReceipt, EventStoreError> {
             self.inner.flush(session_id).await
         }
@@ -1296,6 +1303,13 @@ mod tests {
             session_id: &SessionId,
         ) -> Result<Box<dyn SessionLease>, EventStoreError> {
             self.inner.lease(session_id).await
+        }
+
+        async fn driver_lease(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<Box<dyn SessionLease>, EventStoreError> {
+            self.inner.driver_lease(session_id).await
         }
 
         async fn flush(&self, session_id: &SessionId) -> Result<FlushReceipt, EventStoreError> {

@@ -52,7 +52,7 @@
 
 use std::sync::Arc;
 
-use agent_ports::event_store::{EventStore, EventStoreError};
+use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError};
 use agent_protocol::events::{Actor, EventDraft, EventType, StoredEvent};
 use agent_protocol::ids::{
     ApprovalId, EventId, EventSeq, RunId, SchemaVersion, SessionId, StepId, TurnId,
@@ -133,6 +133,11 @@ pub enum ResumeError {
     Approval(#[from] ApprovalError),
     #[error("inbox error: {0}")]
     Inbox(#[from] InboxError),
+    /// Another caller is driving the session. Nothing was read or written and
+    /// no tool ran: the resume did not get far enough to settle anything, so
+    /// answering the wait again later is simply trying again.
+    #[error("session {session_id} is already being driven ({})", holder.as_ref().map_or("holder did not record itself".to_string(), DriverRecord::to_string))]
+    SessionBusy { session_id: SessionId, holder: Option<DriverRecord> },
 }
 
 /// The call a paused turn stopped on.
@@ -178,6 +183,19 @@ impl Resume {
         session_id: &SessionId,
         continuation: &str,
     ) -> Result<ResumeOutcome, ResumeError> {
+        // The driver claim comes first. The write lease below keeps a second
+        // *writer* out, but it waits: a process that is mid-turn in another
+        // terminal holds nothing here yet, and a resume that waited for it
+        // would be waiting to answer a wait that driver is about to settle
+        // itself. The claim says so instead, and says who.
+        let _driver = match self.store.driver_lease(session_id).await {
+            Ok(lease) => lease,
+            Err(EventStoreError::ConcurrentDriver { session_id, holder }) => {
+                return Err(ResumeError::SessionBusy { session_id, holder });
+            }
+            Err(other) => return Err(ResumeError::Store(other)),
+        };
+
         // Hold the session's lease across the whole sequence — the read that
         // finds the wait, the run that answers it, and the appends that record
         // it. A granted call's dispatch is appended before the call runs, so the
@@ -1121,6 +1139,13 @@ mod tests {
             self.inner.flush(session_id).await
         }
 
+        async fn driver_lease(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<Box<dyn SessionLease>, EventStoreError> {
+            self.inner.driver_lease(session_id).await
+        }
+
         async fn read_stream(
             &self,
             session_id: &SessionId,
@@ -1331,6 +1356,40 @@ mod tests {
         // the decision is out, changes nothing and runs nothing.
         assert_eq!(h.types().await, before);
         assert!(h.tools.calls().is_empty());
+    }
+
+    /// The claim, not the write lease, is what a resume can lose to.
+    ///
+    /// A driver in another terminal holds the claim for its whole turn and
+    /// holds nothing in the write lease until it settles. A resume that only
+    /// waited on the write lease would block, then answer a wait that driver is
+    /// about to settle itself. This one is told no, before anything is read.
+    #[tokio::test]
+    async fn a_resume_is_refused_while_another_caller_drives_the_session() {
+        let h = harness(vec![
+            FakeModelProvider::tool_call("deploy", serde_json::json!({})),
+            FakeModelProvider::answer("carried on"),
+        ]);
+        h.ask("deploy it").await.expect("a run");
+        h.grant(&h.pending().await).await;
+
+        let elsewhere = h.store.driver_lease(&h.session_id).await.expect("the claim");
+        let before = h.types().await;
+
+        let refused = h.resume.resume(&h.session_id, "").await;
+        assert!(
+            matches!(refused, Err(ResumeError::SessionBusy { .. })),
+            "expected a busy refusal, got {:?}",
+            refused.err().map(|error| error.to_string())
+        );
+        assert_eq!(h.types().await, before, "a refused resume writes nothing");
+        assert!(h.tools.calls().is_empty(), "and runs nothing");
+
+        drop(elsewhere);
+        assert!(
+            matches!(h.resume("").await, ResumeOutcome::Settled { .. }),
+            "the claim is free again once the other driver lets go"
+        );
     }
 
     #[tokio::test]

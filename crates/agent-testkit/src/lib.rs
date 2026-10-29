@@ -65,6 +65,14 @@ pub struct FakeEventStore {
     inner: Arc<Mutex<Inner>>,
     /// session_id -> lease nesting depth held by this store's callers.
     leases: Arc<Mutex<HashMap<String, usize>>>,
+    /// session_id -> the one caller driving it, if any.
+    ///
+    /// A set, not a depth, because the driver claim is not re-entrant. The fake
+    /// has no processes, so this is the whole of its exclusion: a second driver
+    /// can only come from this process, and it is refused exactly as a second
+    /// process would be. Nothing here has a pid, so a refusal from the fake
+    /// carries no holder record.
+    drivers: Arc<Mutex<HashSet<String>>>,
     /// session_id -> wake signals, mirroring the real store's notification.
     wakeups: Arc<Mutex<HashMap<String, Vec<mpsc::Sender<()>>>>>,
     /// Dropped with the last clone of the store, which is how a live
@@ -103,6 +111,25 @@ impl Drop for FakeLease {
                 leases.remove(&self.key);
             }
         }
+    }
+}
+
+/// Gives the fake's driver claim back when dropped.
+struct FakeDriver {
+    drivers: Arc<Mutex<HashSet<String>>>,
+    key: String,
+    session_id: SessionId,
+}
+
+impl SessionLease for FakeDriver {
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+impl Drop for FakeDriver {
+    fn drop(&mut self) {
+        self.drivers.lock().unwrap().remove(&self.key);
     }
 }
 
@@ -238,6 +265,27 @@ impl EventStore for FakeEventStore {
         let key = session_id.as_str().to_string();
         *self.leases.lock().unwrap().entry(key.clone()).or_insert(0) += 1;
         Ok(Box::new(FakeLease { leases: self.leases.clone(), key, session_id: session_id.clone() }))
+    }
+
+    async fn driver_lease(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Box<dyn SessionLease>, EventStoreError> {
+        if !is_safe_dir_name(session_id.as_str()) {
+            return Err(EventStoreError::unsafe_session_id());
+        }
+        let key = session_id.as_str().to_string();
+        if !self.drivers.lock().unwrap().insert(key.clone()) {
+            return Err(EventStoreError::ConcurrentDriver {
+                session_id: session_id.clone(),
+                holder: None,
+            });
+        }
+        Ok(Box::new(FakeDriver {
+            drivers: self.drivers.clone(),
+            key,
+            session_id: session_id.clone(),
+        }))
     }
 
     async fn delete_session(&self, session_id: &SessionId) -> Result<(), EventStoreError> {

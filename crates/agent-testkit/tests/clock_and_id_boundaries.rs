@@ -120,7 +120,18 @@ fn is_comment(line: &str) -> bool {
 /// A field initializer that records when something happened. These are stamps:
 /// they carry a time into a log or a record, and nothing reads one back to
 /// decide anything (checked by hand for 裁决 #20 — see CONTRACT.md §7).
-const STAMP_SHAPES: [&str; 2] = ["created_at: Utc::now()", "recorded_at: Utc::now()"];
+///
+/// `started_at` / `heartbeat_at` are the driver record's two
+/// (`agent_ports::event_store::DriverRecord`, 裁决 #112). Stamps in the same
+/// sense, and more strictly so: the record is a diagnostic, the driver claim is
+/// decided by a file lock, and nothing in the workspace compares either field
+/// to a clock.
+const STAMP_SHAPES: [&str; 4] = [
+    "created_at: Utc::now()",
+    "recorded_at: Utc::now()",
+    "started_at: Utc::now()",
+    "heartbeat_at: Utc::now()",
+];
 
 /// The only places allowed to read a wall clock outside a stamp: the approval
 /// boundary that hands `fold_at` its instant, and the app edge that hands

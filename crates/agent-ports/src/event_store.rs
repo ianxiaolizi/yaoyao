@@ -2,6 +2,7 @@
 
 use agent_protocol::events::{EventDraft, StoredEvent};
 use agent_protocol::ids::{EventSeq, SessionId};
+use chrono::{DateTime, Utc};
 
 /// Whether a session id is safe to use as a single directory-name segment.
 ///
@@ -133,6 +134,45 @@ pub trait SessionLease: Send + Sync {
     fn session_id(&self) -> &SessionId;
 }
 
+/// Who says they are driving a session, as recorded in the holder's own lock
+/// file.
+///
+/// This is a diagnostic, not the exclusion: exclusion is the operating
+/// system's file lock, which is why a holder that dies without dropping its
+/// lease does not leave a stale claim behind. The record is what lets a
+/// refusal say *who* — a person deciding what to do about "somebody is
+/// already driving this session" needs to tell another terminal mid-turn
+/// (fresh heartbeat) from a process that is alive but wedged (heartbeat
+/// stopped a while ago).
+///
+/// A record that cannot be read is `None` in
+/// [`EventStoreError::ConcurrentDriver`], never an error: the refusal is
+/// already the answer, and a lock file that is mid-write or left over from an
+/// older build must not turn "busy" into "broken".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DriverRecord {
+    pub pid: u32,
+    /// When this caller started driving the session.
+    pub started_at: DateTime<Utc>,
+    /// The last time the holder refreshed this record. Every
+    /// [`DRIVER_HEARTBEAT`](crate::event_store::DRIVER_HEARTBEAT) while the
+    /// lease is held.
+    pub heartbeat_at: DateTime<Utc>,
+}
+
+/// How often a held driver lease refreshes its `DriverRecord`.
+///
+/// Five seconds is the audit's number and is short enough that "the heartbeat
+/// stopped" is visible to a person within one turn's worth of waiting, without
+/// a stat-and-write every second for a lease that usually lasts a minute.
+pub const DRIVER_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl std::fmt::Display for DriverRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pid {}, driving since {}", self.pid, self.started_at.to_rfc3339())
+    }
+}
+
 /// Port for appending and reading durable events.
 #[async_trait::async_trait]
 pub trait EventStore: Send + Sync {
@@ -165,6 +205,35 @@ pub trait EventStore: Send + Sync {
     /// `ConcurrentWriter` after a wait it documents.
     async fn lease(&self, session_id: &SessionId)
     -> Result<Box<dyn SessionLease>, EventStoreError>;
+
+    /// Take the session's *driver* lease: the claim that says "this caller is
+    /// the one running turns for this session".
+    ///
+    /// Distinct from [`lease`](Self::lease) in three ways, and each of them is
+    /// why this is its own method rather than a longer hold on that one:
+    ///
+    /// * **A different claim.** A driver holds it for a whole turn — minutes
+    ///   of model calls and tool runs — while steering and approval answers are
+    ///   single appends that must not queue behind it. A store that has one
+    ///   lock to give cannot satisfy both, so the port demands two.
+    /// * **No waiting.** [`lease`](Self::lease) waits because its holder is
+    ///   about to let go; a driver's holder is mid-turn and nothing here will
+    ///   make it finish sooner. "Someone else is driving" is the answer, and it
+    ///   is reported as `ConcurrentDriver`, not as a wait that ends in one.
+    /// * **No re-entrancy.** [`lease`](Self::lease) is re-entrant so a critical
+    ///   section can be flat code. Here nesting is the failure being prevented:
+    ///   two drivers in one process are as wrong as two in two processes, so
+    ///   the second is refused exactly like a foreign one.
+    ///
+    /// The claim is released when the guard is dropped, and by the operating
+    /// system when the holder's process dies — a supervision loop that wants to
+    /// take over from a crashed driver does not have to break a lock. What a
+    /// store chooses to *record* about the holder is its own business; the
+    /// record travels in the refusal only so a caller can say who.
+    async fn driver_lease(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Box<dyn SessionLease>, EventStoreError>;
 
     /// Make all previously acknowledged appends durable. Until flush returns,
     /// an acknowledged append may be lost on crash.
@@ -240,6 +309,15 @@ pub enum EventStoreError {
     /// written, and the caller may simply be unlucky.
     #[error("session {0} is leased by another writer")]
     ConcurrentWriter(SessionId),
+    /// Somebody else is driving the session: they hold its
+    /// [`driver_lease`](EventStore::driver_lease) and are running a turn. Not
+    /// `ConcurrentWriter`, because nothing tried to write and waiting would
+    /// only make the caller the second driver of one turn — the state this
+    /// refusal exists to prevent. `holder` is the other driver's own account of
+    /// itself when it could be read, so a person can tell a live turn from a
+    /// wedged process.
+    #[error("session {session_id} is already being driven ({})", describe_holder(holder))]
+    ConcurrentDriver { session_id: SessionId, holder: Option<DriverRecord> },
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
@@ -250,6 +328,14 @@ pub enum EventStoreError {
     /// produce a confident answer built on the wrong one.
     #[error("event schema version: {0}")]
     Version(#[from] agent_protocol::versioning::VersionError),
+}
+
+/// The parenthetical in `ConcurrentDriver`, in the store's own words.
+fn describe_holder(holder: &Option<DriverRecord>) -> String {
+    match holder {
+        Some(record) => record.to_string(),
+        None => "holder did not record itself".to_string(),
+    }
 }
 
 impl EventStoreError {

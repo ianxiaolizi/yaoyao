@@ -180,6 +180,40 @@ async fn a_lease_requiring_fake_admits_a_leased_append_and_releases_on_drop() {
     assert!(matches!(err, EventStoreError::ConcurrentWriter(_)));
 }
 
+/// The fake's driver claim has to refuse the way the real one does: one driver
+/// per session, no waiting, no nesting — the real store takes a fresh file lock
+/// per caller for exactly this reason.
+#[tokio::test]
+async fn the_fake_admits_one_driver_per_session_and_no_nesting() {
+    let store = FakeEventStore::new();
+    let sid = SessionId::from_string("test-session");
+
+    let driver = store.driver_lease(&sid).await.unwrap();
+
+    // Same store, second caller: still a second driver.
+    let nested = store.driver_lease(&sid).await;
+    assert!(
+        matches!(nested, Err(EventStoreError::ConcurrentDriver { ref session_id, .. }) if session_id == &sid),
+        "a driver claim must not nest, got {:?}",
+        nested.err().map(|error| error.to_string())
+    );
+    // No holder record: nothing in this process has a pid to report.
+    match store.driver_lease(&sid).await {
+        Err(EventStoreError::ConcurrentDriver { holder, .. }) => assert_eq!(holder, None),
+        Ok(_) => panic!("expected a refusal, got the claim"),
+        Err(error) => panic!("expected a driver refusal, got {error}"),
+    }
+
+    // A different session is a different claim.
+    let other = store.driver_lease(&SessionId::from_string("elsewhere")).await.unwrap();
+
+    // And the claim is a guard: dropping it is the release.
+    drop(driver);
+    let again = store.driver_lease(&sid).await.expect("the claim is free after the drop");
+    drop(again);
+    drop(other);
+}
+
 #[tokio::test]
 async fn a_default_fake_still_permits_a_direct_append() {
     let store = FakeEventStore::new();

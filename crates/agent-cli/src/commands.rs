@@ -41,6 +41,19 @@ pub enum CommandError {
     Invalid(String),
 }
 
+impl CommandError {
+    /// True when the refusal is "another caller is already driving this
+    /// session".
+    ///
+    /// The distinction a front end needs: every other failure says this
+    /// request could not be carried out, while this one says it arrived at a
+    /// session somebody else is turning and will work when they are done. The
+    /// CLI exits `2` either way; the GUI answers `409` for this one alone.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, CommandError::Scheduler(SchedulerError::SessionBusy { .. }))
+    }
+}
+
 /// What starting a turn did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnStart {

@@ -1,11 +1,12 @@
 //! A durable, append-only JSONL `EventStore`.
 //!
 //! Layout: `<root>/<session_id>/events.jsonl`, one JSON-encoded `StoredEvent`
-//! per line, plus `<root>/<session_id>/events.lock` holding the writer lease.
-//! The file is the source of truth; the store keeps a copy of what it has read
-//! so a read never has to rescan the log, and re-reads the tail whenever a
-//! reader asks, so an append made by another process becomes visible without a
-//! reopen.
+//! per line, plus `<root>/<session_id>/events.lock` holding the writer lease,
+//! `driver.lock` holding the driver claim and `driver.holder` recording who
+//! holds it. The log is the source of truth; the store keeps a copy of what it
+//! has read so a read never has to rescan the log, and re-reads the tail
+//! whenever a reader asks, so an append made by another process becomes visible
+//! without a reopen.
 //!
 //! Durability: `append` writes lines but does not fsync; `flush` calls
 //! `sync_all` to make prior appends crash-durable. A torn trailing line (a
@@ -21,6 +22,11 @@
 //! critical section is wider than a write — resuming an approved tool call runs
 //! a side effect before it appends anything, and a lease held across that
 //! sequence is what makes the effect happen once rather than twice.
+//!
+//! Driver exclusion: `driver_lease` is a second, coarser claim for callers that
+//! run turns rather than write events. It is held for a whole turn, refuses
+//! instead of waiting, and is not re-entrant, so two drivers of one session —
+//! in two processes or in one — cannot both start.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -34,8 +40,8 @@ use futures_util::StreamExt;
 use futures_util::future::{self, Either};
 
 use agent_ports::event_store::{
-    AppendReceipt, EventStore, EventStoreError, EventSubscription, FlushReceipt, SessionLease,
-    is_safe_dir_name,
+    AppendReceipt, DRIVER_HEARTBEAT, DriverRecord, EventStore, EventStoreError, EventSubscription,
+    FlushReceipt, SessionLease, is_safe_dir_name,
 };
 use agent_protocol::events::{EventDraft, StoredEvent};
 use agent_protocol::ids::{EventSeq, SessionId};
@@ -90,6 +96,8 @@ pub struct JsonlEventStore {
     /// How long an explicit `lease()` waits for a peer process, or `None` for as
     /// long as it takes. Not used by `append`, which has its own short wait.
     lease_wait: Option<Duration>,
+    /// How often a held driver claim refreshes its record.
+    driver_heartbeat: Duration,
 }
 
 /// Wake signals for this process's live subscriptions, one list per session.
@@ -328,6 +336,88 @@ impl LeaseTable {
     }
 }
 
+/// The driver claim and its record, both beside the log.
+///
+/// Two files, because they need different properties. `driver.lock` exists to
+/// be locked and its contents are never read or written — the handle *is* the
+/// claim. `driver.holder` is the record of who holds it, and it has to be
+/// readable by a caller that just lost the race; on Windows that cannot be the
+/// locked file, because a whole-file lock refuses reads from every other
+/// handle, this process's included.
+const DRIVER_LOCK: &str = "driver.lock";
+const DRIVER_HOLDER: &str = "driver.holder";
+
+/// A held driver claim.
+///
+/// Dropping it releases the claim: the lock handle closes, the heartbeat thread
+/// is stopped and joined so it cannot write a heartbeat on somebody else's
+/// lease, and the record is cleared while the lock is still held, so "a record
+/// exists" means "a driver exists".
+struct DriverGuard {
+    /// The locked handle; closing it releases the claim.
+    lock: Option<File>,
+    /// The record's handle, shared with the heartbeat thread through a `Weak`.
+    record: Option<Arc<File>>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+    session_id: SessionId,
+}
+
+impl SessionLease for DriverGuard {
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        // Stopped before anything is released: a tick landing after the unlock
+        // would rewrite a record belonging to the next holder. `recv_timeout`
+        // makes the send land immediately, so the join does not wait out the
+        // heartbeat interval.
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.heartbeat.take() {
+            let _ = thread.join();
+        }
+        if let Some(record) = self.record.take() {
+            // Still under the claim, so this cannot clear a successor's record.
+            // A failure has nothing left to report, and a stale line is only a
+            // stale line: the lock decides, never the record.
+            let _ = record.set_len(0);
+        }
+        if let Some(lock) = self.lock.take() {
+            let _ = lock.unlock();
+        }
+    }
+}
+
+/// Read a driver record, or nothing.
+///
+/// Every way of not getting one — no file yet, an empty file, a write caught
+/// mid-truncate, a record from a build that spelled it differently — is `None`.
+/// The refusal that carries it is already the answer; a broken record must not
+/// turn "busy" into "cannot tell".
+fn read_driver_record(path: &Path) -> Option<DriverRecord> {
+    let body = fs::read(path).ok()?;
+    if body.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+/// Replace a driver record's contents.
+fn write_driver_record(file: &File, record: &DriverRecord) -> Result<(), EventStoreError> {
+    let body = serde_json::to_vec(record)?;
+    file.set_len(0)?;
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(0))?;
+    handle.write_all(&body)?;
+    handle.flush()?;
+    Ok(())
+}
+
 impl JsonlEventStore {
     /// Create a store whose per-session directories live under `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -339,6 +429,7 @@ impl JsonlEventStore {
             wakeups: Wakeups::default(),
             poll: DEFAULT_SUBSCRIBE_POLL,
             lease_wait: None,
+            driver_heartbeat: DRIVER_HEARTBEAT,
         }
     }
 
@@ -368,6 +459,18 @@ impl JsonlEventStore {
     /// out a peer to observe it.
     pub fn with_lease_wait(mut self, wait: Duration) -> Self {
         self.lease_wait = Some(wait);
+        self
+    }
+
+    /// How often a held driver claim refreshes `driver.holder`.
+    ///
+    /// Exposed for the same reason as [`with_poll_interval`](Self::with_poll_interval):
+    /// the interval is a wall-clock cost paid by whoever watches it, and a test
+    /// that has to observe a second heartbeat should not spend five seconds
+    /// doing it. Nothing about the claim depends on the number — the lock is
+    /// the exclusion, the heartbeat only says the holder is still alive.
+    pub fn with_driver_heartbeat(mut self, heartbeat: Duration) -> Self {
+        self.driver_heartbeat = heartbeat;
         self
     }
 
@@ -777,6 +880,92 @@ impl EventStore for JsonlEventStore {
         }
         fs::create_dir_all(self.session_dir(key))?;
         Ok(Box::new(self.leases.acquire(session_id, self.lease_wait)?))
+    }
+
+    async fn driver_lease(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Box<dyn SessionLease>, EventStoreError> {
+        let key = session_id.as_str();
+        if !is_safe_dir_name(key) {
+            return Err(EventStoreError::unsafe_session_id());
+        }
+        let dir = self.session_dir(key);
+        fs::create_dir_all(&dir)?;
+
+        let holder_path = dir.join(DRIVER_HOLDER);
+
+        // A handle of its own, deliberately not the shared one the write lease
+        // keeps: a second caller in this process has to be refused exactly like
+        // a second process, and a re-entrant handle would read it as a nesting
+        // caller and let it through.
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(DRIVER_LOCK))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            // No wait: a driver is mid-turn, and waiting would only line this
+            // caller up to be the second driver of the same turn.
+            Err(TryLockError::WouldBlock) => {
+                return Err(EventStoreError::ConcurrentDriver {
+                    session_id: session_id.clone(),
+                    holder: read_driver_record(&holder_path),
+                });
+            }
+            Err(TryLockError::Error(error)) => return Err(error.into()),
+        }
+
+        let record = DriverRecord {
+            pid: std::process::id(),
+            started_at: Utc::now(),
+            heartbeat_at: Utc::now(),
+        };
+        // The record is diagnostics, not the claim: a store whose record file
+        // cannot be opened or written still drives, and its refusals say the
+        // holder did not record itself.
+        let record_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&holder_path)
+            .ok()
+            .inspect(|file| {
+                let _ = write_driver_record(file, &record);
+            })
+            .map(Arc::new);
+
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let tick = self.driver_heartbeat;
+        let heartbeat = record_file.as_ref().map(|file| {
+            let file = Arc::downgrade(file);
+            let stamp = record.clone();
+            std::thread::spawn(move || {
+                use std::sync::mpsc::RecvTimeoutError;
+                loop {
+                    match stopped.recv_timeout(tick) {
+                        // The guard let go, or is letting go: stop before it
+                        // clears the record it still owns.
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    let Some(file) = file.upgrade() else { return };
+                    let beat = DriverRecord { heartbeat_at: Utc::now(), ..stamp.clone() };
+                    let _ = write_driver_record(&file, &beat);
+                }
+            })
+        });
+
+        Ok(Box::new(DriverGuard {
+            lock: Some(lock),
+            record: record_file,
+            stop: Some(stop),
+            heartbeat,
+            session_id: session_id.clone(),
+        }))
     }
 
     async fn delete_session(&self, session_id: &SessionId) -> Result<(), EventStoreError> {
