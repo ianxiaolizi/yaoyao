@@ -247,21 +247,34 @@ async fn a_tool_list_changed_notification_over_http_grows_the_surface() {
     provider.spawn_resync_listener(changed);
     assert!(!names_of(&provider).iter().any(|name| name == "mcp__httpfake__grown"));
 
-    provider
-        .invoke(&ToolInvocation::proposed("mcp__httpfake__grow", json!({})))
-        .await
-        .expect("the server grew");
-
-    // The notification has exactly one route to this client: the POST that
-    // called `grow` is already answered, so it can only have come in on the
-    // event stream the client opened after the handshake.
+    // The trigger is repeated, not sent once and waited on longer. The
+    // transport opens its server-initiated event stream on a task of its own
+    // after the handshake, so a notification the server sends before that GET
+    // lands has no subscriber and is legitimately dropped — waiting longer
+    // cannot deliver an event that was never routed to anyone, and a CI
+    // runner slow enough to widen that window once failed this test for it.
+    // `grow` only flips a flag and emits, so asking again costs a round trip
+    // and nothing else.
     let mut grown = false;
-    for _ in 0..400 {
-        if names_of(&provider).iter().any(|name| name == "mcp__httpfake__grown") {
-            grown = true;
+    for _ in 0..40 {
+        provider
+            .invoke(&ToolInvocation::proposed("mcp__httpfake__grow", json!({})))
+            .await
+            .expect("the server grew");
+
+        // The notification has exactly one route to this client: the POST that
+        // called `grow` is already answered, so it can only have come in on the
+        // event stream the client opened after the handshake.
+        for _ in 0..10 {
+            if names_of(&provider).iter().any(|name| name == "mcp__httpfake__grown") {
+                grown = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if grown {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
         grown,
