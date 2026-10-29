@@ -129,6 +129,8 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 
 > `crates/agent-model-openai/src/config.rs` 里的 `ENV_*` 常量装的是**变量名**，不是值。把 base URL / 模型名 / key 的字面值填进去，等于让 `from_env()` 去找一个以该字面值为名的环境变量：配置直接失败，且 key 明文留在受版本控制的源码里。值只经环境变量传递。
 
+`AGENT_TOOL_SECRETS`（逗号分隔的变量名，可选）决定工具参数里可以引用哪些密钥：模型或脚本在参数里写 `secret://env/<NAME>`，网关只在调用真正执行时解析，并把解析值从结果与 provider 错误里按精确串擦掉；事件、审批摘要与导出里只有引用。用引用的调用一律先停下来要一次审批（已有覆盖该能力的授权则直接跑）。没设这个变量时，任何引用都被拒绝（`CONTRACT.md` §7 #121）。
+
 每次运行开始前，爻爻会读 **workspace root 下的 `AGENTS.md`**（只看根部这一份，不读嵌套文件，也不读 `CLAUDE.md`），与内置前言一起作为本次运行的系统指令。上限 64 KiB；不可读、超限、非 UTF-8 或解析到工作区外，本次运行**不会开始**（退 `2`，inbox 项保持待办）。指令按运行快照记进 `run/started`，所以「模型被告知了什么」与日志是同一条事实；没有这份文件是合法状态，运行照常。
 
 `AGENT_WORKSPACE_DIR` 是 workspace root，**相对路径一律相对它解析，与 cwd 无关**（`ResourceGuard` 与工具层同一基准）。配置里写下的路径也按这条规则：MCP server 与 subagent provider 的 `cwd` 同样相对 workspace root 解析、同样受边界约束，**落在工作区外的不启动该插件/后端**（会在 stderr 记一条 note 并跳过，不会让整次 run 失败）——不写 `cwd` 则维持原样，子进程继承进程的 cwd。`AGENT_DATA_DIR` 放事件日志与 artifact，**按同一条规则解析**：相对值相对 workspace root，绝对值原样，未设（或设成空串）则用 workspace 里的 `.agent-data`。注意这意味着「只设了 `AGENT_WORKSPACE_DIR`」时数据落在 workspace 内，而不是 cwd 下的 `./.agent-data`——旧目录不会被搬移或删除。

@@ -1234,6 +1234,19 @@ fn capability_text(facts: &TurnCapabilityFacts, manifest: &ToolManifest) -> Stri
          - sandbox: {sandbox}\n\
          - network for sandboxed commands: {network}\n"
     );
+    if !facts.tool_secrets.is_empty() {
+        // A model cannot guess a secret's name, and an unknown one is refused
+        // before the tool runs. Listing the references is what turns the
+        // mechanism into something it can use; the values are not here,
+        // because nothing above the gateway has them.
+        text.push_str(
+            "- secrets you may name in tool arguments as secret://<source>/<name> \
+             (resolved only when the call runs, never shown to you; using one asks for approval):\n",
+        );
+        for secret in &facts.tool_secrets {
+            text.push_str(&format!("  {}\n", secret.reference()));
+        }
+    }
     if manifest.is_empty() {
         text.push_str("- no tools are available in this run.");
         return text;
@@ -7321,6 +7334,7 @@ mod tests {
         turn.capability = Some(TurnCapabilityFacts {
             sandbox: SandboxMode::LocalProcess,
             network_allowed: false,
+            tool_secrets: Vec::new(),
         });
         let outcome = run_turn(&loop_, &turn).await;
 
@@ -7360,6 +7374,36 @@ mod tests {
         assert_eq!(payload["context_capability"]["text"], text);
     }
 
+    /// A secret name is the one thing the model cannot guess, so the layer
+    /// lists the references it may use — and nothing else about them.
+    #[tokio::test]
+    async fn the_capability_layer_lists_the_secret_references_the_run_resolves() {
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.capability = Some(TurnCapabilityFacts {
+            sandbox: SandboxMode::LocalProcess,
+            network_allowed: false,
+            tool_secrets: vec![agent_protocol::permissions::SecretRef {
+                source: "env".to_string(),
+                name: "TOOL_TOKEN".to_string(),
+            }],
+        });
+        run_turn(&loop_, &turn).await;
+
+        let text = model.requests()[0].messages[0].text_content();
+        assert!(text.contains("secret://<source>/<name>"), "{text}");
+        assert!(text.contains("  secret://env/TOOL_TOKEN"), "{text}");
+        // A reference is not a value: nothing from the environment is here.
+        assert!(!text.to_lowercase().contains("s3cret"), "{text}");
+    }
+
     /// The layer sits between the run's instructions and the turn's own frame:
     /// what this run is, then what this turn is.
     #[tokio::test]
@@ -7378,8 +7422,11 @@ mod tests {
             project_file: None,
             builtin: "test/1".to_string(),
         });
-        turn.capability =
-            Some(TurnCapabilityFacts { sandbox: SandboxMode::ReadOnly, network_allowed: false });
+        turn.capability = Some(TurnCapabilityFacts {
+            sandbox: SandboxMode::ReadOnly,
+            network_allowed: false,
+            tool_secrets: Vec::new(),
+        });
         turn.state = Some(facts());
         run_turn(&loop_, &turn).await;
 
@@ -7414,8 +7461,11 @@ mod tests {
         );
 
         let mut turn = ctx();
-        turn.capability =
-            Some(TurnCapabilityFacts { sandbox: SandboxMode::Container, network_allowed: true });
+        turn.capability = Some(TurnCapabilityFacts {
+            sandbox: SandboxMode::Container,
+            network_allowed: true,
+            tool_secrets: Vec::new(),
+        });
         run_turn(&loop_, &turn).await;
 
         let text = model.requests()[0].messages[0].text_content();

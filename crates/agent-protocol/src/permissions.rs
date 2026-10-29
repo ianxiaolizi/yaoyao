@@ -200,6 +200,19 @@ pub struct SecretRef {
     pub name: String,
 }
 
+impl SecretRef {
+    /// The spelling a model writes in a tool argument.
+    ///
+    /// One constructor, so the parser in the gateway and every place that
+    /// lists a reference to the model cannot disagree about the shape. It is a
+    /// URI rather than a bare name because arguments are otherwise arbitrary
+    /// text: a name alone could be a legitimate value, while a `secret://`
+    /// scheme is something a caller has to have meant.
+    pub fn reference(&self) -> String {
+        format!("secret://{}/{}", self.source, self.name)
+    }
+}
+
 /// A content-addressed reference to an artifact blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
@@ -354,6 +367,12 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&artifact).unwrap()).unwrap();
         assert_eq!(s, secret);
         assert_eq!(a, artifact);
+    }
+
+    #[test]
+    fn a_secret_ref_has_one_spelling_in_a_tool_argument() {
+        let secret = SecretRef { source: "env".to_string(), name: "TOOL_TOKEN".to_string() };
+        assert_eq!(secret.reference(), "secret://env/TOOL_TOKEN");
     }
 
     #[test]

@@ -2881,8 +2881,11 @@ mod tests {
     #[tokio::test]
     async fn a_turn_is_opened_with_the_capability_facts_the_host_assembled() {
         let loop_ = RecordingLoop::new();
-        let facts =
-            TurnCapabilityFacts { sandbox: SandboxMode::WorkspaceSandbox, network_allowed: false };
+        let facts = TurnCapabilityFacts {
+            sandbox: SandboxMode::WorkspaceSandbox,
+            network_allowed: false,
+            tool_secrets: Vec::new(),
+        };
         let scheduler = Scheduler::new(Arc::new(FakeEventStore::new()), loop_.clone(), 8)
             .with_capability(facts.clone());
         let sid = SessionId::from_string("capability-session");

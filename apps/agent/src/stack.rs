@@ -51,9 +51,10 @@ use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_protocol::ids::SessionId;
-use agent_protocol::permissions::{Capability, Workspace};
+use agent_protocol::permissions::{Capability, SecretRef, Workspace};
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
+use agent_store_secret::EnvSecretProvider;
 use agent_tools_fs::{FsToolProvider, LocalExecutionEnvironment, SandboxedFileEnvironment};
 use agent_tools_git::GitToolProvider;
 
@@ -152,6 +153,27 @@ enum JudgmentArm {
     Full,
     Gates,
     Off,
+}
+
+/// The secrets a tool argument may name, from `AGENT_TOOL_SECRETS`.
+///
+/// A comma-separated list of environment variable names. Host configuration
+/// rather than project configuration, for the same reason the sandbox mode and
+/// the model key are: a workspace says what it needs, not what the machine is
+/// willing to hand it. Sorted and deduplicated so the capability layer reads
+/// the same on every run that names the same set. Empty or unset means this run
+/// resolves no references at all.
+fn tool_secret_refs(raw: Option<&str>) -> Vec<SecretRef> {
+    let mut names: Vec<String> = raw
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names.into_iter().map(|name| SecretRef { source: "env".to_string(), name }).collect()
 }
 
 /// Read the arm from `AGENT_JUDGMENT` (default `gates`).
@@ -314,6 +336,9 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     // confined one instead: that would run the tools under a boundary nobody
     // selected.
     let env = environment_for(sandbox, &workspace_root, &data_dir, network_allowed)?;
+    // What the gateway may resolve when a tool argument names a reference. The
+    // same list is what the model is told it may name, one fact read once.
+    let tool_secrets = tool_secret_refs(std::env::var("AGENT_TOOL_SECRETS").ok().as_deref());
     // What this backend actually provides, read once before the environment is
     // handed out. The policy and the plugin surface both ask this question and
     // must get the same answer.
@@ -492,7 +517,10 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
             guard.clone(),
             artifacts.clone(),
         )
-        .with_offload_limit(resolved.budget.tool_output_limit_bytes()),
+        .with_offload_limit(resolved.budget.tool_output_limit_bytes())
+        .with_secrets(Arc::new(EnvSecretProvider::new(
+            tool_secrets.iter().map(|secret| secret.name.clone()),
+        ))),
     );
 
     // Routing and shadow decisions are assembled here, next to the provider they
@@ -632,7 +660,7 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
         // The boundary the host chose, told to the model before it reaches it.
         // These are the same two facts the environment was built over, not a
         // second reading of the environment.
-        .with_capability(TurnCapabilityFacts { sandbox, network_allowed });
+        .with_capability(TurnCapabilityFacts { sandbox, network_allowed, tool_secrets });
     let recovery = Recovery::new(store.clone(), tools.clone());
     let resume = Resume::new(store.clone(), approvals.clone(), gateway.clone());
     // The fork closes its child's interrupted tail with the same Recovery rules,
@@ -657,6 +685,21 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_secrets_are_a_sorted_deduplicated_env_list() {
+        assert!(tool_secret_refs(None).is_empty());
+        assert!(tool_secret_refs(Some("   ")).is_empty());
+
+        let refs = tool_secret_refs(Some(" B_TOKEN , A_TOKEN,,B_TOKEN "));
+        assert_eq!(
+            refs,
+            vec![
+                SecretRef { source: "env".to_string(), name: "A_TOKEN".to_string() },
+                SecretRef { source: "env".to_string(), name: "B_TOKEN".to_string() },
+            ]
+        );
+    }
 
     #[test]
     fn a_backend_this_build_does_not_have_stops_assembly() {

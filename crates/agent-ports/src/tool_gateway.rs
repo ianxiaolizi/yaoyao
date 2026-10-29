@@ -92,6 +92,17 @@ pub enum ToolGatewayError {
     /// provider that ships one is what has to change.
     #[error("tool '{tool}' cannot be called as declared: {reason}")]
     InvalidSchema { tool: String, reason: String },
+    /// A tool argument named a secret this run could not resolve.
+    ///
+    /// A refusal, not a provider failure: the tool was never handed the call.
+    /// The text names the reference, never the value, and `kind` says which
+    /// side has to change — a reference the run was not granted is a
+    /// permission problem, one the provider itself failed to answer is
+    /// unavailability, and a malformed reference is the caller's own mistyping.
+    #[error(
+        "tool '{tool}' was not run: secret reference '{reference}' could not be resolved: {reason}"
+    )]
+    SecretUnavailable { tool: String, reference: String, reason: String, kind: ToolErrorKind },
     /// The provider was reached, and its own answer was a failure.
     ///
     /// Carried whole rather than flattened to a string, because the inner error
@@ -119,6 +130,7 @@ impl ToolGatewayError {
             Self::UnknownTool { .. } => Some(ToolErrorKind::UnknownTool),
             Self::InvalidArguments { .. } => Some(ToolErrorKind::InvalidArguments),
             Self::InvalidSchema { .. } => Some(ToolErrorKind::Protocol),
+            Self::SecretUnavailable { kind, .. } => Some(*kind),
             Self::Tool(error) => Some(error.kind()),
             Self::ApprovalPending { .. } | Self::Approval(_) => None,
         }

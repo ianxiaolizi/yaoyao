@@ -19,6 +19,7 @@ use std::sync::Arc;
 use agent_protocol::events::EventDraft;
 use agent_protocol::ids::{InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::instructions::RunInstructions;
+use agent_protocol::permissions::SecretRef;
 use agent_protocol::profile::RunBudget;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -199,6 +200,14 @@ pub struct TurnCapabilityFacts {
     pub sandbox: crate::execution_environment::SandboxMode,
     /// Whether a command run through the sandbox may reach the network.
     pub network_allowed: bool,
+    /// Secrets this run will resolve if a tool argument names one.
+    ///
+    /// References only — the values never exist at this layer. The loop shows
+    /// the model what it may name, which is the one thing it cannot guess: an
+    /// unresolvable reference is refused before the tool runs, so a model that
+    /// invented a name would spend steps learning nothing. Empty means the run
+    /// resolves no references at all.
+    pub tool_secrets: Vec<SecretRef>,
 }
 
 /// How a turn that ended ended.

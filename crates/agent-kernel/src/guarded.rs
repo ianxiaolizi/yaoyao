@@ -12,13 +12,15 @@
 use std::sync::Arc;
 
 use agent_ports::artifact_store::ArtifactStore;
+use agent_ports::secret_provider::{SecretProvider, SecretProviderError};
 use agent_ports::tool_gateway::{ToolGateway, ToolGatewayError};
 use agent_ports::tool_provider::{
-    ToolDefinition, ToolInvocation, ToolProvider, ToolResult, ToolSideEffect,
+    ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
 };
 use agent_protocol::ids::SessionId;
-use agent_protocol::permissions::{ArtifactRef, Capability, PolicyDecision};
+use agent_protocol::permissions::{ArtifactRef, Capability, PolicyDecision, SecretRef};
 use agent_protocol::redactor::Redactor;
+use agent_protocol::tool::ToolErrorKind;
 
 use crate::approval::ApprovalService;
 use crate::policy::{PolicyContext, PolicyEngine, Refusal};
@@ -44,6 +46,17 @@ const SURFACE_SAMPLE: usize = 12;
 const PREVIEW_HEAD_BYTES: usize = 2_048;
 const PREVIEW_TAIL_BYTES: usize = 512;
 
+/// The scheme a tool argument uses to name a secret instead of carrying one.
+const SECRET_SCHEME: &str = "secret://";
+
+/// The shortest resolved value the result scrubber replaces.
+///
+/// A backstop, not the boundary: the arguments never carried the value, and a
+/// tool that echoes it is the case this covers. Below this length a value is
+/// indistinguishable from an ordinary word, and replacing every occurrence
+/// would corrupt perfectly good output while protecting nothing.
+const MIN_SECRET_SCRUB_CHARS: usize = 8;
+
 /// Policy- and approval-guarded tool executor.
 pub struct GuardedToolProvider {
     inner: Arc<dyn ToolProvider>,
@@ -52,6 +65,11 @@ pub struct GuardedToolProvider {
     guard: ResourceGuard,
     redactor: Redactor,
     artifacts: Arc<dyn ArtifactStore>,
+    /// Resolves `secret://` references in tool arguments at execution time.
+    ///
+    /// `None` is a run that resolves none: a reference is then refused rather
+    /// than passed to the tool as if it were the value it names.
+    secrets: Option<Arc<dyn SecretProvider>>,
     /// How many bytes of one result stay inline; larger results are offloaded.
     offload_max_bytes: usize,
     /// The compiled declarations calls are checked against, kept between calls
@@ -74,9 +92,23 @@ impl GuardedToolProvider {
             guard,
             redactor: Redactor::new(),
             artifacts,
+            secrets: None,
             offload_max_bytes: OFFLOAD_MAX_BYTES,
             schema: SchemaCheck::new(),
         }
+    }
+
+    /// Resolve `secret://` references in arguments through `secrets`.
+    ///
+    /// The plaintext is injected immediately before the tool runs and kept
+    /// only for the length of that call: the invocation the caller built, the
+    /// log it was written to, and the approval summary all still hold the
+    /// reference. What comes back is a *copy* whose argument strings have the
+    /// values substituted, plus the values themselves so the result and any
+    /// provider error can be scrubbed with them.
+    pub fn with_secrets(mut self, secrets: Arc<dyn SecretProvider>) -> Self {
+        self.secrets = Some(secrets);
+        self
     }
 
     /// Bound one result to `max_bytes` inline.
@@ -101,6 +133,175 @@ impl GuardedToolProvider {
 
     fn is_known(&self, tool_name: &str) -> bool {
         self.inner.definitions().into_iter().any(|d| d.name == tool_name)
+    }
+
+    /// Whether any string in `value` names a secret.
+    fn references_secret(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => text.contains(SECRET_SCHEME),
+            serde_json::Value::Array(items) => items.iter().any(Self::references_secret),
+            serde_json::Value::Object(map) => map.values().any(Self::references_secret),
+            _ => false,
+        }
+    }
+
+    /// Resolve every reference in the arguments, refusing the whole call if one
+    /// cannot be resolved.
+    ///
+    /// All-or-nothing: a call that half-resolved would hand the tool a mix of
+    /// values and reference strings, and the tool would act on the mix. The
+    /// returned invocation is a copy — the caller's own value, and the event
+    /// already written from it, keep the references.
+    fn resolve_arguments(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<(ToolInvocation, Vec<ResolvedSecret>), ToolGatewayError> {
+        if !Self::references_secret(&invocation.arguments) {
+            return Ok((invocation.clone(), Vec::new()));
+        }
+        let mut resolved = Vec::new();
+        let arguments =
+            self.resolve_value(&invocation.tool_name, &invocation.arguments, &mut resolved)?;
+        let mut resolved_invocation = invocation.clone();
+        resolved_invocation.arguments = arguments;
+        Ok((resolved_invocation, resolved))
+    }
+
+    fn resolve_value(
+        &self,
+        tool: &str,
+        value: &serde_json::Value,
+        resolved: &mut Vec<ResolvedSecret>,
+    ) -> Result<serde_json::Value, ToolGatewayError> {
+        match value {
+            serde_json::Value::String(text) => {
+                self.resolve_text(tool, text, resolved).map(serde_json::Value::String)
+            }
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|item| self.resolve_value(tool, item, resolved))
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_json::Value::Array),
+            serde_json::Value::Object(map) => map
+                .iter()
+                .map(|(key, item)| {
+                    self.resolve_value(tool, item, resolved).map(|value| (key.clone(), value))
+                })
+                .collect::<Result<serde_json::Map<_, _>, _>>()
+                .map(serde_json::Value::Object),
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Substitute every `secret://<source>/<name>` in one string.
+    ///
+    /// A reference is parsed only at the scheme's start and ends at the first
+    /// character that cannot appear in a name, so `Bearer secret://env/TOKEN`
+    /// inside a shell command substitutes exactly the token and leaves the
+    /// rest of the command alone. A malformed reference is refused rather than
+    /// passed through as text: a tool handed the literal reference would do
+    /// something with it, and the caller would have meant a value.
+    fn resolve_text(
+        &self,
+        tool: &str,
+        text: &str,
+        resolved: &mut Vec<ResolvedSecret>,
+    ) -> Result<String, ToolGatewayError> {
+        let Some(first) = text.find(SECRET_SCHEME) else {
+            return Ok(text.to_string());
+        };
+        let mut out = String::with_capacity(text.len());
+        out.push_str(&text[..first]);
+        let mut rest = &text[first..];
+        while let Some(start) = rest.find(SECRET_SCHEME) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + SECRET_SCHEME.len()..];
+            let end = after
+                .find(|ch: char| {
+                    !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
+                })
+                .unwrap_or(after.len());
+            let body = &after[..end];
+            let reference = format!("{SECRET_SCHEME}{body}");
+            let malformed = || ToolGatewayError::SecretUnavailable {
+                tool: tool.to_string(),
+                reference: reference.clone(),
+                reason: "a secret reference is written secret://<source>/<name>".to_string(),
+                kind: ToolErrorKind::InvalidArguments,
+            };
+            let Some((source, name)) = body.split_once('/') else {
+                return Err(malformed());
+            };
+            if source.is_empty() || name.is_empty() || name.contains('/') {
+                return Err(malformed());
+            }
+            let secret = SecretRef { source: source.to_string(), name: name.to_string() };
+            let Some(provider) = self.secrets.as_deref() else {
+                return Err(ToolGatewayError::SecretUnavailable {
+                    tool: tool.to_string(),
+                    reference: secret.reference(),
+                    reason: "this run has no secret provider configured".to_string(),
+                    kind: ToolErrorKind::PermissionDenied,
+                });
+            };
+            let value = provider.resolve(&secret).map_err(|error| match error {
+                SecretProviderError::NotFound { .. } => ToolGatewayError::SecretUnavailable {
+                    tool: tool.to_string(),
+                    reference: secret.reference(),
+                    reason: "is not available to this run".to_string(),
+                    kind: ToolErrorKind::PermissionDenied,
+                },
+                SecretProviderError::Failed(message) => ToolGatewayError::SecretUnavailable {
+                    tool: tool.to_string(),
+                    reference: secret.reference(),
+                    reason: format!("the secret provider failed: {message}"),
+                    kind: ToolErrorKind::Unavailable,
+                },
+            })?;
+            resolved.push(ResolvedSecret { reference: secret.reference(), value: value.clone() });
+            out.push_str(&value);
+            rest = &after[end..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+
+    /// Whether an approval already covers the capabilities a secret-using call
+    /// declares.
+    ///
+    /// Any intersecting grant is enough: the grant was given for this tool's
+    /// capability, and a secret names a value the person approving the call
+    /// could not see either way.
+    async fn secret_use_granted(
+        &self,
+        session_id: &SessionId,
+        capabilities: &[Capability],
+    ) -> Result<bool, ToolGatewayError> {
+        let leases = self
+            .approvals
+            .leases_in_effect(session_id)
+            .await
+            .map_err(|e| ToolGatewayError::Approval(e.to_string()))?;
+        Ok(leases.iter().any(|lease| capabilities.contains(&lease.capability)))
+    }
+
+    /// Raise the approval a secret-using call needs, and say it is pending.
+    async fn request_approval(
+        &self,
+        session_id: &SessionId,
+        invocation: &ToolInvocation,
+        capability: Capability,
+    ) -> Result<ToolGatewayError, ToolGatewayError> {
+        let summary = self.summarize(invocation);
+        let req = self
+            .approvals
+            .request(session_id, capability, &invocation.tool_name, &summary)
+            .await
+            .map_err(|e| ToolGatewayError::Approval(e.to_string()))?;
+        Ok(ToolGatewayError::ApprovalPending {
+            tool: invocation.tool_name.clone(),
+            approval_id: req.approval_id.to_string(),
+        })
     }
 
     /// Refuse a call whose arguments do not match the tool's declaration.
@@ -209,8 +410,34 @@ impl GuardedToolProvider {
         }
         self.check_arguments(invocation)?;
         self.check_paths(invocation, &self.policy_context(invocation))?;
-        let result = self.inner.invoke(invocation).await.map_err(ToolGatewayError::Tool)?;
-        Ok(self.finalize(result))
+        self.run_resolved(invocation).await
+    }
+
+    /// Resolve references, run the tool, scrub what comes back.
+    ///
+    /// The one path both execution entry points share, so an approved call and
+    /// an allowed one cannot disagree about whether a reference was resolved
+    /// or whether its value was scrubbed afterwards.
+    async fn run_resolved(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<ToolResult, ToolGatewayError> {
+        let (resolved_invocation, secrets) = self.resolve_arguments(invocation)?;
+        self.finish_resolved(&resolved_invocation, &secrets).await
+    }
+
+    /// Run an invocation whose references are already resolved.
+    async fn finish_resolved(
+        &self,
+        resolved_invocation: &ToolInvocation,
+        secrets: &[ResolvedSecret],
+    ) -> Result<ToolResult, ToolGatewayError> {
+        let result = self
+            .inner
+            .invoke(resolved_invocation)
+            .await
+            .map_err(|error| ToolGatewayError::Tool(scrub_provider_error(error, secrets)))?;
+        Ok(self.finalize(result, secrets))
     }
 
     /// The policy's view of the call.
@@ -268,8 +495,19 @@ impl GuardedToolProvider {
     }
 
     /// Redact a result, then decide how much of it the model may see.
-    fn finalize(&self, result: ToolResult) -> ToolResult {
-        let (content, redaction) = self.redactor.redact(&result.content);
+    ///
+    /// A value this call resolved is scrubbed before the pattern-based
+    /// redactor: the redactor knows what a secret *looks* like, and this knows
+    /// the exact bytes of the one that was just handed to the tool. Neither
+    /// subsumes the other, and the result is the one place a tool can echo
+    /// what it was given.
+    fn finalize(&self, result: ToolResult, secrets: &[ResolvedSecret]) -> ToolResult {
+        let (content, mut redaction) = self.redactor.redact(&result.content);
+        let (content, patterns) = scrub_text(&content, secrets);
+        redaction.patterns.extend(patterns);
+        redaction.patterns.sort();
+        redaction.patterns.dedup();
+        redaction.redacted = redaction.redacted || !redaction.patterns.is_empty();
         let mut finalized = result;
         finalized.content = content;
         finalized.redaction_metadata = redaction;
@@ -300,6 +538,55 @@ impl GuardedToolProvider {
     /// Whether content is past either offload limit.
     fn exceeds_offload_limits(&self, content: &str) -> bool {
         content.len() > self.offload_max_bytes || content.lines().count() > OFFLOAD_MAX_LINES
+    }
+}
+
+/// A reference resolved for one call, kept only long enough to scrub the
+/// answer and any error the provider returns.
+struct ResolvedSecret {
+    /// The reference as written, which is what the redaction metadata names.
+    reference: String,
+    /// The plaintext that was handed to the tool. Never persisted.
+    value: String,
+}
+
+/// Replace every occurrence of a resolved value with `***`.
+///
+/// Returns the scrubbed text and the references whose values were found, so
+/// the redaction metadata can say what happened without carrying the value.
+/// Longest first: when one secret contains another, replacing the shorter one
+/// first would leave a fragment of the longer one behind.
+fn scrub_text(text: &str, secrets: &[ResolvedSecret]) -> (String, Vec<String>) {
+    let mut out = text.to_string();
+    let mut patterns = Vec::new();
+    let mut ordered: Vec<&ResolvedSecret> =
+        secrets.iter().filter(|secret| secret.value.len() >= MIN_SECRET_SCRUB_CHARS).collect();
+    ordered.sort_by_key(|secret| std::cmp::Reverse(secret.value.len()));
+    for secret in ordered {
+        if out.contains(&secret.value) {
+            out = out.replace(&secret.value, "***");
+            patterns.push(secret.reference.clone());
+        }
+    }
+    (out, patterns)
+}
+
+/// Scrub resolved values out of a provider's error message.
+///
+/// A shell that echoes its command line, or a server that quotes the header it
+/// rejected, would otherwise put the value into `tool/failed` — durable, and
+/// exported with the session.
+fn scrub_provider_error(error: ToolProviderError, secrets: &[ResolvedSecret]) -> ToolProviderError {
+    match error {
+        ToolProviderError::Failed { tool, message } => {
+            let (message, _) = scrub_text(&message, secrets);
+            ToolProviderError::Failed { tool, message }
+        }
+        ToolProviderError::Classified { tool, kind, message } => {
+            let (message, _) = scrub_text(&message, secrets);
+            ToolProviderError::Classified { tool, kind, message }
+        }
+        other => other,
     }
 }
 
@@ -407,21 +694,29 @@ impl ToolGateway for GuardedToolProvider {
             PolicyDecision::Ask => {
                 let capability =
                     capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
-                let summary = self.summarize(invocation);
-                let req = self
-                    .approvals
-                    .request(session_id, capability, &invocation.tool_name, &summary)
-                    .await
-                    .map_err(|e| ToolGatewayError::Approval(e.to_string()))?;
-                Err(ToolGatewayError::ApprovalPending {
-                    tool: invocation.tool_name.clone(),
-                    approval_id: req.approval_id.to_string(),
-                })
+                Err(self.request_approval(session_id, invocation, capability).await?)
             }
             PolicyDecision::Allow => {
                 self.check_paths(invocation, &ctx)?;
-                let result = self.inner.invoke(invocation).await.map_err(ToolGatewayError::Tool)?;
-                Ok(self.finalize(result))
+                if !Self::references_secret(&invocation.arguments) {
+                    return self.finish_resolved(invocation, &[]).await;
+                }
+                // Resolve before asking: a reference this run cannot resolve is
+                // a call that could never run, and a person should not be asked
+                // to approve one. The values stay in this frame until the call
+                // actually runs (or the approval is raised and they are
+                // dropped with the frame).
+                let (resolved_invocation, secrets) = self.resolve_arguments(invocation)?;
+                // A call that names a secret is a call a person should see
+                // before it runs. The reference is all the summary can show
+                // them, and the tool's own capability says whether they
+                // already said yes to it in this scope.
+                if !self.secret_use_granted(session_id, &capabilities).await? {
+                    let capability =
+                        capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
+                    return Err(self.request_approval(session_id, invocation, capability).await?);
+                }
+                self.finish_resolved(&resolved_invocation, &secrets).await
             }
         }
     }
@@ -1459,5 +1754,213 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.kind(), expected, "{error}");
         }
+    }
+
+    /// A provider that records what it was handed and answers with `reply`.
+    struct RecordingTools {
+        defs: Vec<ToolDefinition>,
+        reply: ToolResult,
+        fail_with: Option<String>,
+        seen: Mutex<Vec<ToolInvocation>>,
+    }
+
+    impl RecordingTools {
+        fn new(reply: &str) -> Self {
+            Self {
+                defs: vec![def("fs.read", &[Capability::FS_READ], ToolSideEffect::Read)],
+                reply: ToolResult::completed(reply),
+                fail_with: None,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(message: &str) -> Self {
+            let mut tools = Self::new("");
+            tools.fail_with = Some(message.to_string());
+            tools
+        }
+
+        fn seen(&self) -> Vec<ToolInvocation> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolProvider for RecordingTools {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            self.defs.clone()
+        }
+
+        fn side_effect(&self, tool_name: &str) -> Option<ToolSideEffect> {
+            self.defs.iter().find(|d| d.name == tool_name).map(|d| d.side_effect)
+        }
+
+        async fn invoke(
+            &self,
+            invocation: &ToolInvocation,
+        ) -> Result<ToolResult, ToolProviderError> {
+            self.seen.lock().unwrap().push(invocation.clone());
+            match &self.fail_with {
+                Some(message) => {
+                    Err(ToolProviderError::failed(&invocation.tool_name, message.clone()))
+                }
+                None => Ok(self.reply.clone()),
+            }
+        }
+    }
+
+    /// A secret provider with one resolvable name.
+    struct OneSecret;
+
+    impl SecretProvider for OneSecret {
+        fn resolve(&self, secret: &SecretRef) -> Result<String, SecretProviderError> {
+            if secret.source == "env" && secret.name == "TOOL_TOKEN" {
+                Ok("s3cret-value-12345".to_string())
+            } else {
+                Err(SecretProviderError::NotFound {
+                    provider: secret.source.clone(),
+                    name: secret.name.clone(),
+                })
+            }
+        }
+    }
+
+    fn secret_gateway(tools: Arc<RecordingTools>) -> GuardedToolProvider {
+        let store = Arc::new(FakeEventStore::new());
+        GuardedToolProvider::new(
+            tools,
+            allowing(Capability::FS_READ),
+            Arc::new(ApprovalService::new(store)),
+            ResourceGuard::new(workspace()),
+            Arc::new(agent_testkit::InMemoryArtifactStore::default()),
+        )
+        .with_secrets(Arc::new(OneSecret))
+    }
+
+    fn secret_invocation(arguments: serde_json::Value) -> ToolInvocation {
+        ToolInvocation::proposed("fs.read", arguments)
+    }
+
+    #[tokio::test]
+    async fn a_secret_reference_is_resolved_at_the_tool_boundary_and_scrubbed_from_the_result() {
+        let tools = Arc::new(RecordingTools::new("the token is s3cret-value-12345"));
+        let gateway = secret_gateway(tools.clone());
+        let invocation = secret_invocation(serde_json::json!({
+            "path": "notes.txt",
+            "command": "echo 'Bearer secret://env/TOOL_TOKEN'",
+        }));
+
+        // The call is a secret-using one, so it stops for approval first.
+        let pending = gateway.execute(&sid(), &invocation).await.unwrap_err();
+        assert!(matches!(pending, ToolGatewayError::ApprovalPending { .. }), "{pending:?}");
+        assert!(tools.seen().is_empty(), "nothing may run before the approval");
+
+        // What the log and the summary hold is the reference, untouched.
+        assert_eq!(invocation.arguments["command"], "echo 'Bearer secret://env/TOOL_TOKEN'");
+
+        let result = gateway.execute_approved(&invocation).await.unwrap();
+        let seen = tools.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].arguments["command"], "echo 'Bearer s3cret-value-12345'");
+        assert!(!result.content.contains("s3cret-value"), "secret leaked: {}", result.content);
+        assert!(result.content.contains("***"));
+        assert!(
+            result
+                .redaction_metadata
+                .patterns
+                .iter()
+                .any(|pattern| pattern == "secret://env/TOOL_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_secret_is_refused_before_the_tool_runs() {
+        let tools = Arc::new(RecordingTools::new("ok"));
+        let gateway = secret_gateway(tools.clone());
+
+        let error = gateway
+            .execute(
+                &sid(),
+                &secret_invocation(serde_json::json!({ "command": "echo secret://env/NOPE" })),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            ToolGatewayError::SecretUnavailable { reference, kind, .. } => {
+                assert_eq!(reference, "secret://env/NOPE");
+                assert_eq!(kind, ToolErrorKind::PermissionDenied);
+            }
+            other => panic!("expected a secret refusal, got {other:?}"),
+        }
+        assert!(tools.seen().is_empty(), "an unresolvable reference must not reach the tool");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_secret_reference_is_refused() {
+        let tools = Arc::new(RecordingTools::new("ok"));
+        let gateway = secret_gateway(tools.clone());
+
+        let error = gateway
+            .execute(
+                &sid(),
+                &secret_invocation(serde_json::json!({ "command": "echo secret://TOOL_TOKEN" })),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ToolGatewayError::SecretUnavailable { kind: ToolErrorKind::InvalidArguments, .. }
+            ),
+            "{error:?}"
+        );
+        assert!(tools.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_secret_provider_refuses_a_reference() {
+        let tools = Arc::new(RecordingTools::new("ok"));
+        let store = Arc::new(FakeEventStore::new());
+        let gateway = GuardedToolProvider::new(
+            tools.clone(),
+            allowing(Capability::FS_READ),
+            Arc::new(ApprovalService::new(store)),
+            ResourceGuard::new(workspace()),
+            Arc::new(agent_testkit::InMemoryArtifactStore::default()),
+        );
+
+        let error = gateway
+            .execute(
+                &sid(),
+                &secret_invocation(
+                    serde_json::json!({ "command": "echo secret://env/TOOL_TOKEN" }),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ToolGatewayError::SecretUnavailable { kind: ToolErrorKind::PermissionDenied, .. }
+            ),
+            "{error:?}"
+        );
+        assert!(tools.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_that_echoes_the_secret_is_scrubbed() {
+        let tools = Arc::new(RecordingTools::failing("rejected header: Bearer s3cret-value-12345"));
+        let gateway = secret_gateway(tools);
+
+        let error = gateway
+            .execute_approved(&secret_invocation(
+                serde_json::json!({ "command": "echo secret://env/TOOL_TOKEN" }),
+            ))
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(!text.contains("s3cret-value"), "secret leaked: {text}");
+        assert!(text.contains("***"));
     }
 }
