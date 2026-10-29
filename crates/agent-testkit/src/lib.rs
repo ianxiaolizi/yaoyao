@@ -724,6 +724,11 @@ pub struct FakeToolProvider {
     /// on the declaration, not on the call, so a test that exercises them has
     /// to be able to say a tool is not idempotent.
     non_idempotent: HashSet<String>,
+    /// How long a tool takes before it answers. A real tool spends wall-clock
+    /// time, and a deadline is only observable if something under it does:
+    /// without this, a run-budget test could only ever see a deadline that had
+    /// already passed.
+    delays: HashMap<String, std::time::Duration>,
     calls: Mutex<Vec<ToolInvocation>>,
 }
 
@@ -739,6 +744,7 @@ impl FakeToolProvider {
             tools: HashMap::new(),
             queued: Mutex::new(HashMap::new()),
             non_idempotent: HashSet::new(),
+            delays: HashMap::new(),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -746,6 +752,16 @@ impl FakeToolProvider {
     /// Register a tool as not safe to retry.
     pub fn with_non_idempotent(mut self, name: &str) -> Self {
         self.non_idempotent.insert(name.to_string());
+        self
+    }
+
+    /// Make a registered tool take `delay` before it answers.
+    ///
+    /// Time passing is the tool's own doing, not the loop's: the loop's clock
+    /// keeps running while a tool works, which is what makes a wall-clock limit
+    /// observable at the next dispatch.
+    pub fn with_delay(mut self, name: &str, delay: std::time::Duration) -> Self {
+        self.delays.insert(name.to_string(), delay);
         self
     }
 
@@ -828,6 +844,9 @@ impl ToolProvider for FakeToolProvider {
         // and a record that skipped it would answer a different question.
         if let Ok(mut calls) = self.calls.lock() {
             calls.push(invocation.clone());
+        }
+        if let Some(delay) = self.delays.get(&invocation.tool_name) {
+            tokio::time::sleep(*delay).await;
         }
         // A scripted outcome comes first; a tool with none (or with its script
         // spent) answers from the frozen map.

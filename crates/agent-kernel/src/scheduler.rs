@@ -23,7 +23,7 @@ use agent_protocol::ids::{
     EventId, EventSeq, InboxItemId, RunId, SchemaVersion, SessionId, StepId, TurnId,
 };
 use agent_protocol::inbox::{InboxItem, InboxKind};
-use agent_protocol::profile::ResolvedProfileSnapshot;
+use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget};
 use chrono::{DateTime, Utc};
 
 use crate::approval::{ApprovalError, ApprovalService};
@@ -38,6 +38,10 @@ pub struct Scheduler {
     inbox: Inbox,
     loop_: Arc<dyn AgentLoop>,
     max_steps: u32,
+    /// The rest of the run's budget. `max_steps` above is the binding step
+    /// limit (a harness supplies it directly); this carries the limits the
+    /// loop enforces inside a step and the ones recorded in a budget stop.
+    budget: RunBudget,
     /// The configuration this session's runs execute under, when the app layer
     /// resolved one. `None` is a real state — a harness or a tool that has no
     /// configuration to speak of — and it means the run records no snapshot
@@ -110,6 +114,7 @@ impl Scheduler {
             inbox,
             loop_,
             max_steps,
+            budget: RunBudget::default(),
             profile: None,
             controls: Vec::new(),
             instructions: None,
@@ -186,6 +191,9 @@ impl Scheduler {
     /// files. A scheduler without one still runs; what it cannot do is tell a
     /// later reader what configuration it was running under.
     pub fn with_profile_snapshot(mut self, snapshot: ResolvedProfileSnapshot) -> Self {
+        // The profile's budget is what the run executes under; the step limit
+        // stays the one `new` was given, which is how a harness states it.
+        self.budget = snapshot.budget;
         self.profile = Some(snapshot);
         self
     }
@@ -347,6 +355,11 @@ impl Scheduler {
     ) -> Result<RunReport, SchedulerError> {
         let run_id = RunId::new();
         let turn_id = TurnId::new();
+        // The run's wall clock, measured on the monotonic clock: it times a
+        // limit, so it is not a timestamp and does not belong in the log. The
+        // loop enforces the deadline inside a step; this is the number written
+        // beside a budget stop.
+        let run_started = std::time::Instant::now();
         // Read before anything is durable: instructions that cannot be
         // assembled are a run that did not start, so the item stays pending and
         // no turn opens over a prompt this build could not compose.
@@ -414,6 +427,7 @@ impl Scheduler {
             previous_turn,
             resumed: decision,
             max_steps: self.max_steps,
+            budget: self.budget,
         };
         let ctx = TurnContext {
             session_id: session_id.clone(),
@@ -514,8 +528,36 @@ impl Scheduler {
             }
         };
 
-        let (stop_reason, final_content, turn_terminal, run_terminal, turn_payload) =
+        let (stop_reason, final_content, turn_terminal, run_terminal, mut turn_payload) =
             ending.settle();
+        // What a budget stop spent. A turn that stops on a limit has to say
+        // how far it got, or a reader cannot tell a limit hit at once from one
+        // hit after a long run. Only budget endings carry it: every other
+        // terminal payload keeps the shape it had, so nothing that reads those
+        // sees a new field. `stop_reason` is not repeated here — the terminal
+        // payload beside this already says it.
+        if matches!(
+            stop_reason,
+            StopReason::MaxSteps | StopReason::MaxToolCalls | StopReason::WallClockExceeded
+        ) {
+            // Counted from the log's own step markers rather than the loop
+            // counter: a step that refused to open — a spent wall clock at the
+            // boundary — returned without one, and it must not be counted as a
+            // step the turn took.
+            let steps = drafts
+                .iter()
+                .filter(|event| event.event_type.as_str() == EventType::STEP_STARTED)
+                .count();
+            let tool_calls = drafts
+                .iter()
+                .filter(|event| event.event_type.as_str() == EventType::TOOL_STARTED)
+                .count();
+            turn_payload["budget"] = serde_json::json!({
+                "steps": steps,
+                "tool_calls": tool_calls,
+                "elapsed_ms": run_started.elapsed().as_millis() as u64,
+            });
+        }
         drafts.push(draft(
             session_id,
             turn_terminal,
@@ -757,7 +799,10 @@ impl Ending {
             _ => None,
         };
         let (turn_event, run_event) = match &reason {
-            StopReason::FinalAnswer | StopReason::MaxSteps => {
+            StopReason::FinalAnswer
+            | StopReason::MaxSteps
+            | StopReason::MaxToolCalls
+            | StopReason::WallClockExceeded => {
                 (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED)
             }
             StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
@@ -778,6 +823,15 @@ impl Ending {
             // told from a turn that ended with nothing to say: on 2026-10-24's
             // real use the log gave no reason and only stdout did.
             Ending::Budget => serde_json::json!({ "stop_reason": &reason }),
+            // A limit the loop enforced inside a step ends the turn the same
+            // way the step limit does, and for the same reason: `turn/completed`
+            // with an empty payload cannot be told from a turn that ended with
+            // nothing to say.
+            Ending::Loop { reason, .. }
+                if matches!(reason, StopReason::MaxToolCalls | StopReason::WallClockExceeded) =>
+            {
+                serde_json::json!({ "stop_reason": reason })
+            }
             _ => match &final_content {
                 Some(content) => serde_json::json!({ "final_content": content }),
                 None => serde_json::json!({}),
@@ -1082,6 +1136,10 @@ mod tests {
     }
 
     fn snapshot() -> ResolvedProfileSnapshot {
+        snapshot_with_budget(agent_protocol::profile::RunBudget::default())
+    }
+
+    fn snapshot_with_budget(budget: agent_protocol::profile::RunBudget) -> ResolvedProfileSnapshot {
         ResolvedProfileSnapshot {
             profile_id: "coding".to_string(),
             config_hash: String::new(),
@@ -1094,7 +1152,7 @@ mod tests {
                 "echo",
             ),
             capability_set: agent_protocol::permissions::CapabilitySet::new(),
-            budget: agent_protocol::profile::RunBudget::default(),
+            budget,
         }
         .sealed()
     }
@@ -1604,7 +1662,96 @@ mod tests {
             .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
             .expect("the turn completed");
         assert_eq!(completed.event.payload["stop_reason"], serde_json::json!("max_steps"));
+        // And how far the turn got: a limit hit at once and one hit after a long
+        // run write the same stop reason, so the numbers beside it are what tell
+        // them apart.
+        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(2));
+        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(2));
+        assert!(completed.event.payload["budget"]["elapsed_ms"].is_u64());
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
+    }
+
+    /// The budget is read from the profile the run froze, and the loop enforces
+    /// the part of it the Scheduler cannot see: how many calls a step made.
+    #[tokio::test]
+    async fn a_profile_tool_call_limit_stops_the_run_and_the_turn_says_how_far_it_got() {
+        let store = Arc::new(FakeEventStore::new());
+        let sid = SessionId::from_string("tool-budget-session");
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({})),
+            FakeModelProvider::answer("never asked"),
+        ]));
+        let budget = agent_protocol::profile::RunBudget {
+            max_tool_calls: Some(0),
+            ..agent_protocol::profile::RunBudget::default()
+        };
+        let scheduler = scheduler_over(store.clone(), model.clone(), 8)
+            .with_profile_snapshot(snapshot_with_budget(budget));
+        scheduler
+            .inbox
+            .append(&sid, InboxKind::NextTurn, serde_json::json!({"text": "hi"}), 0, Actor::User)
+            .await
+            .unwrap();
+
+        let report = scheduler.run_pending(&sid, Utc::now()).await.unwrap().expect("a run");
+
+        assert_eq!(report.stop_reason, StopReason::MaxToolCalls);
+        assert_eq!(model.requests().len(), 1, "the turn ended in the step that hit the limit");
+        let types = event_types(&store, &sid).await;
+        assert!(types.contains(&EventType::TOOL_NOT_STARTED.to_string()), "{types:?}");
+        assert!(!types.contains(&EventType::TOOL_STARTED.to_string()), "{types:?}");
+        // A limit the loop enforced ends the turn the way an exhausted step
+        // budget does; leaving it as `{}` would hide the reason in the log.
+        assert!(types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
+        let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let completed = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
+            .expect("the turn completed");
+        assert_eq!(completed.event.payload["stop_reason"], serde_json::json!("max_tool_calls"));
+        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(1));
+        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(0));
+        assert!(!scheduler.has_active_run(&sid).await.unwrap());
+    }
+
+    /// A run whose clock is already spent takes no step, and the log says so:
+    /// zero steps, not one, because a step that refused to open is not a step
+    /// the turn took.
+    #[tokio::test]
+    async fn a_spent_wall_clock_ends_the_turn_with_no_steps_and_no_request() {
+        let store = Arc::new(FakeEventStore::new());
+        let sid = SessionId::from_string("clock-budget-session");
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("never")]));
+        let budget = agent_protocol::profile::RunBudget {
+            wall_clock_ms: Some(0),
+            ..agent_protocol::profile::RunBudget::default()
+        };
+        let scheduler = scheduler_over(store.clone(), model.clone(), 8)
+            .with_profile_snapshot(snapshot_with_budget(budget));
+        scheduler
+            .inbox
+            .append(&sid, InboxKind::NextTurn, serde_json::json!({"text": "hi"}), 0, Actor::User)
+            .await
+            .unwrap();
+
+        let report = scheduler.run_pending(&sid, Utc::now()).await.unwrap().expect("a run");
+
+        assert_eq!(report.stop_reason, StopReason::WallClockExceeded);
+        assert!(model.requests().is_empty(), "the model was not asked");
+        let types = event_types(&store, &sid).await;
+        assert!(!types.contains(&EventType::STEP_STARTED.to_string()), "{types:?}");
+        let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let completed = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
+            .expect("the turn completed");
+        assert_eq!(
+            completed.event.payload["stop_reason"],
+            serde_json::json!("wall_clock_exceeded")
+        );
+        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(0));
+        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(0));
     }
 
     #[tokio::test]

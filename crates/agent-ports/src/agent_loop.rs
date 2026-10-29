@@ -14,6 +14,7 @@ use std::any::Any;
 use agent_protocol::events::EventDraft;
 use agent_protocol::ids::{InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::instructions::RunInstructions;
+use agent_protocol::profile::RunBudget;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +108,14 @@ pub struct TurnStateFacts {
     pub resumed: Option<String>,
     /// The most steps this run may take, from the run's configuration.
     pub max_steps: u32,
+    /// The run's configured budget, as the caller resolved it.
+    ///
+    /// `max_steps` above stays the binding step limit (the Scheduler owns it);
+    /// this carries the limits the loop itself has to enforce inside a step —
+    /// tool calls, wall clock, and the output reservation that becomes the
+    /// provider's `max_tokens`. A harness with no configuration passes the
+    /// default, which leaves every one of them unbounded.
+    pub budget: RunBudget,
 }
 
 /// What opened a turn.
@@ -221,6 +230,15 @@ pub enum StopReason {
     /// boundary. M5 reaches the first when an adapter aborts its own request and
     /// the second through `Inbox::interrupt`.
     UserCancelled,
+    /// The run's `max_tool_calls` was reached. The calls that could not be
+    /// dispatched after the limit are recorded as `tool/not_started` — the word
+    /// the log already uses for a call that provably did not run — rather than
+    /// dropped: every call in a response needs an answer the model can read.
+    MaxToolCalls,
+    /// The run's `wall_clock_ms` was reached. Checked at the step boundary and
+    /// before each tool dispatch; a request already in flight is not aborted
+    /// by this build, so overshoot is bounded by one request.
+    WallClockExceeded,
 }
 
 /// Port for how a turn advances. Implementations are assembled at the app layer.

@@ -48,6 +48,7 @@ use agent_protocol::ledger::Ledger;
 use agent_protocol::model::{ToolCall, estimate_message, estimate_text};
 use agent_protocol::permissions::ArtifactRef;
 use agent_protocol::plan::{self, Plan, PlanItemStatus};
+use agent_protocol::profile::RunBudget;
 use agent_protocol::reason::{
     self as reason_record, Basis, Mode, ReasonKind, ReasonNode, ReasonSource, Recorder, Situation,
     SpeechAct, Stance,
@@ -475,7 +476,7 @@ impl DefaultAgentLoop {
             capabilities: Vec::new(),
             response_format: None,
             model_route: Some(turn.route.clone()),
-            budget: ModelBudget::default(),
+            budget: turn.model_budget(),
             tool_manifest: ToolManifest::empty(),
         };
 
@@ -878,6 +879,36 @@ struct LoopTurn {
     /// looked at the world is not answering from an earlier turn alone.
     acted_this_turn: bool,
     route: ModelRoute,
+    /// The run's budget, from the caller's facts. A harness with no facts gets
+    /// the default, where every limit but the step count is unset.
+    budget: RunBudget,
+    /// When the run's wall clock is spent. `None` when no limit is configured.
+    /// Monotonic, because it times a limit and is not a timestamp.
+    deadline: Option<std::time::Instant>,
+    /// Tool calls this turn has dispatched. The run's `max_tool_calls` is
+    /// counted here, where the call is; the Scheduler cannot see inside a step.
+    tool_calls_made: u32,
+}
+
+impl LoopTurn {
+    /// The provider budget every request this turn makes carries.
+    ///
+    /// The output reservation becomes the provider's `max_tokens`; a run that
+    /// configured none sends none, and the provider's own default applies. The
+    /// wall clock is what remains of the run's limit, so a request will not be
+    /// given longer than the run has left — zero or less is sent as no limit:
+    /// the step boundary already refuses to start a request past the deadline,
+    /// and a round-trip value of 0 is a different instruction in some adapters.
+    fn model_budget(&self) -> ModelBudget {
+        ModelBudget {
+            max_tokens: self.budget.reserved_output_tokens,
+            wall_clock_ms: self.deadline.and_then(|deadline| {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                (left.as_millis() > 0).then_some(left.as_millis() as u64)
+            }),
+            ..ModelBudget::default()
+        }
+    }
 }
 
 /// A call that failed for a reason the next step could act on.
@@ -1577,6 +1608,14 @@ impl AgentLoop for DefaultAgentLoop {
 
         let capabilities = required_capabilities(&manifest);
 
+        // The run's limits, as the caller resolved them. The wall clock is
+        // measured from the moment the turn opens; a harness with no facts has
+        // the default budget, where only the step count is set.
+        let budget = ctx.state.as_ref().map(|facts| facts.budget).unwrap_or_default();
+        let deadline = budget
+            .wall_clock_ms
+            .map(|millis| std::time::Instant::now() + std::time::Duration::from_millis(millis));
+
         // Routing happens once per turn, before the first request. A tier that
         // changed mid-turn would make `context_revision` and the route it was
         // chosen from impossible to reconcile, and there is nothing a step can
@@ -1591,7 +1630,10 @@ impl AgentLoop for DefaultAgentLoop {
             context_revision,
             message_count: messages.len(),
             required_capabilities: capabilities.clone(),
-            budget: ModelBudget::default(),
+            budget: ModelBudget {
+                max_tokens: budget.reserved_output_tokens,
+                ..ModelBudget::default()
+            },
         };
         let route = self.router.route(&route_request);
 
@@ -1693,6 +1735,9 @@ impl AgentLoop for DefaultAgentLoop {
                 stale_gate_fired: false,
                 acted_this_turn: false,
                 route,
+                budget,
+                deadline,
+                tool_calls_made: 0,
             }),
             events,
         })
@@ -1714,6 +1759,21 @@ impl AgentLoop for DefaultAgentLoop {
         let step_index = turn.step_index;
         let mut events: Vec<EventDraft> = Vec::new();
         let step_id = StepId::new();
+
+        // A run whose wall clock is spent opens no further step. The check is
+        // before `step/started`, so a step that provably did not happen leaves
+        // no half a step in the log; the steering below is not claimed either,
+        // because the turn that would have carried it has ended.
+        if let Some(deadline) = turn.deadline
+            && std::time::Instant::now() >= deadline
+        {
+            return Ok(StepOutcome {
+                step_id,
+                events,
+                stop: Some(StopReason::WallClockExceeded),
+                final_content: None,
+            });
+        }
 
         // Steering goes in before anything else this step does: it was injected
         // at the boundary this step begins at, so it precedes the request that
@@ -1817,7 +1877,7 @@ impl AgentLoop for DefaultAgentLoop {
                 capabilities: turn.capabilities.clone(),
                 response_format: None,
                 model_route: Some(turn.route.clone()),
-                budget: ModelBudget::default(),
+                budget: turn.model_budget(),
                 tool_manifest: turn.manifest.clone(),
             };
 
@@ -2392,7 +2452,25 @@ impl AgentLoop for DefaultAgentLoop {
                 return Ok(StepOutcome { step_id, events, stop: None, final_content: None });
             }
 
-            for call in &tool_calls {
+            // Where, if anywhere, a run limit stopped this batch. The calls
+            // from that index on are answered as never dispatched below: a
+            // provider response's calls all need an answer, and a budget stop
+            // is not a tool failure.
+            let mut budget_stop: Option<(StopReason, usize)> = None;
+            for (index, call) in tool_calls.iter().enumerate() {
+                if let Some(deadline) = turn.deadline
+                    && std::time::Instant::now() >= deadline
+                {
+                    budget_stop = Some((StopReason::WallClockExceeded, index));
+                    break;
+                }
+                if let Some(limit) = turn.budget.max_tool_calls
+                    && turn.tool_calls_made >= limit
+                {
+                    budget_stop = Some((StopReason::MaxToolCalls, index));
+                    break;
+                }
+                turn.tool_calls_made += 1;
                 // The arguments are written scrubbed: the log outlives the run
                 // and is read back on resume, so what is recorded must not be
                 // the secret the model happened to include (§7 row 4). The
@@ -3038,6 +3116,30 @@ impl AgentLoop for DefaultAgentLoop {
                 }
             }
 
+            if let Some((reason, index)) = budget_stop {
+                refuse_undispatched(
+                    ctx,
+                    &step_id,
+                    turn,
+                    &mut events,
+                    &tool_calls[index..],
+                    &reason,
+                );
+                events.push(draft(
+                    ctx,
+                    &step_id,
+                    EventType::STEP_COMPLETED,
+                    serde_json::json!({}),
+                    Actor::Agent,
+                ));
+                return Ok(StepOutcome {
+                    step_id,
+                    events,
+                    stop: Some(reason),
+                    final_content: None,
+                });
+            }
+
             events.push(draft(
                 ctx,
                 &step_id,
@@ -3154,6 +3256,52 @@ fn repeat_text(tool: &str, count: u32) -> String {
 /// and the report agree on what "the same call" means.
 fn call_signature(tool_name: &str, arguments: &serde_json::Value) -> String {
     format!("{tool_name}\u{0}{arguments}")
+}
+
+/// Answer the calls a run limit kept from being dispatched.
+///
+/// `tool/not_started` is the existing word for exactly this: the call provably
+/// did not run, so proposing it again is not a retry. The text names the limit,
+/// so a reader of the log does not have to infer it from the terminal payload.
+fn refuse_undispatched(
+    ctx: &TurnContext,
+    step_id: &StepId,
+    turn: &mut LoopTurn,
+    events: &mut Vec<EventDraft>,
+    calls: &[ToolCall],
+    reason: &StopReason,
+) {
+    let content = match reason {
+        StopReason::MaxToolCalls => format!(
+            "This tool call was never dispatched: the run's tool-call limit ({}) was reached. \
+             Nothing ran; propose it again only if the next run still needs it.",
+            turn.budget.max_tool_calls.unwrap_or_default()
+        ),
+        _ => String::from(
+            "This tool call was never dispatched: the run's wall-clock limit was reached. \
+             Nothing ran; propose it again only if the next run still needs it.",
+        ),
+    };
+    for call in calls {
+        events.push(draft(
+            ctx,
+            step_id,
+            EventType::TOOL_NOT_STARTED,
+            serde_json::json!({
+                "tool_name": call.tool_name,
+                "provider_tool_call_id": call.tool_call_id,
+                "content": content,
+            }),
+            Actor::Tool,
+        ));
+        turn.messages.push(ModelMessage::tool_for_call(
+            step_id,
+            call.tool_call_id.clone(),
+            call.tool_name.clone(),
+            content.clone(),
+            true,
+        ));
+    }
 }
 
 /// Answer a held step's calls without running them.
@@ -6794,6 +6942,7 @@ mod tests {
             previous_turn: Some(TurnEnding::Cancelled),
             resumed: None,
             max_steps: 16,
+            budget: RunBudget::default(),
         }
     }
 
@@ -7093,6 +7242,254 @@ mod tests {
         assert!(!text.contains(&"x".repeat(MAX_TASK_CHARS + 1)), "the tail is not quoted");
         assert!(text.contains("Input: scheduled turn."), "{text}");
         assert!(text.contains("at most 1 model step."), "singular: {text}");
+    }
+
+    /// The facts a harness hands the loop when it configured a budget.
+    fn budgeted(budget: RunBudget) -> TurnStateFacts {
+        TurnStateFacts { budget, ..facts() }
+    }
+
+    /// Two calls proposed in one response, so a run limit can stop the batch
+    /// part way — the case where some calls ran and some cannot.
+    fn two_calls() -> ModelResponse {
+        ModelResponse {
+            content_blocks: vec![
+                ContentBlock::tool_use("call_a", "echo", serde_json::json!({ "s": "a" })),
+                ContentBlock::tool_use("call_b", "echo", serde_json::json!({ "s": "b" })),
+            ],
+            usage: None,
+            finish_reason: agent_protocol::model::FinishReason::new(
+                agent_protocol::model::FinishReason::TOOL_CALLS,
+            ),
+            provider_metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn of_type<'a>(events: &'a [EventDraft], event_type: &str) -> Vec<&'a EventDraft> {
+        events.iter().filter(|event| event.event_type.as_str() == event_type).collect()
+    }
+
+    /// A run that allows no tool calls answers the calls it is handed rather
+    /// than dropping them: every call in a response needs an answer the model
+    /// can read, and a budget stop is not a tool failure.
+    #[tokio::test]
+    async fn a_run_with_no_tool_calls_left_answers_every_proposed_call_as_never_run() {
+        let model = Arc::new(FakeModelProvider::new(vec![two_calls()]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools.clone())),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.state = Some(budgeted(RunBudget { max_tool_calls: Some(0), ..RunBudget::default() }));
+        let outcome = run_turn(&loop_, &turn).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::MaxToolCalls);
+        assert!(of_type(&outcome.events, EventType::TOOL_STARTED).is_empty());
+        let not_started = of_type(&outcome.events, EventType::TOOL_NOT_STARTED);
+        assert_eq!(not_started.len(), 2, "both calls are answered");
+        assert_eq!(not_started[0].payload["provider_tool_call_id"], "call_a");
+        assert_eq!(not_started[1].payload["provider_tool_call_id"], "call_b");
+        let content = not_started[0].payload["content"].as_str().unwrap();
+        assert!(content.contains("tool-call limit (0)"), "{content}");
+        assert_eq!(tools.call_count(), 0, "nothing was dispatched");
+        // The step it happened in is closed: a step left open would read as one
+        // still running.
+        assert_eq!(of_type(&outcome.events, EventType::STEP_COMPLETED).len(), 1);
+        assert_eq!(model.requests().len(), 1, "the limit ends the turn where it is hit");
+    }
+
+    /// The limit stops the batch at the call that crosses it, and the calls
+    /// before it in the same response still ran.
+    #[tokio::test]
+    async fn a_tool_call_limit_stops_the_batch_at_the_call_that_crosses_it() {
+        let model = Arc::new(FakeModelProvider::new(vec![two_calls()]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools.clone())),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.state = Some(budgeted(RunBudget { max_tool_calls: Some(1), ..RunBudget::default() }));
+        let outcome = run_turn(&loop_, &turn).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::MaxToolCalls);
+        let started = of_type(&outcome.events, EventType::TOOL_STARTED);
+        assert_eq!(started.len(), 1, "the first call is under the limit");
+        assert_eq!(started[0].payload["provider_tool_call_id"], "call_a");
+        let not_started = of_type(&outcome.events, EventType::TOOL_NOT_STARTED);
+        assert_eq!(not_started.len(), 1, "the call past the limit is answered, not dropped");
+        assert_eq!(not_started[0].payload["provider_tool_call_id"], "call_b");
+        assert_eq!(tools.call_count(), 1);
+        // Order says which happened when: the dispatch precedes the refusal.
+        let started_at = outcome
+            .events
+            .iter()
+            .position(|e| e.event_type.as_str() == EventType::TOOL_STARTED)
+            .unwrap();
+        let refused_at = outcome
+            .events
+            .iter()
+            .position(|e| e.event_type.as_str() == EventType::TOOL_NOT_STARTED)
+            .unwrap();
+        assert!(started_at < refused_at);
+    }
+
+    /// The count is the run's, not the step's: a call taken in an earlier step
+    /// is still spent in the next one.
+    #[tokio::test]
+    async fn the_tool_call_count_carries_across_the_steps_of_one_run() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({ "s": "first" })),
+            FakeModelProvider::tool_call("echo", serde_json::json!({ "s": "second" })),
+            FakeModelProvider::answer("done"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools.clone())),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.state = Some(budgeted(RunBudget { max_tool_calls: Some(1), ..RunBudget::default() }));
+        let outcome = run_turn(&loop_, &turn).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::MaxToolCalls);
+        assert_eq!(of_type(&outcome.events, EventType::TOOL_STARTED).len(), 1);
+        assert_eq!(of_type(&outcome.events, EventType::TOOL_NOT_STARTED).len(), 1);
+        assert_eq!(tools.call_count(), 1, "the second step's call never reached the provider");
+        assert_eq!(model.requests().len(), 2, "the turn ended in the step that proposed it");
+    }
+
+    /// A run whose wall clock is already spent opens no step at all: a step
+    /// that provably did not happen must not leave half of one in the log.
+    #[tokio::test]
+    async fn a_spent_wall_clock_opens_no_step_and_asks_the_model_nothing() {
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("never")]));
+        let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+        let loop_ = DefaultAgentLoop::new(model.clone(), gateway, no_context(), one_model_router());
+
+        let mut turn = ctx();
+        turn.state = Some(budgeted(RunBudget { wall_clock_ms: Some(0), ..RunBudget::default() }));
+        let outcome = run_turn(&loop_, &turn).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::WallClockExceeded);
+        // Opening events exist — the turn did open — but no step did: no
+        // `step/started`, and nothing a step would have asked the model.
+        let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(!types.contains(&EventType::STEP_STARTED), "{types:?}");
+        assert!(of_type(&outcome.events, EventType::STEP_COMPLETED).is_empty(), "{types:?}");
+        assert!(model.requests().is_empty(), "the model was not asked");
+    }
+
+    /// Time spent inside a step counts against the run: a slow tool can leave
+    /// nothing of the limit for the call behind it.
+    #[tokio::test]
+    async fn a_slow_tool_uses_the_wall_clock_and_the_rest_of_the_batch_is_never_dispatched() {
+        let model = Arc::new(FakeModelProvider::new(vec![two_calls()]));
+        let tools = Arc::new(
+            FakeToolProvider::new()
+                .with_tool("echo", "hello", ToolSideEffect::Pure)
+                .with_delay("echo", std::time::Duration::from_millis(600)),
+        );
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools.clone())),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.state = Some(budgeted(RunBudget { wall_clock_ms: Some(300), ..RunBudget::default() }));
+        let outcome = run_turn(&loop_, &turn).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::WallClockExceeded);
+        assert_eq!(tools.call_count(), 1, "only the call that was started under the limit ran");
+        assert_eq!(of_type(&outcome.events, EventType::TOOL_STARTED).len(), 1);
+        let not_started = of_type(&outcome.events, EventType::TOOL_NOT_STARTED);
+        assert_eq!(not_started.len(), 1);
+        assert_eq!(not_started[0].payload["provider_tool_call_id"], "call_b");
+        let content = not_started[0].payload["content"].as_str().unwrap();
+        assert!(content.contains("wall-clock limit"), "{content}");
+    }
+
+    /// The step boundary is where the clock is checked between steps: a turn
+    /// whose limit ran out during a slow step does not open another one.
+    #[tokio::test]
+    async fn a_step_boundary_past_the_deadline_asks_the_model_nothing() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({ "s": "slow" })),
+            FakeModelProvider::answer("never asked"),
+        ]));
+        let tools = Arc::new(
+            FakeToolProvider::new()
+                .with_tool("echo", "hello", ToolSideEffect::Pure)
+                .with_delay("echo", std::time::Duration::from_millis(600)),
+        );
+        let loop_ = DefaultAgentLoop::new(
+            model.clone(),
+            Arc::new(FakeToolGateway::new(tools.clone())),
+            no_context(),
+            one_model_router(),
+        );
+
+        let mut turn = ctx();
+        turn.state = Some(budgeted(RunBudget { wall_clock_ms: Some(300), ..RunBudget::default() }));
+        let outcome = run_turn(&loop_, &turn).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::WallClockExceeded);
+        assert_eq!(model.requests().len(), 1, "the second step never made a request");
+        assert_eq!(tools.call_count(), 1, "the call under the limit ran");
+    }
+
+    /// The output reservation the trimmer budgets against is the provider's
+    /// `max_tokens`, so the two cannot drift apart.
+    #[tokio::test]
+    async fn the_output_reservation_is_the_provider_s_max_tokens() {
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+        let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+        let loop_ = DefaultAgentLoop::new(model.clone(), gateway, no_context(), one_model_router());
+
+        let mut turn = ctx();
+        turn.state = Some(budgeted(RunBudget {
+            max_input_tokens: Some(4_000),
+            reserved_output_tokens: Some(512),
+            ..RunBudget::default()
+        }));
+        run_turn(&loop_, &turn).await;
+
+        assert_eq!(model.requests()[0].budget.max_tokens, Some(512));
+        // No wall clock configured, so none is sent: the provider's own default
+        // applies rather than a made-up limit.
+        assert_eq!(model.requests()[0].budget.wall_clock_ms, None);
+    }
+
+    /// A run with a wall clock tells the provider what is left of it, rather
+    /// than the whole limit again on every step.
+    #[tokio::test]
+    async fn the_provider_is_told_what_is_left_of_the_wall_clock() {
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+        let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+        let loop_ = DefaultAgentLoop::new(model.clone(), gateway, no_context(), one_model_router());
+
+        let mut turn = ctx();
+        turn.state =
+            Some(budgeted(RunBudget { wall_clock_ms: Some(60_000), ..RunBudget::default() }));
+        run_turn(&loop_, &turn).await;
+
+        let left = model.requests()[0].budget.wall_clock_ms.expect("a limit was configured");
+        assert!(left > 0 && left <= 60_000, "{left} is what remains of 60000");
     }
 
     #[test]

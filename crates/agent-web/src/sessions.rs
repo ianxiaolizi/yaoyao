@@ -664,6 +664,7 @@ fn turn_ending(ending: TurnEnding) -> &'static str {
     match ending {
         TurnEnding::Answered => "answered",
         TurnEnding::MaxSteps => "max_steps",
+        TurnEnding::LimitReached => "limit_reached",
         TurnEnding::Yielded => "yielded",
         TurnEnding::Failed => "failed",
         TurnEnding::Cancelled => "cancelled",

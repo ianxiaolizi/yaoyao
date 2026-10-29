@@ -23,8 +23,18 @@ pub struct RunBudget {
     /// How many steps a turn may take before it stops as `MaxSteps`.
     pub max_steps: u32,
     /// How many tool calls the whole run may make. `None` means unbounded.
+    ///
+    /// Enforced by the loop, which is what sees a call before dispatching it: a
+    /// batch that would cross the limit stops at the call that crosses it, and
+    /// the rest are recorded as `tool/not_started`. The count covers one run,
+    /// which is one turn here; the run a resume opens is a new run with its own
+    /// budget.
     pub max_tool_calls: Option<u32>,
     /// How long the run may take, in milliseconds. `None` means unbounded.
+    ///
+    /// Enforced by the loop at the step boundary and before each tool dispatch,
+    /// on the monotonic clock the turn opened with. A request already in flight
+    /// is not aborted, so the overshoot is bounded by one request.
     pub wall_clock_ms: Option<u64>,
     /// The most estimated input tokens one request may carry. `None` means the
     /// history is sent whole — the behaviour before this limit existed.
@@ -36,6 +46,10 @@ pub struct RunBudget {
     pub max_input_tokens: Option<u32>,
     /// How much of `max_input_tokens` is reserved for the model's answer.
     /// Only meaningful with `max_input_tokens`; `None` is treated as zero.
+    ///
+    /// The same number is the provider's `max_tokens` on every request the
+    /// turn makes, so the reservation the trimmer budgets against and the cap
+    /// the endpoint applies are one value rather than two that can drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_output_tokens: Option<u32>,
     /// When the estimated settled history reaches this share of the usable
@@ -74,9 +88,9 @@ impl Default for RunBudget {
     ///
     /// The step limit is the one the assembled binary has always used, so a
     /// run with no config files behaves exactly as it did before profiles
-    /// existed. `max_steps` is enforced by the Scheduler; `max_tool_calls` and
-    /// `wall_clock_ms` are carried through configuration but have no
-    /// enforcement point yet.
+    /// existed. `max_steps` is enforced by the Scheduler, which owns when a
+    /// turn advances; `max_tool_calls` and `wall_clock_ms` are enforced by the
+    /// loop, which is what sees each call before dispatching it.
     fn default() -> Self {
         Self {
             max_steps: 8,

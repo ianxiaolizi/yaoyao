@@ -139,6 +139,11 @@ pub enum TurnEnding {
     Answered,
     /// The step budget ran out.
     MaxSteps,
+    /// A run limit the loop enforces ran out: the tool-call count or the wall
+    /// clock. Its own ending rather than `MaxSteps`, because the badge says
+    /// what ran out, and because `Answered` would show a stop with no answer
+    /// as a turn that produced one.
+    LimitReached,
     /// It stopped for a person (an approval).
     Yielded,
     /// It broke.
@@ -632,6 +637,7 @@ impl ProjectionDefinition for TranscriptProjection {
                 let ending = match event.event.event_type.as_str() {
                     EventType::TURN_COMPLETED => match stop_reason.as_deref() {
                         Some("max_steps") => TurnEnding::MaxSteps,
+                        Some("max_tool_calls" | "wall_clock_exceeded") => TurnEnding::LimitReached,
                         _ => TurnEnding::Answered,
                     },
                     EventType::TURN_YIELDED => TurnEnding::Yielded,
@@ -869,6 +875,41 @@ mod tests {
             })
             .expect("the turn still ends");
         assert_eq!(end, TurnEnding::Yielded);
+    }
+
+    /// A turn a run limit stopped has no answer, so it must not read as one:
+    /// only the limit that stopped it is news, and a reader who sees "answered"
+    /// goes looking for an answer that was never written.
+    #[test]
+    fn a_turn_stopped_by_a_run_limit_is_not_an_answer() {
+        for (reason, expected) in [
+            ("max_steps", TurnEnding::MaxSteps),
+            ("max_tool_calls", TurnEnding::LimitReached),
+            ("wall_clock_exceeded", TurnEnding::LimitReached),
+        ] {
+            let state = apply(
+                &TranscriptProjection::new().init(),
+                &stored(
+                    1,
+                    EventType::TURN_COMPLETED,
+                    Some(TurnId::from_string("t1")),
+                    None,
+                    json!({ "stop_reason": reason, "budget": { "steps": 1 } }),
+                ),
+            );
+            let end = state
+                .items
+                .iter()
+                .find_map(|item| match &item.body {
+                    ItemBody::TurnEnd { ending, stop_reason, .. } => {
+                        Some((*ending, stop_reason.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{reason} still ends the turn"));
+            assert_eq!(end.0, expected, "{reason}");
+            assert_eq!(end.1.as_deref(), Some(reason), "the reader can still see which limit");
+        }
     }
 
     #[test]
