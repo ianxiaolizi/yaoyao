@@ -1431,16 +1431,18 @@ fn memory_search_reports_one_json_object_with_the_documented_shape() {
     assert_eq!(doc["query"], "xylophone", "{doc}");
     let hits = doc["hits"].as_array().expect("hits");
     assert!(!hits.is_empty(), "{doc}");
+    let mut scores = Vec::new();
     for hit in hits {
         assert!(hit["seq"].is_u64(), "{hit}");
         assert!(hit["event_type"].is_string(), "{hit}");
         assert!(hit["snippet"].is_string(), "{hit}");
         assert!(hit.get("turn_id").is_some(), "{hit}");
         assert!(hit.get("step_id").is_some(), "{hit}");
+        scores.push(hit["score"].as_f64().expect("a score"));
     }
-    let newest = hits[0]["seq"].as_u64().expect("a seq");
-    let oldest = hits[hits.len() - 1]["seq"].as_u64().expect("a seq");
-    assert!(newest >= oldest, "newest first: {doc}");
+    // Hits arrive in relevance order, so the score is what the array is sorted
+    // by — and it is reported, not just used, so a caller can see why.
+    assert!(scores.windows(2).all(|pair| pair[0] >= pair[1]), "best first: {doc}");
 }
 
 #[test]

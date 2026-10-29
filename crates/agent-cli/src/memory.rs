@@ -45,6 +45,9 @@ pub async fn run_memory_search(
                     "turn_id": hit.turn_id.as_ref().map(|id| id.as_str()),
                     "step_id": hit.step_id.as_ref().map(|id| id.as_str()),
                     "snippet": hit.snippet,
+                    // Present so a caller can see why one hit came before
+                    // another; comparable only within this one array.
+                    "score": hit.score,
                 })
             })
             .collect();

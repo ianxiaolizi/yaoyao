@@ -77,7 +77,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-subagent-stdio` | 外部 CLI subagent 适配器（stdio 后端） |
 | `agent-sandbox-win` | Windows AppContainer 执行后端：profile/SID、ACL 授予、`STARTUPINFOEX` + Job Object 启动；唯一允许 `unsafe` 的 crate（`CONTRACT.md` §7 #38） |
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |
-| `agent-index-sqlite` | `SqliteMemoryIndex`（可丢弃的 SQLite 读模型：从日志重建、词面子串检索；版本不符拒绝，只由 `reindex` 重建）+ `memory.search` 工具（装配时绑定当前 session，能力 `memory.read`） |
+| `agent-index-sqlite` | `SqliteMemoryIndex`（可丢弃的 SQLite 读模型：从日志重建、FTS5 trigram 短语检索 + 短查询子串回退、按相关度排序；版本不符拒绝，只由 `reindex` 重建）+ `memory.search` 工具（装配时绑定当前 session，能力 `memory.read`） |
 | `agent-testkit` | FakeEventStore / FakeModel·Tool·Gateway / FakeSecret / FakeDoctorCheck + 架构守卫 |
 | `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `why` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `web` `memory search\|reindex` `context inspect` `artifact get` `metrics [--out]` |
 | `agent-web` | 本地回环 HTTP 入口：内嵌 GUI、一次性令牌、会话/transcript/thinking/why/diff/context/plan/subagent/schedule 读模型、SSE（历史重放 + 实时预览）、导出与 artifact、起轮/审批/过期续跑/分叉/插话/中断；写操作经 `Backend` 缝交给 `apps/agent` 的 `WebBackend`，再由它调用同一套 `agent-cli` 具名命令，不复制内核装配 |
@@ -138,6 +138,8 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 
 模型档位写在 profile 的 `[model]` 里：`main` 是本次运行的模型，`fast` / `thinking` 留给摘要与审查；`--model` 只覆盖 `main`，不会动另两档。今天**只有上下文压缩**按 `summarize` 真的走到 `fast`，`review` 还没有生产者，所以配了 `thinking` 也只会被记录、不会被用到。档位只换模型名，不换 provider——一个进程仍然只说一种 provider kind。没配任何档位时行为与以前完全一致，`profile/resolved` 也不多一个字段（`CONTRACT.md` §7 #118）。
 
+记忆检索是**词面**的：`entries` 表存事件正文，`entries_fts`（FTS5，`tokenize='trigram'`，external content）负责查找。查询三个字符以上走 trigram 短语匹配，两字（中文常用词，例如「记账」）退回子串扫描——trigram 没有更短的 token，硬走索引会静默零命中。命中按 `score` 排序：`-bm25`（词在事件里有多密、事件有多短）+ 按日志末尾归一的时间项 + 事件种类权重（人说的话 0.3 / 助手的话 0.1 / 工具输出 0），同分取新。`score` 只在一次结果内可比，不是概率；`memory search --json` 会给出它。索引版本 `memory-index/0.2.0`，旧库搜索会得到版本错误，`memory reindex` 重建即可。`CONTRACT.md` §7 #119。
+
 ```bash
 # 定时唤醒：安排、查看、取消，然后驱动一次
 cargo run -p agent -- schedule at +10m "check the repo"
@@ -146,8 +148,9 @@ cargo run -p agent -- schedule cancel <item_id>
 cargo run -p agent -- tick          # 0 = 跑了一个 turn；2 = 没有可跑的
 cargo run -p agent -- serve         # 守护循环：到期就跑；Ctrl-C 退 0；一个 session 一个 serve
 
-# 记忆检索：索引是派生数据，每次搜索前先与日志同步
+# 记忆检索：索引是派生数据，每次搜索前先与日志同步；结果按相关度排序（同分取新）
 cargo run -p agent -- memory search xylophone   # 0 = 有结果或没有结果；2 = 搜索没能运行
+cargo run -p agent -- memory search 记账 --json # 两字中文走子串回退；JSON 的每个 hit 带 score
 cargo run -p agent -- memory reindex            # 丢弃并重建 <data_dir>/<session>/memory.sqlite
 
 # 上下文检查：下一条请求会带什么（大小 / 分类 / 预算 / 最大消息 / 上次请求的实录）

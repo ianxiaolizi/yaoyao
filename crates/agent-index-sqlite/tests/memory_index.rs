@@ -133,18 +133,30 @@ async fn search_finds_turn_text_assistant_text_and_tool_output() {
     .await;
 
     let hits = search(&fixture, &sid, "xylophone", 10).await;
-    let types: Vec<&str> = hits.iter().map(|hit| hit.event_type.as_str()).collect();
-    assert_eq!(
-        types,
-        [EventType::TOOL_COMPLETED, EventType::MODEL_RESPONSE_COMPLETED, EventType::INBOX_APPENDED]
-    );
-    let seqs: Vec<u64> = hits.iter().map(|hit| hit.seq.as_u64()).collect();
-    assert_eq!(seqs, [2, 1, 0], "newest first");
-    assert!(hits[2].snippet.contains("xylophone"));
+    let mut found: Vec<&str> = hits.iter().map(|hit| hit.event_type.as_str()).collect();
+    found.sort_unstable();
+    let mut expected = vec![
+        EventType::INBOX_APPENDED,
+        EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::TOOL_COMPLETED,
+    ];
+    expected.sort_unstable();
+    assert_eq!(found, expected, "{hits:?}");
+
+    // Relevance order, not log order — and whichever order the ranking picks,
+    // it never puts a hit above one it scored higher.
+    let scores: Vec<f64> = hits.iter().map(|hit| hit.score).collect();
+    assert!(scores.windows(2).all(|pair| pair[0] >= pair[1]), "scores descend: {scores:?}");
+    assert!(hits.iter().any(|hit| hit.snippet.contains("xylophone")), "{hits:?}");
 }
 
 #[tokio::test]
-async fn search_folds_ascii_case_only() {
+async fn search_folds_case_across_all_of_unicode() {
+    // The trigram tokenizer folds case itself, and it folds every script, not
+    // just ASCII — so a Latin word and a Cyrillic one are both found by a
+    // lower-case query. This is a v2 widening: the fallback scan below still
+    // uses `lower()`, which is ASCII-only, so only a short query has the old
+    // limit.
     let fixture = fixture();
     let sid = session("s1");
     append(
@@ -154,9 +166,17 @@ async fn search_folds_ascii_case_only() {
         json!({"payload": {"text": "XYLOPHONE"}}),
     )
     .await;
+    append(
+        &fixture.store,
+        &sid,
+        EventType::INBOX_APPENDED,
+        json!({"payload": {"text": "ПРИВЕТ мир"}}),
+    )
+    .await;
 
     assert_eq!(search(&fixture, &sid, "xylophone", 10).await.len(), 1);
     assert_eq!(search(&fixture, &sid, "XyLoPhOnE", 10).await.len(), 1);
+    assert_eq!(search(&fixture, &sid, "привет", 10).await.len(), 1);
 }
 
 #[tokio::test]
@@ -283,7 +303,10 @@ async fn a_version_mismatch_is_refused_and_rebuild_recovers() {
 }
 
 #[tokio::test]
-async fn limit_keeps_the_newest_matches() {
+async fn limit_keeps_the_best_scoring_matches() {
+    // Five events that say the same thing differ only in where they are, so
+    // they tie on every part of the score except recency and the limit keeps
+    // the latest two — which is also what "newest first" used to mean.
     let fixture = fixture();
     let sid = session("s1");
     for index in 0..5 {
@@ -360,4 +383,228 @@ async fn an_empty_search_is_refused() {
         .await
         .expect_err("blank text has nothing to look for");
     assert!(matches!(refused, MemoryIndexError::Index(_)));
+}
+
+// ---------------------------------------------------------------------------
+// Ranking: what "most relevant first" is made of.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_denser_match_ranks_above_a_longer_one() {
+    let fixture = fixture();
+    let sid = session("s1");
+    // The dense event is older and shorter; the sparse one is a long aside.
+    // Density has to outrank recency here, or the ordering is just the log
+    // turned inside out.
+    append(
+        &fixture.store,
+        &sid,
+        EventType::INBOX_APPENDED,
+        json!({"payload": {"text": "widget widget widget"}}),
+    )
+    .await;
+    append(
+        &fixture.store,
+        &sid,
+        EventType::INBOX_APPENDED,
+        json!({"payload": {"text":
+            "a widget inside a much longer handbook of assorted tools and notes"}}),
+    )
+    .await;
+    for index in 0..4 {
+        append(
+            &fixture.store,
+            &sid,
+            EventType::INBOX_APPENDED,
+            json!({"payload": {"text": format!("unrelated filler sentence number {index}")}}),
+        )
+        .await;
+    }
+
+    let hits = search(&fixture, &sid, "widget", 10).await;
+    let seqs: Vec<u64> = hits.iter().map(|hit| hit.seq.as_u64()).collect();
+    assert_eq!(seqs, [0, 1], "the denser, older match comes first: {hits:?}");
+}
+
+#[tokio::test]
+async fn identical_matches_are_broken_by_recency() {
+    let fixture = fixture();
+    let sid = session("s1");
+    for _ in 0..3 {
+        append(
+            &fixture.store,
+            &sid,
+            EventType::INBOX_APPENDED,
+            json!({"payload": {"text": "the same words every time"}}),
+        )
+        .await;
+    }
+
+    let hits = search(&fixture, &sid, "same words", 10).await;
+    let seqs: Vec<u64> = hits.iter().map(|hit| hit.seq.as_u64()).collect();
+    assert_eq!(seqs, [2, 1, 0], "nothing separates them but position: {hits:?}");
+}
+
+#[tokio::test]
+async fn the_persons_own_words_outrank_a_reply_that_says_the_same_thing() {
+    let fixture = fixture();
+    let sid = session("s1");
+    append(
+        &fixture.store,
+        &sid,
+        EventType::INBOX_APPENDED,
+        json!({"payload": {"text": "deploy the artifact"}}),
+    )
+    .await;
+    append(
+        &fixture.store,
+        &sid,
+        EventType::MODEL_RESPONSE_COMPLETED,
+        json!({"response": {"content_blocks": [{"type": "text", "text": "deploy the artifact"}]}}),
+    )
+    .await;
+    for index in 0..6 {
+        append(
+            &fixture.store,
+            &sid,
+            EventType::TOOL_COMPLETED,
+            json!({"tool_name": "fs.list", "content": format!("filler {index}")}),
+        )
+        .await;
+    }
+
+    let hits = search(&fixture, &sid, "deploy the artifact", 10).await;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    // The reply is the later of the two, so recency pulls the other way; what
+    // kind of event it is outweighs a couple of log positions.
+    assert_eq!(hits[0].event_type, EventType::INBOX_APPENDED, "{hits:?}");
+    assert_eq!(hits[1].seq.as_u64(), 1, "{hits:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The two search paths.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_query_with_quotes_is_a_phrase_not_syntax() {
+    let fixture = fixture();
+    let sid = session("s1");
+    append(
+        &fixture.store,
+        &sid,
+        EventType::INBOX_APPENDED,
+        json!({"payload": {"text": "she said \"deploy now\" twice"}}),
+    )
+    .await;
+
+    // Balanced quotes and a lone one: both are part of the phrase, and neither
+    // can end it early or leave the index's query syntax unclosed.
+    assert_eq!(search(&fixture, &sid, "said \"deploy now\"", 10).await.len(), 1);
+    assert_eq!(search(&fixture, &sid, "\"deploy now", 10).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_two_character_query_falls_back_to_a_substring_scan() {
+    // Two Chinese characters are the everyday query and are not a trigram, so
+    // this is answered by the scan rather than the index. What must not happen
+    // is that the query silently matches nothing.
+    let fixture = fixture();
+    let sid = session("s1");
+    append(
+        &fixture.store,
+        &sid,
+        EventType::INBOX_APPENDED,
+        json!({"payload": {"text": "今天记账买了咖啡"}}),
+    )
+    .await;
+    append(
+        &fixture.store,
+        &sid,
+        EventType::INBOX_APPENDED,
+        json!({"payload": {"text": "记错了，明天再看"}}),
+    )
+    .await;
+
+    let hits = search(&fixture, &sid, "记账", 10).await;
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].seq.as_u64(), 0);
+    assert!(hits[0].snippet.contains("记账"), "{}", hits[0].snippet);
+}
+
+// ---------------------------------------------------------------------------
+// The evaluation baseline.
+// ---------------------------------------------------------------------------
+
+/// The corpus's text for one event, shaped the way the extraction reads it.
+fn payload_for(event_type: &str, text: &str) -> Value {
+    match event_type {
+        EventType::MODEL_RESPONSE_COMPLETED => {
+            json!({"response": {"content_blocks": [{"type": "text", "text": text}]}})
+        }
+        EventType::TOOL_COMPLETED => json!({"tool_name": "shell", "content": text}),
+        _ => json!({"payload": {"text": text}}),
+    }
+}
+
+/// A fixed corpus and a fixed set of labels: retrieval quality measured, not
+/// asserted one anecdote at a time.
+///
+/// The corpus is synthetic and lives here so that the baseline only moves when
+/// someone edits it deliberately. A ranking change that costs a labeled hit
+/// fails here rather than being discovered in use. A label set taken from real
+/// sessions is the owner's to provide — until then this is the honest floor,
+/// and the thresholds leave room for a small weight tweak without excusing a
+/// retriever that has stopped finding things.
+#[tokio::test]
+async fn a_fixed_corpus_keeps_its_retrieval_quality() {
+    const K: usize = 5;
+
+    let fixture = fixture();
+    let sid = session("s1");
+    let corpus = [
+        (EventType::INBOX_APPENDED, "帮我看看 memory 索引为什么搜不到中文"),
+        (EventType::MODEL_RESPONSE_COMPLETED, "trigram tokenizer 需要三个字符以上才能命中"),
+        (EventType::TOOL_COMPLETED, "INDEX_SCHEMA_VERSION memory-index/0.1.0"),
+        (EventType::INBOX_APPENDED, "把索引改成 0.2.0 并且加上 bm25 排序"),
+        (EventType::MODEL_RESPONSE_COMPLETED, "已经改成 memory-index/0.2.0，bm25 排序也加上了"),
+        (EventType::TOOL_COMPLETED, "test.ps1: 1656 passed; 0 failed; 15 ignored"),
+        (EventType::INBOX_APPENDED, "CI 上 gui-smoke 挂了怎么处理"),
+        (EventType::MODEL_RESPONSE_COMPLETED, "gui-smoke 失败是因为 runner 的完整性标签"),
+        (EventType::TOOL_COMPLETED, "nothing to commit, working tree clean"),
+        (EventType::INBOX_APPENDED, "把这次改动提交并推送到 main"),
+        (EventType::TOOL_COMPLETED, "pushed main to origin"),
+        (EventType::INBOX_APPENDED, "继续下一项审计"),
+    ];
+    for (event_type, text) in corpus {
+        append(&fixture.store, &sid, event_type, payload_for(event_type, text)).await;
+    }
+
+    // The seq each query should find, by position in `corpus`.
+    let labels = [
+        ("working tree clean", 8),
+        ("完整性标签", 7),
+        ("0.1.0", 2),
+        ("1656 passed", 5),
+        ("bm25", 3),
+    ];
+
+    let mut found = 0;
+    let mut reciprocal_sum = 0.0;
+    let mut report = Vec::new();
+    for (query, expected) in labels {
+        let hits = search(&fixture, &sid, query, K).await;
+        let seqs: Vec<u64> = hits.iter().map(|hit| hit.seq.as_u64()).collect();
+        let rank = seqs.iter().position(|seq| *seq == expected).map(|at| at + 1);
+        report.push(format!("'{query}' -> {seqs:?}, wanted {expected}"));
+        if let Some(rank) = rank {
+            found += 1;
+            reciprocal_sum += 1.0 / rank as f64;
+        }
+    }
+
+    let total = labels.len() as f64;
+    let recall = found as f64 / total;
+    let mrr = reciprocal_sum / total;
+    assert!(recall >= 1.0, "recall@{K} fell to {recall}: {report:#?}");
+    assert!(mrr >= 0.9, "MRR fell to {mrr}: {report:#?}");
 }

@@ -47,8 +47,8 @@ impl ToolProvider for MemoryToolProvider {
         vec![ToolDefinition {
             name: TOOL_NAME.to_string(),
             description: "Search this session's earlier turns, assistant replies and tool output \
-                          for a word or phrase. Returns matches newest first, each with the event \
-                          type and a short snippet."
+                          for a word or phrase. Returns the strongest matches first, each with the \
+                          event type and a short snippet."
                 .to_string(),
             source: ToolSource::Builtin,
             side_effect: ToolSideEffect::Pure,
@@ -119,7 +119,12 @@ fn limit_argument(invocation: &ToolInvocation) -> Result<usize, ToolProviderErro
     }
 }
 
-/// The model-facing result: one line per hit, newest first.
+/// The model-facing result: one line per hit, best first.
+///
+/// The score itself is not shown: the order already carries it, and a float
+/// with no scale would invite the model to compare two searches that share
+/// none. Each line carries what the model asked for — where the match is, what
+/// kind of event it was, and the text around it.
 ///
 /// Newlines inside a snippet become spaces so one hit stays one line — the
 /// model reads the numbering, not a layout that changes with the text it
@@ -128,7 +133,7 @@ fn render(query: &str, hits: &[MemoryHit]) -> String {
     if hits.is_empty() {
         return format!("no matches for '{query}' in this session");
     }
-    let mut text = format!("{} matches for '{query}' (newest first):", hits.len());
+    let mut text = format!("{} matches for '{query}' (best first):", hits.len());
     for hit in hits {
         text.push('\n');
         text.push_str(&format!(
@@ -176,13 +181,15 @@ mod tests {
         }
     }
 
-    fn hit(seq: u64, text: &str) -> MemoryHit {
+    /// A hit whose snippet is `text`, scoring better the earlier it is listed.
+    fn hit(seq: u64, rank: usize, text: &str) -> MemoryHit {
         MemoryHit {
             seq: EventSeq::new(seq),
             event_type: "inbox/appended".to_string(),
             turn_id: Some(TurnId::from_string("t1")),
             step_id: None::<StepId>,
             snippet: text.to_string(),
+            score: 1.0 - rank as f64,
         }
     }
 
@@ -215,17 +222,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hit_list_is_rendered_newest_first_with_the_session_bound() {
-        let (provider, index) = provider(vec![hit(9, "a xylophone"), hit(4, "xylophone again")]);
+    async fn a_hit_list_is_rendered_in_the_order_the_index_ranked_it() {
+        let (provider, index) =
+            provider(vec![hit(4, 0, "xylophone again"), hit(9, 1, "a xylophone")]);
         let result = provider
             .invoke(&invocation(serde_json::json!({"query": "xylophone"})))
             .await
             .expect("the search runs");
 
         assert_eq!(result.status, agent_protocol::tool::ToolStatus::Completed);
-        assert!(result.content.starts_with("2 matches for 'xylophone' (newest first):"));
-        assert!(result.content.contains("9  inbox/appended  a xylophone"));
+        assert!(result.content.starts_with("2 matches for 'xylophone' (best first):"));
+        // Seq 4 scores better than seq 9, so it is the first line: the render
+        // preserves the index's order rather than re-sorting by recency.
         assert!(result.content.contains("4  inbox/appended  xylophone again"));
+        assert!(result.content.contains("9  inbox/appended  a xylophone"));
+        let lines: Vec<&str> = result.content.lines().collect();
+        assert!(lines[1].starts_with("4  "), "{lines:?}");
 
         let seen = index.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);

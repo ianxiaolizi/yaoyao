@@ -24,12 +24,36 @@ use crate::extract::extract;
 /// The shape of the derived index. Not the event schema version (C6.1): this
 /// version may change whenever the extraction or the tables change, and the
 /// answer to a mismatch is always `rebuild`.
-pub const INDEX_SCHEMA_VERSION: &str = "memory-index/0.1.0";
+pub const INDEX_SCHEMA_VERSION: &str = "memory-index/0.2.0";
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many characters of context the snippet shows on each side of the match.
 const SNIPPET_CHARS: usize = 80;
+
+/// The shortest query the trigram index can answer. Below this the tokenizer has
+/// no trigram to look up — a two-character Chinese word is the everyday case —
+/// so the search falls back to scanning `text` for the substring.
+const MIN_INDEXED_CHARS: usize = 3;
+
+/// How much a hit's term rarity counts. `bm25()` is the index's own answer to
+/// "how unusual is this match in this session", negated so that bigger is
+/// better; it lands in roughly `0..20` for a session-sized log.
+const BM25_WEIGHT: f64 = 1.0;
+
+/// How much being near the end of the log counts, on a `0..1` scale before the
+/// weight. Recency is a tiebreaker and a nudger, never a reason on its own: a
+/// stale hit that is a much better match should still win.
+const RECENCY_WEIGHT: f64 = 0.5;
+
+/// What kind of event it is, added to the score.
+///
+/// The person's own words are the best thing to find again; the assistant's
+/// reply is context around them; tool output is where a search usually starts
+/// from and is weighted by nothing extra, because a match there is already
+/// specific.
+const TYPE_WEIGHT_INPUT: f64 = 0.3;
+const TYPE_WEIGHT_REPLY: f64 = 0.1;
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS index_meta (
@@ -43,6 +67,15 @@ const SCHEMA: &str = "
         turn_id TEXT,
         step_id TEXT,
         text TEXT NOT NULL
+    );
+    -- External content: the text is stored once, in `entries`. `trigram` is the
+    -- tokenizer that needs no word boundaries, which is what makes Chinese and
+    -- code identifiers indexable without a segmentation step.
+    CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+        text,
+        content='entries',
+        content_rowid='seq',
+        tokenize='trigram'
     );
 ";
 
@@ -189,8 +222,11 @@ fn ready(path: &Path, reset: bool) -> Result<Connection, MemoryIndexError> {
     conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0))
         .map_err(|e| MemoryIndexError::Index(format!("cannot set WAL: {e}")))?;
     if reset {
-        conn.execute_batch("DROP TABLE IF EXISTS entries; DROP TABLE IF EXISTS index_meta;")
-            .map_err(|e| MemoryIndexError::Index(format!("cannot drop the old tables: {e}")))?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS entries_fts; DROP TABLE IF EXISTS entries; \
+             DROP TABLE IF EXISTS index_meta;",
+        )
+        .map_err(|e| MemoryIndexError::Index(format!("cannot drop the old tables: {e}")))?;
     }
     conn.execute_batch(SCHEMA)
         .map_err(|e| MemoryIndexError::Index(format!("cannot create the schema: {e}")))?;
@@ -228,10 +264,25 @@ fn write_rows(path: &Path, rows: &[Row], next: u64) -> Result<(), MemoryIndexErr
         .transaction()
         .map_err(|e| MemoryIndexError::Index(format!("cannot open a transaction: {e}")))?;
     for row in rows {
+        // The FTS table keeps `entries` as its content, so its rows are written
+        // here rather than by a trigger: one writer, one transaction, and no SQL
+        // running behind the code's back.
+        //
+        // The delete comes first and covers a re-indexed seq, which is what a
+        // resumed rebuild writes. It has to: an external-content FTS5 table
+        // reads the row it is deleting out of `entries` to know which postings
+        // to cancel, so the old text must still be there when the delete runs.
+        tx.execute("DELETE FROM entries_fts WHERE rowid = ?1", params![row.seq as i64])
+            .map_err(|e| MemoryIndexError::Index(format!("cannot reindex seq {}: {e}", row.seq)))?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (seq, event_type, turn_id, step_id, text) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![row.seq as i64, row.event_type, row.turn_id, row.step_id, row.text],
+        )
+        .map_err(|e| MemoryIndexError::Index(format!("cannot index seq {}: {e}", row.seq)))?;
+        tx.execute(
+            "INSERT INTO entries_fts (rowid, text) VALUES (?1, ?2)",
+            params![row.seq as i64, row.text],
         )
         .map_err(|e| MemoryIndexError::Index(format!("cannot index seq {}: {e}", row.seq)))?;
     }
@@ -278,47 +329,159 @@ fn remove_db(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The search for a query long enough for the trigram index.
+///
+/// The needle arrives as one quoted phrase, so its trigrams are looked up in
+/// `entries_fts` rather than scanned: `trigram` needs no word boundaries, which
+/// is what lets a Chinese sentence or a code identifier be matched without a
+/// segmentation step.
+///
+/// The score is three things added together. `bm25()` answers "how densely do
+/// these words match inside this event": a phrase that occurs more often wins,
+/// and between equal counts the shorter event wins. Its values are negative for
+/// a good match, so the sign is flipped to make bigger better. `?4` is the log's
+/// end, which turns the absolute position into a `0..1` "how late in this
+/// conversation" — the same log searched before and after it grows ranks for the
+/// same reasons. The last term is the kind of event, because the person's own
+/// words are the best thing to find again.
+///
+/// The event types are literals here rather than parameters; a test pins them
+/// against [`EventType`] so this SQL cannot drift from the events the loop
+/// writes.
+const INDEXED_SEARCH: &str = "
+    SELECT e.seq, e.event_type, e.turn_id, e.step_id, e.text,
+           (-f.rank) * ?3
+             + (CAST(e.seq AS REAL) / ?4) * ?5
+             + CASE e.event_type
+                   WHEN 'inbox/appended' THEN ?6
+                   WHEN 'turn/steered' THEN ?6
+                   WHEN 'model/response.completed' THEN ?7
+                   ELSE 0.0
+               END AS score
+      FROM entries AS e
+      JOIN (
+            SELECT rowid AS seq, bm25(entries_fts) AS rank
+              FROM entries_fts
+             WHERE entries_fts MATCH ?1
+           ) AS f
+        ON f.seq = e.seq
+     ORDER BY score DESC, e.seq DESC
+     LIMIT ?2
+";
+
+/// The same ranking for a query the trigram index cannot answer.
+///
+/// Two characters — `记账` is the everyday case — are not a trigram, so there is
+/// nothing to look up and the search scans `text` for the substring instead. The
+/// substring test is the v1 one, `lower()` on both sides, which folds ASCII only;
+/// the index itself folds all of Unicode, so a short query is the one place where
+/// case is a limit. Everything else about the ranking is identical, minus the
+/// density term the scan has no way to compute.
+const SCAN_SEARCH: &str = "
+    SELECT seq, event_type, turn_id, step_id, text,
+           (CAST(seq AS REAL) / ?3) * ?4
+             + CASE event_type
+                   WHEN 'inbox/appended' THEN ?5
+                   WHEN 'turn/steered' THEN ?5
+                   WHEN 'model/response.completed' THEN ?6
+                   ELSE 0.0
+               END AS score
+      FROM entries
+     WHERE instr(lower(text), lower(?1)) > 0
+     ORDER BY score DESC, seq DESC
+     LIMIT ?2
+";
+
 fn search_at(path: &Path, needle: &str, limit: usize) -> Result<Vec<MemoryHit>, MemoryIndexError> {
     let conn = ready(path, false)?;
-    let mut statement = conn
-        .prepare(
-            "SELECT seq, event_type, turn_id, step_id, text FROM entries \
-             WHERE instr(lower(text), lower(?1)) > 0 ORDER BY seq DESC LIMIT ?2",
+    // The log's end, so a position is a place in this conversation rather than
+    // an absolute number that grows with it. At least 1: a row can only exist
+    // once the log has an event, and the division must never be by zero.
+    let end = current_seq(&conn)?.max(1) as f64;
+    let limit = limit as i64;
+
+    if needle.chars().count() >= MIN_INDEXED_CHARS {
+        query(
+            &conn,
+            INDEXED_SEARCH,
+            params![
+                phrase(needle),
+                limit,
+                BM25_WEIGHT,
+                end,
+                RECENCY_WEIGHT,
+                TYPE_WEIGHT_INPUT,
+                TYPE_WEIGHT_REPLY
+            ],
+            needle,
         )
+    } else {
+        // The needle reaches the scan as typed — no quoting, no phrase — because
+        // a substring is exactly what was asked for; `lower()` folds the ASCII
+        // case the scan always folded.
+        query(
+            &conn,
+            SCAN_SEARCH,
+            params![needle, limit, end, RECENCY_WEIGHT, TYPE_WEIGHT_INPUT, TYPE_WEIGHT_REPLY],
+            needle,
+        )
+    }
+}
+
+/// Run one of the two searches and read its rows into hits.
+fn query(
+    conn: &Connection,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+    needle: &str,
+) -> Result<Vec<MemoryHit>, MemoryIndexError> {
+    let mut statement = conn
+        .prepare(sql)
         .map_err(|e| MemoryIndexError::Index(format!("cannot prepare the search: {e}")))?;
     let rows = statement
-        .query_map(params![needle, limit as i64], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
+        .query_map(parameters, |row| hit_from(row, needle))
         .map_err(|e| MemoryIndexError::Index(format!("cannot run the search: {e}")))?;
 
     let mut hits = Vec::new();
     for row in rows {
-        let (seq, event_type, turn_id, step_id, text) =
-            row.map_err(|e| MemoryIndexError::Index(format!("cannot read a hit: {e}")))?;
-        hits.push(MemoryHit {
-            seq: EventSeq::new(seq.max(0) as u64),
-            event_type,
-            turn_id: turn_id.map(TurnId::from_string),
-            step_id: step_id.map(StepId::from_string),
-            snippet: snippet(&text, needle),
-        });
+        hits.push(row.map_err(|e| MemoryIndexError::Index(format!("cannot read a hit: {e}")))?);
     }
     Ok(hits)
 }
 
+/// One hit: the six columns both searches select, in that order.
+fn hit_from(row: &rusqlite::Row<'_>, needle: &str) -> rusqlite::Result<MemoryHit> {
+    let seq: i64 = row.get(0)?;
+    Ok(MemoryHit {
+        seq: EventSeq::new(seq.max(0) as u64),
+        event_type: row.get(1)?,
+        turn_id: row.get::<_, Option<String>>(2)?.map(TurnId::from_string),
+        step_id: row.get::<_, Option<String>>(3)?.map(StepId::from_string),
+        snippet: snippet(&row.get::<_, String>(4)?, needle),
+        score: row.get(5)?,
+    })
+}
+
+/// The needle as one FTS5 phrase.
+///
+/// Everything between the quotes is a literal, so no character of a person's
+/// query can be read as FTS5 syntax; a quote of its own is doubled, which is how
+/// FTS5 escapes one inside a string. The phrase is what makes the trigram lookup
+/// a substring test rather than a bag of trigrams: the tokens have to appear
+/// next to each other.
+fn phrase(needle: &str) -> String {
+    format!("\"{}\"", needle.replace('"', "\"\""))
+}
+
 /// A window around the first match, cut on character boundaries.
 ///
-/// The match is found the way SQLite found it: ASCII-only case folding. Doing
-/// Unicode folding here would sometimes find a different position than the one
-/// the `WHERE` clause accepted, and a snippet pointing at the wrong place is
-/// worse than no highlighting at all.
+/// The window is placed by an ASCII-case-insensitive search, which is the folding
+/// the fallback scan uses. The trigram index folds case across all of Unicode, so
+/// a hit that differs only in a non-ASCII letter's case — `ПРИВЕТ` found by
+/// `привет` — is a real hit whose window starts at the head of the text rather
+/// than at the match. Folding in Rust instead would find a different position
+/// than the one SQLite accepted, and a window pointing at the wrong place is
+/// worse than none; the hit itself is right either way.
 fn snippet(text: &str, needle: &str) -> String {
     let match_start = find_ascii_case_insensitive(text, needle).unwrap_or(0);
     let mut match_start = match_start.min(text.len());
@@ -356,4 +519,38 @@ fn find_ascii_case_insensitive(text: &str, needle: &str) -> Option<usize> {
             .zip(needle)
             .all(|(a, b)| a.eq_ignore_ascii_case(b))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_protocol::events::EventType;
+
+    use super::*;
+
+    /// The scoring SQL names the event kinds it weighs, as literals. If the
+    /// loop ever renames one, the weight would silently stop applying; this is
+    /// what makes that a test failure instead.
+    #[test]
+    fn the_scoring_names_the_event_types_this_build_writes() {
+        for sql in [INDEXED_SEARCH, SCAN_SEARCH] {
+            for event_type in [
+                EventType::INBOX_APPENDED,
+                EventType::TURN_STEERED,
+                EventType::MODEL_RESPONSE_COMPLETED,
+            ] {
+                assert!(
+                    sql.contains(&format!("'{event_type}'")),
+                    "{event_type} is scored in {sql}"
+                );
+            }
+        }
+    }
+
+    /// A quote in the query must not end the phrase early: FTS5 reads `""`
+    /// inside a string as one literal quote.
+    #[test]
+    fn a_quote_in_the_query_stays_inside_the_phrase() {
+        assert_eq!(phrase("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(phrase("记账"), "\"记账\"");
+    }
 }
