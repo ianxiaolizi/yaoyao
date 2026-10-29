@@ -137,6 +137,16 @@ pub struct ResolvedProfileSnapshot {
     pub decision_backends: Vec<String>,
     /// The model this run's requests are routed to.
     pub model_route: ModelRoute,
+    /// The routes for tiers besides `main`, keyed by tier name.
+    ///
+    /// Absent unless the configuration named a tier besides `main`: a run with
+    /// one model has nothing a table would add, and emitting an empty one would
+    /// move `config_hash` for every configuration that never asked for routing.
+    /// `main` is not repeated here — [`Self::model_route`] is already it, and is
+    /// also what every unnamed task class falls back to. The map is ordered, so
+    /// the same configuration serializes to the same bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_routes: BTreeMap<String, ModelRoute>,
     /// The capabilities this run is authorized to use.
     pub capability_set: CapabilitySet,
     pub budget: RunBudget,
@@ -174,6 +184,7 @@ mod tests {
             policy_version: "p".to_string(),
             decision_backends: Vec::new(),
             model_route: ModelRoute::new(ModelTier::Main, "echo", model),
+            model_routes: BTreeMap::new(),
             capability_set: [Capability::new(Capability::FS_READ)].into_iter().collect(),
             budget: RunBudget::default(),
         }

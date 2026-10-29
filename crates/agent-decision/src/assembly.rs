@@ -7,10 +7,10 @@
 //!
 //! Three properties are deliberate:
 //!
-//! - **The route comes from the caller.** This function does not decide which
-//!   model a process talks to; it takes a route someone else chose and builds a
-//!   router that always returns it. That keeps "which model" a single decision
-//!   made at the app layer.
+//! - **The router comes from the caller.** This function does not decide which
+//!   model a process talks to; it takes the router someone else built — one
+//!   route, or a table of them — and wraps it with the advisor. That keeps
+//!   "which model" a single decision made at the app layer.
 //! - **The only baseline is the rule.** The spec requires that a rule baseline
 //!   always exists and is always asked, so it is not a backend choice a caller
 //!   gets to make. Every other backend is: they arrive as a list, built by
@@ -24,15 +24,14 @@
 use std::sync::Arc;
 
 use agent_ports::decision::{DecisionAdvisor, DecisionMode, FastDecisionProvider};
-use agent_ports::model_router::{ModelRoute, ModelRouter};
+use agent_ports::model_router::ModelRouter;
 
 use crate::broker::DecisionBroker;
 use crate::deadline::DeadlineAdvisor;
 use crate::model_route;
-use crate::router::TableModelRouter;
 use crate::rule::{RuleDecision, RuleDecisionProvider};
 
-/// Build the deterministic router and the shadow advisor for `route`.
+/// Wrap `router` with the shadow advisor.
 ///
 /// The baseline answers "which tier?" with the tier the router already chose.
 /// That is the comparison the trace exists to hold: a backend that disagrees is
@@ -43,11 +42,9 @@ use crate::rule::{RuleDecision, RuleDecisionProvider};
 /// with no sidecar configured: the trace then says the baseline was the only
 /// participant, which is a different statement from a sidecar that abstained.
 pub fn shadow_for(
-    route: ModelRoute,
+    router: Arc<dyn ModelRouter>,
     backends: Vec<Arc<dyn FastDecisionProvider>>,
 ) -> (Arc<dyn ModelRouter>, Arc<dyn DecisionAdvisor>) {
-    let router: Arc<dyn ModelRouter> = Arc::new(TableModelRouter::new(route));
-
     let baseline = Arc::new(RuleDecisionProvider::new(vec![RuleDecision::from_fact(
         agent_protocol::decision::DecisionFamily::MODEL_ROUTE,
         model_route::TIER_QUESTION,

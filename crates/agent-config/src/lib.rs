@@ -127,6 +127,7 @@ mod tests {
     use super::*;
     use agent_protocol::model::{ModelRoute, ModelTier};
     use agent_protocol::permissions::{Capability, PolicyDecision};
+    use std::collections::BTreeMap;
 
     /// The layers a test is about, with everything else empty.
     fn no_layers() -> Layers {
@@ -967,7 +968,7 @@ plugins = { enable = ["mcp.foo"] }
         let resolved = resolve(layers).unwrap();
         assert_eq!(resolved.model.as_deref(), Some("chosen-on-the-command-line"));
         let policy_version = resolved.policy_version.clone();
-        let snapshot = resolved.into_snapshot(route());
+        let snapshot = resolved.into_snapshot(route(), BTreeMap::new());
 
         assert_eq!(snapshot.profile_id, "coding");
         assert_eq!(snapshot.plugin_versions["mcp.foo"], "1.0.0");
@@ -987,7 +988,7 @@ plugins = { enable = ["mcp.foo"] }
             ))
             .unwrap();
             layers.profile_override = Some("coding".to_string());
-            resolve(layers).unwrap().into_snapshot(route).config_hash
+            resolve(layers).unwrap().into_snapshot(route, BTreeMap::new()).config_hash
         };
 
         assert_eq!(seal(8, route()), seal(8, route()));
@@ -1009,8 +1010,76 @@ plugins = { enable = ["mcp.foo"] }
 
         let resolved = resolve(layers).unwrap();
         assert_eq!(resolved.model.as_deref(), Some("asked-for"));
-        let snapshot = resolved.into_snapshot(ModelRoute::new(ModelTier::Main, "echo", "echo"));
+        let snapshot = resolved
+            .into_snapshot(ModelRoute::new(ModelTier::Main, "echo", "echo"), BTreeMap::new());
         assert_eq!(snapshot.model_route.model, "echo");
+    }
+
+    #[test]
+    fn every_named_tier_lands_in_the_table() {
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            "[profiles.coding]\nmodel = { main = \"big\", fast = \"small\", thinking = \"deep\" }\n",
+        )
+        .unwrap();
+        layers.profile_override = Some("coding".to_string());
+
+        let resolved = resolve(layers).unwrap();
+        assert_eq!(resolved.model.as_deref(), Some("big"));
+        assert_eq!(resolved.model_tiers[&ModelTier::Main], "big");
+        assert_eq!(resolved.model_tiers[&ModelTier::Fast], "small");
+        assert_eq!(resolved.model_tiers[&ModelTier::Thinking], "deep");
+    }
+
+    #[test]
+    fn a_command_line_model_replaces_main_and_leaves_the_other_tiers_alone() {
+        // `--model` is about this run's own model, not about the table: a
+        // layer that named a cheaper model for summarization keeps saying so.
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            "[profiles.coding]\nmodel = { main = \"big\", fast = \"small\" }\n",
+        )
+        .unwrap();
+        layers.profile_override = Some("coding".to_string());
+        layers.model_override = Some("chosen-on-the-command-line".to_string());
+
+        let resolved = resolve(layers).unwrap();
+        assert_eq!(resolved.model_tiers[&ModelTier::Main], "chosen-on-the-command-line");
+        assert_eq!(resolved.model_tiers[&ModelTier::Fast], "small");
+    }
+
+    #[test]
+    fn an_unnamed_tier_is_absent_rather_than_defaulted() {
+        // The router falls back to `main` on its own. Writing `main` into the
+        // table for a tier nobody named would make "not configured" and
+        // "configured to the same model" read the same in the log.
+        let mut layers = no_layers();
+        layers.user =
+            UserConfig::from_toml_str("[profiles.coding]\nmodel = { fast = \"small\" }\n").unwrap();
+        layers.profile_override = Some("coding".to_string());
+
+        let resolved = resolve(layers).unwrap();
+        assert_eq!(resolved.model_tiers.len(), 1);
+        assert_eq!(resolved.model_tiers[&ModelTier::Fast], "small");
+        assert!(!resolved.model_tiers.contains_key(&ModelTier::Main));
+        assert!(!resolved.model_tiers.contains_key(&ModelTier::Thinking));
+    }
+
+    #[test]
+    fn a_run_with_one_model_records_no_route_table_at_all() {
+        // An empty table is skipped on the way out, so a configuration that
+        // never asked for routing leaves `profile/resolved` byte-identical to
+        // what it was before tiers existed — the hash included.
+        let mut layers = no_layers();
+        layers.user =
+            UserConfig::from_toml_str("[profiles.coding]\nmodel = { main = \"big\" }\n").unwrap();
+        layers.profile_override = Some("coding".to_string());
+
+        let snapshot = resolve(layers)
+            .unwrap()
+            .into_snapshot(ModelRoute::new(ModelTier::Main, "echo", "big"), BTreeMap::new());
+        let bytes = serde_json::to_string(&snapshot).unwrap();
+        assert!(!bytes.contains("model_routes"), "{bytes}");
     }
 
     #[test]
@@ -1179,7 +1248,7 @@ decisions = { laya = true }
                 .unwrap();
 
         let resolved = resolve(layers).unwrap();
-        let snapshot = resolved.into_snapshot(route());
+        let snapshot = resolved.into_snapshot(route(), BTreeMap::new());
         assert_eq!(snapshot.decision_backends, vec!["laya:http://127.0.0.1:8231".to_string()]);
     }
 

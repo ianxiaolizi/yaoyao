@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent_protocol::digest;
-use agent_protocol::model::ModelRoute;
+use agent_protocol::model::{ModelRoute, ModelTier};
 use agent_protocol::permissions::{Capability, CapabilitySet, PolicyDecision};
 use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget};
 
@@ -57,6 +57,14 @@ pub struct ResolvedProfile {
     pub profile_id: String,
     /// The model the configuration names, if any.
     pub model: Option<String>,
+    /// Every tier the configuration named a model for, `main` included.
+    ///
+    /// `model` above is what the *run's* provider is switched to; this map is
+    /// what a task class asks for. They overlap on `main` by construction, and
+    /// they are kept separate because only one of them is a single value:
+    /// `--model` overrides `main` and nothing else, so a layer that names
+    /// `fast` keeps it.
+    pub model_tiers: BTreeMap<ModelTier, String>,
     pub capability_set: CapabilitySet,
     pub plugin_versions: BTreeMap<String, String>,
     /// The MCP servers this run starts, one per enabled `mcp.<server>` plugin,
@@ -97,7 +105,16 @@ pub struct ResolvedProfile {
 
 impl ResolvedProfile {
     /// Freeze it, now that the app knows which model it selected.
-    pub fn into_snapshot(self, model_route: ModelRoute) -> ResolvedProfileSnapshot {
+    ///
+    /// `model_routes` is the table the app built from [`Self::model_tiers`],
+    /// complete with provider ids. It arrives here rather than being derived
+    /// here because which provider serves a tier is the app's to know — this
+    /// crate never learns a vendor's name.
+    pub fn into_snapshot(
+        self,
+        model_route: ModelRoute,
+        model_routes: BTreeMap<String, ModelRoute>,
+    ) -> ResolvedProfileSnapshot {
         ResolvedProfileSnapshot {
             profile_id: self.profile_id,
             config_hash: String::new(),
@@ -105,6 +122,7 @@ impl ResolvedProfile {
             decision_backends: self.decision_backends,
             policy_version: self.policy_version,
             model_route,
+            model_routes,
             capability_set: self.capability_set,
             budget: self.budget,
         }
@@ -318,6 +336,7 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
             .model_override
             .clone()
             .or_else(|| composed.model.as_ref().and_then(|model| model.main.clone())),
+        model_tiers: model_tiers(&layers, composed.model.as_ref()),
         capability_set,
         plugin_versions,
         mcp_servers,
@@ -339,6 +358,34 @@ fn selected_id(layers: &Layers) -> String {
         .clone()
         .or_else(|| layers.workspace.profile.clone())
         .unwrap_or_else(|| "default".to_string())
+}
+
+/// The models the layers named for each tier.
+///
+/// `--model` is a statement about *this run*, not about a tier: it replaces
+/// `main` and leaves `fast`/`thinking` exactly as the layers wrote them. A tier
+/// that names no model is absent rather than defaulted to `main` here — the
+/// table says only what was asked for, and the router's own default supplies
+/// the rest, so "not configured" and "configured to the same model as main"
+/// stay distinguishable in `profile/resolved`.
+fn model_tiers(
+    layers: &Layers,
+    spec: Option<&crate::layers::ModelSpec>,
+) -> BTreeMap<ModelTier, String> {
+    let mut tiers = BTreeMap::new();
+    if let Some(spec) = spec {
+        if let Some(model) = &spec.fast {
+            tiers.insert(ModelTier::Fast, model.clone());
+        }
+        if let Some(model) = &spec.thinking {
+            tiers.insert(ModelTier::Thinking, model.clone());
+        }
+    }
+    let main = layers.model_override.clone().or_else(|| spec.and_then(|spec| spec.main.clone()));
+    if let Some(model) = main {
+        tiers.insert(ModelTier::Main, model);
+    }
+    tiers
 }
 
 /// Compose a profile and everything it extends, parent first.

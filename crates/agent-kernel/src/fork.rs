@@ -593,6 +593,7 @@ mod tests {
                 "echo",
                 "echo",
             ),
+            model_routes: std::collections::BTreeMap::new(),
             capability_set: [agent_protocol::permissions::Capability::new(
                 agent_protocol::permissions::Capability::FS_READ,
             )]

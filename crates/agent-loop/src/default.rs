@@ -427,6 +427,24 @@ impl DefaultAgentLoop {
         let input_uid =
             input_message.as_ref().map(|message| message.message_uid.as_str().to_string());
 
+        // A summarizer is not the turn. It is asked a different question with a
+        // different request, so it gets its own route: a configuration that
+        // named a cheaper tier for summarization means this call, and reusing
+        // the turn's route here would silently ignore that. On a run that named
+        // no such tier the table falls back to `main`, which is the turn's
+        // route again.
+        let route = self.router.route(&RouteRequest {
+            session_id: ctx.session_id.clone(),
+            turn_id: ctx.turn_id.clone(),
+            task: TaskClass::new(TaskClass::SUMMARIZE),
+            context_revision: turn.context_revision,
+            message_count: candidate.messages.len() + 1 + usize::from(input_message.is_some()),
+            // The compaction request asks nothing of the provider beyond text:
+            // the same empty list the request below carries.
+            required_capabilities: Vec::new(),
+            budget: turn.model_budget(),
+        });
+
         events.push(draft(
             &ctx,
             step_id,
@@ -434,7 +452,7 @@ impl DefaultAgentLoop {
             serde_json::json!({
                 "attempt_id": attempt_id,
                 "provider": self.model.provider_id(),
-                "route": serde_json::to_value(&turn.route)?,
+                "route": serde_json::to_value(&route)?,
                 "context_revision": turn.context_revision.as_u64(),
                 "prompt_version": "summary/5",
                 "prompt": COMPACTION_PROMPT,
@@ -476,7 +494,7 @@ impl DefaultAgentLoop {
             messages: request_messages,
             capabilities: Vec::new(),
             response_format: None,
-            model_route: Some(turn.route.clone()),
+            model_route: Some(route),
             budget: turn.model_budget(),
             tool_manifest: ToolManifest::empty(),
         };
@@ -5994,6 +6012,86 @@ mod tests {
         let uids: Vec<&str> = refs.iter().filter_map(|r| r["message_uid"].as_str()).collect();
         assert!(!uids.contains(&older.message_uid.as_str()));
         assert!(uids.contains(&summary_uid.as_str()));
+    }
+
+    /// The summarizer is routed on its own: a configuration that named a
+    /// cheaper tier for summarization means this call, not the turn.
+    #[tokio::test]
+    async fn a_compaction_is_routed_as_a_summarization_not_as_the_turn() {
+        use agent_protocol::ids::TurnId;
+
+        /// Answers by task class, the way a route table does.
+        struct ByTask {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl ModelRouter for ByTask {
+            fn route(&self, request: &RouteRequest) -> ModelRoute {
+                self.seen.lock().map(|mut seen| seen.push(request.task.to_string())).ok();
+                match request.task.as_str() {
+                    TaskClass::SUMMARIZE => {
+                        ModelRoute::new(ModelTier::Fast, "routed-provider", "small")
+                    }
+                    _ => ModelRoute::new(ModelTier::Main, "routed-provider", "big"),
+                }
+            }
+        }
+
+        let older = ModelMessage::user_for_turn(&TurnId::from_string("t-old"), "older");
+        let newer = ModelMessage::user_for_turn(&TurnId::from_string("t-new"), "newer");
+        let candidate = CompactionCandidate {
+            messages: vec![older],
+            estimated_tokens: 1200,
+            retained_tokens: 300,
+            budget_tokens: 2000,
+            observed_input_tokens: None,
+            scope: CompactionScope::Settled,
+        };
+        let context = Arc::new(
+            FakeContextEngine::new(vec![newer], EventSeq::new(3)).with_compaction(candidate),
+        );
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::answer("the conversation greeted twice"),
+            FakeModelProvider::answer("done"),
+        ]));
+        let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+        let router = Arc::new(ByTask { seen: std::sync::Mutex::new(Vec::new()) });
+        let loop_ = DefaultAgentLoop::new(model.clone(), gateway, context, router.clone());
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        // The request that reached the provider, not just the label on it.
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].model_route.as_ref().map(|r| r.model.as_str()), Some("small"));
+        assert_eq!(requests[0].model_route.as_ref().map(|r| r.tier), Some(ModelTier::Fast));
+        assert_eq!(requests[1].model_route.as_ref().map(|r| r.model.as_str()), Some("big"));
+
+        let started = outcome
+            .events
+            .iter()
+            .find(|e| e.event_type.as_str() == EventType::CONTEXT_COMPACTION_STARTED)
+            .expect("a compaction start event");
+        assert_eq!(started.payload["route"]["model"], "small");
+        assert_eq!(started.payload["route"]["tier"], "fast");
+
+        // The turn's own attempt still says it was routed to `main`: the two
+        // calls are told apart in the log, not by trusting the event order.
+        let attempt = outcome
+            .events
+            .iter()
+            .find(|e| e.event_type.as_str() == EventType::MODEL_ATTEMPT_STARTED)
+            .expect("an attempt event");
+        assert_eq!(attempt.payload["route"]["model"], "big");
+
+        // And the router was asked twice, once as each class: the turn is routed
+        // when it opens, and the summarizer asks for its own route when the
+        // compaction begins — it is not a second turn and does not inherit one.
+        let seen = router.seen.lock().expect("the router's log").clone();
+        assert_eq!(
+            seen,
+            vec![TaskClass::INTERACTIVE.to_string(), TaskClass::SUMMARIZE.to_string()]
+        );
     }
 
     /// A summarized turn's tool traffic is recorded as a ledger beside the

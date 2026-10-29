@@ -1084,6 +1084,48 @@ budget = { max_steps = 3 }
 }
 
 #[test]
+fn a_run_records_the_tiers_the_configuration_named() {
+    // The table is only worth recording if it is what the router was built
+    // from; a config that names `fast` has to leave a trace a reader can find
+    // without going back to the files it was resolved from.
+    let (data, workspace, home) = dirs_with_config();
+    let user = write_config(
+        &home,
+        "user.toml",
+        r#"
+capabilities = ["fs.read"]
+
+[profiles.coding]
+tools = { allow = ["fs.read"] }
+model = { main = "big", fast = "small" }
+"#,
+    );
+    write_project_config(workspace.path(), "profile = \"coding\"\n");
+
+    let r = ran_with(
+        data.path(),
+        workspace.path(),
+        &[(ENV_USER_CONFIG, user.as_str())],
+        &["run", "hello", "--events"],
+    );
+    assert!(r.ok, "{}", r.err);
+
+    let events = chain(&r.out);
+    let resolved = events
+        .iter()
+        .find(|event| event["type"] == "profile/resolved")
+        .unwrap_or_else(|| panic!("the run recorded its configuration: {}", r.out));
+    assert_eq!(resolved["payload"]["model_route"]["model"], "big");
+    let routes = &resolved["payload"]["model_routes"];
+    assert_eq!(routes["fast"]["model"], "small");
+    assert_eq!(routes["fast"]["tier"], "fast");
+    // One provider kind per run: a tier changes the model, not the vendor.
+    assert_eq!(routes["fast"]["provider"], "echo");
+    // `main` is the run's own route, not a table entry.
+    assert!(routes.get("main").is_none(), "{routes}");
+}
+
+#[test]
 fn a_configuration_that_does_not_resolve_stops_the_run() {
     let (data, workspace, home) = dirs_with_config();
     let user = write_config(&home, "user.toml", "[profiles.only-this]\n");

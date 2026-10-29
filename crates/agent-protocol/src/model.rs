@@ -542,7 +542,11 @@ fn hash_json(value: &serde_json::Value) -> String {
 }
 
 /// Which model an agent role should use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialOrd`/`Ord` exist so a route table can be a `BTreeMap` keyed by tier:
+/// two runs of one configuration must produce the same serialization, and a map
+/// ordered by its key is how that holds without a hash seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelTier {
     Main,

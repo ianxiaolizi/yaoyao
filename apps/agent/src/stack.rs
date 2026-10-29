@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use agent_config::{McpTransport, ResolvedProfile};
 use agent_context::ProjectionContextEngine;
-use agent_decision::TableModelRouter;
 use agent_index_sqlite::{MemoryToolProvider, SqliteMemoryIndex};
 use agent_kernel::approval::ApprovalService;
 use agent_kernel::fork::Fork;
@@ -502,17 +501,23 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
         Some(selected) => selected,
         None => providers::select(resolved.model.as_deref())?,
     };
+    // The tiers the configuration named, pointed at the provider this run
+    // selected. Every entry differs from `main` only in its model name: this
+    // build speaks to one provider kind per run, and a route that named another
+    // kind would be a claim nothing here can honor.
+    let routes = providers::route_table(&selected.route, &resolved.model_tiers);
     let (router, advisor): (Arc<dyn ModelRouter>, Option<Arc<dyn DecisionAdvisor>>) =
         match decisions {
             Decisions::FromConfiguration => {
+                let router = providers::router(selected.route.clone(), &routes);
                 let (router, advisor) =
-                    decisions::assemble(selected.route.clone(), resolved.laya.clone())?;
+                    decisions::assemble(Arc::new(router), resolved.laya.clone())?;
                 (router, Some(advisor))
             }
             // No advisor, but still a router: the loop is always given one, and a
             // run without an observation is a run whose choices are still routed.
             Decisions::Unobserved => {
-                (Arc::new(TableModelRouter::new(selected.route.clone())), None)
+                (Arc::new(providers::router(selected.route.clone(), &routes)), None)
             }
         };
     // Which advisors this run has is said out loud when there is something to
@@ -596,7 +601,7 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     // same grant the run started with, and it is checked against the registry by
     // the same gate either way.
     let capabilities = resolved.capability_set.clone();
-    let snapshot = resolved.into_snapshot(selected.route.clone());
+    let snapshot = resolved.into_snapshot(selected.route.clone(), routes.clone());
     // The controls that turn a plugin off and back on are assembled next to the
     // registry that holds them, and handed to the scheduler — which applies them
     // at a turn boundary, never inside one. A run that started no plugins still

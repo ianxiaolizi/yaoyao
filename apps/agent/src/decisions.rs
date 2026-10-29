@@ -11,7 +11,7 @@ use std::sync::Arc;
 use agent_config::ResolvedLaya;
 use agent_decision_laya::{LayaConfig, LayaConfigError, LayaDecisionProvider};
 use agent_ports::decision::{DecisionAdvisor, FastDecisionProvider};
-use agent_ports::model_router::{ModelRoute, ModelRouter};
+use agent_ports::model_router::ModelRouter;
 
 /// Why the shadow stack could not be assembled.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -23,7 +23,7 @@ pub enum AssembleError {
 /// The router a run executes with, and the advisor that observes its choices.
 pub type DecisionStack = (Arc<dyn ModelRouter>, Arc<dyn DecisionAdvisor>);
 
-/// Build the router and the shadow advisor for `route`.
+/// Wrap `router` with the shadow advisor.
 ///
 /// The sidecar is built here, once, at startup — not lazily on the first turn.
 /// A configuration this build will not honor (an endpoint that is not loopback,
@@ -38,7 +38,7 @@ pub type DecisionStack = (Arc<dyn ModelRouter>, Arc<dyn DecisionAdvisor>);
 /// records `unavailable` next to the rule baseline's answer, which is exactly
 /// what the trace is for — and the run continues.
 pub fn assemble(
-    route: ModelRoute,
+    router: Arc<dyn ModelRouter>,
     laya: Option<ResolvedLaya>,
 ) -> Result<DecisionStack, AssembleError> {
     let mut backends: Vec<Arc<dyn FastDecisionProvider>> = Vec::new();
@@ -50,21 +50,27 @@ pub fn assemble(
         backends.push(Arc::new(LayaDecisionProvider::new(config)?));
     }
 
-    Ok(agent_decision::shadow_for(route, backends))
+    Ok(agent_decision::shadow_for(router, backends))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_ports::model_router::ModelTier;
+    use agent_decision::TableModelRouter;
+    use agent_ports::model_router::{ModelRoute, ModelTier};
 
     fn route() -> ModelRoute {
         ModelRoute::new(ModelTier::Main, "openai-compat", "m")
     }
 
+    /// One route, for the tests that are not about routing.
+    fn one_route() -> Arc<dyn ModelRouter> {
+        Arc::new(TableModelRouter::new(route()))
+    }
+
     #[test]
     fn a_run_with_no_sidecar_configured_assembles_without_one() {
-        let (_, advisor) = assemble(route(), None).expect("no sidecar is no problem");
+        let (_, advisor) = assemble(one_route(), None).expect("no sidecar is no problem");
         // Nothing to assert about the advisor's insides from here; what matters
         // is that the call is total and needs no configuration.
         drop(advisor);
@@ -75,7 +81,7 @@ mod tests {
         // The refusal the config layer cannot make: it checks that a URL was
         // written, not what this build is willing to connect to.
         let error = assemble(
-            route(),
+            one_route(),
             Some(ResolvedLaya {
                 url: "http://laya.internal:8000".to_string(),
                 model: None,
@@ -92,7 +98,7 @@ mod tests {
     #[test]
     fn a_configured_sidecar_assembles_with_its_parameters() {
         let (_, advisor) = assemble(
-            route(),
+            one_route(),
             Some(ResolvedLaya {
                 url: "http://127.0.0.1:8231".to_string(),
                 model: Some("multilingual".to_string()),

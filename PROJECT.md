@@ -136,6 +136,8 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 
 `app-container` 需要先以管理员权限运行 `sandbox setup`。它的授权、网络策略、启动和保活细节由 `CONTRACT.md` §7 约束；选中但环境未准备好时退 `2`，不会悄悄回落到 `local`。`AGENT_SANDBOX_NETWORK=allow|deny` 控制沙箱网络，默认 `deny`。
 
+模型档位写在 profile 的 `[model]` 里：`main` 是本次运行的模型，`fast` / `thinking` 留给摘要与审查；`--model` 只覆盖 `main`，不会动另两档。今天**只有上下文压缩**按 `summarize` 真的走到 `fast`，`review` 还没有生产者，所以配了 `thinking` 也只会被记录、不会被用到。档位只换模型名，不换 provider——一个进程仍然只说一种 provider kind。没配任何档位时行为与以前完全一致，`profile/resolved` 也不多一个字段（`CONTRACT.md` §7 #118）。
+
 ```bash
 # 定时唤醒：安排、查看、取消，然后驱动一次
 cargo run -p agent -- schedule at +10m "check the repo"

@@ -1371,6 +1371,7 @@ mod tests {
                 "echo",
                 "echo",
             ),
+            model_routes: std::collections::BTreeMap::new(),
             capability_set: agent_protocol::permissions::CapabilitySet::new(),
             budget,
         }
