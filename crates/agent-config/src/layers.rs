@@ -319,6 +319,10 @@ pub struct McpServer {
     pub requires: Vec<String>,
     /// How long one call under this server may take, e.g. `"90s"`.
     pub timeout: Option<String>,
+    /// What this run does with a tool whose declaration it cannot enforce:
+    /// `"strict"` (the default) refuses the server, `"warn"` registers it and
+    /// says so. See [`crate::SchemaPolicy`].
+    pub schema: Option<String>,
 
     /// The program to run, for a stdio server.
     pub command: Option<String>,

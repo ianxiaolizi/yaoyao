@@ -3092,22 +3092,27 @@ impl AgentLoop for DefaultAgentLoop {
                         // log keeps: a gateway failure that lives only in
                         // memory could never be rebuilt into this message.
                         let content = e.to_string();
-                        let refused = draft(
-                            ctx,
-                            &step_id,
-                            EventType::TOOL_FAILED,
-                            serde_json::json!({
-                                "tool_name": call.tool_name,
-                                "provider_tool_call_id": call.tool_call_id,
-                                "status": ToolStatus::Failed,
-                                "content": content,
-                                // Read back by the Scheduler when a resumed
-                                // turn opens: a refusal is not a failure the
-                                // gate should hold the turn on.
-                                "outcome": GATEWAY_REFUSED_OUTCOME,
-                            }),
-                            Actor::Tool,
-                        );
+                        let mut payload = serde_json::json!({
+                            "tool_name": call.tool_name,
+                            "provider_tool_call_id": call.tool_call_id,
+                            "status": ToolStatus::Failed,
+                            "content": content,
+                            // Read back by the Scheduler when a resumed
+                            // turn opens: a refusal is not a failure the
+                            // gate should hold the turn on.
+                            "outcome": GATEWAY_REFUSED_OUTCOME,
+                        });
+                        // Why it was refused, as a word rather than a sentence
+                        // to parse: policy, a bad argument, an unknown name and
+                        // an unenforceable declaration all land on this one
+                        // channel, and adding them up by hand is what a log
+                        // full of prose is good for only once. Omitted for the
+                        // two answers that are not classes of refusal.
+                        if let Some(kind) = e.kind() {
+                            payload["error_kind"] = serde_json::json!(kind.as_str());
+                        }
+                        let refused =
+                            draft(ctx, &step_id, EventType::TOOL_FAILED, payload, Actor::Tool);
                         let refused_event_id = refused.event_id.as_str().to_string();
                         events.push(refused);
                         // A gateway refusal (policy, resource, unknown tool)
@@ -3691,6 +3696,54 @@ mod tests {
                 .any(|event| event.event_type.as_str() == EventType::TOOL_STARTED),
             "a committed draft must not also be returned"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_is_recorded_with_the_class_it_was_refused_for() {
+        // The refusal text is prose and reads differently for every cause; the
+        // class is the part a reader can add up. The gateway is what knows it,
+        // so it is written beside the text it belongs to.
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("missing.tool", serde_json::json!({})),
+            FakeModelProvider::answer("done"),
+        ]));
+        // A gateway with no tools at all: every call is refused as unknown.
+        let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+        let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        let refused = outcome
+            .events
+            .iter()
+            .find(|event| event.event_type.as_str() == EventType::TOOL_FAILED)
+            .expect("the call was refused");
+        assert_eq!(refused.payload["outcome"], serde_json::json!(GATEWAY_REFUSED_OUTCOME));
+        assert_eq!(refused.payload["error_kind"], serde_json::json!("unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn a_held_call_records_no_class_because_it_has_not_failed() {
+        // An approval pending is a call waiting to run. Giving it an error class
+        // would put it in a count of failures it does not belong to.
+        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::tool_call(
+            "echo",
+            serde_json::json!({"s": "hi"}),
+        )]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let gateway = Arc::new(FakeToolGateway::requiring_approval(tools, "approval-1"));
+        let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        let held = outcome
+            .events
+            .iter()
+            .find(|event| event.event_type.as_str() == EventType::TOOL_FAILED)
+            .expect("the call was held");
+        assert_eq!(held.payload["outcome"], serde_json::json!(APPROVAL_PENDING_OUTCOME));
+        assert!(held.payload.get("error_kind").is_none(), "{:?}", held.payload);
     }
 
     #[tokio::test]

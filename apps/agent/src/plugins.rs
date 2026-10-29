@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use agent_cli::{CliOutput, json_output};
-use agent_config::{McpTransport, ResolvedProfile};
+use agent_config::{McpTransport, ResolvedProfile, SchemaPolicy};
 use agent_kernel::inbox::Inbox;
 use agent_kernel::plugin::{PluginError, PluginHandle, PluginRegistry, PluginRuntime};
 use agent_kernel::resource_guard::{ResourceGuard, ResourceGuardError};
@@ -104,6 +104,8 @@ pub struct ServerSpec {
     pub requires: Vec<Capability>,
     pub timeout_ms: Option<u64>,
     pub transport: McpTransport,
+    /// What to do with a tool whose declaration this build cannot enforce.
+    pub schema: SchemaPolicy,
 }
 
 /// The MCP servers a resolved configuration enables, in name order.
@@ -123,6 +125,7 @@ pub fn server_specs(resolved: &ResolvedProfile) -> Vec<ServerSpec> {
                 requires: server.requires.clone(),
                 timeout_ms: server.timeout_ms,
                 transport: server.transport.clone(),
+                schema: server.schema,
             }
         })
         .collect()
@@ -172,6 +175,9 @@ pub enum RegisterError {
     /// Its configured working directory is not one the workspace boundary
     /// admits, so the program was never started.
     WorkingDirectory(ResourceGuardError),
+    /// It answered, and one of its declarations is not something this build can
+    /// enforce — so every call to that tool would be refused.
+    Schema { tool: String, reason: String },
 }
 
 impl std::fmt::Display for RegisterError {
@@ -180,6 +186,11 @@ impl std::fmt::Display for RegisterError {
             Self::Unavailable(error) => write!(f, "is not available: {error}"),
             Self::Refused(error) => write!(f, "could not be registered: {error}"),
             Self::WorkingDirectory(error) => write!(f, "is not started: {error}"),
+            Self::Schema { tool, reason } => write!(
+                f,
+                "has a tool this run cannot check ('{tool}': {reason}); set `schema = \"warn\"` on \
+                 the server to register it anyway"
+            ),
         }
     }
 }
@@ -201,7 +212,7 @@ pub async fn register_server(
     capabilities: &CapabilitySet,
     guard: &ResourceGuard,
     artifacts: &Arc<dyn ArtifactStore>,
-) -> Result<PluginHandle, RegisterError> {
+) -> Result<(PluginHandle, Vec<String>), RegisterError> {
     let transport =
         transport_spec(&spec.transport, guard).map_err(RegisterError::WorkingDirectory)?;
     let connector = RmcpConnector::new(spec.name.clone(), transport, Arc::clone(artifacts));
@@ -215,6 +226,17 @@ pub async fn register_server(
     if let Err(error) = provider.start().await {
         return Err(RegisterError::Unavailable(error.to_string()));
     }
+    // What this server just claimed its tools take. A declaration is checked
+    // here rather than only when a call arrives because the alternative is
+    // discovering it one call at a time: the server is up, its tools are on the
+    // manifest, and the first one to be used comes back refused. The gateway
+    // still checks at every call — this is the same rule, asked earlier and
+    // once — and it is the *listing* that is new information, so a re-listed
+    // tool set is checked by whichever call meets it.
+    let notes = match check_declarations(&provider, &spec.schema) {
+        Ok(notes) => notes,
+        Err(error) => return Err(error),
+    };
     // The pump outlives this call and holds the provider with it, so a
     // `list_changed` the server sends later still reaches the surface.
     provider.spawn_resync_listener(connector.tool_list_changed());
@@ -239,10 +261,40 @@ pub async fn register_server(
         config_schema: None,
     };
 
-    registry
+    let handle = registry
         .register(session, manifest, PluginRuntime { tool_provider: Some(provider) }, capabilities)
         .await
-        .map_err(RegisterError::Refused)
+        .map_err(RegisterError::Refused)?;
+    Ok((handle, notes))
+}
+
+/// Check every declaration a freshly listed server offers.
+///
+/// `Strict` refuses the registration and names the tool that made it
+/// unenforceable; `Warn` registers anyway and puts one sentence per bad tool in
+/// front of the operator. Both are the same rule the gateway applies at call
+/// time — this one just runs when the surface is built, so the answer arrives
+/// before a model has picked a tool that cannot run.
+fn check_declarations(
+    provider: &McpToolProvider,
+    policy: &SchemaPolicy,
+) -> Result<Vec<String>, RegisterError> {
+    use agent_ports::tool_provider::ToolProvider as _;
+    let check = agent_kernel::tool_schema::SchemaCheck::new();
+    let mut notes = Vec::new();
+    for definition in provider.definitions() {
+        let Err(reason) = check.declaration(&definition.input_schema) else {
+            continue;
+        };
+        if *policy == SchemaPolicy::Strict {
+            return Err(RegisterError::Schema { tool: definition.name, reason });
+        }
+        notes.push(format!(
+            "tool '{}' cannot be checked and will refuse every call: {reason}",
+            definition.name
+        ));
+    }
+    Ok(notes)
 }
 
 /// A resolved server's transport, in the vocabulary the adapter speaks.
@@ -347,7 +399,8 @@ pub async fn register_configured(
             Suppressed::ByTheLog(_) => {}
         }
         match register_server(registry, session, spec, capabilities, guard, artifacts).await {
-            Ok(handle) => {
+            Ok((handle, server_notes)) => {
+                notes.extend(server_notes);
                 handles.insert(PluginId::from_string(&id), handle);
             }
             Err(error) => notes.push(format!("mcp server '{}' {error}", spec.name)),
@@ -564,12 +617,15 @@ impl PluginControl {
         )
         .await
         {
-            Ok(handle) => {
+            Ok((handle, mut notes)) => {
                 let generation = handle.generation();
                 self.held().insert(plugin_id, Arc::new(handle));
-                Ok(ControlOutcome::Applied {
-                    detail: format!("plugin '{id}' registered at generation {generation}"),
-                })
+                let mut detail = format!("plugin '{id}' registered at generation {generation}");
+                for note in notes.drain(..) {
+                    detail.push_str("; ");
+                    detail.push_str(&note);
+                }
+                Ok(ControlOutcome::Applied { detail })
             }
             // Tried and could not, rather than will not: the configuration
             // describes a server that did not answer. That is a failure rather
@@ -893,6 +949,7 @@ mod tests {
             version: "1.0.0".to_string(),
             requires: Vec::new(),
             timeout_ms: None,
+            schema: SchemaPolicy::Strict,
             transport: McpTransport::Stdio {
                 command: "unused-by-this-test".to_string(),
                 args: Vec::new(),

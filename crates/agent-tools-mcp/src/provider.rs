@@ -23,13 +23,28 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agent_ports::tool_provider::{
-    ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
+    ToolDefinition, ToolErrorKind, ToolInvocation, ToolProvider, ToolProviderError, ToolResult,
+    ToolSideEffect,
 };
 use agent_protocol::permissions::Capability;
 use tokio::sync::Notify;
 
 use crate::connection::{McpConnection, McpConnector, McpError, McpTool};
 use crate::naming;
+
+/// What a connector error says about the call it ended.
+///
+/// The distinction the log keeps is "did the server get the call": an
+/// unreachable server never did, a name collision on the listing is the two
+/// sides disagreeing about the surface, and a `ToolCall` is the tool itself
+/// answering — which is `Failed`, the class only a tool can give.
+fn classify(error: &McpError) -> ToolErrorKind {
+    match error {
+        McpError::Unreachable { .. } => ToolErrorKind::Unavailable,
+        McpError::NameCollision { .. } => ToolErrorKind::Protocol,
+        McpError::ToolCall { .. } => ToolErrorKind::Failed,
+    }
+}
 
 /// How long a tool call may run when the configuration names no timeout.
 ///
@@ -312,9 +327,12 @@ impl McpToolProvider {
         };
 
         if self.current_connection().is_none() {
-            self.resync().await.map_err(|error| ToolProviderError::Failed {
-                tool: tool_name.to_string(),
-                message: error.to_string(),
+            self.resync().await.map_err(|error| {
+                ToolProviderError::classified(
+                    classify(&error),
+                    tool_name.to_string(),
+                    error.to_string(),
+                )
             })?;
         }
 
@@ -323,10 +341,11 @@ impl McpToolProvider {
         // lost it between this call's two reads — cheap insurance, not a path.
         match self.current_connection() {
             Some(connection) => Ok((connection, original_name)),
-            None => Err(ToolProviderError::Failed {
-                tool: tool_name.to_string(),
-                message: format!("mcp server '{}' has no live session", self.server),
-            }),
+            None => Err(ToolProviderError::classified(
+                ToolErrorKind::Unavailable,
+                tool_name.to_string(),
+                format!("mcp server '{}' has no live session", self.server),
+            )),
         }
     }
 
@@ -394,10 +413,11 @@ impl ToolProvider for McpToolProvider {
                 // server, so it is no more evidence that the session survived
                 // than a plain failure is. Same treatment: drop the connection.
                 self.clear_connection();
-                return Err(ToolProviderError::Failed {
-                    tool: invocation.tool_name.clone(),
-                    message: format!("timed out after {} ms", deadline.as_millis()),
-                });
+                return Err(ToolProviderError::classified(
+                    ToolErrorKind::Timeout,
+                    invocation.tool_name.clone(),
+                    format!("timed out after {} ms", deadline.as_millis()),
+                ));
             }
         };
 
@@ -413,10 +433,20 @@ impl ToolProvider for McpToolProvider {
                 // (`session_for`), so the surface heals one call later rather
                 // than staying broken until the process restarts.
                 self.clear_connection();
-                Err(ToolProviderError::Failed {
-                    tool: invocation.tool_name.clone(),
-                    message: error.to_string(),
-                })
+                // A call the server answered with an error is the tool saying
+                // no — `Failed`. Only a call that never got an answer is
+                // `Unavailable`, and that is what the connector reports.
+                match classify(&error) {
+                    ToolErrorKind::Unavailable => Err(ToolProviderError::classified(
+                        ToolErrorKind::Unavailable,
+                        invocation.tool_name.clone(),
+                        error.to_string(),
+                    )),
+                    _ => Err(ToolProviderError::failed(
+                        invocation.tool_name.clone(),
+                        error.to_string(),
+                    )),
+                }
             }
         }
     }
@@ -913,11 +943,14 @@ mod tests {
             .unwrap_err();
 
         let message = match error {
-            ToolProviderError::Failed { tool, message } => {
+            // A call cut off by its deadline is not the tool saying no: it never
+            // answered, and the class is what a reader counts it under.
+            ToolProviderError::Classified { tool, kind, message } => {
                 assert_eq!(tool, "mcp__files__slow");
+                assert_eq!(kind, ToolErrorKind::Timeout);
                 message
             }
-            other => panic!("expected Failed, got {other:?}"),
+            other => panic!("expected a classified timeout, got {other:?}"),
         };
         // The number in the message is the number that was configured. That is
         // the whole point: the deadline a call gets is the declared one, not a

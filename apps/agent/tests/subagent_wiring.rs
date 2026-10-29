@@ -426,10 +426,15 @@ fn a_backend_this_run_does_not_have_is_refused_by_name() {
     );
 
     assert!(!r.ok, "{}", r.out);
-    assert!(r.err.contains("'ghost' is not a backend this run has"), "{}", r.err);
+    // Refused by the gateway rather than by the backend, because the backends
+    // this run has are in the tool's declared schema: a name outside that enum
+    // is an argument the declaration already excludes. The provider's own
+    // sentence is the defence behind this one, and has its own test.
+    assert!(r.err.contains("was not run"), "{}", r.err);
+    assert!(r.err.contains("/provider"), "the refusal names the field: {}", r.err);
     // And the refusal says what the run does have, because a caller that named
     // the wrong provider can only act on that if it is told the right one.
-    assert!(r.err.contains("fake"), "{}", r.err);
+    assert!(r.err.contains(r#""ghost" is not one of "fake""#), "{}", r.err);
     assert!(children(data.path()).is_empty(), "nothing ran, so nothing was forked");
 }
 
@@ -456,7 +461,10 @@ fn an_argument_the_request_does_not_define_is_refused() {
     );
 
     assert!(!r.ok, "{}", r.out);
-    assert!(r.err.contains("not a subagent request"), "{}", r.err);
-    assert!(r.err.contains("timeout_ms"), "the refusal names the field it wanted: {}", r.err);
+    // Again the gateway, not the backend: `additionalProperties: false` is part
+    // of the declaration, so an undeclared field never reaches the tool. What a
+    // caller needs — which word it used that does not exist — is in the message.
+    assert!(r.err.contains("was not run"), "{}", r.err);
+    assert!(r.err.contains("'timeout' was unexpected"), "{}", r.err);
     assert!(children(data.path()).is_empty(), "nothing ran, so nothing was forked");
 }

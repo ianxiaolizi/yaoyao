@@ -24,7 +24,7 @@ pub use layers::{
 };
 pub use resolve::{
     Directive, Layers, McpServerConfig, McpTransport, ResolvedLaya, ResolvedPolicy,
-    ResolvedProfile, SubagentConfig, resolve,
+    ResolvedProfile, SchemaPolicy, SubagentConfig, resolve,
 };
 
 /// Why a configuration could not be resolved.
@@ -503,6 +503,7 @@ plugins = { enable = ["mcp.files", "mcp.web"] }
                     },
                     requires: caps(&["fs.read"]),
                     timeout_ms: Some(90_000),
+                    schema: SchemaPolicy::Strict,
                 },
                 McpServerConfig {
                     name: "web".to_string(),
@@ -512,6 +513,7 @@ plugins = { enable = ["mcp.files", "mcp.web"] }
                     },
                     requires: vec![],
                     timeout_ms: None,
+                    schema: SchemaPolicy::Strict,
                 },
             ]
         );
@@ -645,6 +647,41 @@ plugins = { enable = ["mcp.files"] }
                 }
                 other => panic!("expected a refusal for {server}, got {other}"),
             }
+        }
+    }
+
+    /// A server that says nothing about `schema` is refused when its tools
+    /// cannot be checked — the safe answer is the one that needs no writing.
+    #[test]
+    fn a_server_that_does_not_say_how_to_treat_an_uncheckable_tool_is_strict() {
+        let load = |line: &str| {
+            let mut layers = no_layers();
+            layers.user = UserConfig::from_toml_str(&format!(
+                "plugins = [\"mcp.files\"]\n\n[mcp.servers.files]\n\
+                 command = \"files-mcp\"\n{line}\n\n\
+                 [profiles.p]\nplugins = {{ enable = [\"mcp.files\"] }}\n"
+            ))
+            .unwrap();
+            layers.profile_override = Some("p".to_string());
+            resolve(layers)
+        };
+
+        for (line, expected) in [
+            ("", SchemaPolicy::Strict),
+            ("schema = \"strict\"", SchemaPolicy::Strict),
+            ("schema = \"warn\"", SchemaPolicy::Warn),
+        ] {
+            let resolved = load(line).unwrap_or_else(|e| panic!("{line:?} was refused: {e}"));
+            assert_eq!(resolved.mcp_servers[0].schema, expected, "{line:?}");
+        }
+
+        match load("schema = \"lenient\"").unwrap_err() {
+            ConfigError::InvalidMcpServer { server, detail, .. } => {
+                assert_eq!(server, "files");
+                assert!(detail.contains("\"strict\""), "{detail}");
+                assert!(detail.contains("\"warn\""), "{detail}");
+            }
+            other => panic!("expected a refusal for an unknown policy, got {other}"),
         }
     }
 

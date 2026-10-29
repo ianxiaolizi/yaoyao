@@ -72,3 +72,12 @@ encoding_rs = "0.8"
 # one router, no TLS, no proxy. Axum is hyper + routing and nothing else, which
 # is exactly the amount of HTTP this needs.
 axum = "0.8"
+# Tool arguments are checked against the schema their tool declares, and a
+# schema is not a thing to hand-roll: the interesting parts are `$ref`
+# resolution, the differences between drafts, and keywords that look simple and
+# are not. Built with no features at all, which is what keeps resolution local
+# — the http and file resolvers are what would turn a `$ref` into a fetch, and
+# a declaration this build cannot resolve is one it must refuse rather than
+# chase. Pinned exactly: the rule a model's call is judged against must not
+# move under a `cargo update`.
+jsonschema = { version = "=0.60.2", default-features = false }

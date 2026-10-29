@@ -70,6 +70,63 @@ pub const GATE_REFUSED_OUTCOME: &str = "gate_refused";
 /// observation about the world — the class that ends in a silent stop.
 pub const GATEWAY_REFUSED_OUTCOME: &str = "gateway_refused";
 
+/// Why a tool call did not produce what it was asked for.
+///
+/// One vocabulary for both sides of the gateway seam. A provider says what went
+/// wrong with a call it was handed; the gateway says why a call never reached
+/// one. Both are written into the same `tool/failed` payload as `error_kind`,
+/// so a reader counting failures by class — the audit this came from, a
+/// metrics command, a person reading one turn — does not have to know which
+/// side answered in order to add them up.
+///
+/// `Failed` is not the absence of a class: it is the one only a tool can give,
+/// "I ran, and the answer is no". Everything else here says the call did not
+/// get that far, and each names a different place to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorKind {
+    /// The arguments do not match the tool's declared `input_schema`.
+    InvalidArguments,
+    /// Policy or the file boundary refused the call; nothing ran.
+    PermissionDenied,
+    /// The name is not on this run's surface.
+    UnknownTool,
+    /// The call ran past its deadline.
+    Timeout,
+    /// Whatever stands behind the tool could not be reached.
+    Unavailable,
+    /// The call was cut off before it could answer.
+    Cancelled,
+    /// The far side answered in a shape this build cannot read — including a
+    /// tool whose own declaration cannot be enforced.
+    Protocol,
+    /// The tool ran and answered that it could not do the thing.
+    Failed,
+}
+
+impl ToolErrorKind {
+    /// The word the log keeps. Stable: it is read by people and by anything
+    /// that counts these.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::InvalidArguments => "invalid_arguments",
+            Self::PermissionDenied => "permission_denied",
+            Self::UnknownTool => "unknown_tool",
+            Self::Timeout => "timeout",
+            Self::Unavailable => "unavailable",
+            Self::Cancelled => "cancelled",
+            Self::Protocol => "protocol",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A tool's declared metadata, used by policy and manifest generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -239,6 +296,27 @@ mod tests {
         assert_eq!(serde_json::to_string(&ToolSideEffect::Write).unwrap(), "\"write\"");
         assert_eq!(serde_json::to_string(&ToolStatus::Cancelled).unwrap(), "\"cancelled\"");
         assert_eq!(serde_json::to_string(&ToolSource::Builtin).unwrap(), "\"builtin\"");
+    }
+
+    #[test]
+    fn an_error_kind_keeps_one_word_in_json_and_in_the_log() {
+        // The serialized word and `as_str` are two spellings of one thing, and
+        // the log, a metrics count and a config file all read it. Two spellings
+        // that could drift are two vocabularies.
+        for kind in [
+            ToolErrorKind::InvalidArguments,
+            ToolErrorKind::PermissionDenied,
+            ToolErrorKind::UnknownTool,
+            ToolErrorKind::Timeout,
+            ToolErrorKind::Unavailable,
+            ToolErrorKind::Cancelled,
+            ToolErrorKind::Protocol,
+            ToolErrorKind::Failed,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
     }
 
     #[test]

@@ -167,6 +167,29 @@ pub struct McpServerConfig {
     pub requires: Vec<Capability>,
     /// How long one call may take, as a duration in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// What to do with a tool whose declaration this build cannot enforce.
+    pub schema: SchemaPolicy,
+}
+
+/// What a run does with a tool whose `input_schema` it cannot enforce.
+///
+/// A declaration belongs to whoever wrote the tool, so which answer is right is
+/// the operator's to give rather than this build's to guess. Refusing the
+/// server is the default because a surface is a promise: a tool on it is a tool
+/// whose arguments can be checked. `warn` is for a person who would rather keep
+/// the other tools behind a server that has one bad declaration.
+///
+/// Neither value means "run it anyway". A tool this build cannot check is
+/// refused when it is called, whichever policy is set — the difference is
+/// whether the run says so at assembly, with the rest of the server still
+/// registered, or leaves it to the call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SchemaPolicy {
+    /// An unenforceable declaration keeps the whole server off the surface.
+    #[default]
+    Strict,
+    /// The server is registered and the tool is named in a note.
+    Warn,
 }
 
 /// One subagent provider a run may delegate through.
@@ -877,7 +900,22 @@ fn server_config(
         });
     }
 
-    Ok(McpServerConfig { name: name.to_string(), transport, requires, timeout_ms })
+    let schema = match server.schema.as_deref() {
+        None | Some("strict") => SchemaPolicy::Strict,
+        Some("warn") => SchemaPolicy::Warn,
+        Some(other) => {
+            return Err(ConfigError::InvalidMcpServer {
+                layer: layer.to_string(),
+                server: name.to_string(),
+                detail: format!(
+                    "`schema` is '{other}'; it is either \"strict\" (the server is refused when a \
+                     tool cannot be checked) or \"warn\" (it is registered, and the tool is named)"
+                ),
+            });
+        }
+    };
+
+    Ok(McpServerConfig { name: name.to_string(), transport, requires, timeout_ms, schema })
 }
 
 /// Which of the two shapes a server entry is, refusing anything in between.

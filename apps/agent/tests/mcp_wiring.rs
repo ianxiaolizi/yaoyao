@@ -542,6 +542,96 @@ plugins = {{ enable = ["mcp.ghost"] }}
     assert!(absent.err.contains("mcp__ghost__echo"), "{}", absent.err);
 }
 
+/// A user configuration whose one server lists a tool this build cannot check,
+/// with whatever `schema` line the caller wants on the server entry.
+fn config_with_an_uncheckable_tool(home: &TempDir, schema: &str) -> PathBuf {
+    write_config(
+        home,
+        &format!(
+            r#"capabilities = ["process.spawn"]
+plugins = ["mcp.fake"]
+
+[mcp.servers.fake]
+command = '{command}'
+env = {{ FAKE_MCP_UNCHECKABLE_TOOL = "1" }}
+requires = ["process.spawn"]
+{schema}
+
+[profiles.p]
+tools = {{ allow = ["process.spawn"] }}
+policy = {{ shell = "allow" }}
+plugins = {{ enable = ["mcp.fake"] }}
+"#,
+            command = server_bin().display(),
+        ),
+    )
+}
+
+#[test]
+fn a_server_with_a_declaration_this_run_cannot_enforce_is_not_registered() {
+    let (data, workspace, home) = dirs();
+    // No `schema` line: the default is the answer that needs no writing.
+    let config = config_with_an_uncheckable_tool(&home, "");
+
+    // The run itself is not refused — a server that cannot be checked is not a
+    // reason to stop, and the model simply does not get its tools.
+    let r = ran(data.path(), workspace.path(), &config, &["--profile", "p", "run", "hello"]);
+    assert!(r.ok, "{}", r.err);
+    assert!(r.err.contains("mcp server 'fake' has a tool this run cannot check"), "{}", r.err);
+    // Named by the name the surface would have given it, so the line an
+    // operator reads and the name a caller would use are the same string.
+    assert!(r.err.contains("'mcp__fake__uncheckable'"), "the tool is named: {}", r.err);
+    // The message says what to write if the operator means it. A refusal that
+    // leaves the reader looking for the file format is half a refusal.
+    assert!(r.err.contains(r#"set `schema = "warn"`"#), "{}", r.err);
+
+    // And the server is genuinely off the surface, not a name that quietly
+    // resolves to nothing.
+    let absent = ran(
+        data.path(),
+        workspace.path(),
+        &config,
+        &["--profile", "p", "tool", "mcp__fake__echo", r#"{"text":"x"}"#],
+    );
+    assert_eq!(absent.code, Some(2), "{}", absent.err);
+    assert!(absent.err.contains("unknown tool 'mcp__fake__echo'"), "{}", absent.err);
+}
+
+#[test]
+fn warn_registers_the_server_and_says_which_tool_will_refuse() {
+    let (data, workspace, home) = dirs();
+    let config = config_with_an_uncheckable_tool(&home, r#"schema = "warn""#);
+
+    let r = ran(
+        data.path(),
+        workspace.path(),
+        &config,
+        &["--profile", "p", "tool", "mcp__fake__echo", r#"{"text":"still reachable"}"#],
+    );
+
+    // Registered: a policy about one tool does not take the rest of the server
+    // away from a run whose operator asked to keep it.
+    assert!(r.ok, "{}", r.err);
+    assert_eq!(r.out.trim(), "still reachable");
+    assert!(
+        r.err
+            .contains("tool 'mcp__fake__uncheckable' cannot be checked and will refuse every call"),
+        "{}",
+        r.err
+    );
+
+    // And the promise the warning made is kept: the one tool is refused at the
+    // gateway, with the class a metric would count, before anything runs.
+    let refused = ran(
+        data.path(),
+        workspace.path(),
+        &config,
+        &["--profile", "p", "tool", "mcp__fake__uncheckable", "{}"],
+    );
+    assert_eq!(refused.code, Some(2), "{}", refused.err);
+    assert!(refused.err.contains("cannot be called as declared"), "{}", refused.err);
+}
+
 #[test]
 fn a_server_reached_by_url_is_reached_through_the_configuration() {
     let (data, workspace, home) = dirs();

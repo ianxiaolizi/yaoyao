@@ -507,6 +507,54 @@ mod tests {
         assert_eq!(admitted[0].cwd, None);
     }
 
+    /// One delegation to a backend nothing ever starts, for the two argument
+    /// checks below. Both refuse before the child would be forked, so the
+    /// program named here is never executed.
+    fn provider() -> SubagentToolProvider {
+        SubagentToolProvider::new(
+            Arc::new(agent_testkit::FakeEventStore::new()),
+            Arc::new(agent_testkit::FakeToolProvider::new()),
+            SessionId::from_string("parent"),
+            &[config("fake", None)],
+        )
+    }
+
+    /// The gateway refuses a name outside the backends this run has before the
+    /// tool is reached, so this is the second line: a caller that bypasses it —
+    /// or a declaration that stopped excluding the name — still gets a sentence
+    /// naming what the run does have rather than a bare "unknown".
+    #[tokio::test]
+    async fn a_backend_the_run_does_not_have_is_named_with_the_ones_it_has() {
+        let error = provider()
+            .invoke(&ToolInvocation::proposed(
+                TOOL_NAME,
+                json!({ "provider": "ghost", "objective": "x" }),
+            ))
+            .await
+            .expect_err("a backend this run does not have was accepted");
+
+        let message = error.to_string();
+        assert!(message.contains("'ghost' is not a backend this run has"), "{message}");
+        assert!(message.contains("fake"), "it says what the run has: {message}");
+    }
+
+    /// Likewise for an argument the request does not define: the schema says
+    /// `additionalProperties: false`, and this is the check behind it.
+    #[tokio::test]
+    async fn an_argument_the_request_does_not_define_never_reaches_a_child() {
+        let error = provider()
+            .invoke(&ToolInvocation::proposed(
+                TOOL_NAME,
+                json!({ "provider": "fake", "objective": "x", "timeout": "5s" }),
+            ))
+            .await
+            .expect_err("an undefined argument was accepted");
+
+        let message = error.to_string();
+        assert!(message.contains("not a subagent request"), "{message}");
+        assert!(message.contains("timeout_ms"), "it names the field it wanted: {message}");
+    }
+
     #[test]
     fn one_refused_backend_does_not_take_the_others_with_it() {
         // A misconfigured provider is skipped, not fatal: a run that has a backend

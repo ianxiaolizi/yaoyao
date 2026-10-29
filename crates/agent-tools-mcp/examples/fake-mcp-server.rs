@@ -18,7 +18,12 @@
 //!     which is how the list-changed pump is driven from a real notification;
 //!   * calling `exit` ends the process mid-call, so a test can watch the client
 //!     survive a server that is truly gone — the case no transport-level
-//!     re-initialization can paper over.
+//!     re-initialization can paper over;
+//!   * with `FAKE_MCP_UNCHECKABLE_TOOL=1` in its environment it also lists
+//!     `uncheckable`, whose `inputSchema` is not valid JSON Schema at all. The
+//!     assembly checks every declaration before it registers a server, so this
+//!     is how a test drives that check from a real process: closing the surface
+//!     under the default policy, and printing a warning under `warn`.
 
 use std::io::{BufRead, Write};
 
@@ -170,6 +175,17 @@ fn tool_list(grown: bool) -> Vec<Value> {
             "name": "grown",
             "description": "A tool that appeared after a list_changed notification",
             "inputSchema": { "type": "object", "properties": {} },
+        }));
+    }
+    if std::env::var("FAKE_MCP_UNCHECKABLE_TOOL").is_ok() {
+        // `required` is an array of property names, so a string here is not a
+        // schema this client can compile. It is the smallest honest example of
+        // a declaration that cannot be enforced: everything about it looks
+        // like a schema until it is read.
+        tools.push(json!({
+            "name": "uncheckable",
+            "description": "A tool whose inputSchema is not a schema",
+            "inputSchema": { "type": "object", "required": "path" },
         }));
     }
     tools

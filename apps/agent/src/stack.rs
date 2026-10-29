@@ -687,6 +687,7 @@ mod tests {
             requires: Vec::new(),
             timeout_ms: None,
             transport,
+            schema: agent_config::SchemaPolicy::Strict,
         }
     }
 

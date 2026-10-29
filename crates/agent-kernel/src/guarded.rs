@@ -23,6 +23,7 @@ use agent_protocol::redactor::Redactor;
 use crate::approval::ApprovalService;
 use crate::policy::{PolicyContext, PolicyEngine, Refusal};
 use crate::resource_guard::ResourceGuard;
+use crate::tool_schema::{SchemaCheck, SchemaGap};
 
 /// A result past either limit is offloaded to the artifact store instead of
 /// entering the model context whole. Two limits rather than one because they
@@ -53,6 +54,9 @@ pub struct GuardedToolProvider {
     artifacts: Arc<dyn ArtifactStore>,
     /// How many bytes of one result stay inline; larger results are offloaded.
     offload_max_bytes: usize,
+    /// The compiled declarations calls are checked against, kept between calls
+    /// because a tool's schema is the same object every time it is called.
+    schema: SchemaCheck,
 }
 
 impl GuardedToolProvider {
@@ -71,6 +75,7 @@ impl GuardedToolProvider {
             redactor: Redactor::new(),
             artifacts,
             offload_max_bytes: OFFLOAD_MAX_BYTES,
+            schema: SchemaCheck::new(),
         }
     }
 
@@ -96,6 +101,37 @@ impl GuardedToolProvider {
 
     fn is_known(&self, tool_name: &str) -> bool {
         self.inner.definitions().into_iter().any(|d| d.name == tool_name)
+    }
+
+    /// Refuse a call whose arguments do not match the tool's declaration.
+    ///
+    /// Before policy, because the two answers differ in what they cost: a
+    /// person is not asked to approve a call that could never run, and a policy
+    /// review is not spent on one. The gateway is where this belongs rather
+    /// than each provider, because the declaration is what the *model* was
+    /// shown — the surface and the check against it should be the same list.
+    ///
+    /// A provider still owns its own semantic checks: a schema can say
+    /// `fs.edit` takes two strings, and only the tool can say the anchor
+    /// appears exactly once.
+    fn check_arguments(&self, invocation: &ToolInvocation) -> Result<(), ToolGatewayError> {
+        let Some(definition) =
+            self.inner.definitions().into_iter().find(|d| d.name == invocation.tool_name)
+        else {
+            // `is_known` already answered; a provider that changed its surface
+            // between the two calls is a race this cannot do better than.
+            return Err(self.unknown_tool(&invocation.tool_name));
+        };
+        match self.schema.check(&definition.input_schema, &invocation.arguments) {
+            Ok(()) => Ok(()),
+            Err(SchemaGap::Arguments(problems)) => Err(ToolGatewayError::InvalidArguments {
+                tool: invocation.tool_name.clone(),
+                problems,
+            }),
+            Err(SchemaGap::Declaration(reason)) => {
+                Err(ToolGatewayError::InvalidSchema { tool: invocation.tool_name.clone(), reason })
+            }
+        }
     }
 
     /// A refusal of a name nobody registered, carrying the surface to look at.
@@ -171,6 +207,7 @@ impl GuardedToolProvider {
         if !self.is_known(&invocation.tool_name) {
             return Err(self.unknown_tool(&invocation.tool_name));
         }
+        self.check_arguments(invocation)?;
         self.check_paths(invocation, &self.policy_context(invocation))?;
         let result = self.inner.invoke(invocation).await.map_err(ToolGatewayError::Tool)?;
         Ok(self.finalize(result))
@@ -326,6 +363,7 @@ impl ToolGateway for GuardedToolProvider {
         if !self.is_known(&invocation.tool_name) {
             return Err(self.unknown_tool(&invocation.tool_name));
         }
+        self.check_arguments(invocation)?;
         let capabilities = self.capabilities_for(&invocation.tool_name);
         let ctx = self.policy_context(invocation);
 
@@ -1282,5 +1320,144 @@ mod tests {
             )
             .await;
         assert!(ok.is_ok(), "a declared-pure call must not be refused as a write: {ok:?}");
+    }
+
+    fn declared(name: &str, schema: serde_json::Value) -> ToolDefinition {
+        ToolDefinition { input_schema: schema, ..def(name, &[], ToolSideEffect::Read) }
+    }
+
+    #[tokio::test]
+    async fn arguments_that_miss_the_declaration_never_reach_the_tool() {
+        let tools = Arc::new(ScriptedTools::echo(vec![declared(
+            "fs.write",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            }),
+        )]));
+        let gateway = gateway_any(ResourceGuard::new(workspace()), tools, PolicyEngine::new());
+
+        let err = gateway
+            .execute(
+                &sid(),
+                &ToolInvocation::proposed("fs.write", serde_json::json!({ "path": "a.txt" })),
+            )
+            .await
+            .expect_err("content is missing");
+        let ToolGatewayError::InvalidArguments { tool, problems } = &err else {
+            panic!("unexpected: {err:?}")
+        };
+        assert_eq!(tool, "fs.write");
+        assert!(problems[0].contains("content"), "{problems:?}");
+        assert!(err.to_string().contains("fs.write"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_call_refused_for_its_arguments_never_asks_a_person() {
+        // The order is the point: a person is not asked to approve a call that
+        // could never run, and a policy review is not spent on one.
+        let tools = Arc::new(ScriptedTools::echo(vec![ToolDefinition {
+            capability_requirements: vec![Capability::new(Capability::FS_WRITE)],
+            ..declared("fs.write", serde_json::json!({ "type": "object", "required": ["path"] }))
+        }]));
+        let policy = PolicyEngine::new()
+            .with_rules([crate::policy::PolicyRule::ask(Capability::new(Capability::FS_WRITE))])
+            .with_sandbox([Capability::new(Capability::FS_WRITE)]);
+        let (gateway, approvals, _) = gateway_over(ResourceGuard::new(workspace()), tools, policy);
+
+        let err = gateway
+            .execute(&sid(), &ToolInvocation::proposed("fs.write", serde_json::json!({})))
+            .await
+            .expect_err("path is missing");
+        assert!(matches!(err, ToolGatewayError::InvalidArguments { .. }), "unexpected: {err:?}");
+
+        let pending = approvals.pending(&sid()).await.expect("the approval list is readable").len();
+        assert_eq!(pending, 0, "a call that could not run must not raise an approval");
+    }
+
+    #[tokio::test]
+    async fn a_declaration_this_build_cannot_enforce_refuses_the_call() {
+        let tools = Arc::new(ScriptedTools::echo(vec![declared(
+            "broken.tool",
+            serde_json::json!({ "type": "object", "required": "path" }),
+        )]));
+        let gateway = gateway_any(ResourceGuard::new(workspace()), tools, PolicyEngine::new());
+
+        let err = gateway
+            .execute(&sid(), &ToolInvocation::proposed("broken.tool", serde_json::json!({})))
+            .await
+            .expect_err("the declaration is not a schema");
+        let ToolGatewayError::InvalidSchema { tool, reason } = &err else {
+            panic!("unexpected: {err:?}")
+        };
+        assert_eq!(tool, "broken.tool");
+        assert!(reason.contains("JSON Schema"), "{reason}");
+        assert_eq!(err.kind(), Some(agent_protocol::tool::ToolErrorKind::Protocol));
+    }
+
+    #[tokio::test]
+    async fn an_approved_call_is_checked_too() {
+        // The resume path does not go through `execute`, so a call that was
+        // held, approved and then replayed would otherwise skip the check.
+        let tools = Arc::new(ScriptedTools::echo(vec![declared(
+            "fs.write",
+            serde_json::json!({ "type": "object", "required": ["path"] }),
+        )]));
+        let gateway = gateway_any(ResourceGuard::new(workspace()), tools, PolicyEngine::new());
+
+        let err = gateway
+            .execute_approved(&ToolInvocation::proposed("fs.write", serde_json::json!({})))
+            .await
+            .expect_err("path is missing");
+        assert!(matches!(err, ToolGatewayError::InvalidArguments { .. }), "unexpected: {err:?}");
+    }
+
+    #[test]
+    fn every_refusal_names_the_class_a_metric_would_count() {
+        use agent_protocol::tool::ToolErrorKind;
+        let cases = [
+            (
+                ToolGatewayError::PolicyDenied { tool: "t".into(), reason: "r".into() },
+                Some(ToolErrorKind::PermissionDenied),
+            ),
+            (
+                ToolGatewayError::ResourceDenied { tool: "t".into(), reason: "r".into() },
+                Some(ToolErrorKind::PermissionDenied),
+            ),
+            (
+                ToolGatewayError::UnknownTool { tool: "t".into(), reason: "r".into() },
+                Some(ToolErrorKind::UnknownTool),
+            ),
+            (
+                ToolGatewayError::InvalidArguments { tool: "t".into(), problems: vec![] },
+                Some(ToolErrorKind::InvalidArguments),
+            ),
+            (
+                ToolGatewayError::InvalidSchema { tool: "t".into(), reason: "r".into() },
+                Some(ToolErrorKind::Protocol),
+            ),
+            (
+                ToolGatewayError::Tool(ToolProviderError::failed("t", "no")),
+                Some(ToolErrorKind::Failed),
+            ),
+            (
+                ToolGatewayError::Tool(ToolProviderError::classified(
+                    ToolErrorKind::Timeout,
+                    "t",
+                    "late",
+                )),
+                Some(ToolErrorKind::Timeout),
+            ),
+            // The two that are not answers about a call at all.
+            (ToolGatewayError::ApprovalPending { tool: "t".into(), approval_id: "a".into() }, None),
+            (ToolGatewayError::Approval("broken".into()), None),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), expected, "{error}");
+        }
     }
 }

@@ -22,6 +22,7 @@
 
 use crate::tool_provider::ToolProviderError;
 use agent_protocol::ids::SessionId;
+use agent_protocol::tool::ToolErrorKind;
 use agent_protocol::tool::{ToolDefinition, ToolInvocation, ToolResult};
 
 /// The seam the loop uses to execute tool calls under policy and approval.
@@ -74,6 +75,23 @@ pub enum ToolGatewayError {
     /// only place that knows it.
     #[error("unknown tool '{tool}': {reason}")]
     UnknownTool { tool: String, reason: String },
+    /// The call's arguments do not match the schema the tool declares.
+    ///
+    /// A refusal, not a provider failure: the tool was never handed the call.
+    /// It is also the one refusal a model can fix by itself, which is why the
+    /// text names the field and what was expected of it rather than saying
+    /// "invalid arguments" and stopping there.
+    #[error("tool '{tool}' was not run: {}", .problems.join("; "))]
+    InvalidArguments { tool: String, problems: Vec<String> },
+    /// The tool's own declaration cannot be enforced by this build — a schema
+    /// that is not a schema, one too large to compile, or one that reaches for
+    /// something outside its own document.
+    ///
+    /// A wiring fault rather than a caller's mistake, so it is kept apart from
+    /// `InvalidArguments`: nobody who called this tool can fix it, and a
+    /// provider that ships one is what has to change.
+    #[error("tool '{tool}' cannot be called as declared: {reason}")]
+    InvalidSchema { tool: String, reason: String },
     /// The provider was reached, and its own answer was a failure.
     ///
     /// Carried whole rather than flattened to a string, because the inner error
@@ -84,4 +102,25 @@ pub enum ToolGatewayError {
     Tool(ToolProviderError),
     #[error("approval service failed: {0}")]
     Approval(String),
+}
+
+impl ToolGatewayError {
+    /// The class a `tool/failed` event records for this refusal.
+    ///
+    /// `None` for the two that are not failures of a call: an approval pending
+    /// is a call waiting to run (the log says `approval_pending` instead), and
+    /// an approval-service fault is a fault of this run's own machinery, not an
+    /// answer about the call.
+    pub fn kind(&self) -> Option<ToolErrorKind> {
+        match self {
+            Self::PolicyDenied { .. } | Self::ResourceDenied { .. } => {
+                Some(ToolErrorKind::PermissionDenied)
+            }
+            Self::UnknownTool { .. } => Some(ToolErrorKind::UnknownTool),
+            Self::InvalidArguments { .. } => Some(ToolErrorKind::InvalidArguments),
+            Self::InvalidSchema { .. } => Some(ToolErrorKind::Protocol),
+            Self::Tool(error) => Some(error.kind()),
+            Self::ApprovalPending { .. } | Self::Approval(_) => None,
+        }
+    }
 }

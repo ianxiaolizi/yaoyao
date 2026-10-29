@@ -10,6 +10,10 @@ agent-protocol = { path = "../agent-protocol" }
 agent-ports = { path = "../agent-ports" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Pure computation over values already in hand — no I/O, no adapter. The gateway
+# is where a call's arguments meet the declaration it was admitted under, and
+# that check lives here so every provider's calls are judged by one rule.
+jsonschema = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
