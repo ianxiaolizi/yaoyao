@@ -21,6 +21,7 @@ pub mod instructions;
 pub mod plugins;
 pub mod providers;
 pub mod sandbox;
+pub mod session;
 pub mod stack;
 pub mod subagents;
 pub mod web_runtime;

@@ -8,4 +8,4 @@
 
 mod store;
 
-pub use store::JsonlEventStore;
+pub use store::{JsonlEventStore, has_session, session_ids};

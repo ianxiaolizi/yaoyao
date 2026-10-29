@@ -418,6 +418,53 @@ fn write_driver_record(file: &File, record: &DriverRecord) -> Result<(), EventSt
     Ok(())
 }
 
+/// The sessions a data directory holds.
+///
+/// A session is a directory with an `events.jsonl` in it and a name that is safe
+/// to use as one — the same rule [`is_safe_dir_name`] applies, so the listing
+/// cannot name something the store would refuse to open. Anything else under
+/// the root (a `driver.lock`, a checkpoints directory, an editor's stray file)
+/// is not a session and is skipped: this is the answer to "what is here", not a
+/// validation of what is.
+///
+/// A root that does not exist yet has no sessions rather than an error: a
+/// machine that has never run a turn is empty, not broken.
+pub fn session_ids(root: &Path) -> std::io::Result<Vec<SessionId>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if !entry.path().join("events.jsonl").is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_safe_dir_name(&name) {
+            continue;
+        }
+        ids.push(SessionId::from_string(name));
+    }
+    Ok(ids)
+}
+
+/// Whether `root` holds a session log for `id`, by the same rule as
+/// [`session_ids`].
+///
+/// Reads the directory rather than the store because opening a session is what
+/// creates its directory: a question about whether a session exists has to be
+/// answered without bringing one into being.
+pub fn has_session(root: &Path, id: &str) -> bool {
+    is_safe_dir_name(id) && root.join(id).join("events.jsonl").is_file()
+}
+
 impl JsonlEventStore {
     /// Create a store whose per-session directories live under `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {

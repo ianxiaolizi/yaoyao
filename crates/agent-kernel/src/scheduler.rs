@@ -32,6 +32,7 @@ use crate::inbox::{DiscardCause, Due, Inbox, InboxError};
 use crate::judgment;
 use crate::lifecycle;
 use crate::plan;
+use crate::session_lifecycle;
 
 /// Drives runs: claims input, enforces a single active run, and settles turns.
 pub struct Scheduler {
@@ -419,6 +420,12 @@ impl Scheduler {
             .filter(|pending| matches!(&pending.kind, InboxKind::NextTurn | InboxKind::Scheduled))
             .count();
         let history = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+        // A session created before this build wrote `session/started` on its
+        // first use still has to get one, or the lifecycle fold says a session
+        // that has been running turns never began. It is written at the opening
+        // of its next turn, which is the first moment this session is used
+        // again; a session that already says it started is left alone.
+        let unstarted = !session_lifecycle::has_started(&history);
         let previous_turn = lifecycle::last_turn_ending(&history).map(|(_turn_id, ending)| ending);
         // The plan ledger as of this boundary. `Some` even when nothing has
         // been recorded: the Scheduler keeps the ledger, and "none recorded
@@ -488,6 +495,9 @@ impl Scheduler {
         // for recovery to close instead of a session with nothing to show.
         // The item is deliberately *not* claimed here — see the terminal batch.
         let mut pending: Vec<EventDraft> = Vec::new();
+        if unstarted {
+            pending.push(session_lifecycle::started_draft(session_id, Actor::Scheduler));
+        }
         // What this run is, before it is a run. The snapshot belongs to the run
         // and not to the session: a session can be driven by several processes
         // over its life, and the later ones may be configured differently.
@@ -1084,6 +1094,9 @@ mod tests {
             // is answered when the turn ends, and a turn that dies before that
             // leaves it pending rather than consumed.
             vec![
+                // Queuing the first input into an empty session starts it; the
+                // two are written in one append (see `Inbox::append`).
+                "session/started",
                 "inbox/appended",
                 "run/started",
                 "turn/started",
@@ -1261,7 +1274,14 @@ mod tests {
 
         assert_eq!(
             event_types(&store, &sid).await,
-            vec!["inbox/appended", "run/started", "turn/started", "turn/failed", "run/failed"]
+            vec![
+                "session/started",
+                "inbox/appended",
+                "run/started",
+                "turn/started",
+                "turn/failed",
+                "run/failed",
+            ]
         );
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
         assert_eq!(scheduler.inbox.pending(&sid).await.unwrap().len(), 1);
@@ -1971,6 +1991,7 @@ mod tests {
         assert_eq!(
             event_types(&store, &sid).await,
             [
+                EventType::SESSION_STARTED,
                 EventType::INBOX_APPENDED,
                 EventType::RUN_STARTED,
                 EventType::TURN_STARTED,
@@ -2476,7 +2497,10 @@ mod tests {
         let now = Utc::now();
         assert!(scheduler.run_due(&sid, now).await.unwrap().is_none());
         assert_eq!(scheduler.inbox.scheduled(&sid).await.unwrap().len(), 1);
-        assert_eq!(event_types(&store, &sid).await, vec![EventType::INBOX_APPENDED]);
+        assert_eq!(
+            event_types(&store, &sid).await,
+            vec![EventType::SESSION_STARTED, EventType::INBOX_APPENDED]
+        );
     }
 
     #[tokio::test]
@@ -2648,7 +2672,7 @@ mod tests {
 
         // Nothing was written and nothing was consumed: the next attempt (or the
         // next process, after the file is fixed) finds the item still there.
-        assert_eq!(event_types(&store, &sid).await, vec!["inbox/appended"]);
+        assert_eq!(event_types(&store, &sid).await, vec!["session/started", "inbox/appended"]);
         assert_eq!(scheduler.inbox.pending(&sid).await.unwrap().len(), 1);
     }
 
@@ -3027,8 +3051,8 @@ mod tests {
         );
         assert_eq!(
             event_types(&store, &sid).await,
-            vec!["inbox/appended"],
-            "a refused start writes nothing at all"
+            vec!["session/started", "inbox/appended"],
+            "a refused start appends nothing beyond what queuing the input already wrote"
         );
         assert_eq!(
             scheduler.inbox.pending(&sid).await.unwrap().len(),

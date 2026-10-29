@@ -151,6 +151,7 @@ async fn main() {
         "deny" => deny(&args).await,
         "tool" => tool(&args).await,
         "plugin" => plugin(&args).await,
+        "session" => session(&args).await,
         "schedule" => schedule(&args).await,
         "tick" => tick(&args).await,
         "serve" => serve(&args).await,
@@ -187,6 +188,11 @@ fn usage() {
          plugin list                What the configuration, the log and the queue say about plugins\n  \
          plugin disable <id>        Ask for a plugin to be withdrawn at the next turn boundary\n  \
          plugin enable <id>         Ask for a disabled plugin to be registered again\n  \
+         session new [--id <id>]    Record that a session has started (idempotent)\n  \
+         session list               Every session under the data directory, newest first\n  \
+         session archive <id>       Hide a session from the working list; its log stays\n  \
+         session unarchive <id>     Show an archived session again\n  \
+         session delete <id>        Remove a session's log (refuses while a turn runs there)\n  \
          schedule at <when> <text>  Schedule a turn: RFC3339 or +10m; run it with tick\n  \
          schedule list              Show scheduled turns that have not run\n  \
          schedule cancel <id>       Withdraw a scheduled turn before it runs\n  \
@@ -781,6 +787,149 @@ async fn plugin_enable(args: &Args) {
             .map(|output| Produced { output, session: args.session.clone() }),
     )
     .await;
+}
+
+/// `session`: create, list, hide or delete a session.
+///
+/// None of the verbs assembles a runtime: a session exists because its log does,
+/// and every question here is about that log and the directory that holds it. A
+/// model provider that is misconfigured cannot stop a person from tidying up
+/// their sessions.
+async fn session(args: &Args) {
+    match args.command_args().first().map(String::as_str) {
+        Some("new") => session_new(args).await,
+        Some("list") => session_list(args).await,
+        Some("archive") => session_set_archived(args, true).await,
+        Some("unarchive") => session_set_archived(args, false).await,
+        Some("delete") => session_delete(args).await,
+        Some(other) => {
+            eprintln!("unknown session subcommand '{other}'");
+            usage();
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+        None => {
+            eprintln!(
+                "Usage: agent session new [--id <id>]\n       \
+                 agent session list\n       \
+                 agent session archive <session_id>\n       \
+                 agent session unarchive <session_id>\n       \
+                 agent session delete <session_id>"
+            );
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
+}
+
+/// The store and data directory the `session` verbs work on.
+fn session_store() -> (Arc<dyn EventStore>, String) {
+    let data = data_dir();
+    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(&data));
+    (store, data)
+}
+
+/// `session new [--id <id>]`: record that a session has started.
+async fn session_new(args: &Args) {
+    let (store, _data) = session_store();
+    let id = option(args, "--id").map_or_else(SessionId::new, SessionId::from_string);
+    // The chain starts where the session's log already ends — nothing, for an
+    // id nobody has used. A name the store would refuse is left to the verb to
+    // report: reading a stream cannot say what is wrong with it as clearly.
+    let from = if agent_ports::event_store::is_safe_dir_name(id.as_str()) {
+        chain_start_for(store.as_ref(), &id, args).await
+    } else {
+        None
+    };
+    let outcome = match agent::session::run_session_new(&store, &id, args.json).await {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    let verdict = outcome.verdict;
+    report(store.as_ref(), args, from, Ok(Produced { output: outcome.output, session: id })).await;
+    exit_on(verdict);
+}
+
+/// `session list`: every session in the data directory, newest activity first.
+///
+/// Nothing is written, so there is no chain: with `--events` the listing is the
+/// answer and goes to stderr, where every other command's answer goes when the
+/// chain owns stdout.
+async fn session_list(args: &Args) {
+    let (store, data) = session_store();
+    let outcome = match agent::session::run_session_list(&store, Path::new(&data), args.json).await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    let verdict = outcome.verdict;
+    answer(args, &outcome.output);
+    exit_on(verdict);
+}
+
+/// `session archive` / `session unarchive`: hide a session or show it again.
+async fn session_set_archived(args: &Args, archived: bool) {
+    let verb = if archived { "archive" } else { "unarchive" };
+    let id = session_id_argument(args, verb);
+    let (store, data) = session_store();
+    // Only a session that exists has a chain to start at, and asking the store
+    // about one that does not would create the very directory the verb is about
+    // to say does not exist.
+    let from = if agent_store_jsonl::has_session(Path::new(&data), id.as_str()) {
+        chain_start_for(store.as_ref(), &id, args).await
+    } else {
+        None
+    };
+    let outcome = match agent::session::run_session_archive(
+        &store,
+        Path::new(&data),
+        &id,
+        archived,
+        args.json,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    let verdict = outcome.verdict;
+    report(
+        store.as_ref(),
+        args,
+        from,
+        Ok(Produced { output: outcome.output, session: id.clone() }),
+    )
+    .await;
+    exit_on(verdict);
+}
+
+/// `session delete`: remove the log, refusing while a turn is running there.
+///
+/// A deleted log has no events left to show, so `--events` yields no chain and
+/// the answer moves to stderr — the same split as any other command.
+async fn session_delete(args: &Args) {
+    let id = session_id_argument(args, "delete");
+    let (store, _data) = session_store();
+    let outcome = match agent::session::run_session_delete(&store, &id, args.json).await {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    let verdict = outcome.verdict;
+    answer(args, &outcome.output);
+    exit_on(verdict);
+}
+
+/// The session id an `<verb> <session_id>` command names, or a usage line and
+/// no process.
+///
+/// The first word of the arguments is the verb; the id is the first word after
+/// it that is not a flag, so `session archive --id s1` names `s1` just as well
+/// as `session archive s1` does.
+fn session_id_argument(args: &Args, verb: &str) -> SessionId {
+    let positional = positionals(args);
+    let Some(id) = positional.get(1) else {
+        eprintln!("Usage: agent session {verb} <session_id>");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    };
+    SessionId::from_string(id.as_str())
 }
 
 /// `schedule`: arrange, list, or cancel turns that run at a time.
@@ -1469,10 +1618,23 @@ struct Produced {
 /// have a store and no runtime — and `--events` has to mean the same thing for
 /// them as for everything else.
 async fn chain_start(store: &dyn EventStore, args: &Args) -> Option<EventSeq> {
+    chain_start_for(store, &args.session, args).await
+}
+
+/// Where the chain starts for a session other than the one `--session` names.
+///
+/// The `session` verbs act on a name of their own (`new --id`, or the id after
+/// the verb), so they cannot use [`chain_start`] — and `fork` is the precedent:
+/// the session that grew is not always the one that was given.
+async fn chain_start_for(
+    store: &dyn EventStore,
+    session: &SessionId,
+    args: &Args,
+) -> Option<EventSeq> {
     if !args.events {
         return None;
     }
-    match store.read_stream(&args.session, EventSeq::ZERO, usize::MAX).await {
+    match store.read_stream(session, EventSeq::ZERO, usize::MAX).await {
         Ok(events) => Some(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO)),
         Err(e) => {
             eprintln!("cannot read the session's history: {e}");
@@ -1871,6 +2033,23 @@ fn print(output: &agent_cli::CliOutput) {
     match output {
         agent_cli::CliOutput::Text(t) => println!("{t}"),
         agent_cli::CliOutput::Json(j) => println!("{j}"),
+    }
+}
+
+/// Print a command's answer, honouring where `--events` puts it.
+///
+/// A command that produces no events has nothing for stdout when the chain was
+/// asked for, so the answer moves to stderr — exactly as it does for a command
+/// whose chain ends up empty. Writing it to stdout instead would hand a parser
+/// a sentence where it expected JSON lines.
+fn answer(args: &Args, output: &agent_cli::CliOutput) {
+    if !args.events {
+        print(output);
+        return;
+    }
+    match output {
+        agent_cli::CliOutput::Text(t) => eprintln!("{t}"),
+        agent_cli::CliOutput::Json(j) => eprintln!("{j}"),
     }
 }
 

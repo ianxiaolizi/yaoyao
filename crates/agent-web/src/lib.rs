@@ -473,14 +473,18 @@ async fn delete_session(
         }
         // A build with no driver has no stack to drop either; the log is still
         // this process's to remove, and leaving a delete endpoint that only says
-        // "unavailable" would be a button that never works.
-        None => {
-            state
-                .store
-                .delete_session(&session)
-                .await
-                .map_err(|error| ApiFailure::internal(format!("会话没有删掉：{error}")))?;
-        }
+        // "unavailable" would be a button that never works. The kernel's delete
+        // still asks for the driver claim, so a turn in another process — an
+        // `agent ask` running beside the page — refuses the removal here too.
+        None => match agent_kernel::session_lifecycle::delete(&state.store, &session).await {
+            Ok(_) => {}
+            Err(busy @ agent_kernel::session_lifecycle::LifecycleError::Busy { .. }) => {
+                return Err(ApiFailure::conflict("busy", busy.to_string()));
+            }
+            Err(error) => {
+                return Err(ApiFailure::internal(format!("会话没有删掉：{error}")));
+            }
+        },
     }
     Ok(Json(json!({ "v": PROTOCOL, "ok": true, "session": id })))
 }

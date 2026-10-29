@@ -184,6 +184,9 @@ fn the_events_chain_is_the_work_this_command_did() {
 
     let events = chain(&r.out);
     assert!(events.len() > 1, "a turn is more than one event: {}", r.out);
+    // A turn on a session nobody has used yet starts that session first, so a
+    // run's log and `session new`'s log begin the same way.
+    assert_eq!(events[0]["type"], "session/started", "a new session starts first: {}", r.out);
 
     // A fresh session, so the chain is the whole log and its sequence runs from
     // zero without a gap.
@@ -1588,9 +1591,10 @@ fn context_inspect_after_a_turn_reports_the_last_request() {
     assert!(text.contains("- no tools are available in this run."), "{doc}");
     // The two revisions answer different questions: the top-level one names
     // what the derivation just folded, and the request's names the prefix it
-    // saw. The first turn of a session saw an empty context, so its request
-    // says 0 even though the log has grown since.
-    assert_eq!(last["context_revision"], 0, "{doc}");
+    // saw. The first turn of a session saw only what was queued for it — the
+    // start at sequence 0 and its input at sequence 1 — so its request says 1
+    // even though the log has grown since.
+    assert_eq!(last["context_revision"], 1, "{doc}");
 
     // The request's messages are recorded in order, as references. Their text
     // is durable where each was produced; the list and the hashes are what
@@ -1741,4 +1745,133 @@ fn the_file_tools_answer_under_app_container() {
         assert_eq!(local.code, container_ran[index].code, "{tool}: {}", local.err);
         assert_eq!(local.out, container_ran[index].out, "{tool}");
     }
+}
+
+/// `session new` starts a session, and the start is the log's first event.
+///
+/// The chain is read through `--events`, which also checks where the two
+/// outputs go: the event on stdout, the sentence on stderr.
+#[test]
+fn session_new_records_the_start_first() {
+    let (data, workspace) = dirs();
+    let created =
+        ran(data.path(), workspace.path(), &["session", "new", "--id", "cli-one", "--events"]);
+    assert_eq!(created.code, Some(0), "{}", created.err);
+    assert_eq!(types(&chain(&created.out)), ["session/started"]);
+    assert!(created.err.contains("session cli-one created"), "{}", created.err);
+
+    // On disk too: the first event is the start, not a byproduct of one.
+    let log = std::fs::read_to_string(log_file(data.path(), "cli-one")).expect("the log");
+    let first: serde_json::Value =
+        serde_json::from_str(log.lines().next().expect("an event")).expect("JSON");
+    assert_eq!(first["event"]["event_type"], "session/started");
+
+    // Asking again is not an error and does not write a second start.
+    let again =
+        ran(data.path(), workspace.path(), &["session", "new", "--id", "cli-one", "--json"]);
+    assert_eq!(again.code, Some(0), "{}", again.err);
+    let answer: serde_json::Value = serde_json::from_str(&again.out).expect("JSON");
+    assert_eq!(answer["created"], false);
+    let log = std::fs::read_to_string(log_file(data.path(), "cli-one")).expect("the log");
+    assert_eq!(log.lines().filter(|line| line.contains("\"session/started\"")).count(), 1);
+}
+
+/// `session list` reads the directory the logs are in, so both clients agree.
+#[test]
+fn session_list_reads_the_data_directory() {
+    let (data, workspace) = dirs();
+    for id in ["list-a", "list-b"] {
+        let created = ran(data.path(), workspace.path(), &["session", "new", "--id", id]);
+        assert_eq!(created.code, Some(0), "{}", created.err);
+    }
+
+    let listed = ran(data.path(), workspace.path(), &["session", "list", "--json"]);
+    assert_eq!(listed.code, Some(0), "{}", listed.err);
+    let answer: serde_json::Value = serde_json::from_str(&listed.out).expect("JSON");
+    let ids: Vec<&str> = answer["sessions"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["session_id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(ids.len(), 2, "{}", listed.out);
+    assert!(ids.contains(&"list-a") && ids.contains(&"list-b"), "{ids:?}");
+
+    // An empty data directory lists nothing rather than failing.
+    let (empty, empty_workspace) = dirs();
+    let none = ran(empty.path(), empty_workspace.path(), &["session", "list"]);
+    assert_eq!(none.code, Some(0), "{}", none.err);
+    assert_eq!(none.out.trim(), "no sessions");
+}
+
+/// Archiving hides a session without removing it; deleting removes it.
+#[test]
+fn a_session_is_hidden_before_it_is_deleted() {
+    let (data, workspace) = dirs();
+    let created = ran(data.path(), workspace.path(), &["session", "new", "--id", "tidy"]);
+    assert_eq!(created.code, Some(0), "{}", created.err);
+
+    let archived = ran(data.path(), workspace.path(), &["session", "archive", "tidy", "--json"]);
+    assert_eq!(archived.code, Some(0), "{}", archived.err);
+    let answer: serde_json::Value = serde_json::from_str(&archived.out).expect("JSON");
+    assert_eq!(answer["archived"], true);
+    let log = std::fs::read_to_string(log_file(data.path(), "tidy")).expect("the log stays");
+    assert!(log.contains("session/archived"));
+
+    let unarchived = ran(data.path(), workspace.path(), &["session", "unarchive", "tidy"]);
+    assert_eq!(unarchived.code, Some(0), "{}", unarchived.err);
+
+    // A session that is not there cannot be archived, and the refusal does not
+    // bring one into being.
+    let ghost = ran(data.path(), workspace.path(), &["session", "archive", "ghost"]);
+    assert_eq!(ghost.code, Some(2), "{}", ghost.err);
+    assert!(!data.path().join("ghost").exists(), "a refused archive creates no session");
+
+    let deleted = ran(data.path(), workspace.path(), &["session", "delete", "tidy"]);
+    assert_eq!(deleted.code, Some(0), "{}", deleted.err);
+    assert!(!log_file(data.path(), "tidy").exists(), "the log is gone");
+
+    // Deleting twice is a success twice: the first request was for it to be
+    // gone, and it is.
+    let twice = ran(data.path(), workspace.path(), &["session", "delete", "tidy"]);
+    assert_eq!(twice.code, Some(0), "{}", twice.err);
+    assert!(twice.out.contains("did not exist"), "{}", twice.out);
+}
+
+/// A turn in another process refuses the delete, and says whose turn it is.
+///
+/// The claim is held here, on this side of the process boundary, so the refusal
+/// comes from the store's own file lock rather than from anything the two
+/// callers share in memory.
+#[test]
+fn deleting_a_session_another_process_is_driving_is_refused() {
+    use agent_ports::event_store::EventStore;
+    use agent_protocol::ids::SessionId;
+
+    let (data, workspace) = dirs();
+    let created = ran(data.path(), workspace.path(), &["session", "new", "--id", "held"]);
+    assert_eq!(created.code, Some(0), "{}", created.err);
+
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let store = agent_store_jsonl::JsonlEventStore::new(data.path());
+    let held = runtime
+        .block_on(store.driver_lease(&SessionId::from_string("held")))
+        .expect("this process takes the driver claim");
+
+    let refused = ran(data.path(), workspace.path(), &["session", "delete", "held"]);
+    assert_eq!(refused.code, Some(2), "{} {}", refused.err, refused.out);
+    assert!(refused.out.contains("already being driven"), "{}", refused.out);
+    assert!(
+        refused.out.contains(&format!("pid {}", std::process::id())),
+        "the refusal names the holder: {}",
+        refused.out
+    );
+    assert!(log_file(data.path(), "held").exists(), "a refused delete removes nothing");
+
+    // Released, the same delete goes through — the refusal was the claim, not
+    // the session.
+    drop(held);
+    let deleted = ran(data.path(), workspace.path(), &["session", "delete", "held"]);
+    assert_eq!(deleted.code, Some(0), "{}", deleted.err);
+    assert!(!log_file(data.path(), "held").exists());
 }

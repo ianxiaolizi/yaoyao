@@ -152,9 +152,24 @@ impl Inbox {
         // (YA-36)
         let _lease = self.store.lease(session_id).await?;
         let next = self.next_seq(session_id).await?;
-        let draft =
-            self.draft(session_id, EventType::INBOX_APPENDED, serde_json::to_value(&item)?, actor);
-        self.store.append(session_id, next, vec![draft]).await?;
+        let mut drafts = Vec::with_capacity(2);
+        // A session used for the first time starts here. `next == 0` means this
+        // append is the first event the session will ever have, so writing
+        // `session/started` beside it is what makes "a session's log says it
+        // started" true rather than something a reader has to infer from
+        // whichever event happens to come first. One append, one lease: an item
+        // queued without the opening line, or an opening line for an item that
+        // was never queued, cannot exist.
+        if next == EventSeq::ZERO {
+            drafts.push(crate::session_lifecycle::started_draft(session_id, actor.clone()));
+        }
+        drafts.push(self.draft(
+            session_id,
+            EventType::INBOX_APPENDED,
+            serde_json::to_value(&item)?,
+            actor,
+        ));
+        self.store.append(session_id, next, drafts).await?;
         Ok(item)
     }
 

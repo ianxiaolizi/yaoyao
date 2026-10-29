@@ -686,7 +686,11 @@ fn headline(text: &str) -> String {
 /// The directories under `data_dir` that hold a session log.
 ///
 /// `file_type()` is read without following a link, so a symlinked directory is
-/// not a session: the list is what this data directory actually contains.
+/// not a session: the list is what this data directory actually contains. The
+/// same rule is the store's (`agent_store_jsonl::session_ids`); this page cannot
+/// call it, because a read model may not depend on an adapter, so the rule is
+/// written out here as well and the id half of it is shared
+/// ([`safe_session_id`]).
 fn session_ids(data_dir: &Path) -> Result<Vec<SessionId>, ReadError> {
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,

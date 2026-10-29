@@ -1469,13 +1469,15 @@ mod tests {
         assert_eq!(queued[0].payload["plugin_id"], "mcp.one");
         assert_eq!(queued[0].payload["reason"], "not needed");
 
-        // The command wrote one thing and nothing else.
+        // The command wrote the queue item and nothing else. The session's own
+        // start rides along with the first append into an empty log
+        // (`Inbox::append`), so it is the one other event that can be here.
         let events = store.read_stream(&session, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let types: Vec<&str> = events.iter().map(|event| event.event.event_type.as_str()).collect();
         assert_eq!(
-            events.len(),
-            1,
-            "a queueing command wrote more than the queue: {:?}",
-            events.iter().map(|e| e.event.event_type.as_str()).collect::<Vec<_>>()
+            types,
+            ["session/started", "inbox/appended"],
+            "a queueing command wrote more than the queue: {types:?}"
         );
     }
 

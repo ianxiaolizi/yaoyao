@@ -187,9 +187,15 @@ async fn an_item_not_yet_due_is_left_completely_alone() {
         "a future item ran early"
     );
 
+    // The queueing wrote the session's start and the item; `run_due` added
+    // nothing to them, which is what "left alone" means here.
     let events = log(&runtime, &session).await;
     let types: Vec<&str> = events.iter().map(|e| e.event.event_type.as_str()).collect();
-    assert_eq!(types, vec![EventType::INBOX_APPENDED], "a future item left a trace: {types:?}");
+    assert_eq!(
+        types,
+        vec![EventType::SESSION_STARTED, EventType::INBOX_APPENDED],
+        "a future item left a trace: {types:?}"
+    );
     assert_eq!(
         runtime.scheduler.inbox().scheduled(&session).await.expect("read the queue").len(),
         1,

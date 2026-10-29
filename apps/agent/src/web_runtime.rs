@@ -488,9 +488,20 @@ impl Backend for WebBackend {
         let dropped = self.runtimes.lock().await.remove(session.as_str());
         drop(dropped);
 
-        self.inputs.store.delete_session(session).await.map_err(|error| {
-            BackendError::internal(format!("the session log could not be removed: {error}"))
-        })?;
+        // The in-process lock only sees turns this server is running. The
+        // kernel's delete also asks for the driver claim, which is on disk, so a
+        // turn in another process is refused too — and the refusal names it.
+        match agent_kernel::session_lifecycle::delete(&self.inputs.store, session).await {
+            Ok(_) => {}
+            Err(busy @ agent_kernel::session_lifecycle::LifecycleError::Busy { .. }) => {
+                return Err(BackendError::busy(busy.to_string()));
+            }
+            Err(error) => {
+                return Err(BackendError::internal(format!(
+                    "the session log could not be removed: {error}"
+                )));
+            }
+        }
         self.sessions.lock().await.remove(session.as_str());
         Ok(())
     }

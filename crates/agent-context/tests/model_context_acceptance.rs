@@ -225,7 +225,10 @@ async fn the_second_turn_sees_the_first_turns_durable_history() {
         settled(opening.messages),
         vec![ModelMessage::user_for_turn(&first.turn_id, "first")]
     );
-    assert_eq!(opening.context_revision, 0, "nothing was durable before the first turn");
+    // The revision is a log position, not a count of messages: the session's
+    // start at sequence 0 and the queued input at sequence 1 are everything
+    // that had been written when the first request was built.
+    assert_eq!(opening.context_revision, 1, "nothing but the start and the input was durable");
 
     // The second turn saw the first turn's transcript, verbatim from the log.
     let later_request = first_request(&h, &second.turn_id);
