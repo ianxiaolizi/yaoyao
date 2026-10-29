@@ -73,7 +73,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        # The same script the developer machine runs. On a hosted runner the
+        # integrity and TEMP steps are no-ops, but one entry point means the
+        # local and CI gates cannot drift into two definitions of "the tests
+        # passed".
+        run: pwsh -File scripts/test.ps1 -SkipFormat -SkipClippy
 
   gui-smoke:
     # The page is a real projection of a real server, so its smoke test builds

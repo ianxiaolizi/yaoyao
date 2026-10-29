@@ -110,12 +110,12 @@ Rust / Cargo，**edition 2024，`rust-version = 1.99`**；tokio 1.53、serde、a
 
 ## 怎么跑
 
-```bash
+```powershell
 cargo build --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+powershell -File scripts\test.ps1   # fmt + clippy + 全量测试
 ```
+
+`scripts\test.ps1` 是跑门的唯一入口。仓库根可能带 Low 完整性标签，构建出的测试二进制会继承它，导致 CLI 集成测试打不开 `NUL` 而假失败；脚本先 `cargo test --workspace --no-run`，再把 `target\debug` 下的二进制提到 Medium integrity，并把 `TEMP/TMP` 指到 `%TEMP%\yaoyao-test-tmp`。`scripts\preflight.ps1` 在跑门前报告 TEMP / NUL / 完整性 / 工具链。该修复由 `crates/agent-testkit/tests/environment_gate.rs` 把守。
 
 默认 `AGENT_MODEL_PROVIDER=echo`，**离线可跑，不需要网络与凭据**。接真实模型（第一版 OpenAI-compatible）：
 
