@@ -4,12 +4,13 @@
 //! would — seq assignment, expected-next-seq checks, idempotency, and
 //! pass/fail results that are not normalized to success.
 
+use agent_ports::agent_loop::EventSink;
 use agent_ports::doctor::DoctorCheck;
 use agent_ports::event_store::{EventStore, EventStoreError};
 use agent_protocol::diagnostics::{HealthCheckId, HealthStatus};
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::*;
-use agent_testkit::{FakeDoctorCheck, FakeEventStore};
+use agent_testkit::{FakeDoctorCheck, FakeEventStore, RecordingJournal};
 use chrono::Utc;
 
 fn draft(session_id: &str, event_type: &str) -> EventDraft {
@@ -279,6 +280,27 @@ async fn fake_doctor_check_passing() {
     let results = check.run().await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, HealthStatus::Passed);
+}
+
+/// The recording journal keeps what it was handed, in order, and a mark is a
+/// position in that record.
+///
+/// It is what the loop's durability tests read: a mark taken before a step and
+/// `since(mark)` after it is what separates "made durable before the side
+/// effect" from "collected once the step ended".
+#[tokio::test]
+async fn recording_journal_keeps_order_and_marks() {
+    let journal = RecordingJournal::new();
+    journal.commit(vec![draft("s", "tool/started")]).await.unwrap();
+    let mark = journal.mark();
+    journal.commit(vec![draft("s", "tool/completed")]).await.unwrap();
+
+    let all = journal.since(0);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].event_type.as_str(), "tool/started");
+    assert_eq!(all[1].event_type.as_str(), "tool/completed");
+    assert_eq!(journal.since(mark).len(), 1, "a mark is the size at the time it was taken");
+    assert!(journal.since(journal.mark()).is_empty());
 }
 
 #[tokio::test]

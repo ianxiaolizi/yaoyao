@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_channel::mpsc;
 use futures_util::StreamExt;
 
-use agent_ports::agent_loop::{AgentLoop, AgentLoopError, StopReason, TurnContext, TurnStart};
+use agent_ports::agent_loop::{
+    AgentLoop, AgentLoopError, EventSink, Journal, StopReason, TurnContext, TurnStart,
+};
 use agent_ports::artifact_store::{ArtifactStore, ArtifactStoreError, is_blob_name};
 use agent_ports::context_engine::{
     CompactionCandidate, ContextEngine, ContextEngineError, ContextUsage, DerivedContext,
@@ -778,7 +780,17 @@ pub struct FakeToolProvider {
     /// already passed.
     delays: HashMap<String, std::time::Duration>,
     calls: Mutex<Vec<ToolInvocation>>,
+    /// Called with each invocation as it is about to run.
+    ///
+    /// Some facts only exist while a call is in flight — what the journal had
+    /// made durable before the side effect, say. After the call returns the
+    /// step's own events have been collected, and the difference this hook can
+    /// see is gone.
+    observer: Option<CallObserver>,
 }
+
+/// A hook that looks at a call as it is about to run.
+type CallObserver = Arc<dyn Fn(&ToolInvocation) + Send + Sync>;
 
 impl Default for FakeToolProvider {
     fn default() -> Self {
@@ -794,7 +806,14 @@ impl FakeToolProvider {
             non_idempotent: HashSet::new(),
             delays: HashMap::new(),
             calls: Mutex::new(Vec::new()),
+            observer: None,
         }
+    }
+
+    /// Watch each call as it is about to run.
+    pub fn with_observer(mut self, observer: CallObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Register a tool as not safe to retry.
@@ -892,6 +911,9 @@ impl ToolProvider for FakeToolProvider {
         // and a record that skipped it would answer a different question.
         if let Ok(mut calls) = self.calls.lock() {
             calls.push(invocation.clone());
+        }
+        if let Some(observer) = &self.observer {
+            observer(invocation);
         }
         if let Some(delay) = self.delays.get(&invocation.tool_name) {
             tokio::time::sleep(*delay).await;
@@ -1143,6 +1165,45 @@ pub struct DrivenTurn {
     pub final_content: Option<String>,
 }
 
+/// An [`EventSink`] that keeps what it was handed, in order.
+///
+/// A real sink writes the session's log; this one exists so a test can read
+/// what a loop made durable *before* a side effect, which is the half of a
+/// turn's events that no longer travels back in `StepOutcome`.
+#[derive(Default)]
+pub struct RecordingJournal {
+    committed: Mutex<Vec<EventDraft>>,
+}
+
+impl RecordingJournal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything committed so far, from `mark` onward.
+    pub fn since(&self, mark: usize) -> Vec<EventDraft> {
+        let committed = self.committed.lock().unwrap_or_else(|error| error.into_inner());
+        committed.iter().skip(mark).cloned().collect()
+    }
+
+    /// How much has been committed, for use as a later `since` mark.
+    pub fn mark(&self) -> usize {
+        self.committed.lock().unwrap_or_else(|error| error.into_inner()).len()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for RecordingJournal {
+    async fn commit(
+        &self,
+        drafts: Vec<EventDraft>,
+    ) -> Result<(), agent_ports::event_store::EventStoreError> {
+        let mut committed = self.committed.lock().unwrap_or_else(|error| error.into_inner());
+        committed.extend(drafts);
+        Ok(())
+    }
+}
+
 /// Drive a turn to its end, the way the Scheduler does but with nobody
 /// steering.
 ///
@@ -1150,11 +1211,20 @@ pub struct DrivenTurn {
 /// one. It deliberately mirrors the Scheduler's loop, and the Scheduler's own
 /// tests are what pin that loop: if the two ever disagree, the kernel's tests
 /// are the ones that mean something.
+///
+/// The journal is this helper's own recording sink, whatever the caller put in
+/// the context: the events a turn made durable are part of what the turn did,
+/// and a turn's story read from `StepOutcome` alone would be missing the ones
+/// that had to land before a side effect.
 pub async fn drive_turn(
     loop_: &dyn AgentLoop,
     ctx: &TurnContext,
     max_steps: u32,
 ) -> Result<DrivenTurn, AgentLoopError> {
+    let journal = Arc::new(RecordingJournal::new());
+    let mut ctx = ctx.clone();
+    ctx.journal = Journal::new(journal.clone());
+    let ctx = &ctx;
     let TurnStart { mut state, events } = loop_.begin_turn(ctx).await?;
     let mut all = events;
     let mut steps = 0u32;
@@ -1166,7 +1236,10 @@ pub async fn drive_turn(
                 final_content: None,
             });
         }
+        let mark = journal.mark();
         let outcome = loop_.step(&mut state, &[]).await?;
+        // What went to the journal during this step precedes what it returned.
+        all.extend(journal.since(mark));
         all.extend(outcome.events);
         steps += 1;
         if let Some(stop_reason) = outcome.stop {

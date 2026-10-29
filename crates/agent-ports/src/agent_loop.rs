@@ -2,14 +2,19 @@
 //!
 //! The kernel's Scheduler owns turn/run lifecycle, single-active-run
 //! enforcement, the step budget, and when a turn advances; an AgentLoop decides
-//! what happens *inside* one step. The loop returns durable events and the
-//! Scheduler appends them, so the loop never touches the EventStore directly.
+//! what happens *inside* one step. The loop returns the events a step produced
+//! and the Scheduler appends them, so the loop never touches the EventStore
+//! directly — with one exception it cannot avoid: a tool call's side effect
+//! happens inside a step, so the facts that record it have to be durable
+//! *before* the effect and not after the step. That narrow write goes through
+//! [`EventSink`], which the caller owns and the loop only calls.
 //!
 //! A turn is opened once and then advanced one step at a time, which is what
 //! makes the boundary between two steps a place the kernel can act: input the
 //! user injects while the turn runs reaches the loop there.
 
 use std::any::Any;
+use std::sync::Arc;
 
 use agent_protocol::events::EventDraft;
 use agent_protocol::ids::{InboxItemId, RunId, SessionId, StepId, TurnId};
@@ -17,6 +22,57 @@ use agent_protocol::instructions::RunInstructions;
 use agent_protocol::profile::RunBudget;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::event_store::EventStoreError;
+
+/// Where a loop puts the facts that must outlive the process that produced
+/// them.
+///
+/// Everything else a step produces travels back in [`StepOutcome::events`] and
+/// is appended once the step is over, which is right for facts about a step
+/// that finished. It is wrong for the facts that must *precede* a side effect:
+/// the step that opened and the call that is about to run. Without them a crash
+/// between "the tool ran" and "the step ended" leaves a world changed by
+/// nothing the log can name, and the next attempt cannot tell a call that ran
+/// from one that never left.
+///
+/// `commit` returns only once the drafts are durable, because surviving the
+/// loss of the process is the entire reason to call it before a side effect.
+/// It is not a general write path — a caller that commits a step's events one
+/// at a time has moved the whole log into the middle of a step and lost the
+/// boundary the Scheduler was keeping.
+#[async_trait::async_trait]
+pub trait EventSink: Send + Sync {
+    /// Append these drafts as the session's next events and make them durable.
+    async fn commit(&self, drafts: Vec<EventDraft>) -> Result<(), EventStoreError>;
+}
+
+/// The [`EventSink`] a turn was handed, as it travels in [`TurnContext`].
+///
+/// A newtype rather than the bare `Arc` so `TurnContext` can keep deriving
+/// `Debug` without the sink having to describe itself: what a sink does is the
+/// caller's, and printing it would say nothing about the turn.
+#[derive(Clone)]
+pub struct Journal(Arc<dyn EventSink>);
+
+impl Journal {
+    pub fn new(sink: Arc<dyn EventSink>) -> Self {
+        Self(sink)
+    }
+}
+
+impl std::fmt::Debug for Journal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Journal(..)")
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for Journal {
+    async fn commit(&self, drafts: Vec<EventDraft>) -> Result<(), EventStoreError> {
+        self.0.commit(drafts).await
+    }
+}
 
 /// What a loop needs to open one turn.
 #[derive(Debug, Clone)]
@@ -26,6 +82,11 @@ pub struct TurnContext {
     pub run_id: RunId,
     /// The inbox item payload that started this turn, e.g. `{"text": "..."}`.
     pub user_input: serde_json::Value,
+    /// Where the loop makes durable the facts that must precede a side effect.
+    ///
+    /// It is the caller's, not the loop's: only the caller knows what a
+    /// committed event costs and which log it belongs in.
+    pub journal: Journal,
     /// What this run recorded as its instructions, if the caller had a source.
     ///
     /// It reaches the loop here because `run/started` — which is where the
@@ -275,6 +336,12 @@ pub enum AgentLoopError {
     Context(#[from] crate::context_engine::ContextEngineError),
     #[error("loop payload error: {0}")]
     Payload(#[from] serde_json::Error),
+    /// A fact the loop had to make durable before a side effect could not be
+    /// written. The call is *not* dispatched: a loop that cannot record what it
+    /// is about to do does not do it, because the record is the only thing that
+    /// would let the next attempt tell what happened.
+    #[error("journal error: {0}")]
+    Journal(#[from] EventStoreError),
     /// The turn state handed back was not produced by this loop. Fail closed
     /// rather than start a step on a conversation this loop cannot see.
     #[error("turn state does not belong to this loop")]

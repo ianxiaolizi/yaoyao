@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_ports::agent_loop::{
-    AgentLoop, AgentLoopError, SteeringInput, StepOutcome, StopReason, TurnCapabilityFacts,
-    TurnContext, TurnEnding, TurnInputKind, TurnStart, TurnState, TurnStateFacts,
+    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, StepOutcome, StopReason,
+    TurnCapabilityFacts, TurnContext, TurnEnding, TurnInputKind, TurnStart, TurnState,
+    TurnStateFacts,
 };
 use agent_ports::context_engine::{
     CompactionCandidate, CompactionScope, ContextEngine, ContextUsage,
@@ -888,6 +889,13 @@ struct LoopTurn {
     /// Tool calls this turn has dispatched. The run's `max_tool_calls` is
     /// counted here, where the call is; the Scheduler cannot see inside a step.
     tool_calls_made: u32,
+    /// Where the facts that must precede a side effect become durable.
+    ///
+    /// A step's events travel back to the caller and are appended after the
+    /// step, which is too late for the two facts a tool call needs: the step
+    /// that opened and the call that is about to run. Those go to the log here,
+    /// before the gateway is asked to do anything.
+    journal: Journal,
 }
 
 impl LoopTurn {
@@ -1738,6 +1746,7 @@ impl AgentLoop for DefaultAgentLoop {
                 budget,
                 deadline,
                 tool_calls_made: 0,
+                journal: ctx.journal.clone(),
             }),
             events,
         })
@@ -2800,6 +2809,18 @@ impl AgentLoop for DefaultAgentLoop {
                 // refused never looked at anything, and counting it as a check
                 // would let a stop rest on a decision rather than an
                 // observation.
+                // Everything this step has produced so far becomes durable
+                // before the call can change the world: the step that opened,
+                // the model's answer, the reasoning node for this decision, and
+                // the `tool/started` that names it. A process that dies after
+                // this line leaves a dispatched call with no outcome, which
+                // recovery marks `tool/outcome_unknown`; one that dies before
+                // it leaves a call that provably never left. Both are answers
+                // the next attempt can act on, and neither exists when the
+                // whole step is written only after it ends.
+                let journal = turn.journal.clone();
+                journal.commit(std::mem::take(&mut events)).await?;
+
                 let invocation = ToolInvocation::from_tool_call(
                     call.tool_call_id.clone(),
                     call.tool_name.clone(),
@@ -3504,12 +3525,12 @@ mod tests {
     use agent_ports::live_event_bus::LiveEventBusError;
     use agent_ports::model_provider::ModelProviderError;
     use agent_ports::model_router::{ModelRoute, ModelTier};
-    use agent_ports::tool_provider::ToolSideEffect;
+    use agent_ports::tool_provider::{ToolInvocation, ToolSideEffect};
     use agent_protocol::instructions::RunInstructions;
     use agent_testkit::{
         DrivenTurn, FakeContextEngine, FakeDecisionAdvisor, FakeModelProvider, FakeModelStep,
-        FakeToolGateway, FakeToolProvider, FixedModelRouter, NullContextEngine, drive_turn,
-        one_model_router,
+        FakeToolGateway, FakeToolProvider, FixedModelRouter, NullContextEngine, RecordingJournal,
+        drive_turn, one_model_router,
     };
     use std::sync::Mutex;
 
@@ -3605,6 +3626,7 @@ mod tests {
             turn_id: agent_protocol::ids::TurnId::new(),
             run_id: agent_protocol::ids::RunId::new(),
             user_input: serde_json::json!({"text": "hi"}),
+            journal: Journal::new(Arc::new(RecordingJournal::new())),
             instructions: None,
             state: None,
             capability: None,
@@ -3612,6 +3634,63 @@ mod tests {
             judgment: None,
             pending_failure: None,
         }
+    }
+
+    /// A call that changes the world is in the log before it runs.
+    ///
+    /// This is the fact the journal exists for, and the one a pass-through
+    /// test cannot see: by the time a step returns it no longer matters
+    /// whether the record went in before the call or after it. The probe reads
+    /// the journal from inside the call, which is the only vantage point that
+    /// tells the two apart.
+    #[tokio::test]
+    async fn a_tool_call_is_durable_before_it_runs() {
+        let journal = Arc::new(RecordingJournal::new());
+        let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let journal = journal.clone();
+            let seen = seen.clone();
+            Arc::new(move |_: &ToolInvocation| {
+                let types =
+                    journal.since(0).iter().map(|event| event.event_type.to_string()).collect();
+                if let Ok(mut seen) = seen.lock() {
+                    seen.push(types);
+                }
+            })
+        };
+        let tools = Arc::new(
+            FakeToolProvider::new()
+                .with_tool("echo", "hello", ToolSideEffect::Pure)
+                .with_observer(observer),
+        );
+        let gateway = Arc::new(FakeToolGateway::new(tools));
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({"s": "hi"})),
+            FakeModelProvider::answer("done"),
+        ]));
+        let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
+
+        let mut ctx = ctx();
+        ctx.journal = Journal::new(journal.clone());
+        let TurnStart { mut state, .. } = loop_.begin_turn(&ctx).await.unwrap();
+        let outcome = loop_.step(&mut state, &[]).await.unwrap();
+
+        let at_call = seen.lock().unwrap().pop().expect("the tool ran");
+        // The step that opened and the call that is about to run, both already
+        // durable when the call was handed over.
+        assert!(
+            at_call.contains(&EventType::TOOL_STARTED.to_string()),
+            "tool/started must be durable before the call runs, saw {at_call:?}"
+        );
+        // One fact, one place: the same draft is not also handed back in the
+        // step's outcome, where the caller would append it a second time.
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|event| event.event_type.as_str() == EventType::TOOL_STARTED),
+            "a committed draft must not also be returned"
+        );
     }
 
     #[tokio::test]

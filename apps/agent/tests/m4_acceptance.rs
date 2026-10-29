@@ -419,6 +419,9 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
         EventType::MODEL_RESPONSE_COMPLETED,
         EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
+        // The claim lands with the ending: the item is answered when the turn
+        // ends, not when it opens.
+        EventType::INBOX_CLAIMED,
         EventType::TURN_COMPLETED,
     ];
     assert_eq!(&types[opened..opened + expected.len()], expected);
@@ -662,6 +665,9 @@ async fn a_plan_recorded_by_the_loop_reaches_the_next_request_and_the_log() {
         EventType::MODEL_RESPONSE_COMPLETED,
         EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
+        // The claim lands with the ending: the item is answered when the turn
+        // ends, not when it opens.
+        EventType::INBOX_CLAIMED,
         EventType::TURN_COMPLETED,
     ];
     assert_eq!(&types[opened..opened + expected.len()], expected);

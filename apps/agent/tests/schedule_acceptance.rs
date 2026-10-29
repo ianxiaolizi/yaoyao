@@ -118,9 +118,11 @@ async fn a_due_item_becomes_a_turn_the_model_sees_and_is_claimed_in_its_batch() 
 
     // The terminal batch is one append, so it occupies one contiguous range of
     // sequence numbers: the claim is written in it (first, because the drafts
-    // are built claim-first) and so is the turn's closing. A claim written in a
-    // separate commit before the work would leave a gap here, and would be the
-    // consume-then-die shape this design avoids.
+    // are built claim-first) and so is the turn's closing. The turn's *opening*
+    // is a separate append that precedes it: the run is durable from the moment
+    // it exists, while the claim is not written until the item has an answer.
+    // A claim at the opening would leave the message consumed by a turn that
+    // never finished — the consume-then-die shape this design avoids.
     let started = events
         .iter()
         .find(|e| e.event.event_type.as_str() == EventType::TURN_STARTED)
@@ -130,10 +132,10 @@ async fn a_due_item_becomes_a_turn_the_model_sees_and_is_claimed_in_its_batch() 
         .find(|e| e.event.event_type.as_str() == EventType::TURN_COMPLETED)
         .expect("the turn closed");
     assert!(
-        started.seq < completed.seq,
-        "the turn's opening does not precede its close: started {}, completed {}",
+        started.seq < claim.seq,
+        "the turn's opening must precede its claim: started {}, claimed {}",
         started.seq,
-        completed.seq
+        claim.seq
     );
     let batch: Vec<&StoredEvent> =
         events.iter().filter(|e| claim.seq <= e.seq && e.seq <= completed.seq).collect();
@@ -143,8 +145,8 @@ async fn a_due_item_becomes_a_turn_the_model_sees_and_is_claimed_in_its_batch() 
         "the claim and the turn's close are not one contiguous append: {types:?}"
     );
     assert!(
-        batch.iter().any(|e| e.event.event_type.as_str() == EventType::TURN_STARTED),
-        "the turn began outside the batch its claim belongs to"
+        batch.iter().all(|e| e.event.event_type.as_str() != EventType::TURN_STARTED),
+        "the turn's opening shares the append its claim belongs to: {types:?}"
     );
     assert_eq!(
         events.iter().filter(|e| e.event.event_type.as_str() == EventType::INBOX_CLAIMED).count(),

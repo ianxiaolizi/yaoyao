@@ -10,10 +10,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use agent_ports::agent_loop::{
-    AgentLoop, AgentLoopError, SteeringInput, StopReason, TurnCapabilityFacts, TurnContext,
-    TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
+    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, StopReason, TurnCapabilityFacts,
+    TurnContext, TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
 };
 use agent_ports::control::{ControlError, ControlHandler, ControlOutcome, ControlRequest};
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
@@ -460,11 +461,15 @@ impl Scheduler {
             max_steps: self.max_steps,
             budget: self.budget,
         };
+        // The turn's journal: the same log every other write goes to, committed
+        // and flushed at the points where a fact has to outlive the process.
+        let journal = Arc::new(SessionJournal::new(self.store.clone(), session_id.clone()));
         let ctx = TurnContext {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             run_id: run_id.clone(),
             user_input: item.payload.clone(),
+            journal: Journal::new(journal.clone()),
             instructions: instructions.clone(),
             state: Some(state),
             capability: self.capability.clone(),
@@ -478,13 +483,16 @@ impl Scheduler {
         // pending rather than consume it.
         let TurnStart { mut state, events: opening } = self.loop_.begin_turn(&ctx).await?;
 
-        let mut drafts = Vec::new();
-        drafts.push(self.inbox.claim_draft(session_id, &item.item_id, Some(&run_id)).await?);
+        // The turn boundary, made durable before a single step runs: the run
+        // exists from here on, and a process that dies now leaves an open run
+        // for recovery to close instead of a session with nothing to show.
+        // The item is deliberately *not* claimed here — see the terminal batch.
+        let mut pending: Vec<EventDraft> = Vec::new();
         // What this run is, before it is a run. The snapshot belongs to the run
         // and not to the session: a session can be driven by several processes
         // over its life, and the later ones may be configured differently.
         if let Some(profile) = &self.profile {
-            drafts.push(draft(
+            pending.push(draft(
                 session_id,
                 EventType::PROFILE_RESOLVED,
                 serde_json::to_value(profile)?,
@@ -494,7 +502,7 @@ impl Scheduler {
                 None,
             ));
         }
-        drafts.push(draft(
+        pending.push(draft(
             session_id,
             EventType::RUN_STARTED,
             match &instructions {
@@ -506,7 +514,7 @@ impl Scheduler {
             None,
             None,
         ));
-        drafts.push(draft(
+        pending.push(draft(
             session_id,
             EventType::TURN_STARTED,
             serde_json::json!({ "inbox_item": item.item_id }),
@@ -515,16 +523,15 @@ impl Scheduler {
             Some(&turn_id),
             None,
         ));
-        drafts.extend(opening);
+        pending.extend(opening);
+        journal.commit(std::mem::take(&mut pending)).await?;
 
         let mut steps = 0u32;
         let mut last_step: Option<StepId> = None;
         // What this turn has already taken out of the queue, whether it went to
-        // a step or was discarded as unreadable. The records are in `drafts`, not
-        // in the log — the whole turn appends in one batch — so the store still
-        // reports these items as pending, and the next boundary would read them
-        // again. Being consumed by the turn is a fact only the turn can know
-        // until it settles.
+        // a step or was discarded as unreadable. Being consumed by the turn is a
+        // fact only the turn can know, so it is tracked across steps even though
+        // each boundary now writes what it produced.
         let mut consumed: HashSet<InboxItemId> = HashSet::new();
         let ending = loop {
             if steps >= self.max_steps {
@@ -533,9 +540,10 @@ impl Scheduler {
             // An interrupt ends the turn at the boundary rather than inside a
             // step: what it stops is the next step, not the one already running.
             if let Some(interrupt) = self.inbox.pending_interrupt(session_id).await? {
-                drafts.push(
+                pending.push(
                     self.inbox.claim_draft(session_id, &interrupt.item_id, Some(&run_id)).await?,
                 );
+                journal.commit(std::mem::take(&mut pending)).await?;
                 break Ending::Interrupted { item_id: interrupt.item_id };
             }
 
@@ -546,13 +554,33 @@ impl Scheduler {
                     &turn_id,
                     last_step.as_ref(),
                     &mut consumed,
-                    &mut drafts,
+                    &mut pending,
                 )
                 .await?;
-            let outcome = self.loop_.step(&mut state, &steering).await?;
-            drafts.extend(outcome.events);
+            // What the boundary took out of the queue is durable before the
+            // step that consumes it: a `turn/steered` written after the message
+            // it introduced would date the claim later than the turn's use of
+            // it, and a reader sorting by sequence would see a request carry
+            // text whose arrival is recorded as still to come.
+            journal.commit(std::mem::take(&mut pending)).await?;
+            let outcome = match self.loop_.step(&mut state, &steering).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // The run is already durable, so an error here cannot be
+                    // answered by writing nothing: the turn has to be closed
+                    // with the fact that it failed, or the next caller finds an
+                    // open run and waits for recovery to guess what happened.
+                    close_failed_turn(&journal, &run_id, &turn_id, pending).await;
+                    return Err(SchedulerError::Loop(error));
+                }
+            };
+            pending.extend(outcome.events);
             last_step = Some(outcome.step_id);
             steps += 1;
+            // The step boundary: what it produced is durable before the next
+            // step starts, so a crash between two steps loses at most the step
+            // that was in flight.
+            journal.commit(std::mem::take(&mut pending)).await?;
 
             if let Some(reason) = outcome.stop {
                 break Ending::Loop { reason, final_content: outcome.final_content };
@@ -574,22 +602,25 @@ impl Scheduler {
             // Counted from the log's own step markers rather than the loop
             // counter: a step that refused to open — a spent wall clock at the
             // boundary — returned without one, and it must not be counted as a
-            // step the turn took.
-            let steps = drafts
-                .iter()
-                .filter(|event| event.event_type.as_str() == EventType::STEP_STARTED)
-                .count();
-            let tool_calls = drafts
-                .iter()
-                .filter(|event| event.event_type.as_str() == EventType::TOOL_STARTED)
-                .count();
+            // step the turn took. The journal counts what it actually wrote,
+            // which is the same number whether the batch was written once or a
+            // boundary at a time.
+            let steps = journal.steps();
+            let tool_calls = journal.calls();
             turn_payload["budget"] = serde_json::json!({
                 "steps": steps,
                 "tool_calls": tool_calls,
                 "elapsed_ms": run_started.elapsed().as_millis() as u64,
             });
         }
-        drafts.push(draft(
+        // The item is claimed only now: the claim is the fact "this input has
+        // been answered", and a turn that never reached its end has not
+        // answered it. Writing the claim at the opening would consume the
+        // person's message on a crash that produced no answer at all — the one
+        // failure worse than doing the work twice, and the one no event in the
+        // vocabulary can undo.
+        pending.push(self.inbox.claim_draft(session_id, &item.item_id, Some(&run_id)).await?);
+        pending.push(draft(
             session_id,
             turn_terminal,
             turn_payload,
@@ -598,7 +629,7 @@ impl Scheduler {
             Some(&turn_id),
             None,
         ));
-        drafts.push(draft(
+        pending.push(draft(
             session_id,
             run_terminal,
             serde_json::json!({}),
@@ -608,13 +639,9 @@ impl Scheduler {
             None,
         ));
 
-        // The terminal batch is the run's last write. The sequence is read from
-        // the log and appended at it as one step — another process on this
-        // session moves it otherwise, and the append is refused. Held only for
-        // these two calls, not across the turn. (YA-36)
-        let _lease = self.store.lease(session_id).await?;
-        let next = self.next_seq(session_id).await?;
-        self.store.append(session_id, next, drafts).await?;
+        // The run's last write, and the one that makes the turn's ending
+        // durable rather than merely accepted.
+        journal.commit(std::mem::take(&mut pending)).await?;
 
         Ok(RunReport { run_id, turn_id, stop_reason, final_content })
     }
@@ -785,6 +812,95 @@ impl Scheduler {
         let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
         Ok(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO))
     }
+}
+
+/// The Scheduler's [`EventSink`]: this session's log, appended under the write
+/// lease and flushed before returning.
+///
+/// Sequence and write are one step here for the same reason they are at the
+/// terminal batch (YA-36): the number is read from the log and consumed by the
+/// append, and a number read outside the lease could be moved by another
+/// process before the append lands.
+struct SessionJournal {
+    store: Arc<dyn EventStore>,
+    session_id: SessionId,
+    /// Steps that actually opened, and calls that actually started — counted
+    /// as their markers pass through, so a turn's budget report does not
+    /// depend on how many boundaries the turn happened to be written in.
+    steps: AtomicU32,
+    calls: AtomicU32,
+}
+
+impl SessionJournal {
+    fn new(store: Arc<dyn EventStore>, session_id: SessionId) -> Self {
+        Self { store, session_id, steps: AtomicU32::new(0), calls: AtomicU32::new(0) }
+    }
+
+    fn steps(&self) -> usize {
+        self.steps.load(Ordering::Relaxed) as usize
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed) as usize
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for SessionJournal {
+    async fn commit(&self, drafts: Vec<EventDraft>) -> Result<(), EventStoreError> {
+        if drafts.is_empty() {
+            return Ok(());
+        }
+        for event in &drafts {
+            match event.event_type.as_str() {
+                EventType::STEP_STARTED => self.steps.fetch_add(1, Ordering::Relaxed),
+                EventType::TOOL_STARTED => self.calls.fetch_add(1, Ordering::Relaxed),
+                _ => continue,
+            };
+        }
+        let _lease = self.store.lease(&self.session_id).await?;
+        let events = self.store.read_stream(&self.session_id, EventSeq::ZERO, usize::MAX).await?;
+        let next = events.last().map(|event| event.seq.next()).unwrap_or(EventSeq::ZERO);
+        self.store.append(&self.session_id, next, drafts).await?;
+        // Accepting the append is not the promise this method makes: it says
+        // the fact survives losing the process, so it waits for the disk.
+        self.store.flush(&self.session_id).await?;
+        Ok(())
+    }
+}
+
+/// Close a turn the loop failed inside, so the log says a run failed rather
+/// than leaving it open for recovery to call it an interruption.
+///
+/// Best effort on purpose: the caller is already returning an error, and a
+/// store that cannot take these two events is a store whose next caller runs
+/// recovery, which closes an open run exactly as well.
+async fn close_failed_turn(
+    journal: &SessionJournal,
+    run_id: &RunId,
+    turn_id: &TurnId,
+    mut pending: Vec<EventDraft>,
+) {
+    let session_id = &journal.session_id;
+    pending.push(draft(
+        session_id,
+        EventType::TURN_FAILED,
+        serde_json::json!({}),
+        Actor::Scheduler,
+        Some(run_id),
+        Some(turn_id),
+        None,
+    ));
+    pending.push(draft(
+        session_id,
+        EventType::RUN_FAILED,
+        serde_json::json!({}),
+        Actor::Scheduler,
+        Some(run_id),
+        None,
+        None,
+    ));
+    let _ = journal.commit(pending).await;
 }
 
 /// What the session's lifecycle says about starting a run.
@@ -964,9 +1080,11 @@ mod tests {
 
         assert_eq!(
             event_types(&store, &sid).await,
+            // The claim lands with the ending, not with the opening: the item
+            // is answered when the turn ends, and a turn that dies before that
+            // leaves it pending rather than consumed.
             vec![
                 "inbox/appended",
-                "inbox/claimed",
                 "run/started",
                 "turn/started",
                 "model/tools.frozen",
@@ -979,6 +1097,7 @@ mod tests {
                 "model/response.completed",
                 "reason/recorded",
                 "step/completed",
+                "inbox/claimed",
                 "turn/completed",
                 "run/completed",
             ]
@@ -1096,6 +1215,56 @@ mod tests {
                 final_content: None,
             })
         }
+    }
+
+    /// A loop whose step fails after the turn has already opened.
+    struct FailingLoop;
+
+    #[async_trait::async_trait]
+    impl AgentLoop for FailingLoop {
+        async fn begin_turn(&self, _ctx: &TurnContext) -> Result<TurnStart, AgentLoopError> {
+            Ok(TurnStart { state: TurnState::new(()), events: vec![] })
+        }
+
+        async fn step(
+            &self,
+            _turn: &mut TurnState,
+            _steering: &[SteeringInput],
+        ) -> Result<StepOutcome, AgentLoopError> {
+            Err(AgentLoopError::StateNotOwned)
+        }
+    }
+
+    /// A turn that dies inside a step leaves a closed run and an unanswered
+    /// item.
+    ///
+    /// Both halves matter. The run was made durable when the turn opened, so
+    /// the log has to say how it ended — otherwise the next caller finds an
+    /// open run and waits for recovery to guess what happened. The item is the
+    /// other way round: nothing answered it, so it must still be pending rather
+    /// than consumed by a turn that produced no answer.
+    #[tokio::test]
+    async fn a_turn_the_loop_fails_inside_closes_its_run_and_leaves_the_item_pending() {
+        let store = Arc::new(FakeEventStore::new());
+        let scheduler = Scheduler::new(store.clone(), Arc::new(FailingLoop), 8);
+        let sid = SessionId::from_string("failed-mid-turn");
+        scheduler
+            .inbox
+            .append(&sid, InboxKind::NextTurn, serde_json::json!({"text": "hi"}), 0, Actor::User)
+            .await
+            .unwrap();
+
+        assert!(
+            scheduler.run_pending(&sid, Utc::now()).await.is_err(),
+            "the loop's failure is reported"
+        );
+
+        assert_eq!(
+            event_types(&store, &sid).await,
+            vec!["inbox/appended", "run/started", "turn/started", "turn/failed", "run/failed"]
+        );
+        assert!(!scheduler.has_active_run(&sid).await.unwrap());
+        assert_eq!(scheduler.inbox.pending(&sid).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1803,7 +1972,6 @@ mod tests {
             event_types(&store, &sid).await,
             [
                 EventType::INBOX_APPENDED,
-                EventType::INBOX_CLAIMED,
                 EventType::RUN_STARTED,
                 EventType::TURN_STARTED,
                 EventType::MODEL_TOOLS_FROZEN,
@@ -1825,6 +1993,7 @@ mod tests {
                 EventType::MODEL_RESPONSE_COMPLETED,
                 "reason/recorded",
                 EventType::STEP_COMPLETED,
+                EventType::INBOX_CLAIMED,
                 EventType::TURN_COMPLETED,
                 EventType::RUN_COMPLETED,
             ]
