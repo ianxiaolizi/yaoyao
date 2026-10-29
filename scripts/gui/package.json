@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "smoke": "node smoke.mjs"
+    "smoke": "node smoke.mjs",
+    "perf": "node perf.mjs"
   },
   "devDependencies": {
     "playwright-core": "1.56.1"

@@ -56,6 +56,10 @@
     reconnectAttempt: 0,
     search: '',
     pendingRender: 0,
+    /// Keyed timeline bookkeeping: each block's html string and the node that
+    /// holds it. `renderedFor` is the session those nodes belong to.
+    rendered: new Map(),
+    renderedFor: null,
     refreshTimer: null,
     whyTimer: null,
     lastError: '',
@@ -1100,9 +1104,13 @@
     return out.join('');
   }
 
+  // The timeline is diffed by block: one turn, one loose entry, or the tail
+  // that carries the live text. A block whose html did not change keeps its
+  // node, and with it the folds the reader opened, the "show full output"
+  // toggle, the current selection and the scroll position. Before this, every
+  // streamed chunk rebuilt the whole list.
   function renderTimeline() {
     const { groups, loose } = groupTurns();
-    const timeline = $('timeline');
     const empty = $('empty');
     // The inbox item lands before its turn exists, so it briefly has no
     // `turn` to group under. Live text belongs to *that* turn, not to the
@@ -1121,13 +1129,13 @@
 
     if (!state.active) {
       empty.hidden = false;
-      timeline.innerHTML = '';
+      resetTimeline();
       return;
     }
     if (!hasAnything) {
       empty.hidden = false;
       empty.querySelector('h2').textContent = state.activeSummary ? '这一段还没有内容' : '从一句话开始';
-      timeline.innerHTML = '';
+      resetTimeline();
       return;
     }
     empty.hidden = true;
@@ -1140,12 +1148,15 @@
       for (const note of group.notes) groupedNotes.add((note.text || '').trim());
     }
 
-    const out = [];
+    const blocks = [];
     for (const item of loose) {
       if (item === looseUser && pendingText) continue;
       if (item.kind === 'note' && groupedNotes.has((item.text || '').trim())) continue;
-      if (item.kind === 'note') out.push(`<div class="end">${esc(truncate(item.text, 220))}</div>`);
-      else if (item.kind === 'answer') out.push(`<div class="ans"><div class="md">${md(item.text)}</div></div>`);
+      if (item.kind === 'note') {
+        blocks.push({ key: `loose:${item.id}`, html: `<div class="end">${esc(truncate(item.text, 220))}</div>` });
+      } else if (item.kind === 'answer') {
+        blocks.push({ key: `loose:${item.id}`, html: `<div class="ans"><div class="md">${md(item.text)}</div></div>` });
+      }
     }
 
     let turnNo = 0;
@@ -1156,8 +1167,11 @@
       if (!resumed) turnNo += 1;
       const label = resumed ? '继续' : `第 ${turnNo} 轮`;
       const title = resumed ? '' : headline(group.user?.text || '');
+      const key = `turn:${group.turn}`;
       if (!isLast) {
-        out.push(`
+        blocks.push({
+          key,
+          html: `
           <details class="prev" data-turn="${esc(group.turn)}">
             <summary>
               <span class="chev">›</span>
@@ -1166,68 +1180,136 @@
               <span class="meta">${group.actions.length} 次工具 · ${esc(status.label)}</span>
             </summary>
             <div class="body">${renderTurnBody(group, false)}</div>
-          </details>`);
+          </details>`,
+        });
         return;
       }
-      out.push(`
+      blocks.push({
+        key,
+        html: `
         <div class="turn-h">
           <span class="n">${label}</span>
           <span class="ln"></span>
           <span class="st ${status.cls}">${status.label}</span>
         </div>
-        ${renderTurnBody(group, isLast && !showPending)}`);
+        ${renderTurnBody(group, isLast && !showPending)}`,
+      });
     });
 
     if (showPending) {
-      out.push(`
+      blocks.push({
+        key: 'live',
+        html: `
         <div class="turn-h"><span class="n">${pendingText ? '新的一轮' : '继续'}</span><span class="ln"></span><span class="st live"><i></i>进行中</span></div>
         ${pendingText ? `<div class="u"><div class="ul">你</div><p>${esc(pendingText)}</p></div>` : ''}
         ${state.live.reasoning ? `<details class="think live-think" open><summary><span class="chev">›</span> 思考 · 正在生成</summary><div class="bd">${esc(state.live.reasoning)}</div></details>` : ''}
         ${state.live.text
           ? `<div class="ans live-answer"><div class="md">${md(state.live.text)}</div><span class="caret"></span></div>`
-          : '<div class="gen"><i></i><i></i><i></i> 正在启动这一轮</div>'}`);
+          : '<div class="gen"><i></i><i></i><i></i> 正在启动这一轮</div>'}`,
+      });
     }
 
-    timeline.innerHTML = out.join('');
-    bindTimeline();
+    syncTimeline(blocks);
     maybeScroll();
   }
 
-  function bindTimeline() {
+  // Only the blocks whose html changed are rebuilt; the rest keep the node they
+  // already have. The wrapper is what makes that possible — a block is several
+  // top-level elements (a turn header and a body) and they have to move as one.
+  // It carries no box of its own that could change layout: the margins inside
+  // collapse through it exactly as they did between the elements themselves.
+  function syncTimeline(blocks) {
     const timeline = $('timeline');
-    timeline.querySelectorAll('[data-expand]').forEach((button) => {
-      button.addEventListener('click', () => {
-        const host = button.parentElement;
+    if (state.renderedFor !== state.active) {
+      // Keys are per session, so a node left over from another session must
+      // never be matched against this session's blocks.
+      state.renderedFor = state.active;
+      state.rendered.clear();
+      timeline.textContent = '';
+    }
+    // Resolve every block's node first, then place them by position. Placing as
+    // we build would have to remember a "next sibling" across a rebuild, and a
+    // rebuilt node leaves that reference detached.
+    const keep = new Set();
+    const nodes = blocks.map((block) => {
+      keep.add(block.key);
+      let entry = state.rendered.get(block.key);
+      if (!entry) {
+        entry = { html: block.html, node: blockNode(block) };
+        state.rendered.set(block.key, entry);
+      } else if (entry.html !== block.html) {
+        const fresh = blockNode(block);
+        entry.node.replaceWith(fresh);
+        entry.node = fresh;
+        entry.html = block.html;
+      }
+      return entry.node;
+    });
+    nodes.forEach((node, index) => {
+      if (timeline.children[index] !== node) timeline.insertBefore(node, timeline.children[index] || null);
+    });
+    for (const [key, entry] of state.rendered) {
+      if (keep.has(key)) continue;
+      entry.node.remove();
+      state.rendered.delete(key);
+    }
+  }
+
+  function blockNode(block) {
+    const node = document.createElement('div');
+    node.className = 'tblock';
+    node.dataset.key = block.key;
+    node.innerHTML = block.html;
+    return node;
+  }
+
+  function resetTimeline() {
+    state.renderedFor = state.active;
+    state.rendered.clear();
+    $('timeline').textContent = '';
+  }
+
+  // One listener for the whole timeline: the blocks are patched in place, so a
+  // handler bound to a node would disappear the moment that block is rebuilt.
+  function bindTimeline() {
+    $('timeline').addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      const expand = target.closest('[data-expand]');
+      if (expand) {
+        const host = expand.parentElement;
         const short = host?.querySelector('[data-short]');
         const full = host?.querySelector('[data-full]');
         if (!short || !full) return;
         const expanding = full.hidden;
         full.hidden = !expanding;
         short.hidden = expanding;
-        button.textContent = expanding ? '▸ 收起输出' : '▸ 查看完整输出';
-      });
-    });
-    timeline.querySelectorAll('[data-decision]').forEach((button) => {
-      button.addEventListener('click', () => {
-        const card = button.closest('[data-approval]');
-        if (!card) return;
-        decide(card.dataset.approval, button.dataset.decision);
-      });
-    });
-    timeline.querySelectorAll('[data-expired-resume]').forEach((button) => {
-      button.addEventListener('click', resumeExpired);
-    });
-    timeline.querySelectorAll('[data-artifact]').forEach((button) => {
-      button.addEventListener('click', () => openArtifact(button.dataset.artifact));
-    });
-    timeline.querySelectorAll('[data-why]').forEach((link) => {
-      link.addEventListener('click', () => {
+        expand.textContent = expanding ? '▸ 收起输出' : '▸ 查看完整输出';
+        return;
+      }
+      const decision = target.closest('[data-decision]');
+      if (decision) {
+        const card = decision.closest('[data-approval]');
+        if (card) decide(card.dataset.approval, decision.dataset.decision);
+        return;
+      }
+      if (target.closest('[data-expired-resume]')) {
+        resumeExpired();
+        return;
+      }
+      const artifact = target.closest('[data-artifact]');
+      if (artifact) {
+        openArtifact(artifact.dataset.artifact);
+        return;
+      }
+      const why = target.closest('[data-why]');
+      if (why) {
         // Open the turn this link sits on, not whichever turn is newest.
-        state.whyWant = link.dataset.why || null;
+        state.whyWant = why.dataset.why || null;
         state.why = null;
         state.whyFor = null;
         openPanel('why');
-      });
+      }
     });
   }
 
@@ -1571,7 +1653,7 @@
     renderSessions();
     $('empty').hidden = false;
     $('empty').querySelector('h2').textContent = '正在读取…';
-    $('timeline').innerHTML = '';
+    resetTimeline();
     connection('idle', '连接中');
 
     let payload;
@@ -2375,6 +2457,7 @@
     applyLayout();
     bindResizers();
     bindInput();
+    bindTimeline();
     // A pending approval can outlive the event that created it. Re-render the
     // countdown on a slow tick so the card changes to "已过期" even when no
     // durable event is arriving.

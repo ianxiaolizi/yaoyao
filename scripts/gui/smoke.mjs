@@ -473,6 +473,74 @@ async function main() {
   assert.match(await page.textContent('.ask-state'), /已过期/);
   await page.screenshot({ path: join(screenshots, 'gui-smoke-expired.png') });
 
+  // The timeline updates per turn, not wholesale: a streamed reply must not
+  // re-create the turns that were already closed. Three real turns give the
+  // check finished turns to protect while a fourth one streams, and the page
+  // keeps one wrapper per block — so a finished turn that is rebuilt loses its
+  // node, which is exactly what the observer below counts.
+  await page.goto(`${origin}/#t=${token}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('#newTask', { timeout: 15_000 });
+  await page.click('#newTask');
+  const settled = (count) =>
+    page.waitForFunction(
+      (want) => {
+        const blocks = document.querySelectorAll('#timeline > .tblock[data-key^="turn:"]');
+        return (
+          blocks.length >= want &&
+          Boolean(document.querySelector('#timeline > .tblock:last-child .end [data-why]'))
+        );
+      },
+      count,
+      { timeout: 20_000 },
+    );
+  for (const [index, prompt] of ['one', 'two', 'three'].entries()) {
+    await page.fill('#input', `turn ${prompt}`);
+    await page.click('#sendBtn');
+    await page.waitForFunction(
+      (want) => [...document.querySelectorAll('.ans')].some((node) => node.textContent.includes(want)),
+      `echo: turn ${prompt}`,
+      { timeout: 20_000 },
+    );
+    await settled(index + 1);
+  }
+  await page.evaluate(() => {
+    const timeline = document.getElementById('timeline');
+    window.__smoke = {
+      keys: [...timeline.children].filter((node) => node.dataset.key?.startsWith('turn:')).map((node) => node.dataset.key),
+      rebuilt: [],
+    };
+    new MutationObserver((rows) => {
+      for (const row of rows) {
+        for (const node of row.removedNodes) {
+          if (node.nodeType === 1 && node.classList.contains('tblock')) {
+            window.__smoke.rebuilt.push(node.dataset.key);
+          }
+        }
+      }
+    }).observe(timeline, { childList: true });
+  });
+  await page.fill('#input', 'turn four');
+  await page.click('#sendBtn');
+  await page.waitForFunction(
+    () => [...document.querySelectorAll('.ans')].some((node) => node.textContent.includes('echo: turn four')),
+    null,
+    { timeout: 20_000 },
+  );
+  const streamed = await page.evaluate(() => {
+    const { keys, rebuilt } = window.__smoke;
+    const closing = keys[keys.length - 1];
+    return {
+      // A turn folds into a summary when the next one opens: that turn is
+      // allowed to be rebuilt once, while it changes shape.
+      closingRebuilds: rebuilt.filter((key) => key === closing).length,
+      untouched: rebuilt.filter((key) => key !== closing && keys.includes(key)).length,
+      turns: document.querySelectorAll('#timeline > .tblock[data-key^="turn:"]').length,
+    };
+  });
+  assert.equal(streamed.untouched, 0, 'streaming a reply left the closed turns alone');
+  assert.ok(streamed.closingRebuilds <= 1, `the closing turn changed shape at most once (${streamed.closingRebuilds})`);
+  assert.ok(streamed.turns >= 4, 'the new turn was appended');
+
   await page.goto(`${origin}/#t=${token}`, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(700);
   await page.click('#newTask');
