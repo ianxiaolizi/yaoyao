@@ -79,7 +79,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |
 | `agent-index-sqlite` | `SqliteMemoryIndex`（可丢弃的 SQLite 读模型：从日志重建、词面子串检索；版本不符拒绝，只由 `reindex` 重建）+ `memory.search` 工具（装配时绑定当前 session，能力 `memory.read`） |
 | `agent-testkit` | FakeEventStore / FakeModel·Tool·Gateway / FakeSecret / FakeDoctorCheck + 架构守卫 |
-| `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `why` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `web` `memory search\|reindex` `context inspect` `artifact get` |
+| `agent-cli` | CLI 命令 runner：`doctor` `run\|ask` `resume` `fork` `steer` `interrupt` `export` `why` `status` `approve` `deny` `tool` `plugin enable\|disable` `schedule at\|list\|cancel` `tick` `serve` `web` `memory search\|reindex` `context inspect` `artifact get` `metrics [--out]` |
 | `agent-web` | 本地回环 HTTP 入口：内嵌 GUI、一次性令牌、会话/transcript/thinking/why/diff/context/plan/subagent/schedule 读模型、SSE（历史重放 + 实时预览）、导出与 artifact、起轮/审批/过期续跑/分叉/插话/中断；写操作经 `Backend` 缝交给 `apps/agent` 的 `WebBackend`，再由它调用同一套 `agent-cli` 具名命令，不复制内核装配 |
 | `apps/agent` | 唯一具体组装入口（二进制）；`instructions` 模块把工作区根部的 `AGENTS.md` + 内置前言组成每次运行的系统指令 |
 
@@ -151,6 +151,10 @@ cargo run -p agent -- memory reindex            # 丢弃并重建 <data_dir>/<se
 # 上下文检查：下一条请求会带什么（大小 / 分类 / 预算 / 最大消息 / 上次请求的实录）
 cargo run -p agent -- context inspect            # 空会话也是答案（0）；配置/日志读不了 2
 cargo run -p agent -- context inspect --json --top 10   # 一条 JSON；--top 控制最大消息条数
+
+# 指标：turn/工具/审批/压缩/token/耗时的纯日志派生（默认全部会话；--session 收窄）
+cargo run -p agent -- metrics                      # 文本；空数据目录也是答案（0）
+cargo run -p agent -- metrics --json --out metrics.json   # 派生文档，同一日志重算字节相同
 
 # 倒推一轮的每一步为什么：从答复沿依据走到用户原话（无链时退 2）
 cargo run -p agent -- why

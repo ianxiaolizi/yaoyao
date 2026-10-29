@@ -26,6 +26,14 @@ pub struct Args {
     /// came before or after the command, so `rest[0]` is always the command
     /// and `rest[1..]` are its own arguments.
     pub session: SessionId,
+    /// Whether `--session` was actually typed.
+    ///
+    /// Commands that act on one session do not need this: [`DEFAULT_SESSION`]
+    /// is a real session and they mean it. A command whose default scope is
+    /// *every* session — `agent metrics` — has to be able to tell "the caller
+    /// named the default session" from "the caller named nothing", and the
+    /// value alone cannot say.
+    pub session_given: bool,
     /// The profile to compose (`--profile`), if the line named one.
     pub profile: Option<String>,
     /// The model for this run (`--model`), if the line named one.
@@ -146,6 +154,7 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
 
     Ok(Args {
         command,
+        session_given: session.is_some(),
         session: session.unwrap_or_else(|| SessionId::from_string(DEFAULT_SESSION)),
         profile,
         model,

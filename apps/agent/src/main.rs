@@ -158,6 +158,7 @@ async fn main() {
         "web" => web(&args).await,
         "memory" => memory(&args).await,
         "context" => context(&args).await,
+        "metrics" => metrics(&args).await,
         "artifact" => artifact(&args).await,
         "sandbox" => sandbox_command(&args),
         other => {
@@ -202,6 +203,7 @@ fn usage() {
          memory search <text>       Find events whose text contains <text>\n  \
          memory reindex             Rebuild the searchable index from the session log\n  \
          context inspect            Show what the next request would carry (size, kinds, budget)\n  \
+         metrics [--out <path>]     Count turns, tools, approvals, tokens and time\n                              from the event log (every session unless --session names one)\n  \
          artifact get <ref> [--out] Fetch a stored blob (locator or hash). Text to stdout otherwise\n  \
          sandbox setup              Create the AppContainer profile and its grants (elevated)\n  \
          sandbox status             Report whether the AppContainer setup is in place\n  \
@@ -1515,6 +1517,47 @@ async fn context(args: &Args) {
         };
     print(&outcome.output);
     exit_on(outcome.verdict);
+}
+
+/// `metrics`: count what the event logs say happened.
+///
+/// A reader like `context inspect`: no model, no tool surface and no runtime is
+/// assembled, so it answers when the provider or the sandbox is misconfigured.
+/// The store takes a zero lease wait for the same reason `doctor` does — a
+/// session another process is driving still has a readable prefix, and waiting
+/// behind its open lease would make "how is this going?" hang behind the thing
+/// being asked about.
+///
+/// `--events` is refused because nothing here appends, and `--out` writes only
+/// derived data: the report is a function of the logs, and the same logs always
+/// produce the same bytes.
+async fn metrics(args: &Args) {
+    if args.events {
+        eprintln!("metrics does not support --events; it writes no events");
+        std::process::exit(EXIT_DID_NOT_RUN);
+    }
+    let out = option(args, "--out");
+    let data_dir = data_dir();
+    let store: Arc<dyn EventStore> =
+        Arc::new(JsonlEventStore::new(&data_dir).with_lease_wait(Duration::ZERO));
+    // Only a typed `--session` narrows the scope; the parser's default session
+    // is a real session, so its value alone cannot tell "all" from "default".
+    let only = args.session_given.then(|| args.session.clone());
+    let outcome = match agent::metrics::run_metrics(
+        &store,
+        Path::new(&data_dir),
+        only.as_ref(),
+        out.as_deref(),
+        args.json,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => fail(args, &e),
+    };
+    let verdict = outcome.verdict;
+    answer(args, &outcome.output);
+    exit_on(verdict);
 }
 
 /// `artifact get`: fetch the bytes behind a locator the log handed out.

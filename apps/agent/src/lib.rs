@@ -18,6 +18,7 @@ pub mod clock;
 pub mod config;
 pub mod decisions;
 pub mod instructions;
+pub mod metrics;
 pub mod plugins;
 pub mod providers;
 pub mod sandbox;
