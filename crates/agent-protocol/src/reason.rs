@@ -407,6 +407,11 @@ pub const RULES: &[Rule] = &[
         version: 1,
         text: "the input read as an action and the turn stayed in the act posture, but no call was dispatched: the turn answered where it was expected to act",
     },
+    Rule {
+        id: "verdict/output-truncated",
+        version: 1,
+        text: "the provider stopped the response at the run's output-token limit, so what arrived is the beginning of an answer rather than the answer; the turn ends on that limit, not on the model's choice to stop",
+    },
 ];
 
 /// Look up a rule by id.
@@ -1286,6 +1291,7 @@ mod tests {
         assert!(rule("verdict/answer").is_some());
         assert!(rule("verdict/criterion-observed").is_some());
         assert!(rule("verdict/after-failure").is_some());
+        assert!(rule("verdict/output-truncated").is_some());
         assert!(rule("gate/stale-read").is_some());
         assert!(rule("gate/repeat-call").is_some());
         assert!(rule("switch/failure-repair").is_some());

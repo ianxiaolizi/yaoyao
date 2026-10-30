@@ -637,7 +637,12 @@ impl ProjectionDefinition for TranscriptProjection {
                 let ending = match event.event.event_type.as_str() {
                     EventType::TURN_COMPLETED => match stop_reason.as_deref() {
                         Some("max_steps") => TurnEnding::MaxSteps,
-                        Some("max_tool_calls" | "wall_clock_exceeded") => TurnEnding::LimitReached,
+                        // A response cut off at the output limit is a limit
+                        // stop, not an answer: the text beside it is the
+                        // beginning of one (CONTRACT §7 #131).
+                        Some("max_tool_calls" | "wall_clock_exceeded" | "max_output_tokens") => {
+                            TurnEnding::LimitReached
+                        }
                         _ => TurnEnding::Answered,
                     },
                     EventType::TURN_YIELDED => TurnEnding::Yielded,
@@ -886,6 +891,9 @@ mod tests {
             ("max_steps", TurnEnding::MaxSteps),
             ("max_tool_calls", TurnEnding::LimitReached),
             ("wall_clock_exceeded", TurnEnding::LimitReached),
+            // The provider cut the response off; the text beside it is the
+            // beginning of an answer, and this is the word that says so.
+            ("max_output_tokens", TurnEnding::LimitReached),
         ] {
             let state = apply(
                 &TranscriptProjection::new().init(),

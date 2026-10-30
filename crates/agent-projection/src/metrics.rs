@@ -531,6 +531,33 @@ mod tests {
         assert_eq!(metrics.turns.by_stop_reason.get("max_steps"), Some(&1));
     }
 
+    /// A truncated turn is counted under the limit that stopped it, not as an
+    /// answer: the 2026-10-30 run below read `final_answer=1` for one.
+    #[test]
+    fn a_truncated_turn_is_counted_under_the_limit_not_the_answer() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::TURN_STARTED,
+                None,
+                Some("t1"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TURN_COMPLETED,
+                None,
+                Some("t1"),
+                serde_json::json!({ "stop_reason": "max_output_tokens", "final_content": "half" }),
+                "2026-01-01T00:00:01Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.turns.by_stop_reason.get("max_output_tokens"), Some(&1));
+        assert_eq!(metrics.turns.by_stop_reason.get(STOP_FINAL_ANSWER), None);
+    }
+
     #[test]
     fn a_turn_that_yields_and_is_resumed_ends_once_but_is_counted_twice() {
         // The yield is an ending (it closed the turn) and the completion is

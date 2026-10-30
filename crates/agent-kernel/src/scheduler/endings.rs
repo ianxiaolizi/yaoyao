@@ -15,6 +15,21 @@ pub(crate) enum Gate {
     Busy,
 }
 
+/// Whether the turn stopped because a limit was reached, rather than because an
+/// answer, a person or a failure ended it.
+///
+/// These endings carry what the run spent, because a limit hit tells a reader
+/// nothing without how far the turn got before it.
+pub(crate) fn is_limit(reason: &StopReason) -> bool {
+    matches!(
+        reason,
+        StopReason::MaxSteps
+            | StopReason::MaxToolCalls
+            | StopReason::WallClockExceeded
+            | StopReason::MaxOutputTokens
+    )
+}
+
 /// How a turn stopped.
 ///
 /// Three endings, because two of them are decisions the Scheduler makes rather
@@ -51,9 +66,8 @@ impl Ending {
             StopReason::FinalAnswer
             | StopReason::MaxSteps
             | StopReason::MaxToolCalls
-            | StopReason::WallClockExceeded => {
-                (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED)
-            }
+            | StopReason::WallClockExceeded
+            | StopReason::MaxOutputTokens => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
             StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
             StopReason::FatalError => (EventType::TURN_FAILED, EventType::RUN_FAILED),
             StopReason::UserCancelled => (EventType::TURN_CANCELLED, EventType::RUN_CANCELLED),
@@ -80,6 +94,18 @@ impl Ending {
                 if matches!(reason, StopReason::MaxToolCalls | StopReason::WallClockExceeded) =>
             {
                 serde_json::json!({ "stop_reason": reason })
+            }
+            // A truncated response is a limit stop too, but unlike the other
+            // two it has text: the beginning of an answer. The terminal says
+            // both, so `metrics` counts it under the limit rather than under
+            // `final_answer`, and a reader is not handed half an answer dressed
+            // as a whole one (CONTRACT §7 #131).
+            Ending::Loop { reason: StopReason::MaxOutputTokens, final_content } => {
+                let mut payload = serde_json::json!({ "stop_reason": StopReason::MaxOutputTokens });
+                if let Some(content) = final_content {
+                    payload["final_content"] = serde_json::json!(content);
+                }
+                payload
             }
             _ => match &final_content {
                 Some(content) => serde_json::json!({ "final_content": content }),

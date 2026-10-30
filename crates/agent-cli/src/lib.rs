@@ -16,6 +16,7 @@ use agent_kernel::inbox::Inbox;
 use agent_kernel::recovery::RecoveryReport;
 use agent_kernel::resume::{Disposition, Resume, ResumeOutcome};
 use agent_kernel::scheduler::Scheduler;
+use agent_ports::agent_loop::StopReason;
 use agent_ports::artifact_store::{ArtifactStore, ArtifactStoreError};
 use agent_ports::event_store::EventStore;
 use agent_ports::tool_gateway::ToolGateway;
@@ -309,23 +310,32 @@ pub async fn run_ask(
 
     match started {
         commands::TurnStart::Ran(r) => {
-            if json {
+            let output = if json {
                 let value = serde_json::json!({
                     "run_id": r.run_id.as_str(),
                     "turn_id": r.turn_id.as_str(),
                     "stop_reason": r.stop_reason,
                     "final_content": r.final_content,
                 });
-                Ok(CliOutcome::ok(CliOutput::Json(json_output(&value)?)))
+                CliOutput::Json(json_output(&value)?)
+            } else if r.stop_reason == StopReason::MaxOutputTokens {
+                CliOutput::Text(truncated_text(r.final_content.as_deref()))
             } else {
                 match r.final_content {
-                    Some(content) => Ok(CliOutcome::ok(CliOutput::Text(content))),
-                    None => Ok(CliOutcome::ok(CliOutput::Text(format!(
-                        "[turn ended: {:?}]",
-                        r.stop_reason
-                    )))),
+                    Some(content) => CliOutput::Text(content),
+                    None => CliOutput::Text(format!("[turn ended: {:?}]", r.stop_reason)),
                 }
-            }
+            };
+            // A truncated response is not an answer: the provider cut the model
+            // off at the run's output limit, and what is on stdout is the
+            // beginning of one. `AnsweredNo` is what stops a script from taking
+            // it for a whole answer (CONTRACT §7 #131); the text itself is
+            // still printed, with the notice saying what it is.
+            Ok(if r.stop_reason == StopReason::MaxOutputTokens {
+                CliOutcome::failed(output)
+            } else {
+                CliOutcome::ok(output)
+            })
         }
         commands::TurnStart::NotStarted => Ok(CliOutcome::did_not_run(if json {
             let value = serde_json::json!({ "run": null, "reason": "busy_or_no_input" });
@@ -388,8 +398,9 @@ pub async fn run_resume(
             let settled = disposition_text(&disposition);
             match report {
                 Some(r) => {
-                    if json {
-                        Ok(CliOutcome::ok(CliOutput::Json(json_output(&serde_json::json!({
+                    let truncated = r.stop_reason == StopReason::MaxOutputTokens;
+                    let output = if json {
+                        CliOutput::Json(json_output(&serde_json::json!({
                             "outcome": "settled",
                             "turn_id": turn_id.as_str(),
                             "tool_name": tool_name,
@@ -397,22 +408,44 @@ pub async fn run_resume(
                             "run_id": r.run_id.as_str(),
                             "stop_reason": r.stop_reason,
                             "final_content": r.final_content,
-                        }))?)))
+                        }))?)
                     } else {
                         let mut lines =
                             vec![format!("resumed {turn_id}: {tool_name} was {settled}")];
-                        lines.push(match r.final_content {
-                            Some(content) => content,
-                            None => format!("[turn ended: {:?}]", r.stop_reason),
+                        // The same reading `ask` gives a truncated answer: the
+                        // continuation may be the one the limit cut off.
+                        lines.push(if truncated {
+                            truncated_text(r.final_content.as_deref())
+                        } else {
+                            match r.final_content {
+                                Some(content) => content,
+                                None => format!("[turn ended: {:?}]", r.stop_reason),
+                            }
                         });
-                        Ok(CliOutcome::ok(CliOutput::Text(lines.join("\n"))))
-                    }
+                        CliOutput::Text(lines.join("\n"))
+                    };
+                    Ok(if truncated { CliOutcome::failed(output) } else { CliOutcome::ok(output) })
                 }
                 None => Ok(CliOutcome::ok(CliOutput::Text(format!(
                     "resumed {turn_id}: {tool_name} was {settled}; no continuation ran"
                 )))),
             }
         }
+    }
+}
+
+/// What a truncated answer prints: the text that arrived, and the fact that it
+/// is not the whole answer.
+///
+/// The notice goes with the text rather than to stderr, because a caller that
+/// redirects stdout would otherwise keep exactly the bytes that look like an
+/// answer and lose the sentence saying they are not one.
+pub(crate) fn truncated_text(content: Option<&str>) -> String {
+    const NOTICE: &str = "the model's answer was cut off at the output token limit; raise \
+                          `max_output_tokens` in the profile's budget and run again";
+    match content {
+        Some(text) if !text.trim().is_empty() => format!("{text}\n\n[truncated: {NOTICE}]"),
+        _ => format!("[truncated: {NOTICE}]"),
     }
 }
 

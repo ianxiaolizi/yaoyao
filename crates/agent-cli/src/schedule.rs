@@ -12,6 +12,7 @@
 use agent_kernel::approval::ApprovalService;
 use agent_kernel::inbox::{Inbox, scheduled_due_at};
 use agent_kernel::scheduler::{RunReport, Scheduler, SchedulerError};
+use agent_ports::agent_loop::StopReason;
 use agent_protocol::events::Actor;
 use agent_protocol::ids::{InboxItemId, SessionId, TurnId};
 use chrono::{DateTime, Duration, Utc};
@@ -232,7 +233,12 @@ pub async fn earliest_due(
 }
 
 /// What a tick that ran a turn says.
+///
+/// A truncated answer is read the way `ask` reads one — the text that arrived,
+/// the notice, and `AnsweredNo` — because a scheduled turn whose answer was cut
+/// off at the output limit did not do the work it was scheduled for.
 pub fn render_ran(report: RunReport, json: bool) -> Result<CliOutcome, String> {
+    let truncated = report.stop_reason == StopReason::MaxOutputTokens;
     let output = if json {
         CliOutput::Json(json_output(&serde_json::json!({
             "ran": true,
@@ -241,13 +247,15 @@ pub fn render_ran(report: RunReport, json: bool) -> Result<CliOutcome, String> {
             "stop_reason": report.stop_reason,
             "final_content": report.final_content,
         }))?)
+    } else if truncated {
+        CliOutput::Text(super::truncated_text(report.final_content.as_deref()))
     } else {
         CliOutput::Text(match report.final_content {
             Some(content) => content,
             None => format!("[turn ended: {:?}]", report.stop_reason),
         })
     };
-    Ok(CliOutcome::ok(output))
+    Ok(if truncated { CliOutcome::failed(output) } else { CliOutcome::ok(output) })
 }
 
 /// What a tick that ran nothing says.

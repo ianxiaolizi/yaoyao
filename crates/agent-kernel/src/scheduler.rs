@@ -608,16 +608,13 @@ impl Scheduler {
 
         let (stop_reason, final_content, turn_terminal, run_terminal, mut turn_payload) =
             ending.settle();
-        // What a budget stop spent. A turn that stops on a limit has to say
+        // What a limit stop spent. A turn that stops on a limit has to say
         // how far it got, or a reader cannot tell a limit hit at once from one
-        // hit after a long run. Only budget endings carry it: every other
+        // hit after a long run. Only limit endings carry it: every other
         // terminal payload keeps the shape it had, so nothing that reads those
         // sees a new field. `stop_reason` is not repeated here — the terminal
         // payload beside this already says it.
-        if matches!(
-            stop_reason,
-            StopReason::MaxSteps | StopReason::MaxToolCalls | StopReason::WallClockExceeded
-        ) {
+        if endings::is_limit(&stop_reason) {
             // Counted from the log's own step markers rather than the loop
             // counter: a step that refused to open — a spent wall clock at the
             // boundary — returned without one, and it must not be counted as a

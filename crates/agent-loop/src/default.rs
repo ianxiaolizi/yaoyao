@@ -45,7 +45,7 @@ use agent_protocol::failures::Failures;
 use agent_protocol::ids::{AttemptId, EventId, EventSeq, SchemaVersion, SessionId, StepId};
 use agent_protocol::judgment::{self, Judgment, JudgmentStage};
 use agent_protocol::ledger::Ledger;
-use agent_protocol::model::{ToolCall, estimate_message, estimate_text};
+use agent_protocol::model::{FinishReason, ToolCall, estimate_message, estimate_text};
 use agent_protocol::permissions::ArtifactRef;
 use agent_protocol::plan::{self, Plan, PlanItemStatus};
 use agent_protocol::profile::RunBudget;
@@ -58,6 +58,10 @@ use agent_protocol::tool::{
     APPROVAL_PENDING_OUTCOME, GATE_REFUSED_OUTCOME, GATEWAY_REFUSED_OUTCOME, ToolSideEffect,
 };
 use agent_protocol::usertext::UserText;
+
+use crate::checks::{check_command, first_line, is_check_command};
+use crate::gates::{call_signature, repeat_text, retry_text, stale_text};
+use crate::verdict;
 use chrono::Utc;
 
 use crate::context_layers::{
@@ -927,15 +931,19 @@ struct LoopTurn {
 impl LoopTurn {
     /// The provider budget every request this turn makes carries.
     ///
-    /// The output reservation becomes the provider's `max_tokens`; a run that
-    /// configured none sends none, and the provider's own default applies. The
-    /// wall clock is what remains of the run's limit, so a request will not be
-    /// given longer than the run has left — zero or less is sent as no limit:
-    /// the step boundary already refuses to start a request past the deadline,
-    /// and a round-trip value of 0 is a different instruction in some adapters.
+    /// `max_output_tokens` becomes the provider's `max_tokens`; a run that
+    /// configured none sends none, and the provider's own default applies. It is
+    /// deliberately not the window's reservation: that number says how much of
+    /// the working set to leave for an answer, and using it as the completion
+    /// cap is what ended real answers at 2,000 tokens on 2026-10-30 (CONTRACT
+    /// §7 #131). The wall clock is what remains of the run's limit, so a request
+    /// will not be given longer than the run has left — zero or less is sent as
+    /// no limit: the step boundary already refuses to start a request past the
+    /// deadline, and a round-trip value of 0 is a different instruction in some
+    /// adapters.
     fn model_budget(&self) -> ModelBudget {
         ModelBudget {
-            max_tokens: self.budget.reserved_output_tokens,
+            max_tokens: self.budget.max_output_tokens,
             wall_clock_ms: self.deadline.and_then(|deadline| {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 (left.as_millis() > 0).then_some(left.as_millis() as u64)
@@ -1281,10 +1289,7 @@ impl AgentLoop for DefaultAgentLoop {
             context_revision,
             message_count: messages.len(),
             required_capabilities: capabilities.clone(),
-            budget: ModelBudget {
-                max_tokens: budget.reserved_output_tokens,
-                ..ModelBudget::default()
-            },
+            budget: ModelBudget { max_tokens: budget.max_output_tokens, ..ModelBudget::default() },
         };
         let route = self.router.route(&route_request);
 
@@ -1983,34 +1988,26 @@ impl AgentLoop for DefaultAgentLoop {
                 // An action the turn only talked about is a fact, not a tone:
                 // the reading named an action, the posture stayed act, and no
                 // call was dispatched. Naming it on the verdict lets `why` say
-                // so and the evaluation count it without reading prose.
-                let unmet_action = turn.dispatched == 0 && turn.mode.stance == Stance::Act;
-                let answer_summary = if answer_text.trim().is_empty() {
-                    String::from("(no text)")
-                } else {
-                    truncate(&answer_text, 160)
-                };
+                // so and the evaluation count it without reading prose. A
+                // response the provider cut off at the output limit is not an
+                // answer at all, and the verdict says that instead.
+                let read = verdict::answer(
+                    &answer_text,
+                    &verdict::Facts {
+                        truncated: response.finish_reason.as_str() == FinishReason::LENGTH,
+                        output_limit: turn.budget.max_output_tokens,
+                        unmet_action: turn.dispatched == 0 && turn.mode.stance == Stance::Act,
+                        criterion_observed: turn.criterion_observed,
+                        repair_after_failure: turn.stance_switched
+                            && turn.mode.stance == Stance::Repair,
+                    },
+                );
                 let verdict = turn.reason.node(
                     ReasonKind::Verdict,
                     step_index,
-                    if unmet_action {
-                        format!(
-                            "answer (the reading asked for an action; no call was dispatched): \
-                             {answer_summary}"
-                        )
-                    } else {
-                        format!("answer: {answer_summary}")
-                    },
+                    read.claim,
                     verdict_basis,
-                    if turn.criterion_observed {
-                        "verdict/criterion-observed"
-                    } else if turn.stance_switched && turn.mode.stance == Stance::Repair {
-                        "verdict/after-failure"
-                    } else if unmet_action {
-                        "verdict/action-unmet"
-                    } else {
-                        "verdict/answer"
-                    },
+                    read.rule,
                     ReasonSource::Model,
                 );
                 events.push(reason_event(ctx, Some(&step_id), &verdict));
@@ -2024,7 +2021,7 @@ impl AgentLoop for DefaultAgentLoop {
                 return Ok(StepOutcome {
                     step_id,
                     events,
-                    stop: Some(StopReason::FinalAnswer),
+                    stop: Some(read.stop),
                     final_content: Some(answer_text),
                 });
             }
@@ -2902,66 +2899,6 @@ fn step_failed(ctx: &TurnContext, step_id: &StepId) -> EventDraft {
     draft(ctx, step_id, EventType::STEP_FAILED, serde_json::json!({}), Actor::Agent)
 }
 
-/// The first line of a tool result, bounded — what the gate quotes back.
-fn first_line(text: &str) -> String {
-    truncate(text.lines().next().unwrap_or_default(), 200)
-}
-
-/// The command a call carries, when the call is one that runs a command.
-///
-/// This is the difference between looking at a check and running one. Only a
-/// call that carries a command can observe a criterion; a tool whose arguments
-/// name a file (`fs.read tests/…`) has no command and therefore cannot.
-fn check_command(call: &ToolCall) -> Option<String> {
-    ["command", "cmd", "script"]
-        .iter()
-        .find_map(|key| call.arguments.get(*key).and_then(|value| value.as_str()))
-        .map(str::to_string)
-}
-
-/// Whether a command is a check: it names a test or a verification.
-fn is_check_command(command: &str) -> bool {
-    let lower = command.to_lowercase();
-    ["test", "check", "verify", "测试", "检查", "验证"].iter().any(|word| lower.contains(*word))
-}
-
-/// What the model is told when it answers after recording a retry without
-/// making it.
-fn retry_text(retry: &str, hint: String) -> String {
-    format!(
-        "Kernel check: you recorded a retry — `{retry}` — but answered without making the \
-         call. Make it now with a tool call ({hint}). If it cannot be made, record reconcile \
-         again with `stop` true and say in `next` why stopping is the right answer. A retry \
-         that is only described was not made."
-    )
-}
-
-/// What the model is told when its answer restates a read from an earlier
-/// turn. Names the read and the one call that refreshes it.
-fn stale_text(stale: &StaleRead) -> String {
-    format!(
-        "Kernel check: `{}` was read in an earlier turn ({}), not in this one — the answer \
-         restates an old reading. Read it again now with {}, then answer.",
-        stale.target, stale.tool, stale.tool
-    )
-}
-
-/// What the model is told when the same call would run a third time unchanged.
-fn repeat_text(tool: &str, count: u32) -> String {
-    format!(
-        "Kernel check: `{tool}` has already run {count} times in a row with the same \
-         arguments; another identical run will do the same thing. Change an argument or use \
-         another tool, or record a reconcile saying why this time will be different."
-    )
-}
-
-/// What makes two calls the same call: the tool and the arguments, byte for
-/// byte. This is how `kernel_eval` classifies an identical retry, so the gate
-/// and the report agree on what "the same call" means.
-fn call_signature(tool_name: &str, arguments: &serde_json::Value) -> String {
-    format!("{tool_name}\u{0}{arguments}")
-}
-
 /// Answer the calls a run limit kept from being dispatched.
 ///
 /// `tool/not_started` is the existing word for exactly this: the call provably
@@ -3497,6 +3434,31 @@ mod tests {
             "{verdict:?}"
         );
         assert_eq!(verdict.rule, "verdict/answer");
+    }
+
+    /// A response the provider cut off at the output limit is not an answer.
+    ///
+    /// 2026-10-30: a reasoning model spent the whole completion budget on
+    /// reasoning tokens, returned `finish_reason: length` with no content, and
+    /// the loop logged an ordinary final answer — exit 0, `final_answer` in
+    /// `metrics`, `(no text)` in `why`. The stop has to say what happened.
+    #[tokio::test]
+    async fn a_response_cut_off_at_the_output_limit_is_not_a_final_answer() {
+        let model =
+            Arc::new(FakeModelProvider::new(vec![FakeModelProvider::truncated("half a sent")]));
+        let tools = Arc::new(FakeToolProvider::new());
+        let gateway = Arc::new(FakeToolGateway::new(tools));
+        let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::MaxOutputTokens);
+        assert_eq!(outcome.final_content.as_deref(), Some("half a sent"));
+        let verdict = reason_nodes(&outcome.events)
+            .into_iter()
+            .find(|node| node.kind == ReasonKind::Verdict)
+            .expect("a verdict names the stop");
+        assert_eq!(verdict.rule, "verdict/output-truncated", "{}", verdict.claim);
     }
 
     /// A turn that was read as an action, stayed in the act posture, and
@@ -7687,14 +7649,18 @@ mod tests {
         assert_eq!(tools.call_count(), 1, "the call under the limit ran");
     }
 
-    /// The output reservation the trimmer budgets against is the provider's
-    /// `max_tokens`, so the two cannot drift apart.
+    /// The provider's `max_tokens` is the output cap, not the window's
+    /// reservation. One number for both jobs is what ended real answers at
+    /// 2,000 tokens on 2026-10-30 (CONTRACT §7 #131).
     #[tokio::test]
-    async fn the_output_reservation_is_the_provider_s_max_tokens() {
+    async fn the_provider_s_max_tokens_is_the_output_cap_not_the_reservation() {
         let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
         let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
         let loop_ = DefaultAgentLoop::new(model.clone(), gateway, no_context(), one_model_router());
 
+        // A reservation alone sends no cap: it is room kept in the window, not
+        // a length limit. No wall clock configured either, so the provider's
+        // own defaults apply rather than a made-up limit.
         let mut turn = ctx();
         turn.state = Some(budgeted(RunBudget {
             max_input_tokens: Some(4_000),
@@ -7702,11 +7668,14 @@ mod tests {
             ..RunBudget::default()
         }));
         run_turn(&loop_, &turn).await;
-
-        assert_eq!(model.requests()[0].budget.max_tokens, Some(512));
-        // No wall clock configured, so none is sent: the provider's own default
-        // applies rather than a made-up limit.
+        assert_eq!(model.requests()[0].budget.max_tokens, None);
         assert_eq!(model.requests()[0].budget.wall_clock_ms, None);
+
+        let mut turn = ctx();
+        turn.state =
+            Some(budgeted(RunBudget { max_output_tokens: Some(3_000), ..RunBudget::default() }));
+        run_turn(&loop_, &turn).await;
+        assert_eq!(model.requests()[1].budget.max_tokens, Some(3_000));
     }
 
     /// A run with a wall clock tells the provider what is left of it, rather

@@ -6,7 +6,10 @@
 
 #![deny(unsafe_code)]
 
+mod checks;
 mod context_layers;
 mod default;
+mod gates;
+mod verdict;
 
 pub use default::DefaultAgentLoop;

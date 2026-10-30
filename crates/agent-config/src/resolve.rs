@@ -449,6 +449,7 @@ fn merge(base: Profile, above: Profile) -> Profile {
             wall_clock_timeout: above.wall_clock_timeout.or(base.wall_clock_timeout),
             max_input_tokens: above.max_input_tokens.or(base.max_input_tokens),
             reserved_output_tokens: above.reserved_output_tokens.or(base.reserved_output_tokens),
+            max_output_tokens: above.max_output_tokens.or(base.max_output_tokens),
             compact_at_percent: above.compact_at_percent.or(base.compact_at_percent),
         }),
         plugins: merge_with(base.plugins, above.plugins, |base, above| PluginsSpec {
@@ -622,6 +623,17 @@ const DEFAULT_MAX_INPUT_TOKENS: u32 = 8_000;
 const DEFAULT_RESERVED_OUTPUT_TOKENS: u32 = 2_000;
 const DEFAULT_COMPACT_AT_PERCENT: u32 = 75;
 
+/// The completion cap a run gets when no layer names one.
+///
+/// Not a share of the window and not tied to the reservation: reasoning models
+/// bill their reasoning tokens to the same budget, so a cap sized to the prose
+/// can end a response before a single word of it is written. The 2,000 the
+/// reservation has always used was doing this job after CONTRACT §7 #111 mapped
+/// it to `max_tokens`, and on 2026-10-30 a real run spent all 2,000 on reasoning
+/// and returned an empty answer (§7 #131). 8,000 is the value the round retested
+/// that task with: 4/4, with no single response passing 4.9k output tokens.
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_000;
+
 /// Whether a layer said anything about the window.
 ///
 /// Step and tool-call limits do not count: a profile that only tightens how
@@ -643,6 +655,12 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
         budget.max_input_tokens = Some(DEFAULT_MAX_INPUT_TOKENS);
         budget.reserved_output_tokens = Some(DEFAULT_RESERVED_OUTPUT_TOKENS);
         budget.compact_at_percent = Some(DEFAULT_COMPACT_AT_PERCENT);
+    }
+    // The completion cap is not part of the window, so it is filled in whether
+    // or not a layer named a window: a run that configured its own working set
+    // still needs an answer limit that is not that set's reservation.
+    if budget.max_output_tokens.is_none() {
+        budget.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
     }
     // The pair is checked once both layers have had their say: one layer may
     // name the window and another the reservation, and each is unremarkable
@@ -738,6 +756,17 @@ fn apply_budget(budget: &mut RunBudget, spec: Option<&BudgetSpec>) -> Result<()>
             });
         }
         budget.reserved_output_tokens = Some(reserved);
+    }
+    if let Some(output) = spec.max_output_tokens {
+        if output == 0 {
+            return Err(ConfigError::InvalidBudget {
+                layer: "budget".to_string(),
+                detail: "`max_output_tokens` is zero, which asks the provider for no answer at \
+                         all; omit it for the shipped default"
+                    .to_string(),
+            });
+        }
+        budget.max_output_tokens = Some(output);
     }
     if let Some(percent) = spec.compact_at_percent {
         if !(1..=99).contains(&percent) {

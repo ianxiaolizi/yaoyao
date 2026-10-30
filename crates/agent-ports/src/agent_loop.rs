@@ -318,6 +318,14 @@ pub enum StopReason {
     /// before each tool dispatch; a request already in flight is not aborted
     /// by this build, so overshoot is bounded by one request.
     WallClockExceeded,
+    /// The provider stopped a response at the run's `max_output_tokens` before
+    /// the model finished. The text that arrived is the beginning of an answer,
+    /// not an answer: it is reported with this reason rather than as a final
+    /// answer, because on 2026-10-30 a reasoning model spent the whole 2,000
+    /// token default on reasoning tokens and the empty result was logged as an
+    /// ordinary answer — exit 0, `final_answer` in `metrics`, `(no text)` in
+    /// `why`.
+    MaxOutputTokens,
 }
 
 /// Port for how a turn advances. Implementations are assembled at the app layer.

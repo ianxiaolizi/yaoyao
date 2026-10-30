@@ -520,6 +520,19 @@ impl FakeModelProvider {
         ModelResponse::text(content)
     }
 
+    /// A response the provider stopped at its output limit. The text that
+    /// arrived is the beginning of an answer, not an answer: this is what a
+    /// reasoning model returns when its reasoning spends the whole completion
+    /// budget (`finish_reason: length`, often with no content at all).
+    pub fn truncated(content: &str) -> ModelResponse {
+        ModelResponse {
+            content_blocks: vec![ContentBlock::text(content)],
+            usage: None,
+            finish_reason: FinishReason::new(FinishReason::LENGTH),
+            provider_metadata: serde_json::Value::Null,
+        }
+    }
+
     /// A response that proposes a single tool call.
     pub fn tool_call(name: &str, arguments: serde_json::Value) -> ModelResponse {
         // A placeholder call id; `stream` rewrites it to a unique one so two

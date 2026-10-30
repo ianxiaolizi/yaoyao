@@ -291,6 +291,10 @@ pub struct BudgetSpec {
     /// How much of `max_input_tokens` to reserve for the answer. Defaults to
     /// zero; must be smaller than `max_input_tokens` when both are set.
     pub reserved_output_tokens: Option<u32>,
+    /// The most completion tokens one request may ask the provider for. Omit
+    /// for the shipped default (8,000); independent of the window, and it is
+    /// what the request's `max_tokens` carries.
+    pub max_output_tokens: Option<u32>,
     /// The share of the usable window at which older history is summarized
     /// before a request is sent. Omit to keep the trimmer as the only
     /// protection. Requires `max_input_tokens`; 1..=99.

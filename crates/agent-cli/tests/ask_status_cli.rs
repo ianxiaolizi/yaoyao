@@ -122,6 +122,43 @@ async fn a_run_while_a_run_is_active_did_not_run() {
     assert_eq!(value["reason"], "busy_or_no_input");
 }
 
+/// A truncated answer is not an answer: it exits `1`, keeps the text that
+/// arrived, and says what it is.
+///
+/// 2026-10-30: a response cut off at the output limit was logged and printed as
+/// an ordinary answer. The terminal now names the stop, and the command judges
+/// it `AnsweredNo` so only `$?` is needed to tell half an answer from a whole
+/// one (CONTRACT §7 #131).
+#[tokio::test]
+async fn a_truncated_answer_is_reported_as_not_answered() {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::truncated("half a sen")]));
+    let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    let scheduler = Scheduler::new(store.clone(), loop_, 8);
+    let sid = SessionId::from_string("truncated");
+
+    let outcome = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+    assert_eq!(outcome.verdict, Verdict::AnsweredNo);
+    let CliOutput::Text(text) = outcome.output else { panic!("expected text output") };
+    assert!(text.starts_with("half a sen"), "the text that arrived is kept: {text}");
+    assert!(text.contains("[truncated:"), "the notice says it is not whole: {text}");
+
+    // The log says the same thing, in the form `metrics` and `why` read.
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let end = events
+        .iter()
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
+        .expect("the turn ended");
+    assert_eq!(end.event.payload["stop_reason"], "max_output_tokens");
+    assert_eq!(end.event.payload["final_content"], "half a sen");
+}
+
 #[tokio::test]
 async fn status_reports_closed_state_after_an_ask() {
     let (scheduler, sid) = scheduler();

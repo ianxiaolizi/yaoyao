@@ -47,11 +47,24 @@ pub struct RunBudget {
     /// How much of `max_input_tokens` is reserved for the model's answer.
     /// Only meaningful with `max_input_tokens`; `None` is treated as zero.
     ///
-    /// The same number is the provider's `max_tokens` on every request the
-    /// turn makes, so the reservation the trimmer budgets against and the cap
-    /// the endpoint applies are one value rather than two that can drift.
+    /// This is window accounting and nothing else: the trimmer leaves this much
+    /// room so a request plus its answer fits the working set. It is no longer
+    /// the provider's `max_tokens` — see [`Self::max_output_tokens`], which
+    /// exists because one number for both jobs made a 2,000-token reservation
+    /// into a hard completion cap that reasoning models exhausted before
+    /// writing anything (CONTRACT §7 #131).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reserved_output_tokens: Option<u32>,
+    /// The most completion tokens one request may ask the provider for, sent
+    /// as the request's `max_tokens`. `None` sends no cap and lets the
+    /// provider's own default apply.
+    ///
+    /// Independent of the window: `reserved_output_tokens` is how much room the
+    /// trimmer keeps for the answer, this is how long an answer may be. A
+    /// reasoning model spends part of this budget on its reasoning, so a cap
+    /// sized for the prose is a cap that can end the response mid-thought.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     /// When the estimated settled history reaches this share of the usable
     /// window, the loop asks the model for a handover summary before its
     /// normal request. `None` means compaction is off and the trimmer is the
@@ -98,6 +111,7 @@ impl Default for RunBudget {
             wall_clock_ms: None,
             max_input_tokens: None,
             reserved_output_tokens: None,
+            max_output_tokens: None,
             compact_at_percent: None,
         }
     }

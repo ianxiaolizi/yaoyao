@@ -165,6 +165,40 @@ mod tests {
         assert_eq!(budget.max_input_tokens, Some(8_000));
         assert_eq!(budget.reserved_output_tokens, Some(2_000));
         assert_eq!(budget.compact_at_percent, Some(75));
+        assert_eq!(budget.max_output_tokens, Some(8_000));
+    }
+
+    #[test]
+    fn the_output_cap_is_not_the_window_s_reservation() {
+        // The two numbers answer different questions and are set apart: the
+        // reservation is room kept in the working set, the cap is how long an
+        // answer may be. A 2,000-token reservation with an 8,000-token cap is
+        // the shipped shape; a layer that names one does not move the other.
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            r#"
+[profiles.p]
+budget = { max_input_tokens = 1000 }
+"#,
+        )
+        .unwrap();
+        layers.profile_override = Some("p".to_string());
+        let budget = resolve(layers).unwrap().budget;
+        assert_eq!(budget.reserved_output_tokens, None, "the reservation stays unset");
+        assert_eq!(budget.max_output_tokens, Some(8_000), "the cap is filled in anyway");
+
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            r#"
+[profiles.p]
+budget = { max_input_tokens = 24000, reserved_output_tokens = 2000, max_output_tokens = 12000 }
+"#,
+        )
+        .unwrap();
+        layers.profile_override = Some("p".to_string());
+        let budget = resolve(layers).unwrap().budget;
+        assert_eq!(budget.reserved_output_tokens, Some(2_000));
+        assert_eq!(budget.max_output_tokens, Some(12_000), "an explicit cap wins");
     }
 
     #[test]
@@ -1311,6 +1345,7 @@ decisions = { laya = true }
         for budget in [
             "budget = { max_input_tokens = 0 }",
             "budget = { max_input_tokens = 1000, reserved_output_tokens = 0 }",
+            "budget = { max_output_tokens = 0 }",
         ] {
             let mut layers = no_layers();
             layers.user = UserConfig::from_toml_str(&format!("[profiles.p]\n{budget}\n")).unwrap();
