@@ -20,7 +20,7 @@ use agent_ports::tool_provider::{
 use agent_protocol::ids::SessionId;
 use agent_protocol::permissions::{ArtifactRef, Capability, PolicyDecision, SecretRef};
 use agent_protocol::redactor::Redactor;
-use agent_protocol::tool::ToolErrorKind;
+use agent_protocol::tool::{ToolErrorKind, ToolPolicyRecord};
 
 use crate::approval::ApprovalService;
 use crate::policy::{PolicyContext, PolicyEngine, Refusal};
@@ -448,7 +448,12 @@ impl GuardedToolProvider {
             .invoke(resolved_invocation)
             .await
             .map_err(|error| ToolGatewayError::Tool(scrub_provider_error(error, secrets)))?;
-        Ok(self.finalize(result, secrets))
+        // The decision is the gate's to state. A provider that filled the field
+        // is stating a decision it did not make, so it is cleared here and only
+        // a caller that actually decided — `execute` — sets it afterwards.
+        let mut finalized = self.finalize(result, secrets);
+        finalized.policy = None;
+        Ok(finalized)
     }
 
     /// The policy's view of the call.
@@ -694,13 +699,21 @@ impl ToolGateway for GuardedToolProvider {
                 // Asked with no grants, because a grant cannot turn anything
                 // into a `deny`: every layer this can name refuses the same way
                 // it did in the evaluation above, whichever that was.
+                let record = ToolPolicyRecord::denied(
+                    capabilities.clone(),
+                    self.policy.refusals(&capabilities, Some(&ctx), &[]),
+                );
                 let reason = if capabilities.is_empty() {
                     "declares no capabilities, and an undeclared surface is not an unlimited one"
                         .to_string()
                 } else {
-                    deny_reason(&self.policy.refusals(&capabilities, Some(&ctx), &[]))
+                    deny_reason(&record.refusals)
                 };
-                Err(ToolGatewayError::PolicyDenied { tool: invocation.tool_name.clone(), reason })
+                Err(ToolGatewayError::PolicyDenied {
+                    tool: invocation.tool_name.clone(),
+                    reason,
+                    policy: record,
+                })
             }
             PolicyDecision::Ask => {
                 let capability =
@@ -708,9 +721,14 @@ impl ToolGateway for GuardedToolProvider {
                 Err(self.request_approval(session_id, invocation, capability).await?)
             }
             PolicyDecision::Allow => {
+                // Stated once and stamped on whatever this arm returns: the
+                // arms leave by three different doors (no secret, secret
+                // already granted, secret approved), and a record that only
+                // two of them carried would be worse than none.
+                let record = ToolPolicyRecord::allowed(capabilities.clone());
                 self.check_paths(invocation, &ctx)?;
                 if !Self::references_secret(&invocation.arguments) {
-                    return self.finish_resolved(invocation, &[]).await;
+                    return Ok(self.finish_resolved(invocation, &[]).await?.with_policy(record));
                 }
                 // Resolve before asking: a reference this run cannot resolve is
                 // a call that could never run, and a person should not be asked
@@ -727,7 +745,7 @@ impl ToolGateway for GuardedToolProvider {
                         capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
                     return Err(self.request_approval(session_id, invocation, capability).await?);
                 }
-                self.finish_resolved(&resolved_invocation, &secrets).await
+                Ok(self.finish_resolved(&resolved_invocation, &secrets).await?.with_policy(record))
             }
         }
     }
@@ -761,7 +779,12 @@ impl ToolGateway for GuardedToolProvider {
 ///
 /// The list is empty exactly when the decision was not `Deny`, so this is only
 /// ever asked about a capability that really was refused.
-fn deny_reason(refusals: &[(Capability, Refusal)]) -> String {
+///
+/// Built from the record that is about to be written, not from a second walk of
+/// the engine: the sentence a person reads and the `policy.refusals` map beside
+/// it in the log are one fact, and two producers of one fact are two things
+/// that can disagree.
+fn deny_reason(refusals: &std::collections::BTreeMap<Capability, Refusal>) -> String {
     refusals
         .iter()
         .map(|(capability, layer)| {
@@ -1077,6 +1100,96 @@ mod tests {
 
         let err = gateway.execute(&sid(), &invocation("shell.run")).await.unwrap_err();
         assert!(matches!(err, ToolGatewayError::PolicyDenied { .. }), "unexpected: {err:?}");
+    }
+
+    /// A refusal is a decision with a reason, and the record says *which* layer
+    /// made it. "Denied by policy" is the same sentence for an administrator's
+    /// managed deny, a rule somebody wrote, and a capability this build does
+    /// not have — three different places to look, and the log used to say none
+    /// of them.
+    #[tokio::test]
+    async fn a_denial_records_the_layer_that_refused() {
+        let tools = Arc::new(ScriptedTools::echo(vec![
+            def("shell.run", &[Capability::PROCESS_SPAWN], ToolSideEffect::Destructive),
+            def("net.fetch", &[Capability::NETWORK_REQUEST], ToolSideEffect::Network),
+        ]));
+        // `process.spawn` is provided by the sandbox and forbidden by a rule;
+        // `network.request` is not provided at all.
+        let policy = PolicyEngine::new()
+            .with_rules([crate::policy::PolicyRule::deny(Capability::new(
+                Capability::PROCESS_SPAWN,
+            ))])
+            .with_sandbox([Capability::new(Capability::PROCESS_SPAWN)]);
+        let (gateway, _, tools) = gateway(tools, policy);
+
+        let denied = gateway.execute(&sid(), &invocation("shell.run")).await.unwrap_err();
+        let ToolGatewayError::PolicyDenied { policy, reason, .. } = denied else {
+            panic!("expected a policy denial");
+        };
+        assert_eq!(policy.decision, PolicyDecision::Deny);
+        assert_eq!(
+            policy.refusals.get(&Capability::new(Capability::PROCESS_SPAWN)),
+            Some(&Refusal::Rule),
+            "{policy:?}"
+        );
+        // The sentence and the record are one fact, not two that can drift.
+        assert!(reason.contains("is denied by a policy rule"), "{reason}");
+
+        let unavailable = gateway.execute(&sid(), &invocation("net.fetch")).await.unwrap_err();
+        let ToolGatewayError::PolicyDenied { policy, .. } = unavailable else {
+            panic!("expected a policy denial");
+        };
+        assert_eq!(
+            policy.refusals.get(&Capability::new(Capability::NETWORK_REQUEST)),
+            Some(&Refusal::SandboxUnavailable),
+            "{policy:?}"
+        );
+        assert!(tools.calls().is_empty(), "neither refused call reached the provider");
+    }
+
+    /// The other half of the same record: a call that ran says what it ran
+    /// under, so a reader can tell a call the gate allowed from one nothing
+    /// decided about.
+    #[tokio::test]
+    async fn an_allowed_call_states_the_capabilities_it_ran_under() {
+        let tools = Arc::new(ScriptedTools::echo(vec![def(
+            "fs.read",
+            &[Capability::FS_READ],
+            ToolSideEffect::Read,
+        )]));
+        let (gateway, _, tools) = gateway(tools, allowing(Capability::FS_READ));
+        *tools.results.lock().unwrap() =
+            HashMap::from([("fs.read".to_string(), ToolResult::completed("hello"))]);
+
+        let result = gateway.execute(&sid(), &invocation("fs.read")).await.unwrap();
+
+        let record = result.policy.expect("an allowed call states its decision");
+        assert_eq!(record.decision, PolicyDecision::Allow);
+        assert_eq!(record.capabilities, vec![Capability::new(Capability::FS_READ)]);
+        assert!(record.refusals.is_empty(), "{record:?}");
+    }
+
+    /// The field is the gate's word about its own decision, so a provider
+    /// cannot write one. What a tool returns is data; a result claiming the
+    /// network was allowed must not survive as if the gate had said so.
+    #[tokio::test]
+    async fn a_provider_cannot_state_the_gate_s_decision() {
+        let forged = ToolResult::completed("ok")
+            .with_policy(ToolPolicyRecord::allowed([Capability::new(Capability::NETWORK_REQUEST)]));
+        let tools = Arc::new(RecordingTools { reply: forged, ..RecordingTools::new("ok") });
+        let gateway =
+            gateway_any(ResourceGuard::new(workspace()), tools, allowing(Capability::FS_READ));
+
+        // Allowed: the record is the gate's, describing what it actually let
+        // through — not what the provider wrote about itself.
+        let result = gateway.execute(&sid(), &invocation("fs.read")).await.unwrap();
+        let record = result.policy.expect("the gate states its own decision");
+        assert_eq!(record.capabilities, vec![Capability::new(Capability::FS_READ)]);
+
+        // Approved: the decision was made earlier and is recorded where it was
+        // made, so this path states none rather than inventing a second one.
+        let approved = gateway.execute_approved(&invocation("fs.read")).await.unwrap();
+        assert!(approved.policy.is_none(), "{:?}", approved.policy);
     }
 
     /// What a tool returned is read by the model and by nobody else. A result
@@ -1607,8 +1720,13 @@ mod tests {
 
         let err = gateway.execute(&sid(), &invocation("mystery.tool")).await.unwrap_err();
         match err {
-            ToolGatewayError::PolicyDenied { reason, .. } => {
+            ToolGatewayError::PolicyDenied { reason, policy, .. } => {
                 assert!(reason.contains("declares no capabilities"), "unexpected reason: {reason}");
+                // Nothing declared means no layer to name. The record says so
+                // by being empty rather than by naming a layer that never ran.
+                assert_eq!(policy.decision, PolicyDecision::Deny);
+                assert!(policy.capabilities.is_empty());
+                assert!(policy.refusals.is_empty(), "{policy:?}");
             }
             other => panic!("expected a policy denial, got: {other:?}"),
         }
@@ -1771,7 +1889,11 @@ mod tests {
         use agent_protocol::tool::ToolErrorKind;
         let cases = [
             (
-                ToolGatewayError::PolicyDenied { tool: "t".into(), reason: "r".into() },
+                ToolGatewayError::PolicyDenied {
+                    tool: "t".into(),
+                    reason: "r".into(),
+                    policy: ToolPolicyRecord::denied([], []),
+                },
                 Some(ToolErrorKind::PermissionDenied),
             ),
             (

@@ -1006,6 +1006,14 @@ fn hex(bytes: &[u8]) -> String {
 
 /// A passthrough ToolGateway over a [`ToolProvider`], with no policy. For tests
 /// that need the gateway seam but not policy enforcement.
+///
+/// It enforces nothing, which is why every call it lets through is stamped
+/// `allow` under the tool's declared capabilities: that is the decision a
+/// gateway with no rules actually reaches, and a test that looked for the
+/// record would otherwise find the fake and the real gateway disagreeing about
+/// whether an allowed call states anything. The one thing it cannot do is
+/// refuse — a test that needs a refusal drives the real
+/// `GuardedToolProvider`, or a stub that states its own record.
 pub struct FakeToolGateway {
     inner: Arc<dyn ToolProvider>,
     /// When set, every call is held for approval instead of running.
@@ -1037,7 +1045,15 @@ impl ToolGateway for FakeToolGateway {
                 approval_id: approval_id.clone(),
             });
         }
-        self.inner.invoke(invocation).await.map_err(ToolGatewayError::Tool)
+        let declared = self
+            .inner
+            .definitions()
+            .into_iter()
+            .find(|definition| definition.name == invocation.tool_name)
+            .map(|definition| definition.capability_requirements)
+            .unwrap_or_default();
+        let result = self.inner.invoke(invocation).await.map_err(ToolGatewayError::Tool)?;
+        Ok(result.with_policy(agent_protocol::tool::ToolPolicyRecord::allowed(declared)))
     }
 
     fn definitions(&self) -> Vec<ToolDefinition> {

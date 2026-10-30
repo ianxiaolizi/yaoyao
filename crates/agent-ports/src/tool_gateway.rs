@@ -23,7 +23,7 @@
 use crate::tool_provider::ToolProviderError;
 use agent_protocol::ids::SessionId;
 use agent_protocol::tool::ToolErrorKind;
-use agent_protocol::tool::{ToolDefinition, ToolInvocation, ToolResult};
+use agent_protocol::tool::{ToolDefinition, ToolInvocation, ToolPolicyRecord, ToolResult};
 
 /// The seam the loop uses to execute tool calls under policy and approval.
 #[async_trait::async_trait]
@@ -60,8 +60,16 @@ pub trait ToolGateway: Send + Sync {
 /// Errors from a [`ToolGateway`] implementation.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolGatewayError {
+    /// Policy refused the call before it ran.
+    ///
+    /// The sentence and the decision are both carried. The sentence is what a
+    /// person reads; the record is what a reader of the log can count by —
+    /// which layer refused, not merely that something did. "Denied by policy"
+    /// is the same message for an administrator's managed deny, a rule
+    /// somebody wrote, and a capability this build's sandbox does not have, and
+    /// those are three different places to fix.
     #[error("policy denied tool '{tool}': {reason}")]
-    PolicyDenied { tool: String, reason: String },
+    PolicyDenied { tool: String, reason: String, policy: ToolPolicyRecord },
     #[error("approval pending for tool '{tool}': {approval_id}")]
     ApprovalPending { tool: String, approval_id: String },
     #[error("resource boundary violation for tool '{tool}': {reason}")]

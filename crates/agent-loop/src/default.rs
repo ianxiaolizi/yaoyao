@@ -3037,6 +3037,13 @@ impl AgentLoop for DefaultAgentLoop {
                         if !result.facts.is_empty() {
                             payload["facts"] = serde_json::to_value(&result.facts)?;
                         }
+                        // The gate's own statement of what it decided, beside
+                        // the result it decided about: a reader can see which
+                        // capabilities the call ran under without re-deriving
+                        // the rules from the rest of the log.
+                        if let Some(policy) = &result.policy {
+                            payload["policy"] = serde_json::to_value(policy)?;
+                        }
                         let event_type = match result.status {
                             ToolStatus::Completed => EventType::TOOL_COMPLETED,
                             ToolStatus::Failed => EventType::TOOL_FAILED,
@@ -3234,6 +3241,13 @@ impl AgentLoop for DefaultAgentLoop {
                         // two answers that are not classes of refusal.
                         if let Some(kind) = e.kind() {
                             payload["error_kind"] = serde_json::json!(kind.as_str());
+                        }
+                        // `error_kind` says a permission rule refused it. This
+                        // says which one — managed policy, a rule, or a
+                        // capability the sandbox does not provide — which is
+                        // the fact that tells a reader where to look.
+                        if let ToolGatewayError::PolicyDenied { policy, .. } = &e {
+                            payload["policy"] = serde_json::to_value(policy)?;
                         }
                         let refused =
                             draft(ctx, &step_id, EventType::TOOL_FAILED, payload, Actor::Tool);
@@ -5762,6 +5776,7 @@ mod tests {
             }],
             truncated: true,
             facts: ToolFacts { exit_code: Some(0), line_count: Some(2500) },
+            policy: None,
             redaction_metadata: RedactionMetadata {
                 redacted: true,
                 patterns: vec!["token".to_string()],
@@ -7674,6 +7689,97 @@ mod tests {
             vec![("echo", "builtin"), (plan::TOOL_NAME, "loop"), ("fs.missing", "unknown")],
             "a name no provider offered is answered by nobody, and says so"
         );
+    }
+
+    /// A call the gate let through records what it ran under.
+    ///
+    /// The decision is the gateway's, and the loop writes it beside the result
+    /// so a reader can tell a call that was allowed from one nothing decided
+    /// about, without re-deriving the rules from the rest of the log.
+    #[tokio::test]
+    async fn an_allowed_call_records_the_gate_decision() {
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({ "s": "hi" })),
+            FakeModelProvider::answer("done"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        let completed = of_type(&outcome.events, EventType::TOOL_COMPLETED);
+        let policy = completed[0].payload["policy"].clone();
+        assert_eq!(policy["decision"], serde_json::json!("allow"), "{policy}");
+    }
+
+    /// A gateway that refuses every call with a stated decision, so that what
+    /// the loop records can be checked without a policy engine behind it.
+    struct RefusingGateway(agent_protocol::tool::ToolPolicyRecord);
+
+    #[async_trait::async_trait]
+    impl ToolGateway for RefusingGateway {
+        async fn execute(
+            &self,
+            _session_id: &SessionId,
+            invocation: &ToolInvocation,
+        ) -> Result<ToolResult, ToolGatewayError> {
+            Err(ToolGatewayError::PolicyDenied {
+                tool: invocation.tool_name.clone(),
+                reason: "capability process.spawn is not provided by this build's execution \
+                         sandbox"
+                    .to_string(),
+                policy: self.0.clone(),
+            })
+        }
+    }
+
+    /// A refusal the gate stated is recorded with its layer, not only with the
+    /// word `permission_denied`: which layer said no is what tells a reader
+    /// where to look, and it used to be recoverable only by reading the prose.
+    #[tokio::test]
+    async fn a_gateway_refusal_records_the_layer_that_refused() {
+        use agent_protocol::permissions::{Capability, PolicyDecision, RefusalLayer};
+        use agent_protocol::tool::ToolPolicyRecord;
+
+        let record = ToolPolicyRecord::denied(
+            [Capability::new(Capability::PROCESS_SPAWN)],
+            [(Capability::new(Capability::PROCESS_SPAWN), RefusalLayer::SandboxUnavailable)],
+        );
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("shell.run", serde_json::json!({ "command": "ls" })),
+            FakeModelProvider::answer("cannot run that"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_tool("shell.run", "x", ToolSideEffect::Write));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(RefusingGateway(record)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        let failed = of_type(&outcome.events, EventType::TOOL_FAILED)
+            .into_iter()
+            .find(|event| event.payload["tool_name"] == "shell.run")
+            .expect("the refused call has an outcome");
+        assert_eq!(failed.payload["outcome"], serde_json::json!(GATEWAY_REFUSED_OUTCOME));
+        assert_eq!(failed.payload["error_kind"], serde_json::json!("permission_denied"));
+        let policy = &failed.payload["policy"];
+        assert_eq!(policy["decision"], serde_json::json!(PolicyDecision::Deny), "{policy}");
+        assert_eq!(
+            policy["refusals"]["process.spawn"],
+            serde_json::json!("sandbox_unavailable"),
+            "{policy}"
+        );
+        assert!(tools.invocations().is_empty(), "a refused call never reaches the provider");
     }
 
     /// A tool result keeps its role. Text in it that imitates a system message

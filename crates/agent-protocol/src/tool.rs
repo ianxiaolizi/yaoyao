@@ -1,11 +1,19 @@
 //! Tool protocol: definitions, invocations, and results.
 //!
 //! These are the stable DTOs the kernel, loop, and adapters exchange. A model
-//! proposes a tool call; the loop turns it into a `ToolInvocation`; policy and
-//! approval attach a `policy_decision` before execution; the adapter returns a
-//! `ToolResult` whose large output is offloaded as `artifacts`.
+//! proposes a tool call; the loop turns it into a `ToolInvocation`; the gateway
+//! decides under policy and approval and states its decision on the result it
+//! returns ([`ToolPolicyRecord`]); the adapter's large output is offloaded as
+//! `artifacts`.
+//!
+//! The decision is on the **result**, not on the invocation: the invocation is
+//! the question and the caller builds it, while the answer is the gate's. A
+//! field on the request would be one the caller could fill with a decision
+//! nobody made.
 
-use crate::permissions::{ArtifactRef, Capability, PolicyDecision, RedactionMetadata};
+use crate::permissions::{
+    ArtifactRef, Capability, PolicyDecision, RedactionMetadata, RefusalLayer,
+};
 use serde::{Deserialize, Serialize};
 
 /// How much risk a tool carries, used by policy and replay/recovery.
@@ -143,8 +151,7 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
-/// A request to run a tool. `policy_decision` is attached by the policy
-/// pipeline before execution; it is `None` when the loop proposes the call.
+/// A request to run a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInvocation {
     pub tool_name: String,
@@ -152,18 +159,12 @@ pub struct ToolInvocation {
     /// The model's `ToolUse` id this invocation came from. `None` for
     /// invocations started outside a model response, such as `agent tool`.
     pub provider_tool_call_id: Option<String>,
-    pub policy_decision: Option<PolicyDecision>,
 }
 
 impl ToolInvocation {
     /// An invocation proposed without a model-originated call id.
     pub fn proposed(tool_name: impl Into<String>, arguments: serde_json::Value) -> Self {
-        Self {
-            tool_name: tool_name.into(),
-            arguments,
-            provider_tool_call_id: None,
-            policy_decision: None,
-        }
+        Self { tool_name: tool_name.into(), arguments, provider_tool_call_id: None }
     }
 
     /// An invocation derived from a model's `ToolUse` block. Keeping the call id
@@ -177,14 +178,61 @@ impl ToolInvocation {
             tool_name: tool_name.into(),
             arguments,
             provider_tool_call_id: Some(tool_call_id.into()),
-            policy_decision: None,
+        }
+    }
+}
+
+/// What the policy gate decided about one call, and — when it said no — which
+/// layer said it.
+///
+/// Three parties read this. A person reading a session wants to know why a call
+/// ran or did not, in a word rather than in prose. The judgment gate needs to
+/// tell "the world said no" from "the gate said no". And anything that counts
+/// refusals by layer — `agent metrics` today, whatever folds the log next —
+/// can only do it if the layer is a value.
+///
+/// The prose (`reason` on a refusal) stays beside it: the layer says where the
+/// fix belongs, the sentence says what was refused. One is for counting, the
+/// other for reading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicyRecord {
+    pub decision: PolicyDecision,
+    /// Every capability the call's tool declares, in declaration order.
+    ///
+    /// Empty for a tool that declares nothing — which is itself the reason a
+    /// call like that is refused, so an empty list is a finding and not a gap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<Capability>,
+    /// The capabilities that were refused, and the layer that refused each.
+    ///
+    /// Sorted by capability rather than by request order: this is a set of
+    /// refusals, and two records made from the same decision have to be equal.
+    /// Empty exactly when nothing was refused — a `deny` of a call that
+    /// declares no capabilities has nothing to name here.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub refusals: std::collections::BTreeMap<Capability, RefusalLayer>,
+}
+
+impl ToolPolicyRecord {
+    /// The gate let the call through under these capabilities.
+    pub fn allowed(capabilities: impl IntoIterator<Item = Capability>) -> Self {
+        Self {
+            decision: PolicyDecision::Allow,
+            capabilities: capabilities.into_iter().collect(),
+            refusals: Default::default(),
         }
     }
 
-    /// Attach the policy decision reached before execution.
-    pub fn with_policy_decision(mut self, decision: PolicyDecision) -> Self {
-        self.policy_decision = Some(decision);
-        self
+    /// The gate refused the call.
+    pub fn denied(
+        capabilities: impl IntoIterator<Item = Capability>,
+        refusals: impl IntoIterator<Item = (Capability, RefusalLayer)>,
+    ) -> Self {
+        Self {
+            decision: PolicyDecision::Deny,
+            capabilities: capabilities.into_iter().collect(),
+            refusals: refusals.into_iter().collect(),
+        }
     }
 }
 
@@ -244,6 +292,15 @@ pub struct ToolResult {
     /// Structured facts beside the text, for readers that must not parse it.
     #[serde(default, skip_serializing_if = "ToolFacts::is_empty")]
     pub facts: ToolFacts,
+    /// What the gate decided about this call.
+    ///
+    /// Set by the gateway, which is the only party that made the decision. A
+    /// provider that fills it in is stating something it did not decide, so the
+    /// gateway clears the field on the way in and stamps its own answer after.
+    /// `None` means this path states no decision — a resumed call whose decision
+    /// is recorded in the approval events, or a gateway that enforces nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ToolPolicyRecord>,
     pub redaction_metadata: RedactionMetadata,
     pub duration_ms: Option<u64>,
 }
@@ -257,6 +314,7 @@ impl ToolResult {
             artifacts: Vec::new(),
             truncated: false,
             facts: ToolFacts::default(),
+            policy: None,
             redaction_metadata: RedactionMetadata::default(),
             duration_ms: None,
         }
@@ -282,6 +340,12 @@ impl ToolResult {
     /// Record how many lines the full result had before any preview.
     pub fn with_line_count(mut self, line_count: u64) -> Self {
         self.facts.line_count = Some(line_count);
+        self
+    }
+
+    /// State what the gate decided. Called by the gateway, and by nothing else.
+    pub fn with_policy(mut self, policy: ToolPolicyRecord) -> Self {
+        self.policy = Some(policy);
         self
     }
 }
@@ -341,29 +405,92 @@ mod tests {
     }
 
     #[test]
-    fn tool_invocation_round_trips_with_and_without_policy_decision() {
-        let no_decision = ToolInvocation::proposed("fs.read", json!({ "path": "src/main.rs" }));
+    fn tool_invocation_round_trips() {
+        let no_id = ToolInvocation::proposed("fs.read", json!({ "path": "src/main.rs" }));
         let decoded: ToolInvocation =
-            serde_json::from_str(&serde_json::to_string(&no_decision).unwrap()).unwrap();
-        assert!(decoded.policy_decision.is_none());
+            serde_json::from_str(&serde_json::to_string(&no_id).unwrap()).unwrap();
         assert!(decoded.provider_tool_call_id.is_none());
+    }
 
-        let with_decision = ToolInvocation::proposed("shell.run", json!({ "command": "ls" }))
-            .with_policy_decision(PolicyDecision::Ask);
-        let decoded: ToolInvocation =
-            serde_json::from_str(&serde_json::to_string(&with_decision).unwrap()).unwrap();
-        assert_eq!(decoded.policy_decision, Some(PolicyDecision::Ask));
+    /// The decision used to be a field on the invocation, documented as
+    /// "attached by the policy pipeline before execution" — and nothing ever
+    /// attached it. A request carrying a decision is a request the caller can
+    /// fill with one nobody made; it is the gate's answer, and it belongs on
+    /// the result the gate returns.
+    #[test]
+    fn a_request_carries_no_decision_only_the_case_for_one() {
+        let inv = ToolInvocation::proposed("shell.run", json!({ "command": "ls" }));
+        let value = serde_json::to_value(&inv).unwrap();
+        assert!(value.get("policy_decision").is_none(), "the question is not the answer: {value}");
+        assert!(value.get("policy").is_none(), "{value}");
     }
 
     #[test]
     fn model_originated_invocation_keeps_the_provider_call_id() {
         let inv = ToolInvocation::from_tool_call("call_1", "fs.read", json!({ "path": "a.txt" }));
         assert_eq!(inv.provider_tool_call_id.as_deref(), Some("call_1"));
-        assert!(inv.policy_decision.is_none());
 
         let decoded: ToolInvocation =
             serde_json::from_str(&serde_json::to_string(&inv).unwrap()).unwrap();
         assert_eq!(decoded.provider_tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn a_policy_record_states_what_was_decided_and_who_decided_it() {
+        let allowed = ToolPolicyRecord::allowed([Capability::new(Capability::FS_READ)]);
+        assert_eq!(
+            serde_json::to_value(&allowed).unwrap(),
+            json!({ "decision": "allow", "capabilities": ["fs.read"] }),
+            "a refusal set that is empty adds no key"
+        );
+
+        let denied = ToolPolicyRecord::denied(
+            [Capability::new(Capability::PROCESS_SPAWN)],
+            [(Capability::new(Capability::PROCESS_SPAWN), RefusalLayer::SandboxUnavailable)],
+        );
+        let value = serde_json::to_value(&denied).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "decision": "deny",
+                "capabilities": ["process.spawn"],
+                "refusals": { "process.spawn": "sandbox_unavailable" },
+            })
+        );
+        // The layer survives a round trip as the same layer, not as a string
+        // someone has to parse back.
+        let decoded: ToolPolicyRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, denied);
+    }
+
+    #[test]
+    fn a_result_states_no_policy_unless_the_gate_states_one() {
+        let plain = ToolResult::completed("ok");
+        assert!(plain.policy.is_none());
+        assert!(serde_json::to_value(&plain).unwrap().get("policy").is_none());
+
+        let stamped = ToolResult::completed("ok")
+            .with_policy(ToolPolicyRecord::allowed([Capability::new(Capability::FS_READ)]));
+        let value = serde_json::to_value(&stamped).unwrap();
+        assert_eq!(value["policy"]["decision"], json!("allow"));
+        let decoded: ToolResult = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.policy, stamped.policy);
+    }
+
+    #[test]
+    fn a_result_written_before_the_field_existed_reads_as_no_decision() {
+        // Not "allow": a record with nothing in it cannot be read as a decision
+        // anybody made, and guessing one would attribute a decision to a gate
+        // that never spoke.
+        let older: ToolResult = serde_json::from_value(json!({
+            "status": "completed",
+            "content": "hello",
+            "artifacts": [],
+            "redaction_metadata": { "redacted": false, "patterns": [] },
+            "duration_ms": null,
+        }))
+        .unwrap();
+        assert!(older.policy.is_none());
     }
 
     #[test]
@@ -378,6 +505,7 @@ mod tests {
             }],
             truncated: false,
             facts: ToolFacts::default(),
+            policy: None,
             redaction_metadata: RedactionMetadata {
                 redacted: true,
                 patterns: vec!["token".to_string()],

@@ -20,6 +20,57 @@ pub enum PolicyDecision {
     Deny,
 }
 
+/// Which layer refused a capability, and therefore where the fix belongs.
+///
+/// The policy engine tries its layers in a fixed order and the first to say no
+/// is the one that refused. Two of these four are not policy decisions at all:
+/// a capability the execution environment does not provide is a fact about the
+/// build, and one no rule grants is a rule somebody has not written yet. Both
+/// are fixed in a different place from a rule that forbids the call, so a
+/// refusal that names only "denied by policy" leaves the reader to guess which
+/// of the three they are looking at.
+///
+/// The vocabulary lives here, not in the engine, because it is written into
+/// durable `tool/failed` payloads: whatever the log spells is a stable word a
+/// reader and a counter agree on, and that has to be a protocol type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalLayer {
+    /// An administrator's managed policy denies it. Nothing below this layer
+    /// can override the decision.
+    ManagedPolicy,
+    /// A profile or configuration rule says deny.
+    Rule,
+    /// The bound execution environment does not provide the capability, so
+    /// nothing here could grant it.
+    SandboxUnavailable,
+    /// This build provides the capability and no rule grants it.
+    Ungranted,
+}
+
+impl RefusalLayer {
+    /// The word the log keeps. Stable: it is read by people and by anything
+    /// that counts these.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ManagedPolicy => "managed_policy",
+            Self::Rule => "rule",
+            Self::SandboxUnavailable => "sandbox_unavailable",
+            Self::Ungranted => "ungranted",
+        }
+    }
+
+    /// How the layer reads inside a refusal a person is shown.
+    pub fn described(self) -> &'static str {
+        match self {
+            Self::ManagedPolicy => "is denied by managed policy",
+            Self::Rule => "is denied by a policy rule",
+            Self::SandboxUnavailable => "is not provided by this build's execution sandbox",
+            Self::Ungranted => "is not granted by any policy rule",
+        }
+    }
+}
+
 /// A namespaced capability identifier, such as `fs.read` or `process.spawn`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -313,6 +364,28 @@ mod tests {
         assert_eq!(serde_json::to_string(&PolicyDecision::Allow).unwrap(), "\"allow\"");
         assert_eq!(serde_json::to_string(&PolicyDecision::Ask).unwrap(), "\"ask\"");
         assert_eq!(serde_json::to_string(&PolicyDecision::Deny).unwrap(), "\"deny\"");
+    }
+
+    #[test]
+    fn a_refusal_layer_keeps_one_word_in_json_and_in_the_log() {
+        // Two spellings of one thing — `as_str` for the prose and serde for the
+        // payload — would be two vocabularies the moment either drifts. The log
+        // carries this word, so the log and the code have to agree on it.
+        for layer in [
+            RefusalLayer::ManagedPolicy,
+            RefusalLayer::Rule,
+            RefusalLayer::SandboxUnavailable,
+            RefusalLayer::Ungranted,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&layer).unwrap(),
+                format!("\"{}\"", layer.as_str()),
+                "{layer:?}"
+            );
+            // Every layer says where the fix belongs; a layer with no sentence
+            // would leave the refusal text with a hole in it.
+            assert!(!layer.described().is_empty(), "{layer:?}");
+        }
     }
 
     #[test]

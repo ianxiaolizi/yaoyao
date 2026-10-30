@@ -57,31 +57,12 @@ pub struct PolicyContext<'a> {
 /// written yet. Both are fixed in a different place from a rule that forbids it,
 /// and a refusal that does not name the layer leaves the reader to guess which
 /// of them they are looking at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// An administrator's managed policy denies it. Nothing below this layer can
-    /// override the decision.
-    ManagedPolicy,
-    /// A profile or configuration rule says deny.
-    Rule,
-    /// The bound execution environment does not provide the capability, so
-    /// nothing here could grant it.
-    SandboxUnavailable,
-    /// This build provides the capability and no rule grants it.
-    Ungranted,
-}
-
-impl Refusal {
-    /// How the layer reads inside a refusal a person is shown.
-    pub fn described(self) -> &'static str {
-        match self {
-            Refusal::ManagedPolicy => "is denied by managed policy",
-            Refusal::Rule => "is denied by a policy rule",
-            Refusal::SandboxUnavailable => "is not provided by this build's execution sandbox",
-            Refusal::Ungranted => "is not granted by any policy rule",
-        }
-    }
-}
+///
+/// The vocabulary itself is [`agent_protocol::permissions::RefusalLayer`],
+/// because the layer is written into durable `tool/failed` payloads: two enums
+/// of the same four names would be two things to keep in step, and the one the
+/// log spells is the one that has to win.
+pub use agent_protocol::permissions::RefusalLayer as Refusal;
 
 /// A profile/config rule prescribing a disposition for a capability, optionally
 /// narrowed to a tool/path/command prefix.

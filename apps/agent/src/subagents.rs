@@ -312,6 +312,9 @@ impl ToolProvider for SubagentToolProvider {
             artifacts: Vec::new(),
             truncated: false,
             facts: Default::default(),
+            // This provider runs a child; it does not decide policy. The
+            // gateway that handed it the call stamps the decision.
+            policy: None,
             redaction_metadata: Default::default(),
             duration_ms: Some(started.elapsed().as_millis() as u64),
         })
