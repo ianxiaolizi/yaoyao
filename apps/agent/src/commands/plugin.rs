@@ -13,6 +13,22 @@ use agent::{config, plugins};
 use crate::support::{Produced, chain_start, data_dir, option, report, workspace_root};
 use crate::{EXIT_DID_NOT_RUN, positionals, usage};
 
+/// `plugin`: the verbs that read or change the plugin surface.
+///
+/// None of them assembles a runtime, and that is the point rather than a
+/// shortcut. `list` answers a question about a file, a log and a queue; `disable`
+/// and `enable` append to that queue. None needs a model, a tool surface or a
+/// started MCP server. Assembling one anyway would make all three fail whenever
+/// the *model provider* is misconfigured — a failure with nothing to do with what
+/// was asked — and would make `list` write `plugin/loaded` events into the very
+/// log it describes.
+///
+/// The two changing verbs are mirrors of each other and neither performs its
+/// change: the process driving the session owns the registration, so it is the
+/// one that applies the request at a boundary. What makes that arrangement work
+/// across processes is that a disabled plugin is *recorded* as disabled, which is
+/// why a later run does not register it and why `enable` is a registration rather
+/// than an erasure of some hidden flag.
 pub(crate) async fn plugin(args: &Args) {
     match args.command_args().first().map(String::as_str) {
         Some("list") => plugin_list(args).await,
