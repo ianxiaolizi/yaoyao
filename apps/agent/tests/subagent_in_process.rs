@@ -281,3 +281,68 @@ fn a_schema_an_in_process_child_cannot_honour_never_forks_one() {
         "a request that never ran was recorded as a delegation"
     );
 }
+
+/// A child's answer too large to sit in the parent's context comes back the way
+/// every large tool output does — a preview naming an `artifact://` locator —
+/// and the artifact reads back whole.
+///
+/// This backend has no answer channel of its own, and does not need one: the
+/// child was never asked for a schema (`output_schema` is refused at
+/// negotiation), so `Completed.result` is `None` by construction and the words
+/// are the `summary`, which the gateway bounds like any other result. Pinned
+/// here because it is the property that makes a long answer survivable, and it
+/// holds one layer above the backend rather than in it.
+#[test]
+fn a_long_answer_reaches_the_parent_as_a_locator_that_reads_back_whole() {
+    let (data, workspace, home) = dirs();
+    let config = config(&home, DELEGATING);
+    a_parent_with_a_closed_turn(data.path(), workspace.path(), &config, &[]);
+
+    // Past any configured tool-output limit, and past what one step of a
+    // parent's context could hold.
+    // 8 KiB is the floor a run's tool-output limit is clamped to, and this is
+    // past it while still fitting a Windows command line.
+    let objective = "the notes say the sentinel is RHUBARB-7731.\n".repeat(260);
+    let request =
+        serde_json::json!({ "provider": "inner", "objective": objective }).to_string();
+
+    let r = ran(
+        data.path(),
+        workspace.path(),
+        &config,
+        &["--profile", "p", "tool", "subagent.run", request.as_str()],
+    );
+    assert!(r.ok, "{}", r.err);
+    assert!(r.out.contains("completed: echo: the notes say"), "{}", r.out);
+    assert!(
+        !r.out.contains(&objective),
+        "the child's whole answer went inline instead of being offloaded"
+    );
+
+    let locator = r
+        .out
+        .split("artifact://sha256/")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no artifact locator in {}", r.out));
+    let hash: String = locator.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    assert_eq!(hash.len(), 64, "a locator names a sha-256: {locator}");
+
+    let blob = data.path().join("artifacts").join(format!("{hash}.blob"));
+    let whole = std::fs::read_to_string(&blob)
+        .unwrap_or_else(|e| panic!("no artifact at {}: {e}", blob.display()));
+    assert!(
+        whole.ends_with(&objective),
+        "the artifact does not hold the child's answer: {} bytes",
+        whole.len()
+    );
+
+    // The settlement records the same answer, so a reader of the parent's log
+    // does not depend on the artifact surviving either.
+    let log = events(data.path(), "default");
+    let summary = one(&log, "subagent/completed")["payload"]["outcome"]["summary"]
+        .as_str()
+        .expect("the settlement carries the child's words")
+        .to_string();
+    assert!(summary.ends_with(&objective), "{} bytes", summary.len());
+}
