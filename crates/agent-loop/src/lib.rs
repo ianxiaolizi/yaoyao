@@ -6,6 +6,7 @@
 
 #![deny(unsafe_code)]
 
+mod context_layers;
 mod default;
 
 pub use default::DefaultAgentLoop;
