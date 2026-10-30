@@ -249,6 +249,15 @@ pub struct Runtime {
     /// The run's one artifact store: the MCP adapter and the gateway's own
     /// output offload both write here.
     pub artifacts: Arc<dyn ArtifactStore>,
+    /// The children this process started and has not collected.
+    ///
+    /// Held here rather than inside the delegation tool because two callers
+    /// share it: the tool starts a child and answers questions about it, and the
+    /// command that owns the process drains it before exiting
+    /// (`support::watch`). Handing the wrapper this object is also what keeps
+    /// the drain from needing `Runtime: Sync` — it clones one `Arc`, not the
+    /// whole stack.
+    pub children: Arc<subagents::Children>,
 }
 
 /// The execution backend the selected mode names, or a refusal.
@@ -367,7 +376,27 @@ fn reachable_servers(
 /// The configuration arrives already resolved: reading it (and refusing to start
 /// when it does not resolve) belongs to the caller, because only the caller
 /// knows whether there is a process to stop.
+///
+/// A delegation started through this assembly is **background**: every product
+/// command that runs turns takes this, because a turn has a later step to read
+/// the child's ending in. The two callers that run one call and stop —
+/// `agent tool`, `agent approve`, `agent resume` — say so themselves through
+/// [`assemble_with_delegation`].
 pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
+    assemble_with_delegation(inputs, subagents::Delegation::Background).await
+}
+
+/// Assemble the stack, stating what a `subagent.run` call in it means.
+///
+/// The choice is the caller's rather than the configuration's because it is a
+/// fact about the caller, not about the workspace: the same configuration driven
+/// by a turn delegates in the background, and driven by `agent tool` it waits.
+/// See [`subagents::Delegation`] for why the distinction is "who can still read
+/// the answer" rather than a performance knob.
+pub async fn assemble_with_delegation(
+    inputs: Inputs,
+    delegation: subagents::Delegation,
+) -> Result<Runtime, StackError> {
     let Inputs {
         session,
         workspace_root,
@@ -487,11 +516,16 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     for note in &subagent_notes {
         eprintln!("subagents: {note}");
     }
-    // The delegation tool is the run's too, but only in a run that has one:
-    // reserving the name for a run with no backend would refuse a plugin a name
-    // nothing else is using.
+    // The delegation tools are the run's too, but only in a run that has one:
+    // reserving the names for a run with no backend would refuse a plugin names
+    // nothing else is using. All three or none — `subagent.wait` with no
+    // `subagent.run` is a tool whose every call must refuse, and a plugin
+    // offering a *different* `subagent.wait` beside the run's own would be the
+    // one thing worse than no name at all.
     if !subagents_config.is_empty() {
         reserved.insert(subagents::TOOL_NAME.to_string());
+        reserved.insert(subagents::WAIT_TOOL_NAME.to_string());
+        reserved.insert(subagents::STATUS_TOOL_NAME.to_string());
     }
     // One artifact store for the run, built here because two things reach for
     // it and they are built in this order: the MCP adapter, which offloads a
@@ -541,6 +575,12 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     // admitted list is what counts here, so a run whose every configured backend
     // was refused is a run with no delegation tool rather than one whose only
     // tool can name backends the guard already turned down.
+    //
+    // The registry of background children is built here, beside the tool that
+    // fills it, and kept on the runtime so that the command owning this process
+    // can drain it before exiting: a child whose process disappears with the
+    // parent is a delegation the log says began and never ended.
+    let children = Arc::new(subagents::Children::new());
     let tools: Arc<dyn ToolProvider> = if subagents_config.is_empty() {
         builtins.clone()
     } else {
@@ -552,6 +592,8 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
                     builtins.clone(),
                     session.clone(),
                     &subagents_config,
+                    children.clone(),
+                    delegation,
                 )),
             ])
             .map_err(|e| StackError::ToolSurface(e.to_string()))?,
@@ -739,6 +781,7 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
         registry,
         tools,
         artifacts,
+        children,
     })
 }
 

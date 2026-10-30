@@ -195,6 +195,51 @@ pub trait EventStore: Send + Sync {
         drafts: Vec<EventDraft>,
     ) -> Result<AppendReceipt, EventStoreError>;
 
+    /// Append drafts at whatever sequence the log is actually at.
+    ///
+    /// This is [`append`](Self::append) for a batch that was **not** derived
+    /// from anything the caller read — a child's settlement, a notice arriving
+    /// from outside the run — where the only question worth asking is "what
+    /// does the log say next". The distinction is the sentence `append`'s doc
+    /// ends on: a stale sequence there is a signal that a decision built from
+    /// the read has to be made again, and the store refuses to make it. A
+    /// writer with no such decision has nothing to re-decide, so a stale number
+    /// is not a conflict at all; it is the number the caller should not have
+    /// been computing in the first place.
+    ///
+    /// The sequence and the write are still one step: the read behind the
+    /// number is covered by the lease and the number is consumed by the append
+    /// that follows it, exactly as `append`'s own callers do it by hand. An
+    /// implementation whose append decides the sequence under its own lock
+    /// should override this; the default is the read-then-append shape, retried
+    /// a bounded number of times because another writer in this process can land
+    /// between the two.
+    ///
+    /// This is the entry point a **background** writer uses. Anything writing
+    /// while a turn is also writing — a delegation's settlement is the first —
+    /// must come through here rather than read a tail the turn is about to move.
+    async fn append_at_tail(
+        &self,
+        session_id: &SessionId,
+        drafts: Vec<EventDraft>,
+    ) -> Result<AppendReceipt, EventStoreError> {
+        // Bounded: a writer that keeps losing this race is a writer nothing is
+        // serializing, and waiting longer would hide that rather than fix it.
+        const ATTEMPTS: usize = 4;
+        let mut attempt = 0;
+        loop {
+            let _lease = self.lease(session_id).await?;
+            let events = self.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+            let next = events.last().map(|event| event.seq.next()).unwrap_or(EventSeq::ZERO);
+            match self.append(session_id, next, drafts.clone()).await {
+                Err(EventStoreError::SequenceConflict { .. }) if attempt + 1 < ATTEMPTS => {
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Acquire the session's write lease.
     ///
     /// Waits for a holder in another process to let go, because the lease exists

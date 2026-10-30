@@ -23,19 +23,21 @@
 //!
 //! ## How a result gets back
 //!
-//! [`SubagentDelegation::settle`] waits for the child and records the outcome.
-//! The caller that is *standing there* gets the outcome — which is the only way
-//! today, and the reason the assembled binary's delegation tool blocks.
+//! [`SubagentDelegation::settle`] waits for the child and records the outcome;
+//! [`SubagentDelegation::wait`] and [`SubagentDelegation::record_settlement`]
+//! are the same two halves, apart, for the caller whose waiting and whose
+//! writing happen in different tasks (a background waiter and the turn that
+//! collects from it — `agent::subagents` is where that split is assembled).
 //!
-//! The other half of delegation — a parent that has *ended* its turn, with the
-//! child's answer waiting for it as input when a later run picks up — is **not
-//! built**. There used to be a `deliver` here that appended the outcome as an
-//! `external_result` Inbox item, and nothing ever selected that kind: the item
-//! would sit pending forever, and `status` would report a task nobody was ever
-//! going to do. It was removed rather than kept as a documented placeholder
-//! (YA-40). When a run loop that ends its turn instead of blocking exists, both
-//! ends — the writer and the selector — get written together, and the payload's
-//! shape is that loop's to decide, not this file's to guess.
+//! What is **not** built is the ending arriving as input to a *later turn*: a
+//! parent that has ended its turn, with the child's answer waiting for it when
+//! another run picks up. There used to be a `deliver` here that appended the
+//! outcome as an `external_result` Inbox item, and nothing ever selected that
+//! kind: the item would sit pending forever, and `status` would report a task
+//! nobody was ever going to do. It was removed rather than kept as a documented
+//! placeholder (YA-40). When a run loop that ends its turn instead of blocking
+//! exists, both ends — the writer and the selector — get written together, and
+//! the payload's shape is that loop's to decide, not this file's to guess.
 //!
 //! ## What is recorded, and by whom
 //!
@@ -53,7 +55,7 @@ use agent_ports::subagent::{
 };
 use agent_ports::tool_provider::ToolProvider;
 use agent_protocol::events::{Actor, EventDraft, EventType};
-use agent_protocol::ids::{EventId, EventSeq, SchemaVersion, SessionId, TurnId};
+use agent_protocol::ids::{EventId, SchemaVersion, SessionId, TurnId};
 use chrono::Utc;
 use serde_json::json;
 
@@ -213,9 +215,23 @@ impl SubagentDelegation {
         parent: &SessionId,
         handle: &SubagentHandle,
     ) -> Result<SubagentOutcome, DelegationError> {
-        let outcome = self.provider.wait(handle).await?;
+        let outcome = self.wait(handle).await?;
         self.record_settlement(parent, handle, &outcome).await?;
         Ok(outcome)
+    }
+
+    /// Wait for the child to end and say how it ended, **without recording it**.
+    ///
+    /// Split from [`Self::settle`] for the caller that waits in one place and
+    /// records in another: a delegation collected from the background has a
+    /// task that sees the ending arrive and a turn that hears about it later,
+    /// and only the second one may write to the parent's log while the first
+    /// turn is still appending to it. Recording is [`Self::record_settlement`],
+    /// and it is idempotent in the sense that matters here only because the
+    /// caller keeps the count — two settlements of one child would be two
+    /// endings for one child, which the log would then have to explain.
+    pub async fn wait(&self, handle: &SubagentHandle) -> Result<SubagentOutcome, DelegationError> {
+        Ok(self.provider.wait(handle).await?)
     }
 
     /// Ask the child to stop, record how it ended, and return that.
@@ -250,7 +266,11 @@ impl SubagentDelegation {
     /// The event type is coarse and the payload is precise: a reader asking
     /// "did anything go wrong?" matches on the type, and a reader asking
     /// "exactly how did it end?" reads `outcome.status`.
-    async fn record_settlement(
+    ///
+    /// Public because a background waiter and a turn are two different
+    /// callers: the first sees the ending arrive, the second is the one that
+    /// writes to a log it is also writing to. See [`Self::wait`].
+    pub async fn record_settlement(
         &self,
         parent: &SessionId,
         handle: &SubagentHandle,
@@ -285,6 +305,13 @@ impl SubagentDelegation {
     }
 
     /// Append one event to `session`, at the sequence the log is actually at.
+    ///
+    /// The sequence is the store's to decide (`append_at_tail`), not this
+    /// module's to read and then spend: a settlement is written from a
+    /// background task while the parent's turn is appending to the same log,
+    /// and a number read outside the lock that consumes it is one that turn can
+    /// move in between. There is no decision here to re-make from a fresh read,
+    /// which is exactly the case `append`'s documented refusal is not for.
     async fn append(
         &self,
         session: &SessionId,
@@ -292,13 +319,6 @@ impl SubagentDelegation {
         payload: serde_json::Value,
         actor: Actor,
     ) -> Result<(), DelegationError> {
-        // Read and append as one step — see `Recovery::recover` for why. When a
-        // resume holds the lease already this only bumps a depth counter, so a
-        // delegated write under an approved call is not a second acquisition.
-        // (YA-36)
-        let _lease = self.store.lease(session).await?;
-        let events = self.store.read_stream(session, EventSeq::ZERO, usize::MAX).await?;
-        let next = events.last().map(|event| event.seq.next()).unwrap_or(EventSeq::ZERO);
         let draft = EventDraft {
             event_id: EventId::new(),
             event_type: EventType::new(event_type),
@@ -315,7 +335,7 @@ impl SubagentDelegation {
             metadata: json!({}),
             ignorable: false,
         };
-        self.store.append(session, next, vec![draft]).await?;
+        self.store.append_at_tail(session, vec![draft]).await?;
         Ok(())
     }
 }
@@ -329,6 +349,7 @@ mod tests {
     use agent_ports::tool_gateway::ToolGateway;
     use agent_ports::tool_provider::ToolSideEffect;
     use agent_protocol::events::StoredEvent;
+    use agent_protocol::ids::EventSeq;
     use agent_protocol::inbox::InboxKind;
     use agent_testkit::{
         FakeEventStore, FakeModelProvider, FakeToolGateway, FakeToolProvider, NullContextEngine,
@@ -738,6 +759,95 @@ mod tests {
             );
             assert_eq!(payload["child_session_id"], json!(handle.child_session_id.as_str()));
         }
+    }
+
+    #[tokio::test]
+    async fn waiting_learns_the_ending_without_recording_it() {
+        // `settle` is `wait` then `record_settlement`, and the split is there
+        // because the two halves run under different conditions: the task that
+        // hears the ending may not write to a log the turn is writing. What this
+        // checks is that the halves really are separable — a `wait` that also
+        // wrote would put a settlement in the log before anyone had decided the
+        // turn was done with it.
+        let outcome = SubagentOutcome::Failed { message: "broke".into(), side_effects: Vec::new() };
+        let harness = harness(every_feature(), outcome.clone());
+        harness.finish_a_turn().await;
+        let handle = harness
+            .delegation
+            .delegate(&harness.parent, None, delegating("something"))
+            .await
+            .expect("the delegation starts");
+
+        let waited = harness.delegation.wait(&handle).await.expect("the child ends");
+        assert_eq!(waited, outcome);
+        assert_eq!(
+            harness.subagent_payloads().await.len(),
+            1,
+            "waiting alone recorded a settlement"
+        );
+
+        harness
+            .delegation
+            .record_settlement(&harness.parent, &handle, &waited)
+            .await
+            .expect("recorded");
+        let recorded = harness.subagent_payloads().await;
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert_eq!(recorded[1].0, EventType::SUBAGENT_FAILED);
+        assert_eq!(recorded[1].1["outcome"]["status"], json!("failed"));
+    }
+
+    #[tokio::test]
+    async fn a_settlement_lands_after_an_event_written_while_the_child_ran() {
+        // The case that motivated appending at the tail: between the spawn and
+        // the settlement, another writer touched the same log — a background
+        // writer, or a second task collecting a sibling child. A settlement that
+        // read the tail and then spent that number would come back a
+        // `SequenceConflict`, which reads to the caller as "the child's ending
+        // could not be recorded" for a child that ended perfectly well.
+        let harness = harness(
+            every_feature(),
+            SubagentOutcome::Completed { summary: "done".into(), result: None },
+        );
+        harness.finish_a_turn().await;
+        let handle = harness
+            .delegation
+            .delegate(&harness.parent, None, delegating("something"))
+            .await
+            .expect("the delegation starts");
+
+        let foreign = EventDraft {
+            event_id: EventId::new(),
+            event_type: EventType::new(EventType::TOOL_COMPLETED),
+            schema_version: SchemaVersion::current(),
+            session_id: harness.parent.clone(),
+            run_id: None,
+            turn_id: None,
+            step_id: None,
+            actor: Actor::System,
+            created_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            payload: json!({}),
+            metadata: json!({}),
+            ignorable: false,
+        };
+        harness
+            .store
+            .append_at_tail(&harness.parent, vec![foreign])
+            .await
+            .expect("the other writer");
+
+        let settled = harness
+            .delegation
+            .settle(&harness.parent, &handle)
+            .await
+            .expect("a settlement after another writer");
+        assert_eq!(settled.status(), SubagentStatus::Completed);
+
+        let recorded = harness.subagent_payloads().await;
+        assert_eq!(recorded.len(), 2, "the spawn and the settlement, nothing lost: {recorded:?}");
+        assert_eq!(recorded[1].0, EventType::SUBAGENT_COMPLETED);
     }
 
     #[tokio::test]

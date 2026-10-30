@@ -27,11 +27,13 @@
 //! | failure/retry/cancel become attempt facts | `a_provider_failure_becomes_an_attempt_fact` | `agent-loop` unit tests (cancel) |
 //! | a shadow decision does not touch the main chain | `the_shadow_decision_changes_nothing_the_model_sees` | `agent-loop` + `agent-decision` |
 
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use agent::providers::SelectedProvider;
 use agent::stack::{self, Decisions};
-use agent_config::{Layers, ResolvedProfile};
+use agent_config::{Layers, ResolvedProfile, UserConfig};
 use agent_context::ProjectionContextEngine;
 use agent_kernel::scheduler::RunReport;
 use agent_model_openai::{
@@ -905,4 +907,190 @@ async fn the_run_records_the_instructions_the_model_was_given() {
     let derived = h.derived().await;
     assert_eq!(derived[0].role, MessageRole::System);
     assert_eq!(text_of(&derived[0]), text);
+}
+
+// ---------------------------------------------------------------------------
+// Delegation: a receipt in one step, the ending in a later one
+// ---------------------------------------------------------------------------
+
+/// The `agent-subagent-stdio` fixture, built into this test's target directory.
+///
+/// The same helper `subagent_wiring` uses, for the same reason it gives: the
+/// fixture is an `examples/` target, which `cargo test` builds and a plain
+/// `cargo build --workspace` does not, and a test that quietly skipped itself
+/// over a missing fixture would report success for a delegation it never ran.
+fn fake_subagent() -> PathBuf {
+    let agent = PathBuf::from(env!("CARGO_BIN_EXE_agent"));
+    let directory = agent.parent().expect("the binary is in a directory").join("examples");
+    let path = directory.join(if cfg!(windows) { "fake-subagent.exe" } else { "fake-subagent" });
+    if path.exists() {
+        return path;
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let profile = directory.parent().expect("the profile directory");
+    let mut build = Command::new(cargo);
+    build
+        .args(["build", "-p", "agent-subagent-stdio", "--example", "fake-subagent"])
+        .arg("--target-dir")
+        .arg(profile.parent().expect("the target directory"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+    if profile.ends_with("release") {
+        build.arg("--release");
+    }
+    let built = build.status().expect("cargo is on the path");
+    assert!(built.success(), "the fake-subagent fixture could not be built");
+    assert!(path.exists(), "{} was not built where this test looks for it", path.display());
+    path
+}
+
+/// A profile in which a turn may delegate.
+///
+/// Written as TOML and resolved rather than assembled field by field, so what
+/// this test exercises is the resolution a configuration file goes through: a
+/// layer defines how to reach the provider, `capabilities` authorizes the run to
+/// use it, the profile enables it, and a rule lets the call through. All four
+/// are needed, and leaving one out is how the refusals elsewhere are produced.
+fn delegating_profile() -> ResolvedProfile {
+    let user = UserConfig::from_toml_str(&format!(
+        "capabilities = [\"subagent.spawn\"]\n\
+         plugins = [\"subagent.fake@1.0.0\"]\n\n\
+         [subagents.fake]\n\
+         command = '{}'\n\
+         args = [\"result\"]\n\
+         requires = [\"subagent.spawn\"]\n\n\
+         [profiles.p]\n\
+         tools = {{ allow = [\"subagent.spawn\"] }}\n\
+         plugins = {{ enable = [\"subagent.fake\"] }}\n",
+        fake_subagent().display(),
+    ))
+    .expect("the test's configuration parses");
+    let layers = Layers { user, profile_override: Some("p".to_string()), ..Layers::default() };
+    agent_config::resolve(layers).expect("the test's configuration resolves")
+}
+
+/// M4: a turn delegates, goes on, and collects the child's ending in a later
+/// step.
+///
+/// This is the background shape end to end, and the receipt is the proof that
+/// the call did not wait: the model's next request reaches the wire at all only
+/// because `subagent.run` returned before the child ended. The fixture's
+/// `result` mode answers and then sleeps forever, so a blocking call would hang
+/// this test rather than pass it.
+#[tokio::test]
+async fn a_turn_delegates_in_the_background_and_collects_the_child_in_a_later_step() {
+    let responses = vec![
+        // A child is forked from a *closed* turn, so the session has to have
+        // finished one before it can delegate. That is not a test-shortcut: it
+        // is the boundary a fork copies up to, and a delegation in a session's
+        // first turn is refused with exactly that sentence.
+        Scripted::Ok(answer_body("ready")),
+        Scripted::Ok(tool_call_body(
+            "call-1",
+            "subagent.run",
+            serde_json::json!({ "provider": "fake", "objective": "summarize the notes" }),
+        )),
+        // No id: with one child open, naming it is optional. The step after the
+        // receipt is the reader a background delegation exists for.
+        Scripted::Ok(tool_call_body("call-2", "subagent.wait", serde_json::json!({}))),
+        Scripted::Ok(answer_body("all done")),
+    ];
+    let workspace = Arc::new(tempfile::tempdir().expect("temp workspace"));
+    let h = harness_with(workspace, responses, false, delegating_profile()).await;
+    h.ask("warm up").await;
+
+    let report = h.ask("delegate the notes").await;
+    assert_eq!(report.stop_reason, StopReason::FinalAnswer, "{report:?}");
+
+    // Three more model calls: the run, the wait, the answer. The second was
+    // given the receipt rather than the child's result — the ending was not
+    // ready when the call returned, which is what "background" means.
+    let bodies = h.sent_bodies();
+    assert_eq!(bodies.len(), 4, "the turn ran to an answer");
+    assert!(bodies[2].contains("running in the background"), "{}", bodies[2]);
+    assert!(
+        bodies[2].contains("subagent.wait"),
+        "the receipt says how to collect it: {}",
+        bodies[2]
+    );
+    // The fourth saw the ending the wait collected: the child's own answer,
+    // attributed to the child's session.
+    assert!(bodies[3].contains("completed: summarize the notes"), "{}", bodies[3]);
+
+    // The parent's log records one delegation and one ending, under the two
+    // actors that own those halves.
+    let spawned = h.events_of(EventType::SUBAGENT_SPAWNED).await;
+    let settled = h.events_of(EventType::SUBAGENT_COMPLETED).await;
+    assert_eq!(spawned.len(), 1, "{:?}", h.types().await);
+    assert_eq!(settled.len(), 1, "{:?}", h.types().await);
+    assert_eq!(spawned[0].event.actor, Actor::Agent);
+    assert_eq!(settled[0].event.actor, Actor::System);
+    assert_eq!(settled[0].event.payload["outcome"]["status"], "completed");
+
+    // The child is a session of its own, forked from this turn's parent, and its
+    // history opens by saying what it was asked to do.
+    let child = SessionId::from_string(
+        spawned[0].event.payload["child_session_id"].as_str().expect("a child session"),
+    );
+    let child_log = h
+        .stack
+        .store
+        .read_stream(&child, EventSeq::ZERO, usize::MAX)
+        .await
+        .expect("the child's log");
+    assert_eq!(child_log[0].event.event_type.as_str(), EventType::SESSION_FORKED);
+    assert_eq!(child_log[0].event.payload["fork_reason"], "summarize the notes");
+
+    // And nothing was queued for a later turn: the waiting step had the outcome
+    // in hand, and a copy in the Inbox would be pending work nobody will do.
+    let queued: Vec<_> = h
+        .events_of(EventType::INBOX_APPENDED)
+        .await
+        .into_iter()
+        .filter(|event| event.event.payload["kind"] == "external_result")
+        .collect();
+    assert!(queued.is_empty(), "{queued:?}");
+}
+
+/// M4: a turn that starts a child and ends without collecting it leaves the
+/// ending to the drain that runs before the process exits.
+///
+/// This is the case the exit drain exists for, and the one a caller cannot opt
+/// out of by accident: the turn's answer is about the parent's work, and the
+/// child's ending is still a fact the log has to hold. What is checked is that
+/// the registry the tool filled is the one the runtime exposes — a drain over an
+/// empty registry would look identical and record nothing.
+#[tokio::test]
+async fn a_child_left_running_is_collected_by_the_drain_before_the_process_ends() {
+    let responses = vec![
+        Scripted::Ok(answer_body("ready")),
+        Scripted::Ok(tool_call_body(
+            "call-1",
+            "subagent.run",
+            serde_json::json!({ "provider": "fake", "objective": "summarize the notes" }),
+        )),
+        // The model does not wait: it answers the parent's question and the
+        // child goes on by itself. `support::watch` drains at this boundary in
+        // the binary; here the test stands at the same point.
+        Scripted::Ok(answer_body("started it, moving on")),
+    ];
+    let workspace = Arc::new(tempfile::tempdir().expect("temp workspace"));
+    let h = harness_with(workspace, responses, false, delegating_profile()).await;
+    h.ask("warm up").await;
+    h.ask("start the notes work and move on").await;
+
+    assert_eq!(h.events_of(EventType::SUBAGENT_SPAWNED).await.len(), 1, "{:?}", h.types().await);
+    assert!(
+        h.events_of(EventType::SUBAGENT_COMPLETED).await.is_empty(),
+        "nothing collected the child yet: {:?}",
+        h.types().await
+    );
+
+    let notes = h.stack.children.drain().await;
+    assert!(notes.is_empty(), "{notes:?}");
+    let settled = h.events_of(EventType::SUBAGENT_COMPLETED).await;
+    assert_eq!(settled.len(), 1, "the drain recorded the ending: {:?}", h.types().await);
+    assert_eq!(settled[0].event.payload["outcome"]["status"], "completed");
+    // Draining twice must not write a second settlement for the same child.
+    assert!(h.stack.children.drain().await.is_empty());
+    assert_eq!(h.events_of(EventType::SUBAGENT_COMPLETED).await.len(), 1);
 }

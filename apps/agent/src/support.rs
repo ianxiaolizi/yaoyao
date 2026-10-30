@@ -124,8 +124,28 @@ pub(crate) async fn watch<F, O>(
 ) -> CliOutcome
 where
     F: Future<Output = Result<O, String>> + Send,
-    O: Into<CliOutcome>,
+    // `Send` because the command's answer is held across the drain below: a
+    // child the command started is collected before the answer is printed, and
+    // the two are on opposite sides of an await.
+    O: Into<CliOutcome> + Send,
 {
+    // A background delegation outlives the command that started it, so the
+    // command is not over until its children are. The drain sits *inside* the
+    // watched future rather than after it, so the settlements it writes are part
+    // of the chain the caller asked to see, and so the answer below is printed
+    // only once nothing is left running.
+    let children = runtime.children.clone();
+    let command = async move {
+        let result = command.await;
+        // Each note is a child whose ending could not be recorded or whose
+        // handle could not be released. Said out loud because it is the one
+        // thing about a delegation that would otherwise go missing silently.
+        for note in children.drain().await {
+            eprintln!("subagent: {note}");
+        }
+        result
+    };
+
     let Some(from) = from else {
         return match command.await {
             Ok(output) => {
@@ -362,22 +382,39 @@ pub(crate) async fn assemble(args: &Args) -> Runtime {
         std::process::exit(EXIT_DID_NOT_RUN);
     });
 
-    stack::assemble(stack::Inputs {
-        session: args.session.clone(),
-        workspace_root: PathBuf::from(root),
-        data_dir: PathBuf::from(data_dir()),
-        network_allowed,
-        judgment: true,
-        resolved,
-        model: None,
-        decisions: stack::Decisions::FromConfiguration,
-        sandbox,
-    })
+    stack::assemble_with_delegation(
+        stack::Inputs {
+            session: args.session.clone(),
+            workspace_root: PathBuf::from(root),
+            data_dir: PathBuf::from(data_dir()),
+            network_allowed,
+            judgment: true,
+            resolved,
+            model: None,
+            decisions: stack::Decisions::FromConfiguration,
+            sandbox,
+        },
+        delegation_for(args),
+    )
     .await
     .unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(EXIT_DID_NOT_RUN);
     })
+}
+
+/// Whether a command's `subagent.run` calls wait for the child they started.
+///
+/// The three commands that run **one call and then exit** cannot wait for a
+/// child anywhere else: there is no later step in the process to collect it,
+/// and a receipt would be the last thing anyone saw of that child. Everything
+/// else runs a turn, and a turn's next step is the reader a background
+/// delegation exists for.
+fn delegation_for(args: &Args) -> agent::subagents::Delegation {
+    match args.command.as_str() {
+        "tool" | "approve" | "resume" => agent::subagents::Delegation::Await,
+        _ => agent::subagents::Delegation::Background,
+    }
 }
 
 /// Where a run's filesystem boundary is rooted.

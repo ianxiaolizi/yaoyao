@@ -740,6 +740,103 @@ impl JsonlEventStore {
         inner.repaired_tail = Some(inner.repaired_tail.unwrap_or(0) + dropped);
         Ok(())
     }
+
+    /// One write of one batch, with the sequence decided here.
+    ///
+    /// `expected` is `Some` when the caller has a number it read and wants the
+    /// store to hold it to it, and `None` when the caller has no business
+    /// knowing — see [`EventStore::append_at_tail`]. The distinction is one
+    /// comparison; everything else is the same write, because the tail is read
+    /// (and the log refreshed) under the lease and the lock either way.
+    async fn write_at(
+        &self,
+        session_id: &SessionId,
+        expected: Option<EventSeq>,
+        drafts: Vec<EventDraft>,
+    ) -> Result<AppendReceipt, EventStoreError> {
+        let session = self.open(session_id)?;
+
+        // Hold the lease across the whole write. Nested inside a caller's own
+        // lease this only bumps a counter, so a critical section can be written
+        // as flat code instead of a callback. Named rather than `_`: the guard
+        // is the release.
+        let _lease = self.leases.acquire(session_id, Some(LEASE_APPEND_WAIT))?;
+
+        let mut inner = session.inner.lock().map_err(|_| Self::poisoned())?;
+
+        // Before reading the tail, clear anything a dead writer left there. The
+        // write below appends at the file's end, so a fragment left in place
+        // would become the head of our record — one line that parses as neither.
+        // Ordered first because the fragment must be gone before `refresh`
+        // decides what the tail holds.
+        Self::drop_torn_tail(&mut inner)?;
+
+        // Read the tail before comparing: with the lease held, `next_seq` is the
+        // log's own next sequence rather than this process's memory of it, so a
+        // conflict means someone else wrote and not merely that time passed.
+        Self::refresh(&mut inner)?;
+
+        if let Some(expected) = expected
+            && expected.as_u64() != inner.next_seq
+        {
+            return Err(EventStoreError::SequenceConflict {
+                expected,
+                actual: EventSeq::new(inner.next_seq),
+            });
+        }
+
+        // Build the batch in memory first, then persist in a single write. On a
+        // partial write we roll the file length back so the log stays clean.
+        let mut appended = Vec::new();
+        let mut duplicates = 0usize;
+        let mut next = inner.next_seq;
+        let mut buf = Vec::new();
+        for draft in drafts {
+            let id_key = draft.event_id.to_string();
+            if inner.seen.contains_key(&id_key) {
+                duplicates += 1;
+                continue;
+            }
+            let stored =
+                StoredEvent { seq: EventSeq::new(next), recorded_at: Utc::now(), event: draft };
+            serde_json::to_writer(&mut buf, &stored)?;
+            buf.push(b'\n');
+            next += 1;
+            appended.push(stored);
+        }
+
+        let orig_len = inner.file.metadata()?.len();
+        if let Err(e) = inner.file.write_all(&buf) {
+            // Best effort, and deliberately not reported: the caller is about to
+            // get the write's own error, and a rollback that failed has nothing
+            // to add to it. It has to be *able* to succeed, though — this used
+            // to go through the append handle, where on Windows it silently
+            // never happened and a partial batch stayed half-applied (YA-70).
+            let _ = truncate_to(&inner.path, orig_len);
+            return Err(e.into());
+        }
+
+        // Commit to memory only after the write fully succeeded. These bytes are
+        // ours and are known complete, so the read cursor moves past them too —
+        // re-reading them would only parse what we just built.
+        for stored in &appended {
+            inner.seen.insert(stored.event.event_id.to_string(), stored.seq);
+        }
+        inner.next_seq = next;
+        inner.read_offset += buf.len() as u64;
+        inner.events.extend(appended.iter().cloned());
+
+        // After the commit, never before: a subscriber woken by a write that
+        // then failed would look for an event that is not there. It would find
+        // nothing and wait again — a wasted pass, but a pass that cannot show a
+        // fact the log does not contain.
+        drop(inner);
+        if !appended.is_empty() {
+            self.wakeups.wake(session_id.as_str());
+        }
+
+        Ok(AppendReceipt { session_id: session_id.clone(), appended, duplicates })
+    }
 }
 
 /// Decode one durable record and refuse a version this build cannot read.
@@ -834,86 +931,19 @@ impl EventStore for JsonlEventStore {
         expected_next_seq: EventSeq,
         drafts: Vec<EventDraft>,
     ) -> Result<AppendReceipt, EventStoreError> {
-        let session = self.open(session_id)?;
+        self.write_at(session_id, Some(expected_next_seq), drafts).await
+    }
 
-        // Hold the lease across the whole write. Nested inside a caller's own
-        // lease this only bumps a counter, so a critical section can be written
-        // as flat code instead of a callback. Named rather than `_`: the guard
-        // is the release.
-        let _lease = self.leases.acquire(session_id, Some(LEASE_APPEND_WAIT))?;
-
-        let mut inner = session.inner.lock().map_err(|_| Self::poisoned())?;
-
-        // Before reading the tail, clear anything a dead writer left there. The
-        // write below appends at the file's end, so a fragment left in place
-        // would become the head of our record — one line that parses as neither.
-        // Ordered first because the fragment must be gone before `refresh`
-        // decides what the tail holds.
-        Self::drop_torn_tail(&mut inner)?;
-
-        // Read the tail before comparing: with the lease held, `next_seq` is the
-        // log's own next sequence rather than this process's memory of it, so a
-        // conflict means someone else wrote and not merely that time passed.
-        Self::refresh(&mut inner)?;
-
-        if expected_next_seq.as_u64() != inner.next_seq {
-            return Err(EventStoreError::SequenceConflict {
-                expected: expected_next_seq,
-                actual: EventSeq::new(inner.next_seq),
-            });
-        }
-
-        // Build the batch in memory first, then persist in a single write. On a
-        // partial write we roll the file length back so the log stays clean.
-        let mut appended = Vec::new();
-        let mut duplicates = 0usize;
-        let mut next = inner.next_seq;
-        let mut buf = Vec::new();
-        for draft in drafts {
-            let id_key = draft.event_id.to_string();
-            if inner.seen.contains_key(&id_key) {
-                duplicates += 1;
-                continue;
-            }
-            let stored =
-                StoredEvent { seq: EventSeq::new(next), recorded_at: Utc::now(), event: draft };
-            serde_json::to_writer(&mut buf, &stored)?;
-            buf.push(b'\n');
-            next += 1;
-            appended.push(stored);
-        }
-
-        let orig_len = inner.file.metadata()?.len();
-        if let Err(e) = inner.file.write_all(&buf) {
-            // Best effort, and deliberately not reported: the caller is about to
-            // get the write's own error, and a rollback that failed has nothing
-            // to add to it. It has to be *able* to succeed, though — this used
-            // to go through the append handle, where on Windows it silently
-            // never happened and a partial batch stayed half-applied (YA-70).
-            let _ = truncate_to(&inner.path, orig_len);
-            return Err(e.into());
-        }
-
-        // Commit to memory only after the write fully succeeded. These bytes are
-        // ours and are known complete, so the read cursor moves past them too —
-        // re-reading them would only parse what we just built.
-        for stored in &appended {
-            inner.seen.insert(stored.event.event_id.to_string(), stored.seq);
-        }
-        inner.next_seq = next;
-        inner.read_offset += buf.len() as u64;
-        inner.events.extend(appended.iter().cloned());
-
-        // After the commit, never before: a subscriber woken by a write that
-        // then failed would look for an event that is not there. It would find
-        // nothing and wait again — a wasted pass, but a pass that cannot show a
-        // fact the log does not contain.
-        drop(inner);
-        if !appended.is_empty() {
-            self.wakeups.wake(session_id.as_str());
-        }
-
-        Ok(AppendReceipt { session_id: session_id.clone(), appended, duplicates })
+    /// Decided under this store's own lock, so there is no read-then-append gap
+    /// to lose: the sequence the batch lands at and the refresh that sees a
+    /// peer's write are the same critical section. That is why the default
+    /// implementation's retry loop has nothing to retry here.
+    async fn append_at_tail(
+        &self,
+        session_id: &SessionId,
+        drafts: Vec<EventDraft>,
+    ) -> Result<AppendReceipt, EventStoreError> {
+        self.write_at(session_id, None, drafts).await
     }
 
     async fn lease(

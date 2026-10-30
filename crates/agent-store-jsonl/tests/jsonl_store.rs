@@ -86,6 +86,45 @@ async fn rejects_stale_expected_next_seq() {
     }
 }
 
+/// The background writer's entry point: the sequence is decided by the store,
+/// under the lock that writes it, so two writers that never consulted each
+/// other still land in order.
+///
+/// Racing calls are the *normal* case for this method — a turn and the task
+/// collecting a child's settlement write the same log — and neither may see a
+/// conflict: there was no decision built on a read that a conflict would say to
+/// re-make, which is exactly the distinction `append`'s refusal draws.
+#[tokio::test]
+async fn append_at_tail_lands_after_whatever_the_log_is_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonlEventStore::new(dir.path().to_path_buf());
+    let sid = SessionId::from_string("tail");
+
+    // An empty log starts at zero rather than refusing to have a tail.
+    let first =
+        store.append_at_tail(&sid, vec![draft("tail", EventType::TURN_STARTED)]).await.unwrap();
+    assert_eq!(first.appended[0].seq, EventSeq::ZERO);
+
+    let second =
+        store.append_at_tail(&sid, vec![draft("tail", EventType::STEP_STARTED)]).await.unwrap();
+    assert_eq!(second.appended[0].seq, EventSeq::new(1));
+
+    // Two writers at once, neither holding anything the other can invalidate.
+    let (a, b) = tokio::join!(
+        store.append_at_tail(&sid, vec![draft("tail", EventType::TOOL_STARTED)]),
+        store.append_at_tail(&sid, vec![draft("tail", EventType::TOOL_COMPLETED)]),
+    );
+    let (a, b) =
+        (a.expect("the first background append"), b.expect("the second background append"));
+    let mut seqs = vec![a.appended[0].seq.as_u64(), b.appended[0].seq.as_u64()];
+    seqs.sort_unstable();
+    assert_eq!(seqs, vec![2, 3], "both writers landed, at distinct sequence numbers");
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let seqs: Vec<u64> = events.iter().map(|event| event.seq.as_u64()).collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3], "the log is contiguous after racing writers");
+}
+
 #[tokio::test]
 async fn is_idempotent_on_duplicate_event_id() {
     let dir = tempfile::tempdir().unwrap();
