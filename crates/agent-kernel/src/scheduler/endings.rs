@@ -67,7 +67,8 @@ impl Ending {
             | StopReason::MaxSteps
             | StopReason::MaxToolCalls
             | StopReason::WallClockExceeded
-            | StopReason::MaxOutputTokens => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
+            | StopReason::MaxOutputTokens
+            | StopReason::ContentFiltered => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
             StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
             StopReason::FatalError => (EventType::TURN_FAILED, EventType::RUN_FAILED),
             StopReason::UserCancelled => (EventType::TURN_CANCELLED, EventType::RUN_CANCELLED),
@@ -95,13 +96,17 @@ impl Ending {
             {
                 serde_json::json!({ "stop_reason": reason })
             }
-            // A truncated response is a limit stop too, but unlike the other
-            // two it has text: the beginning of an answer. The terminal says
-            // both, so `metrics` counts it under the limit rather than under
-            // `final_answer`, and a reader is not handed half an answer dressed
-            // as a whole one (CONTRACT §7 #131).
-            Ending::Loop { reason: StopReason::MaxOutputTokens, final_content } => {
-                let mut payload = serde_json::json!({ "stop_reason": StopReason::MaxOutputTokens });
+            // A response the provider ended before the model finished is not an
+            // answer, and it may still have text: the beginning of one. The
+            // terminal says both, so `metrics` counts it under the provider's
+            // ending rather than under `final_answer`, and a reader is not
+            // handed half an answer dressed as a whole one (CONTRACT §7 #131,
+            // #132).
+            Ending::Loop {
+                reason: reason @ (StopReason::MaxOutputTokens | StopReason::ContentFiltered),
+                final_content,
+            } => {
+                let mut payload = serde_json::json!({ "stop_reason": reason });
                 if let Some(content) = final_content {
                     payload["final_content"] = serde_json::json!(content);
                 }

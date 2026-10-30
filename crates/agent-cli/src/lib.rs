@@ -318,20 +318,21 @@ pub async fn run_ask(
                     "final_content": r.final_content,
                 });
                 CliOutput::Json(json_output(&value)?)
-            } else if r.stop_reason == StopReason::MaxOutputTokens {
-                CliOutput::Text(truncated_text(r.final_content.as_deref()))
+            } else if halted(&r.stop_reason) {
+                CliOutput::Text(halted_text(&r.stop_reason, r.final_content.as_deref()))
             } else {
                 match r.final_content {
                     Some(content) => CliOutput::Text(content),
                     None => CliOutput::Text(format!("[turn ended: {:?}]", r.stop_reason)),
                 }
             };
-            // A truncated response is not an answer: the provider cut the model
-            // off at the run's output limit, and what is on stdout is the
-            // beginning of one. `AnsweredNo` is what stops a script from taking
-            // it for a whole answer (CONTRACT §7 #131); the text itself is
-            // still printed, with the notice saying what it is.
-            Ok(if r.stop_reason == StopReason::MaxOutputTokens {
+            // A halted response is not an answer: the provider cut the model off
+            // at the run's output limit, or withheld what it wrote. What is on
+            // stdout is the beginning of an answer or nothing at all.
+            // `AnsweredNo` is what stops a script from taking it for a whole
+            // answer (CONTRACT §7 #131, #132); the text itself is still printed,
+            // with the notice saying what it is.
+            Ok(if halted(&r.stop_reason) {
                 CliOutcome::failed(output)
             } else {
                 CliOutcome::ok(output)
@@ -398,7 +399,7 @@ pub async fn run_resume(
             let settled = disposition_text(&disposition);
             match report {
                 Some(r) => {
-                    let truncated = r.stop_reason == StopReason::MaxOutputTokens;
+                    let halted = halted(&r.stop_reason);
                     let output = if json {
                         CliOutput::Json(json_output(&serde_json::json!({
                             "outcome": "settled",
@@ -412,10 +413,10 @@ pub async fn run_resume(
                     } else {
                         let mut lines =
                             vec![format!("resumed {turn_id}: {tool_name} was {settled}")];
-                        // The same reading `ask` gives a truncated answer: the
-                        // continuation may be the one the limit cut off.
-                        lines.push(if truncated {
-                            truncated_text(r.final_content.as_deref())
+                        // The same reading `ask` gives a halted answer: the
+                        // continuation may be the one the provider cut off.
+                        lines.push(if halted {
+                            halted_text(&r.stop_reason, r.final_content.as_deref())
                         } else {
                             match r.final_content {
                                 Some(content) => content,
@@ -424,7 +425,7 @@ pub async fn run_resume(
                         });
                         CliOutput::Text(lines.join("\n"))
                     };
-                    Ok(if truncated { CliOutcome::failed(output) } else { CliOutcome::ok(output) })
+                    Ok(if halted { CliOutcome::failed(output) } else { CliOutcome::ok(output) })
                 }
                 None => Ok(CliOutcome::ok(CliOutput::Text(format!(
                     "resumed {turn_id}: {tool_name} was {settled}; no continuation ran"
@@ -434,18 +435,35 @@ pub async fn run_resume(
     }
 }
 
-/// What a truncated answer prints: the text that arrived, and the fact that it
-/// is not the whole answer.
+/// Whether a stop reason means the provider ended the response before the model
+/// finished. Those turns ran and did not answer, so the commands report them the
+/// same way: `AnsweredNo` (exit 1), never `Answered`.
+pub(crate) fn halted(reason: &StopReason) -> bool {
+    matches!(reason, StopReason::MaxOutputTokens | StopReason::ContentFiltered)
+}
+
+/// What a halted answer prints: the text that arrived, and the fact that it is
+/// not a whole answer.
 ///
 /// The notice goes with the text rather than to stderr, because a caller that
 /// redirects stdout would otherwise keep exactly the bytes that look like an
 /// answer and lose the sentence saying they are not one.
-pub(crate) fn truncated_text(content: Option<&str>) -> String {
-    const NOTICE: &str = "the model's answer was cut off at the output token limit; raise \
-                          `max_output_tokens` in the profile's budget and run again";
+pub(crate) fn halted_text(reason: &StopReason, content: Option<&str>) -> String {
+    let (tag, notice) = match reason {
+        StopReason::ContentFiltered => (
+            "refused",
+            "the provider withheld this answer under its content filter; nothing was lost to a \
+             limit, so rerunning the same input will most likely be refused again",
+        ),
+        _ => (
+            "truncated",
+            "the model's answer was cut off at the output token limit; raise \
+             `max_output_tokens` in the profile's budget and run again",
+        ),
+    };
     match content {
-        Some(text) if !text.trim().is_empty() => format!("{text}\n\n[truncated: {NOTICE}]"),
-        _ => format!("[truncated: {NOTICE}]"),
+        Some(text) if !text.trim().is_empty() => format!("{text}\n\n[{tag}: {notice}]"),
+        _ => format!("[{tag}: {notice}]"),
     }
 }
 

@@ -325,7 +325,18 @@ pub enum StopReason {
     /// token default on reasoning tokens and the empty result was logged as an
     /// ordinary answer — exit 0, `final_answer` in `metrics`, `(no text)` in
     /// `why`.
+    ///
+    /// The stop is the same whether or not the response carried tool calls: a
+    /// batch cut off mid-plan is the beginning of a plan, not the plan, so none
+    /// of its calls is dispatched and each is answered as `tool/not_started`
+    /// (CONTRACT §7 #132).
     MaxOutputTokens,
+    /// The provider withheld the response — its `content_filter` ending —
+    /// before the model finished. A sibling of [`Self::MaxOutputTokens`]: the
+    /// turn ended because the provider refused to continue, not because the
+    /// model chose to stop, so what is left is not an answer and saying it is
+    /// one would repeat the 2026-10-30 reading (§7 #132).
+    ContentFiltered,
 }
 
 /// Port for how a turn advances. Implementations are assembled at the app layer.

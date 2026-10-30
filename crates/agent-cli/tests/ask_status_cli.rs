@@ -159,6 +159,37 @@ async fn a_truncated_answer_is_reported_as_not_answered() {
     assert_eq!(end.event.payload["final_content"], "half a sen");
 }
 
+/// The provider's other ending that is not the model's choice gets the same
+/// reading: exit `1`, and a notice that says rerunning will not help
+/// (CONTRACT §7 #132).
+#[tokio::test]
+async fn a_content_filtered_answer_is_reported_as_not_answered() {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::content_filtered("")]));
+    let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    let scheduler = Scheduler::new(store.clone(), loop_, 8);
+    let sid = SessionId::from_string("filtered");
+
+    let outcome = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+    assert_eq!(outcome.verdict, Verdict::AnsweredNo);
+    let CliOutput::Text(text) = outcome.output else { panic!("expected text output") };
+    assert!(text.contains("[refused:"), "the notice says the provider withheld it: {text}");
+    assert!(text.contains("content filter"), "the notice names the ending that stopped it: {text}");
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let end = events
+        .iter()
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
+        .expect("the turn ended");
+    assert_eq!(end.event.payload["stop_reason"], "content_filtered");
+}
+
 #[tokio::test]
 async fn status_reports_closed_state_after_an_ask() {
     let (scheduler, sid) = scheduler();

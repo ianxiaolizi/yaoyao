@@ -533,6 +533,31 @@ impl FakeModelProvider {
         }
     }
 
+    /// A response the provider withheld under its content filter. Whatever text
+    /// arrived is not an answer, and the provider will most likely refuse the
+    /// same input again — unlike [`Self::truncated`], where a larger limit
+    /// helps.
+    pub fn content_filtered(content: &str) -> ModelResponse {
+        ModelResponse {
+            content_blocks: vec![ContentBlock::text(content)],
+            usage: None,
+            finish_reason: FinishReason::new(FinishReason::CONTENT_FILTER),
+            provider_metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// A response the provider cut off at its output limit **after** proposing
+    /// calls. The calls that arrived are the beginning of a plan: the last one's
+    /// arguments may be missing, and the model may have meant more.
+    pub fn truncated_with_call(name: &str, arguments: serde_json::Value) -> ModelResponse {
+        ModelResponse {
+            content_blocks: vec![ContentBlock::tool_use(String::new(), name, arguments)],
+            usage: None,
+            finish_reason: FinishReason::new(FinishReason::LENGTH),
+            provider_metadata: serde_json::Value::Null,
+        }
+    }
+
     /// A response that proposes a single tool call.
     pub fn tool_call(name: &str, arguments: serde_json::Value) -> ModelResponse {
         // A placeholder call id; `stream` rewrites it to a unique one so two

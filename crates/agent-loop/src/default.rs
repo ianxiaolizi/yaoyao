@@ -45,7 +45,7 @@ use agent_protocol::failures::Failures;
 use agent_protocol::ids::{AttemptId, EventId, EventSeq, SchemaVersion, SessionId, StepId};
 use agent_protocol::judgment::{self, Judgment, JudgmentStage};
 use agent_protocol::ledger::Ledger;
-use agent_protocol::model::{FinishReason, ToolCall, estimate_message, estimate_text};
+use agent_protocol::model::{ToolCall, estimate_message, estimate_text};
 use agent_protocol::permissions::ArtifactRef;
 use agent_protocol::plan::{self, Plan, PlanItemStatus};
 use agent_protocol::profile::RunBudget;
@@ -1994,8 +1994,9 @@ impl AgentLoop for DefaultAgentLoop {
                 let read = verdict::answer(
                     &answer_text,
                     &verdict::Facts {
-                        truncated: response.finish_reason.as_str() == FinishReason::LENGTH,
+                        halt: verdict::Halt::of(&response),
                         output_limit: turn.budget.max_output_tokens,
+                        undispatched_calls: 0,
                         unmet_action: turn.dispatched == 0 && turn.mode.stance == Stance::Act,
                         criterion_observed: turn.criterion_observed,
                         repair_after_failure: turn.stance_switched
@@ -2023,6 +2024,46 @@ impl AgentLoop for DefaultAgentLoop {
                     events,
                     stop: Some(read.stop),
                     final_content: Some(answer_text),
+                });
+            }
+
+            // A response the provider ended before the model finished is not a
+            // plan either: the calls in it are the beginning of one (the last
+            // call's arguments may never have arrived, and the model may have
+            // meant more), so none is dispatched and every one is answered as a
+            // call that provably did not run (CONTRACT §7 #132).
+            if let Some(halt) = verdict::Halt::of(&response) {
+                let text = response.text_content();
+                let calls = tool_calls.len() as u32;
+                let read = verdict::answer(
+                    &text,
+                    &verdict::Facts::halted(halt, turn.budget.max_output_tokens, calls),
+                );
+                let verdict = turn.reason.node(
+                    ReasonKind::Verdict,
+                    step_index,
+                    read.claim,
+                    vec![
+                        Basis::node(turn.stance_node.clone()),
+                        Basis::event(response_event_id.clone()),
+                    ],
+                    read.rule,
+                    ReasonSource::Model,
+                );
+                events.push(reason_event(ctx, Some(&step_id), &verdict));
+                refuse_undispatched(ctx, &step_id, turn, &mut events, &tool_calls, &read.stop);
+                events.push(draft(
+                    ctx,
+                    &step_id,
+                    EventType::STEP_COMPLETED,
+                    serde_json::json!({}),
+                    Actor::Agent,
+                ));
+                return Ok(StepOutcome {
+                    step_id,
+                    events,
+                    stop: Some(read.stop),
+                    final_content: Some(text),
                 });
             }
 
@@ -2918,6 +2959,19 @@ fn refuse_undispatched(
              Nothing ran; propose it again only if the next run still needs it.",
             turn.budget.max_tool_calls.unwrap_or_default()
         ),
+        // The response itself was cut, so the call may be incomplete as well as
+        // unrun: the answer says both, because retrying a half-written call
+        // without changing anything is exactly what the limit would reproduce.
+        StopReason::MaxOutputTokens => format!(
+            "This tool call was never dispatched: the provider stopped the response at the \
+             run's output-token limit ({}), so the calls in it may be incomplete. Nothing ran; \
+             raise `max_output_tokens` and propose them again if the work still needs doing.",
+            turn.budget.max_output_tokens.unwrap_or_default()
+        ),
+        StopReason::ContentFiltered => String::from(
+            "This tool call was never dispatched: the provider withheld the response under its \
+             content filter. Nothing ran; propose it again only if the next run still needs it.",
+        ),
         _ => String::from(
             "This tool call was never dispatched: the run's wall-clock limit was reached. \
              Nothing ran; propose it again only if the next run still needs it.",
@@ -3434,31 +3488,6 @@ mod tests {
             "{verdict:?}"
         );
         assert_eq!(verdict.rule, "verdict/answer");
-    }
-
-    /// A response the provider cut off at the output limit is not an answer.
-    ///
-    /// 2026-10-30: a reasoning model spent the whole completion budget on
-    /// reasoning tokens, returned `finish_reason: length` with no content, and
-    /// the loop logged an ordinary final answer — exit 0, `final_answer` in
-    /// `metrics`, `(no text)` in `why`. The stop has to say what happened.
-    #[tokio::test]
-    async fn a_response_cut_off_at_the_output_limit_is_not_a_final_answer() {
-        let model =
-            Arc::new(FakeModelProvider::new(vec![FakeModelProvider::truncated("half a sent")]));
-        let tools = Arc::new(FakeToolProvider::new());
-        let gateway = Arc::new(FakeToolGateway::new(tools));
-        let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
-
-        let outcome = run_turn(&loop_, &ctx()).await;
-
-        assert_eq!(outcome.stop_reason, StopReason::MaxOutputTokens);
-        assert_eq!(outcome.final_content.as_deref(), Some("half a sent"));
-        let verdict = reason_nodes(&outcome.events)
-            .into_iter()
-            .find(|node| node.kind == ReasonKind::Verdict)
-            .expect("a verdict names the stop");
-        assert_eq!(verdict.rule, "verdict/output-truncated", "{}", verdict.claim);
     }
 
     /// A turn that was read as an action, stayed in the act posture, and

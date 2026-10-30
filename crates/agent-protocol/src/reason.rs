@@ -410,7 +410,12 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "verdict/output-truncated",
         version: 1,
-        text: "the provider stopped the response at the run's output-token limit, so what arrived is the beginning of an answer rather than the answer; the turn ends on that limit, not on the model's choice to stop",
+        text: "the provider stopped the response at the run's output-token limit, so what arrived is the beginning of the turn — text, calls or both — rather than its end; the turn ends on that limit, not on the model's choice to stop",
+    },
+    Rule {
+        id: "verdict/content-filtered",
+        version: 1,
+        text: "the provider withheld the response under its content filter, so no answer arrived; the turn ends on the provider's refusal, not on the model's choice to stop",
     },
 ];
 
@@ -1292,6 +1297,7 @@ mod tests {
         assert!(rule("verdict/criterion-observed").is_some());
         assert!(rule("verdict/after-failure").is_some());
         assert!(rule("verdict/output-truncated").is_some());
+        assert!(rule("verdict/content-filtered").is_some());
         assert!(rule("gate/stale-read").is_some());
         assert!(rule("gate/repeat-call").is_some());
         assert!(rule("switch/failure-repair").is_some());

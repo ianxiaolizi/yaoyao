@@ -871,6 +871,7 @@
         case 'answered': return { label: '完成', cls: 'done' };
         case 'max_steps': return { label: '到达步数上限', cls: 'fail' };
         case 'limit_reached': return { label: '到达调用/时长上限', cls: 'fail' };
+        case 'content_filtered': return { label: '内容被拦截', cls: 'fail' };
         case 'yielded':
           if (group.approvals.some((row) => row.state === 'pending')) {
             return { label: '等待批准', cls: 'yield' };

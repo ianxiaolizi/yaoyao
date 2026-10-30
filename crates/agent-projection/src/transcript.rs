@@ -144,6 +144,10 @@ pub enum TurnEnding {
     /// what ran out, and because `Answered` would show a stop with no answer
     /// as a turn that produced one.
     LimitReached,
+    /// The provider withheld the response (its content filter) before the model
+    /// finished. Not `LimitReached`: no run limit was reached, and the badge
+    /// would send a reader to raise a limit that would not help.
+    ContentFiltered,
     /// It stopped for a person (an approval).
     Yielded,
     /// It broke.
@@ -643,6 +647,10 @@ impl ProjectionDefinition for TranscriptProjection {
                         Some("max_tool_calls" | "wall_clock_exceeded" | "max_output_tokens") => {
                             TurnEnding::LimitReached
                         }
+                        // The provider withheld the response: an ending of its
+                        // own, because no limit was reached and nothing was
+                        // answered (CONTRACT §7 #132).
+                        Some("content_filtered") => TurnEnding::ContentFiltered,
                         _ => TurnEnding::Answered,
                     },
                     EventType::TURN_YIELDED => TurnEnding::Yielded,
@@ -894,6 +902,9 @@ mod tests {
             // The provider cut the response off; the text beside it is the
             // beginning of an answer, and this is the word that says so.
             ("max_output_tokens", TurnEnding::LimitReached),
+            // The provider withheld the response: an ending of its own, because
+            // raising a limit would not have helped (CONTRACT §7 #132).
+            ("content_filtered", TurnEnding::ContentFiltered),
         ] {
             let state = apply(
                 &TranscriptProjection::new().init(),

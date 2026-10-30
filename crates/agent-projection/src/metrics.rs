@@ -558,6 +558,33 @@ mod tests {
         assert_eq!(metrics.turns.by_stop_reason.get(STOP_FINAL_ANSWER), None);
     }
 
+    /// The provider's other ending that is not an answer is counted under its
+    /// own word too, for the same reason (CONTRACT §7 #132).
+    #[test]
+    fn a_content_filtered_turn_is_counted_under_its_own_end() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::TURN_STARTED,
+                None,
+                Some("t1"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TURN_COMPLETED,
+                None,
+                Some("t1"),
+                serde_json::json!({ "stop_reason": "content_filtered" }),
+                "2026-01-01T00:00:01Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.turns.by_stop_reason.get("content_filtered"), Some(&1));
+        assert_eq!(metrics.turns.by_stop_reason.get(STOP_FINAL_ANSWER), None);
+    }
+
     #[test]
     fn a_turn_that_yields_and_is_resumed_ends_once_but_is_counted_twice() {
         // The yield is an ending (it closed the turn) and the completion is
