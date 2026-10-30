@@ -31,6 +31,11 @@
     live: { text: '', reasoning: '' },
     liveTurn: null,
     running: false,
+    /// Whether the log's newest durable item is a turn ending. The stream
+    /// merges two sources without ordering them, so a delta can arrive after
+    /// the events of the turn it belongs to; this is what lets the page tell
+    /// that chunk from one belonging to a turn that is still running.
+    settled: false,
     waiting: false,
     pendingUser: '',
     forceRunningUntil: 0,
@@ -732,6 +737,10 @@
         state.live.text = '';
         state.live.reasoning = '';
       }
+      // Read from the log rather than from the deltas: any durable item means
+      // a turn is producing one, and the turn ending is the only item that
+      // says nothing else will.
+      state.settled = item.kind === 'turn_end';
       if (item.kind === 'thinking') {
         // The durable node has arrived; the preview would be a second copy.
         state.live.reasoning = '';
@@ -792,6 +801,13 @@
         toast(data.text || '运行提示', 'error');
         return;
       }
+      // A chunk that leaves the writer before its turn's own events can reach
+      // the page after them — the two sources are merged without ordering.
+      // Once the log says the turn ended, text and reasoning belong to that
+      // turn, whose answer is already recorded: showing them again as a live
+      // tail reads as a turn that is still running and never stops. The page
+      // therefore waits for a durable item before believing a delta again.
+      if (state.settled && (data.kind === 'text' || data.kind === 'reasoning')) return;
       if (data.kind === 'text') {
         state.live.text += data.text || '';
         state.running = true;
@@ -1588,6 +1604,7 @@
     state.live = { text: '', reasoning: '' };
     state.pendingUser = '';
     state.running = false;
+    state.settled = false;
     state.waiting = false;
     state.forceRunningUntil = 0;
     state.why = null;
@@ -1634,6 +1651,9 @@
     state.live = { text: '', reasoning: '' };
     state.pendingUser = '';
     state.running = Boolean(state.activeSummary?.open_turn) && !state.activeSummary?.yielded;
+    // The fold that follows says where the log stands; until then nothing is
+    // known to have ended, so a delta is believed.
+    state.settled = false;
     state.waiting = Boolean(state.activeSummary?.yielded) || Number(state.activeSummary?.pending_approvals || 0) > 0;
     state.forceRunningUntil = 0;
     state.why = null;
