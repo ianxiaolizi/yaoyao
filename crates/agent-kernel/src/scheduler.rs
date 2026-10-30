@@ -10,7 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use agent_ports::agent_loop::{
     AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, StopReason, TurnCapabilityFacts,
@@ -33,6 +32,12 @@ use crate::judgment;
 use crate::lifecycle;
 use crate::plan;
 use crate::session_lifecycle;
+
+mod endings;
+mod journal;
+
+use endings::{Ending, Gate};
+use journal::{SessionJournal, close_failed_turn};
 
 /// Drives runs: claims input, enforces a single active run, and settles turns.
 pub struct Scheduler {
@@ -821,180 +826,6 @@ impl Scheduler {
     async fn next_seq(&self, session_id: &SessionId) -> Result<EventSeq, SchedulerError> {
         let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
         Ok(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO))
-    }
-}
-
-/// The Scheduler's [`EventSink`]: this session's log, appended under the write
-/// lease and flushed before returning.
-///
-/// Sequence and write are one step here for the same reason they are at the
-/// terminal batch (YA-36): the number is read from the log and consumed by the
-/// append, and a number read outside the lease could be moved by another
-/// process before the append lands.
-struct SessionJournal {
-    store: Arc<dyn EventStore>,
-    session_id: SessionId,
-    /// Steps that actually opened, and calls that actually started — counted
-    /// as their markers pass through, so a turn's budget report does not
-    /// depend on how many boundaries the turn happened to be written in.
-    steps: AtomicU32,
-    calls: AtomicU32,
-}
-
-impl SessionJournal {
-    fn new(store: Arc<dyn EventStore>, session_id: SessionId) -> Self {
-        Self { store, session_id, steps: AtomicU32::new(0), calls: AtomicU32::new(0) }
-    }
-
-    fn steps(&self) -> usize {
-        self.steps.load(Ordering::Relaxed) as usize
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::Relaxed) as usize
-    }
-}
-
-#[async_trait::async_trait]
-impl EventSink for SessionJournal {
-    async fn commit(&self, drafts: Vec<EventDraft>) -> Result<(), EventStoreError> {
-        if drafts.is_empty() {
-            return Ok(());
-        }
-        for event in &drafts {
-            match event.event_type.as_str() {
-                EventType::STEP_STARTED => self.steps.fetch_add(1, Ordering::Relaxed),
-                EventType::TOOL_STARTED => self.calls.fetch_add(1, Ordering::Relaxed),
-                _ => continue,
-            };
-        }
-        let _lease = self.store.lease(&self.session_id).await?;
-        let events = self.store.read_stream(&self.session_id, EventSeq::ZERO, usize::MAX).await?;
-        let next = events.last().map(|event| event.seq.next()).unwrap_or(EventSeq::ZERO);
-        self.store.append(&self.session_id, next, drafts).await?;
-        // Accepting the append is not the promise this method makes: it says
-        // the fact survives losing the process, so it waits for the disk.
-        self.store.flush(&self.session_id).await?;
-        Ok(())
-    }
-}
-
-/// Close a turn the loop failed inside, so the log says a run failed rather
-/// than leaving it open for recovery to call it an interruption.
-///
-/// Best effort on purpose: the caller is already returning an error, and a
-/// store that cannot take these two events is a store whose next caller runs
-/// recovery, which closes an open run exactly as well.
-async fn close_failed_turn(
-    journal: &SessionJournal,
-    run_id: &RunId,
-    turn_id: &TurnId,
-    mut pending: Vec<EventDraft>,
-) {
-    let session_id = &journal.session_id;
-    pending.push(draft(
-        session_id,
-        EventType::TURN_FAILED,
-        serde_json::json!({}),
-        Actor::Scheduler,
-        Some(run_id),
-        Some(turn_id),
-        None,
-    ));
-    pending.push(draft(
-        session_id,
-        EventType::RUN_FAILED,
-        serde_json::json!({}),
-        Actor::Scheduler,
-        Some(run_id),
-        None,
-        None,
-    ));
-    let _ = journal.commit(pending).await;
-}
-
-/// What the session's lifecycle says about starting a run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gate {
-    /// No run is open and nothing is held.
-    Ready,
-    /// A run is already open; the caller should report nothing and consume
-    /// nothing.
-    Busy,
-}
-
-/// How a turn stopped.
-///
-/// Three endings, because two of them are decisions the Scheduler makes rather
-/// than facts the loop reports, and collapsing them into a `StopReason` would
-/// lose that: an exhausted step budget and a user interrupt are not things the
-/// loop decided, they are things that were done to the turn.
-enum Ending {
-    /// The loop said the turn was over.
-    Loop { reason: StopReason, final_content: Option<String> },
-    /// The step budget ran out. The budget is the Scheduler's policy, so only
-    /// the Scheduler can report this ending.
-    Budget,
-    /// The user interrupted the turn at a step boundary.
-    Interrupted { item_id: InboxItemId },
-}
-
-impl Ending {
-    /// The stop reason, the final content, the two terminal event types, and
-    /// the terminal payload.
-    #[allow(clippy::type_complexity)]
-    fn settle(
-        &self,
-    ) -> (StopReason, Option<String>, &'static str, &'static str, serde_json::Value) {
-        let reason = match self {
-            Ending::Loop { reason, .. } => reason.clone(),
-            Ending::Budget => StopReason::MaxSteps,
-            Ending::Interrupted { .. } => StopReason::UserCancelled,
-        };
-        let final_content = match self {
-            Ending::Loop { final_content, .. } => final_content.clone(),
-            _ => None,
-        };
-        let (turn_event, run_event) = match &reason {
-            StopReason::FinalAnswer
-            | StopReason::MaxSteps
-            | StopReason::MaxToolCalls
-            | StopReason::WallClockExceeded => {
-                (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED)
-            }
-            StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
-            StopReason::FatalError => (EventType::TURN_FAILED, EventType::RUN_FAILED),
-            StopReason::UserCancelled => (EventType::TURN_CANCELLED, EventType::RUN_CANCELLED),
-        };
-        // An interrupt names its cause, because `turn/cancelled` alone cannot
-        // say whether the user stopped the turn or an adapter abandoned an
-        // attempt. The paths that predate the interrupt keep their exact
-        // payload — the cancelled turn's shape is not this change's to alter.
-        let payload = match self {
-            Ending::Interrupted { item_id } => serde_json::json!({
-                "cause": "user_interrupt",
-                "inbox_item": item_id,
-            }),
-            // The one terminal payload that would otherwise be empty. A budget
-            // stop writes no final content, and `turn/completed {}` cannot be
-            // told from a turn that ended with nothing to say: on 2026-10-24's
-            // real use the log gave no reason and only stdout did.
-            Ending::Budget => serde_json::json!({ "stop_reason": &reason }),
-            // A limit the loop enforced inside a step ends the turn the same
-            // way the step limit does, and for the same reason: `turn/completed`
-            // with an empty payload cannot be told from a turn that ended with
-            // nothing to say.
-            Ending::Loop { reason, .. }
-                if matches!(reason, StopReason::MaxToolCalls | StopReason::WallClockExceeded) =>
-            {
-                serde_json::json!({ "stop_reason": reason })
-            }
-            _ => match &final_content {
-                Some(content) => serde_json::json!({ "final_content": content }),
-                None => serde_json::json!({}),
-            },
-        };
-        (reason, final_content, turn_event, run_event, payload)
     }
 }
 
