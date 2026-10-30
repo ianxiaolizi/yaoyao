@@ -6,6 +6,7 @@
 
 pub(crate) mod approval;
 pub(crate) mod plugin;
+pub(crate) mod sandbox;
 pub(crate) mod schedule;
 pub(crate) mod session;
 pub(crate) mod turn;
