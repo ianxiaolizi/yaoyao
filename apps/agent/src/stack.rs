@@ -41,7 +41,7 @@ use agent_kernel::scheduler::{Scheduler, SchedulerError};
 use agent_kernel::tools::CompositeToolProvider;
 use agent_loop::DefaultAgentLoop;
 use agent_memory_sqlite::{MemoryFactsToolProvider, SqliteMemoryStore};
-use agent_ports::agent_loop::TurnCapabilityFacts;
+use agent_ports::agent_loop::{AgentLoop, TurnCapabilityFacts};
 use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::control::ControlHandler;
 use agent_ports::decision::DecisionAdvisor;
@@ -528,25 +528,16 @@ pub async fn assemble_with_delegation(
     // *here*, before the reservation below, because whether the run has a
     // delegation tool at all depends on how many backends survived.
     //
-    // A backend is a child process, so a run whose sandbox provides no
+    // A stdio backend is a child process, so a run whose sandbox provides no
     // `process.spawn` has none: admitting one would offer the model a tool that
     // can only ever fail, and the refusal would arrive at call time rather than
-    // here, where it can still be read before the run starts.
-    let can_spawn = advertised.contains(&Capability::new(Capability::PROCESS_SPAWN));
-    let (subagents_config, subagent_notes) = if can_spawn {
-        subagents::admit_backends(&resolved.subagents, &guard)
-    } else {
-        let notes = if resolved.subagents.is_empty() {
-            Vec::new()
-        } else {
-            vec![format!(
-                "{} backend(s) not admitted: the execution sandbox provides no {}",
-                resolved.subagents.len(),
-                Capability::PROCESS_SPAWN
-            )]
-        };
-        (Vec::new(), notes)
-    };
+    // here, where it can still be read before the run starts. An in-process
+    // backend is a turn in this process and needs no more than the run's
+    // `subagent.spawn`, so a read-only run — which advertises that and not
+    // `process.spawn` — admits it and drops the stdio backend beside it
+    // (CONTRACT §7 #133).
+    let (subagents_config, subagent_notes) =
+        subagents::admit_backends(&resolved.subagents, &guard, &advertised);
     for note in &subagent_notes {
         eprintln!("subagents: {note}");
     }
@@ -615,23 +606,31 @@ pub async fn assemble_with_delegation(
     // can drain it before exiting: a child whose process disappears with the
     // parent is a delegation the log says began and never ended.
     let children = Arc::new(subagents::Children::new());
-    let tools: Arc<dyn ToolProvider> = if subagents_config.is_empty() {
-        builtins.clone()
-    } else {
-        Arc::new(
+    // Held as itself, not only behind `dyn ToolProvider`, because the end of this
+    // function hands every in-process backend the run it will execute children
+    // on — a thing only this type can be asked for.
+    let subagent_tools: Option<Arc<subagents::SubagentToolProvider>> =
+        if subagents_config.is_empty() {
+            None
+        } else {
+            Some(Arc::new(subagents::SubagentToolProvider::new(
+                store.clone(),
+                builtins.clone(),
+                session.clone(),
+                &subagents_config,
+                children.clone(),
+                delegation,
+            )))
+        };
+    let tools: Arc<dyn ToolProvider> = match &subagent_tools {
+        None => builtins.clone(),
+        Some(subagent_tools) => Arc::new(
             CompositeToolProvider::new(vec![
                 builtins.clone(),
-                Arc::new(subagents::SubagentToolProvider::new(
-                    store.clone(),
-                    builtins.clone(),
-                    session.clone(),
-                    &subagents_config,
-                    children.clone(),
-                    delegation,
-                )),
+                subagent_tools.clone() as Arc<dyn ToolProvider>,
             ])
             .map_err(|e| StackError::ToolSurface(e.to_string()))?,
-        )
+        ),
     };
 
     // One step's output is bounded by the window the run actually has: a
@@ -642,7 +641,9 @@ pub async fn assemble_with_delegation(
     let gateway = Arc::new(
         GuardedToolProvider::new(
             tools.clone(),
-            policy,
+            // Kept as well as handed over: an in-process child's policy is
+            // derived from this one, by narrowing it (CONTRACT §7 #133).
+            policy.clone(),
             approvals.clone(),
             guard.clone(),
             artifacts.clone(),
@@ -734,24 +735,69 @@ pub async fn assemble_with_delegation(
         }),
         None => engine,
     });
-    let suite: Arc<dyn ToolGateway> = gateway.clone();
-    let mut loop_ = DefaultAgentLoop::new(selected.provider, suite, context, router)
-        .with_live_bus(live_bus.clone())
-        .with_redactor(redactor);
-    if let Some(advisor) = advisor {
-        loop_ = loop_.with_decisions(advisor);
-    }
     // The arms: `gates` (the default) keeps the deterministic refusals without
     // the ledger's tool and advice, `on` adds the ledger for audit and the
     // evaluation's full arm, and `off` is the baseline that predates the
     // pipeline. The binary passes `judgment: true`; a test may pass false to
     // state that it is not exercising the pipeline at all.
-    match judgment_arm(judgment)? {
+    let arm = judgment_arm(judgment)?;
+    let suite: Arc<dyn ToolGateway> = gateway.clone();
+    let mut loop_ =
+        DefaultAgentLoop::new(selected.provider.clone(), suite, context.clone(), router.clone())
+            .with_live_bus(live_bus.clone())
+            .with_redactor(redactor.clone());
+    if let Some(advisor) = advisor {
+        loop_ = loop_.with_decisions(advisor);
+    }
+    match arm {
         JudgmentArm::Full => {}
         JudgmentArm::Gates => loop_ = loop_.without_ledger(),
         JudgmentArm::Off => loop_ = loop_.without_judgment(),
     }
     let loop_ = Arc::new(loop_);
+    // The loop an in-process child runs on (CONTRACT §7 #133): this run's model,
+    // history and routing, a surface holding only the read-only tools, and a
+    // policy that refuses where the parent would stop to ask. All three narrow in
+    // the same direction — a child turn is one nobody is watching, and a turn
+    // that stopped for a person would stand paused forever.
+    //
+    // No shadow advisor: the advisor observes a session a person is driving, and
+    // a child's choices are already recorded in its own log — a shadow there is a
+    // second model call per step nobody asked for.
+    let child_loop: Option<Arc<dyn AgentLoop>> =
+        if subagent_tools.as_ref().is_some_and(|tools| tools.has_in_process()) {
+            let surface: Arc<dyn ToolProvider> =
+                Arc::new(crate::inprocess::ReadOnlySurface::new(builtins.clone()));
+            let child_policy =
+                crate::inprocess::never_asking(&policy, surface.as_ref(), &advertised);
+            let child_gateway: Arc<dyn ToolGateway> = Arc::new(
+                GuardedToolProvider::new(
+                    surface,
+                    child_policy,
+                    approvals.clone(),
+                    guard.clone(),
+                    artifacts.clone(),
+                )
+                .with_offload_limit(resolved.budget.tool_output_limit_bytes())
+                .with_redactor(redactor.clone()),
+            );
+            let mut child = DefaultAgentLoop::new(
+                selected.provider.clone(),
+                child_gateway,
+                context.clone(),
+                router.clone(),
+            )
+            .with_live_bus(live_bus.clone())
+            .with_redactor(redactor.clone());
+            match arm {
+                JudgmentArm::Full => {}
+                JudgmentArm::Gates => child = child.without_ledger(),
+                JudgmentArm::Off => child = child.without_judgment(),
+            }
+            Some(Arc::new(child))
+        } else {
+            None
+        };
     // The configuration is frozen here, now that the route is known, and handed
     // to the scheduler so that the run records what it executed under before it
     // opens.
@@ -793,6 +839,14 @@ pub async fn assemble_with_delegation(
         // These are the same two facts the environment was built over, not a
         // second reading of the environment.
         .with_capability(TurnCapabilityFacts { sandbox, network_allowed, tool_secrets });
+    // Every in-process backend is handed the run its children execute on: this
+    // scheduler with the child's loop in place of the parent's, and the request's
+    // own budget applied at each spawn on top of it. Done here because this run
+    // is built from the scheduler — which is assembled after the tool surface the
+    // backend is part of, so nothing earlier could hand it over.
+    if let (Some(tools), Some(child_loop)) = (&subagent_tools, child_loop) {
+        tools.install(Arc::new(scheduler.relooped(child_loop)));
+    }
     let recovery = Recovery::new(store.clone(), tools.clone());
     let resume = Resume::new(store.clone(), approvals.clone(), gateway.clone());
     // The fork closes its child's interrupted tail with the same Recovery rules,

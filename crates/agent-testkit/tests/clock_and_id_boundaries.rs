@@ -48,7 +48,8 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every `*.rs` under `<root>/{crates,apps}/*/src`, sorted, minus `src/bin`.
+/// Every `*.rs` under `<root>/{crates,apps}/*/src`, sorted, minus `src/bin` and
+/// minus [`is_test_module`] files.
 /// The rule is about the paths a build runs as the framework; the test-double
 /// servers (`fake-openai-server`, `fake-subagent`) are `examples/` targets now,
 /// a directory this walk never visits, and integration tests under `*/tests/`
@@ -69,7 +70,10 @@ fn production_files() -> Vec<PathBuf> {
             }
             let mut found = Vec::new();
             rust_sources(&src, &mut found);
-            found.retain(|path| !path.strip_prefix(&src).is_ok_and(|rel| rel.starts_with("bin")));
+            found.retain(|path| {
+                !path.strip_prefix(&src).is_ok_and(|rel| rel.starts_with("bin"))
+                    && !is_test_module(path)
+            });
             files.extend(found);
         }
     }
@@ -85,19 +89,21 @@ fn relative_to_root(path: &Path) -> String {
 /// file's test module.
 ///
 /// It cuts at the first standalone `#[cfg(test)]` and **asserts the next
-/// non-blank line opens `mod tests`**. The workspace holds that shape today
-/// (checked across every `src` file when the guard was written). If a file ever
-/// grows a `#[cfg(test)]` that is not a tests module — a conditional `use`, a
-/// conditional helper — this panics instead of quietly counting test code as
-/// production or the reverse. A guard that silently mis-scopes is worse than
-/// one that stops.
+/// non-blank line opens `mod tests`** — inline (`mod tests {`) or out of line
+/// (`mod tests;`, the contents then living in a sibling `tests.rs`). Both mark
+/// the same boundary; the second is how a module that outgrew the size ceiling
+/// keeps its tests without keeping its production file at two thousand lines
+/// (§7 #133). If a file ever grows a `#[cfg(test)]` that is not a tests module —
+/// a conditional `use`, a conditional helper — this panics instead of quietly
+/// counting test code as production or the reverse. A guard that silently
+/// mis-scopes is worse than one that stops.
 fn production_lines(text: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = text.lines().collect();
     if let Some(cut) = lines.iter().position(|line| line.trim() == "#[cfg(test)]") {
         let opens_tests = lines[cut + 1..]
             .iter()
             .find(|line| !line.trim().is_empty())
-            .is_some_and(|line| line.trim() == "mod tests {");
+            .is_some_and(|line| matches!(line.trim(), "mod tests {" | "mod tests;"));
         assert!(
             opens_tests,
             "the first `#[cfg(test)]` does not open `mod tests`; `production_lines` \
@@ -106,6 +112,25 @@ fn production_lines(text: &str) -> Vec<&str> {
         lines.truncate(cut);
     }
     lines
+}
+
+/// Whether a file is an out-of-line tests module — `tests.rs` beside the module
+/// it tests, or anything under `src/tests/`.
+///
+/// Such a file is test code end to end, so every line of it is excluded rather
+/// than scanned as production. The rule is the file's *name*, which is the one
+/// thing a text guard can see: a production file called `tests.rs` would be
+/// skipped, and that is the cost of the shortcut — stated here so nobody trusts
+/// the guard further than it goes. Nothing in the tree is named that way, and a
+/// tests module is the only thing the name is for.
+fn is_test_module(path: &Path) -> bool {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let in_tests_dir = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|parent| parent.to_str())
+        .is_some_and(|parent| parent == "tests");
+    name == "tests.rs" || (name.ends_with(".rs") && in_tests_dir)
 }
 
 /// A line that is entirely a comment. The rules are about code, and a doc or a
@@ -294,6 +319,20 @@ fn a_cfg_test_that_is_not_a_tests_module_stops_the_guard() {
     // The scoping rule is an assumption about the tree's shape; when the tree
     // stops matching it, the guard must fail rather than guess.
     let _ = production_lines("fn f() {}\n\n#[cfg(test)]\nfn helper() {}\n");
+}
+
+#[test]
+fn a_cfg_test_naming_an_out_of_line_module_scopes_the_same_way() {
+    // Both spellings mark where production ends. The out-of-line one puts the
+    // tests in a sibling `tests.rs`, which [`is_test_module`] then leaves out of
+    // the walk — so the file that was split is scanned up to the declaration and
+    // the file it hands the tests to is not scanned at all.
+    let text = "fn f() {}\n\n#[cfg(test)]\nmod tests;\n";
+    assert_eq!(production_lines(text), vec!["fn f() {}", ""]);
+    assert!(is_test_module(Path::new("apps/agent/src/subagents/tests.rs")));
+    assert!(is_test_module(Path::new("crates/x/src/tests/some.rs")));
+    assert!(!is_test_module(Path::new("apps/agent/src/subagents.rs")));
+    assert!(!is_test_module(Path::new("crates/x/src/production.rs")));
 }
 
 #[test]

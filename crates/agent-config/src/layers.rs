@@ -372,14 +372,21 @@ pub struct McpServer {
 /// Keyed under `subagents` by provider name, which is also the half of a plugin
 /// id that follows `subagent.`: `[subagents.fake]` is the provider a profile
 /// enables as `subagent.fake`. There is no level between the section and the
-/// name — unlike `[mcp.servers.<name>]` — because there is one shape here, and
-/// the entry is the whole of what there is to say about it.
+/// name — unlike `[mcp.servers.<name>]` — because the entry is the whole of what
+/// there is to say about it.
 ///
-/// One shape is the point. An MCP server may be a program or an endpoint, so
-/// its entry carries fields belonging to both and [`crate::resolve`] has to
-/// decide which one it is. A child is always a program this build starts and
-/// speaks to, so a field for any other way of reaching one is not expressible
-/// rather than expressible and refused.
+/// Two shapes, and `kind` says which. Until CONTRACT §7 #133 this comment said
+/// a child was *always* a program this build starts, so a field for any other
+/// way of reaching one was not expressible. That was true of the only backend
+/// there was, and it made the model's delegation surface unreachable in
+/// practice: no program in this build speaks the child wire, and an external
+/// program is never told which forked session it is meant to continue. An
+/// `in-process` child is a turn this build runs itself in that session, so it is
+/// a shape the entry has to be able to name.
+///
+/// Which fields belong to which shape is a question with one wrong answer —
+/// silently ignoring a field — so [`crate::resolve`] refuses the mixtures rather
+/// than dropping half of an entry.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentSpec {
@@ -388,8 +395,9 @@ pub struct SubagentSpec {
     /// A child does not inherit the parent's permissions, and what a
     /// delegation asks of the parent's policy is the delegation itself: this is
     /// the claim that question is answered against, and the only place it can
-    /// be stated, because the child's own tool calls are governed on the far
-    /// side of a process this build does not see into.
+    /// be stated, because a delegated child's own tool calls are governed where
+    /// this build does not — another process, or a surface restricted before the
+    /// child sees it.
     #[serde(default)]
     pub requires: Vec<String>,
     /// The longest a child may live, e.g. `"5m"`.
@@ -399,10 +407,17 @@ pub struct SubagentSpec {
     /// what a child may cost. Absent leaves the provider's own default.
     pub timeout: Option<String>,
 
-    /// The program to run. Required, because a provider with nothing to run is
-    /// not a provider — and a missing one is a parse error that names the file,
-    /// rather than a definition that resolves into a refusal later.
-    pub command: String,
+    /// How this build reaches a child: `"stdio"` (absent) or `"in-process"`.
+    ///
+    /// Absent means `stdio`, because every definition written before this field
+    /// existed was one, and a configuration that never named a kind must keep
+    /// resolving to the thing it already meant.
+    pub kind: Option<String>,
+
+    /// The program to run. Required for `stdio`, and refused for `in-process`:
+    /// a program named beside a provider that does not start one is an entry
+    /// that says two conflicting things.
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -645,7 +660,12 @@ requires = ["process.spawn"]
         .unwrap();
 
         let fake = &config.subagents.as_ref().unwrap()["fake"];
-        assert_eq!(fake.command, "fake-subagent");
+        assert_eq!(
+            fake.kind.as_deref(),
+            None,
+            "an entry that names no kind is a program this build starts"
+        );
+        assert_eq!(fake.command.as_deref(), Some("fake-subagent"));
         assert_eq!(fake.args, vec!["--mode", "result"]);
         assert_eq!(fake.timeout.as_deref(), Some("5m"));
         assert_eq!(fake.requires, vec!["process.spawn"]);

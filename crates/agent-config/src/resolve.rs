@@ -218,18 +218,45 @@ pub enum SchemaPolicy {
     Warn,
 }
 
+/// How this build reaches a child (CONTRACT §7 #133).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubagentKind {
+    /// A program this build starts and speaks to in JSON lines. The only shape
+    /// there was before #133, and the one an entry that names no kind means.
+    #[default]
+    Stdio,
+    /// A turn this build runs itself, in the session the delegation forked.
+    /// No process, no wire, and the only backend whose child can be held to its
+    /// budget by the kernel.
+    InProcess,
+}
+
+impl SubagentKind {
+    /// The name the configuration writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::InProcess => "in-process",
+        }
+    }
+}
+
 /// One subagent provider a run may delegate through.
 ///
-/// A value rather than a section of TOML, and — unlike [`McpServerConfig`] —
-/// without a transport to go with it, because a child is reached one way.
+/// A value rather than a section of TOML. `kind` decides which of the two
+/// shapes it is, and the fields that only one shape has are `None` for the
+/// other — a mixture is refused where the section is read, not here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubagentConfig {
     /// The provider name — the half of the plugin id after `subagent.`, the
     /// name a delegation records as its `provider`, and the name a refusal
     /// about this provider uses.
     pub provider: String,
-    /// The program to run.
-    pub command: String,
+    /// How a child is reached.
+    pub kind: SubagentKind,
+    /// The program to run. Always `Some` for [`SubagentKind::Stdio`] and always
+    /// `None` for [`SubagentKind::InProcess`].
+    pub command: Option<String>,
     pub args: Vec<String>,
     /// In name order, because a process environment is a set of pairs and two
     /// equal configurations must produce equal values.
@@ -1099,8 +1126,49 @@ fn subagent_config(
         detail,
     };
 
-    if spec.command.trim().is_empty() {
-        return Err(refuse("`command` is empty, so there is no program to run".to_string()));
+    // Which shape this entry is, before any of its fields are read for that
+    // shape. An unknown word is a refusal rather than a fallback: an entry that
+    // misspelled `in-process` and got a provider that runs a program would fail
+    // later, naming a program nobody wrote.
+    let kind = match spec.kind.as_deref() {
+        None | Some("stdio") => SubagentKind::Stdio,
+        Some("in-process") => SubagentKind::InProcess,
+        Some(other) => {
+            return Err(refuse(format!(
+                "`kind` is '{other}'; this build reaches a child as 'stdio' or 'in-process'"
+            )));
+        }
+    };
+    // The fields that belong to the other shape are refused rather than
+    // dropped: a `command` beside an in-process provider, or `cwd` beside one
+    // that has no process to run in, is an entry saying two things at once, and
+    // the one it means is not something a reader can recover.
+    match kind {
+        SubagentKind::Stdio => {
+            let command = spec.command.as_deref().unwrap_or_default();
+            if command.trim().is_empty() {
+                return Err(refuse(
+                    "`command` is empty, so there is no program to run; an `in-process` \
+                     provider names no program at all"
+                        .to_string(),
+                ));
+            }
+        }
+        SubagentKind::InProcess => {
+            for (field, named) in [
+                ("command", spec.command.is_some()),
+                ("args", !spec.args.is_empty()),
+                ("env", !spec.env.is_empty()),
+                ("cwd", spec.cwd.is_some()),
+            ] {
+                if named {
+                    return Err(refuse(format!(
+                        "`{field}` belongs to a provider that runs a program; an \
+                         `in-process` child runs in this process"
+                    )));
+                }
+            }
+        }
     }
 
     let ceiling_ms = match &spec.timeout {
@@ -1132,6 +1200,7 @@ fn subagent_config(
 
     Ok(SubagentConfig {
         provider: provider.to_string(),
+        kind,
         command: spec.command.clone(),
         args: spec.args.clone(),
         env: spec.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),

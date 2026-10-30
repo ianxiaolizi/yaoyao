@@ -56,7 +56,8 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every `*.rs` under `<root>/{crates,apps}/*/src`, sorted, minus `src/bin`.
+/// Every `*.rs` under `<root>/{crates,apps}/*/src`, sorted, minus `src/bin` and
+/// minus out-of-line test modules.
 /// The rule is about the paths a build runs as the framework: the test-double
 /// servers live under `examples/`, which this walk never visits, and `src/bin`
 /// stays excluded for the day a package grows a second binary that *is* the
@@ -75,12 +76,30 @@ fn production_files() -> Vec<PathBuf> {
             }
             let mut found = Vec::new();
             rust_sources(&src, &mut found);
-            found.retain(|path| !path.strip_prefix(&src).is_ok_and(|rel| rel.starts_with("bin")));
+            found.retain(|path| {
+                !path.strip_prefix(&src).is_ok_and(|rel| rel.starts_with("bin"))
+                    && !is_test_module(path)
+            });
             files.extend(found);
         }
     }
     files.sort();
     files
+}
+
+/// Whether a file is an out-of-line tests module — `tests.rs` beside the module
+/// it tests, or anything under a `tests/` directory. Test code end to end, so
+/// the walk leaves it out rather than scanning it as production. The rule is the
+/// file's name, which is all a text guard can see (same rule as
+/// `clock_and_id_boundaries.rs`).
+fn is_test_module(path: &Path) -> bool {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let in_tests_dir = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|parent| parent.to_str())
+        .is_some_and(|parent| parent == "tests");
+    name == "tests.rs" || (name.ends_with(".rs") && in_tests_dir)
 }
 
 fn relative_to_root(path: &Path) -> String {
@@ -90,16 +109,17 @@ fn relative_to_root(path: &Path) -> String {
 /// The lines a normal build compiles: everything before the file's test module.
 ///
 /// Same shape as `clock_and_id_boundaries.rs`: cut at the first standalone
-/// `#[cfg(test)]` and **assert the next non-blank line opens `mod tests`**, so a
-/// `#[cfg(test)]` that is not a tests module stops the guard instead of
-/// mis-scoping it.
+/// `#[cfg(test)]` and **assert the next non-blank line opens `mod tests`** — in
+/// line (`mod tests {`) or out of line (`mod tests;`, the tests in a sibling
+/// `tests.rs` the walk leaves out) — so a `#[cfg(test)]` that is not a tests
+/// module stops the guard instead of mis-scoping it.
 fn production_lines(text: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = text.lines().collect();
     if let Some(cut) = lines.iter().position(|line| line.trim() == "#[cfg(test)]") {
         let opens_tests = lines[cut + 1..]
             .iter()
             .find(|line| !line.trim().is_empty())
-            .is_some_and(|line| line.trim() == "mod tests {");
+            .is_some_and(|line| matches!(line.trim(), "mod tests {" | "mod tests;"));
         assert!(
             opens_tests,
             "the first `#[cfg(test)]` does not open `mod tests`; `production_lines` \

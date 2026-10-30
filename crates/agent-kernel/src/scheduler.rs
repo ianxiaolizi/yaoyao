@@ -34,6 +34,7 @@ use crate::session_lifecycle;
 mod draft;
 mod endings;
 mod journal;
+mod rebuilt;
 
 pub(crate) use draft::draft;
 use endings::{Ending, Gate};

@@ -17,6 +17,7 @@ pub mod checks;
 pub mod clock;
 pub mod config;
 pub mod decisions;
+pub mod inprocess;
 pub mod instructions;
 pub mod metrics;
 pub mod plugins;

@@ -44,15 +44,31 @@ impl SandboxMode {
     /// MCP-over-HTTP and subagent backends. A backend that cannot reach the
     /// network (an AppContainer without the internet capability; a container
     /// started with `--network none`) overrides this and leaves the entry out.
+    ///
+    /// `subagent.spawn` is build-level in the read-only mode too, and stays there
+    /// for a reason that changed shape: the capability means "this build can
+    /// delegate a turn", not "this build can start a program". It did mean the
+    /// latter while every backend was a child process — which is why read-only
+    /// left it out — and an in-process backend is a turn this build runs itself
+    /// over a surface the run's own policy already bounds, so nothing about it
+    /// reaches the sandbox (CONTRACT §7 #133). A *stdio* backend is still a
+    /// process, and a run with no `process.spawn` has its stdio providers dropped
+    /// at admission, so this entry cannot be the backdoor it reads as: the
+    /// advertisement says a delegation is possible, and which kind is possible is
+    /// the backend's question.
     pub fn advertised_capabilities(self) -> Vec<Capability> {
         match self {
-            // A read-only run can look at the workspace and search its own
-            // history, and nothing else: no writes, no child process (so no
-            // `shell.run`, no `git.status`, no subagent backend), and no
-            // network — every other capability this build has is reached
-            // through one of those two.
+            // A read-only run can look at the workspace, search its own history,
+            // and delegate a turn to a backend that runs in this process — no
+            // writes, no child process (so no `shell.run`, no `git.status`, no
+            // stdio subagent backend), and no network — every other capability
+            // this build has is reached through one of those two.
             SandboxMode::ReadOnly => {
-                vec![Capability::new(Capability::FS_READ), Capability::new(Capability::MEMORY_READ)]
+                vec![
+                    Capability::new(Capability::FS_READ),
+                    Capability::new(Capability::MEMORY_READ),
+                    Capability::new(Capability::SUBAGENT_SPAWN),
+                ]
             }
             // A confinement backend that restricts the network overrides this
             // and leaves `network.request` out (slice B).
@@ -249,8 +265,15 @@ mod tests {
         // a read-only run that advertised `process.spawn` would turn a
         // configured `shell.run` into a call that reaches the environment and
         // fails there, instead of a refusal that says the backend cannot do it.
+        // `subagent.spawn` is here and is not a child process: it is a turn this
+        // build runs itself, and a stdio backend — the kind that is a process —
+        // is dropped at admission in a run with no `process.spawn` (§7 #133).
         let caps = SandboxMode::ReadOnly.advertised_capabilities();
-        assert_eq!(names(&caps), vec![Capability::FS_READ, Capability::MEMORY_READ]);
+        assert_eq!(
+            names(&caps),
+            vec![Capability::FS_READ, Capability::MEMORY_READ, Capability::SUBAGENT_SPAWN]
+        );
+        assert!(!names(&caps).contains(&Capability::PROCESS_SPAWN));
     }
 
     #[test]

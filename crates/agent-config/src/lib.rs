@@ -24,7 +24,7 @@ pub use layers::{
 };
 pub use resolve::{
     Directive, Layers, McpServerConfig, McpTransport, ResolvedLaya, ResolvedPolicy,
-    ResolvedProfile, SchemaPolicy, SubagentConfig, resolve,
+    ResolvedProfile, SchemaPolicy, SubagentConfig, SubagentKind, resolve,
 };
 
 /// Why a configuration could not be resolved.
@@ -748,7 +748,8 @@ plugins = { enable = ["subagent.fake"] }
             resolved.subagents,
             vec![SubagentConfig {
                 provider: "fake".to_string(),
-                command: "fake-subagent".to_string(),
+                kind: crate::resolve::SubagentKind::Stdio,
+                command: Some("fake-subagent".to_string()),
                 args: vec!["--mode".to_string(), "result".to_string()],
                 env: vec![("LOG".to_string(), "info".to_string())],
                 cwd: Some("/tmp".to_string()),
@@ -836,7 +837,8 @@ plugins = { enable = ["subagent.fake"] }
 
         let resolved = resolve(layers).unwrap();
         assert_eq!(
-            resolved.subagents[0].command, "operator-subagent",
+            resolved.subagents[0].command.as_deref(),
+            Some("operator-subagent"),
             "a user file does not get to point the operator's provider elsewhere"
         );
         assert!(
@@ -874,12 +876,89 @@ plugins = { enable = ["subagent.fake"] }
             }
         }
 
-        // Naming no program at all never reaches resolution: the entry requires
-        // one, so the file is refused while it is being read.
-        assert!(matches!(
-            UserConfig::from_toml_str("[subagents.fake]\nrequires = []\n"),
-            Err(ConfigError::Parse { .. })
-        ));
+        // Naming no program at all is still a refusal, now one resolution makes:
+        // since §7 #133 the entry may name an `in-process` provider instead, so
+        // "no command" is a question about the entry's shape rather than a
+        // missing field — and an entry that names no kind and no program is a
+        // `stdio` provider with nothing to run.
+        match load("requires = []") {
+            ConfigError::InvalidSubagent { detail, .. } => {
+                assert!(detail.contains("`command` is empty"), "{detail}")
+            }
+            other => panic!("expected a refusal for a provider with no program, got {other}"),
+        }
+    }
+
+    /// An `in-process` entry names no program and resolves to the backend that
+    /// runs the child here (CONTRACT §7 #133).
+    #[test]
+    fn an_in_process_provider_names_no_program_and_is_the_only_row_it_can_be() {
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            r#"
+capabilities = ["subagent.spawn"]
+plugins = ["subagent.here"]
+
+[subagents.here]
+kind = "in-process"
+timeout = "2m"
+requires = ["subagent.spawn"]
+
+[profiles.p]
+plugins = { enable = ["subagent.here"] }
+"#,
+        )
+        .unwrap();
+        layers.profile_override = Some("p".to_string());
+
+        let resolved = resolve(layers).unwrap();
+        let config = &resolved.subagents[0];
+        assert_eq!(config.provider, "here");
+        assert_eq!(config.kind, crate::resolve::SubagentKind::InProcess);
+        assert_eq!(config.command, None, "a child that runs here runs no program");
+        assert_eq!(config.ceiling_ms, Some(120_000), "the ceiling still applies: it is a deadline");
+        assert_eq!(config.requires, caps(&["subagent.spawn"]));
+    }
+
+    /// Each field that belongs to the other shape is refused, and the refusal
+    /// names it: an entry that says both "run this program" and "run in the
+    /// process" means one of them, and a build cannot tell which.
+    #[test]
+    fn a_field_from_the_other_shape_is_a_refusal_not_a_field_to_drop() {
+        let load = |spec: &str| {
+            let mut layers = no_layers();
+            layers.user = UserConfig::from_toml_str(&format!(
+                "plugins = [\"subagent.here\"]\n\n[subagents.here]\n{spec}\n\n\
+                 [profiles.p]\nplugins = {{ enable = [\"subagent.here\"] }}\n"
+            ))
+            .unwrap();
+            layers.profile_override = Some("p".to_string());
+            resolve(layers).unwrap_err()
+        };
+
+        for (spec, field) in [
+            ("kind = \"in-process\"\ncommand = \"agent\"", "`command`"),
+            ("kind = \"in-process\"\nargs = [\"serve\"]", "`args`"),
+            ("kind = \"in-process\"\nenv = { A = \"b\" }", "`env`"),
+            ("kind = \"in-process\"\ncwd = \"/tmp\"", "`cwd`"),
+        ] {
+            match load(spec) {
+                ConfigError::InvalidSubagent { detail, .. } => {
+                    assert!(detail.contains(field), "{detail} did not name {field}")
+                }
+                other => panic!("expected a refusal for {spec}, got {other}"),
+            }
+        }
+
+        // A kind this build does not reach a child by is refused too, rather
+        // than read as `stdio` and failing later with somebody else's complaint.
+        match load("kind = \"inprocess\"\ncommand = \"agent\"") {
+            ConfigError::InvalidSubagent { detail, .. } => {
+                assert!(detail.contains("in-process"), "{detail}");
+                assert!(detail.contains("stdio"), "{detail}");
+            }
+            other => panic!("expected a refusal for a misspelled kind, got {other}"),
+        }
     }
 
     #[test]
