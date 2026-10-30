@@ -185,6 +185,29 @@ async fn an_argument_the_request_does_not_define_never_reaches_a_child() {
     assert!(message.contains("timeout_ms"), "it names the field it wanted: {message}");
 }
 
+/// A refusal that says only "cannot honour" reads as a permission the caller
+/// must not work around: the live endpoint answered it by abandoning the
+/// delegation rather than asking again without the knob it named, and the child
+/// it wanted was one call away. So the message says nothing ran.
+#[test]
+fn a_refusal_that_started_nothing_says_trying_again_is_not_a_bypass() {
+    use agent_ports::subagent::{SubagentFeature, SubagentFeatures};
+
+    let error = DelegationError::Unsupported {
+        provider: "inner".to_string(),
+        features: [SubagentFeature::ToolAllowlist].into_iter().collect::<SubagentFeatures>(),
+    };
+    let text = delegation_refusal(&error);
+    assert!(text.contains("tool_allowlist"), "it names the knob: {text}");
+    assert!(text.contains("Nothing was started"), "it says what did not happen: {text}");
+    assert!(text.contains("without the feature"), "it says the retry is allowed: {text}");
+
+    // Every other refusal is passed through word for word: the advice is about
+    // a request that was refused, and only that one never forked a session.
+    let boundary = DelegationError::NoBoundary { reason: "no closed turn".to_string() };
+    assert_eq!(delegation_refusal(&boundary), boundary.to_string());
+}
+
 #[test]
 fn one_refused_backend_does_not_take_the_others_with_it() {
     // A misconfigured provider is skipped, not fatal: a run that has a backend

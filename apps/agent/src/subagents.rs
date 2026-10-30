@@ -80,10 +80,11 @@ use std::time::{Duration, Instant};
 use agent_config::{SubagentConfig, SubagentKind};
 use agent_kernel::resource_guard::ResourceGuard;
 use agent_kernel::scheduler::Scheduler;
-use agent_kernel::subagent::SubagentDelegation;
+use agent_kernel::subagent::{DelegationError, SubagentDelegation};
 use agent_ports::event_store::EventStore;
 use agent_ports::subagent::{
-    SubagentHandle, SubagentOutcome, SubagentProvider, SubagentRequest, SubagentStatus,
+    SubagentError, SubagentHandle, SubagentOutcome, SubagentProvider, SubagentRequest,
+    SubagentStatus,
 };
 use agent_ports::tool_provider::{
     ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
@@ -831,7 +832,7 @@ impl SubagentToolProvider {
         let handle = delegation
             .delegate(&self.parent, None, args.into_request())
             .await
-            .map_err(|error| refused(TOOL_NAME, error.to_string()))?;
+            .map_err(|error| refused(TOOL_NAME, delegation_refusal(&error)))?;
 
         match self.mode {
             Delegation::Await => {
@@ -1224,6 +1225,25 @@ fn describe(child: &SessionId, outcome: &SubagentOutcome) -> String {
 /// A refusal in the vocabulary the gateway passes on.
 fn refused(tool: &str, message: impl Into<String>) -> ToolProviderError {
     ToolProviderError::Failed { tool: tool.to_string(), message: message.into() }
+}
+
+/// What a caller is told when the delegation itself is refused.
+///
+/// The backend's message names what it cannot honour and stops there. A model
+/// reading only that cannot tell "this backend has no such knob" from "you are
+/// not allowed to ask", and the live endpoint answered the ambiguity by
+/// abandoning the delegation rather than retrying without it — one call away
+/// from the child it wanted. So a refusal that never started anything says so,
+/// and says the request can be made again without the feature.
+fn delegation_refusal(error: &DelegationError) -> String {
+    match error {
+        DelegationError::Unsupported { .. }
+        | DelegationError::Backend(SubagentError::Unsupported { .. }) => format!(
+            "{error}. Nothing was started and no child session exists: the same objective can be \
+             delegated again without the feature(s) it names."
+        ),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
