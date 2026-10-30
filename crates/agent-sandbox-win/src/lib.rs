@@ -81,9 +81,9 @@ impl std::error::Error for SetupError {}
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
-pub use win::{AppContainerLauncher, setup, status};
+pub use win::{AppContainerLauncher, KillOnCloseJob, setup, status};
 
 #[cfg(not(windows))]
 mod unsupported;
 #[cfg(not(windows))]
-pub use unsupported::{AppContainerLauncher, setup, status};
+pub use unsupported::{AppContainerLauncher, KillOnCloseJob, setup, status};

@@ -407,22 +407,38 @@ pub struct SubagentSpec {
     /// what a child may cost. Absent leaves the provider's own default.
     pub timeout: Option<String>,
 
-    /// How this build reaches a child: `"stdio"` (absent) or `"in-process"`.
+    /// How this build reaches a child: `"stdio"` (absent), `"in-process"`, or
+    /// `"self"`.
     ///
     /// Absent means `stdio`, because every definition written before this field
     /// existed was one, and a configuration that never named a kind must keep
     /// resolving to the thing it already meant.
     pub kind: Option<String>,
 
-    /// The program to run. Required for `stdio`, and refused for `in-process`:
-    /// a program named beside a provider that does not start one is an entry
-    /// that says two conflicting things.
+    /// The program to run. Required for `stdio`, and refused for the kinds that
+    /// run this binary: a program named beside a provider that does not start
+    /// one is an entry that says two conflicting things.
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub cwd: Option<String>,
+
+    /// Where a `self` child may write, as workspace-relative directory
+    /// prefixes.
+    ///
+    /// Naming a scope is what makes an entry a **work** provider rather than a
+    /// **read-and-answer** one: the child's surface gains the write tools
+    /// inside these directories and nothing outside them. Without it the child
+    /// is read-only, which is the cheaper and safer default — a delegation that
+    /// can write has to say where.
+    ///
+    /// Refused for the other kinds: a `stdio` child's writes happen in a
+    /// program this build builds no boundary for, and an `in-process` child has
+    /// no write surface at all.
+    #[serde(default)]
+    pub scope: Vec<String>,
 }
 
 /// Parse one layer, naming it in the error so the message says which file.

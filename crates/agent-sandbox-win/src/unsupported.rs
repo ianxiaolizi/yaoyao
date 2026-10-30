@@ -30,6 +30,24 @@ impl ProcessLauncher for AppContainerLauncher {
     }
 }
 
+/// The job object off Windows: nothing to assign and nothing to close.
+///
+/// Not a refusal, because the child it guards is still started and still stopped
+/// by the provider that owns it; what is missing is only the kernel's last line
+/// of defence for a parent that ends without running destructors — the gap the
+/// stdio backend's `kill_tree` already records for this platform.
+pub struct KillOnCloseJob;
+
+impl KillOnCloseJob {
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub fn attach(&self, _pid: u32) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn unavailable() -> LaunchError {
     LaunchError::BackendUnavailable(
         "the AppContainer execution backend exists only on Windows".to_string(),

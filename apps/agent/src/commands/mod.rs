@@ -10,5 +10,6 @@ pub(crate) mod plugin;
 pub(crate) mod sandbox;
 pub(crate) mod schedule;
 pub(crate) mod session;
+pub(crate) mod subagent;
 pub(crate) mod turn;
 pub(crate) mod web;

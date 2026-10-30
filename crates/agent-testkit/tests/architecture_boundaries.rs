@@ -166,7 +166,13 @@ fn dependency_direction_matches_spec() {
         // a port. It knows one wire and one process API and nothing above
         // either — in particular not the kernel that decides what a delegation
         // means, nor the session a child's history lives in.
-        ("crates/agent-subagent-stdio", &["agent-protocol", "agent-ports"]),
+        //
+        // It names the platform crate for one reason: a child it starts is put
+        // in a job that dies with this process, and the job object is the one
+        // piece of the process API this build keeps behind the crate allowed
+        // `unsafe` (CONTRACT §7 #136). The edge is a sibling, not a climb: the
+        // sandbox crate knows nothing of the wire and nothing of this adapter.
+        ("crates/agent-subagent-stdio", &["agent-protocol", "agent-ports", "agent-sandbox-win"]),
         // A backend on the launcher seam and nothing else: it implements
         // `ProcessLauncher`, sees no tool surface, no policy and no kernel.
         ("crates/agent-sandbox-win", &["agent-ports"]),

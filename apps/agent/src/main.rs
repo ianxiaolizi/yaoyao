@@ -28,6 +28,7 @@ use commands::plugin::plugin;
 use commands::sandbox::{doctor, sandbox_command};
 use commands::schedule::{schedule, tick};
 use commands::session::session;
+use commands::subagent::subagent;
 use commands::turn::{export, fork, interrupt, resume, run, status, steer, why};
 use commands::web::{serve, web};
 
@@ -142,6 +143,7 @@ async fn main() {
         "metrics" => metrics(&args).await,
         "artifact" => artifact(&args).await,
         "sandbox" => sandbox_command(&args),
+        "subagent" => subagent(&args).await,
         other => {
             eprintln!("unknown command '{other}'");
             usage();
@@ -180,6 +182,7 @@ pub(crate) fn usage() {
          schedule cancel <id>       Withdraw a scheduled turn before it runs\n  \
          tick                       Run at most one pending or due turn\n  \
          serve                      Keep running turns as they become due (one per session)\n  \
+         subagent serve [args]      Answer one delegation's objective, then exit. A parent\n                              process starts this, not a person: it is the child half\n                              of kind = \"self\" in [subagents.<id>]\n  \
          web [--port <n>]           Serve the GUI on loopback, token printed once\n  \
          memory search <text>       Find events whose text contains <text>\n  \
          memory reindex             Rebuild the searchable index from the session log\n  \

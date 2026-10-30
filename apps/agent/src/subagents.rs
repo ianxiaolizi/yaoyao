@@ -78,6 +78,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_config::{SubagentConfig, SubagentKind};
+use agent_kernel::policy::PolicyEngine;
 use agent_kernel::resource_guard::ResourceGuard;
 use agent_kernel::scheduler::Scheduler;
 use agent_kernel::subagent::{DelegationError, SubagentDelegation};
@@ -92,13 +93,14 @@ use agent_ports::tool_provider::{
 };
 use agent_protocol::events::EventType;
 use agent_protocol::ids::{EventSeq, SessionId};
-use agent_protocol::permissions::Capability;
+use agent_protocol::permissions::{Capability, PolicyDecision};
 use agent_protocol::plan::{PlanItemStatus, WorkState};
 use agent_subagent_stdio::StdioSubagentProvider;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::inprocess::InProcessSubagentProvider;
+use crate::subagent_serve;
 
 /// The name a model calls this by.
 pub const TOOL_NAME: &str = "subagent.run";
@@ -436,6 +438,11 @@ pub struct SubagentToolProvider {
     /// delegation is what a call goes through and this is what makes the backend
     /// behind it able to start anything.
     in_process: Vec<Arc<InProcessSubagentProvider>>,
+    /// Configured backends that could not be built, and why. Said out loud by
+    /// the caller rather than dropped in silence: a run whose configuration
+    /// names a backend the model can never call has a difference between what
+    /// it says and what it does, and only a note can close it.
+    notes: Vec<String>,
 }
 
 impl SubagentToolProvider {
@@ -445,6 +452,7 @@ impl SubagentToolProvider {
     /// built-in family, deliberately not the surface this tool is part of: a
     /// composite cannot hold itself, and repairing a fork has no question about
     /// delegation in it.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn EventStore>,
         tools: Arc<dyn ToolProvider>,
@@ -452,22 +460,34 @@ impl SubagentToolProvider {
         configured: &[SubagentConfig],
         children: Arc<Children>,
         mode: Delegation,
+        facts: &SelfFacts,
     ) -> Self {
         let mut in_process: Vec<Arc<InProcessSubagentProvider>> = Vec::new();
-        let delegations = configured
-            .iter()
-            .filter_map(|config| {
-                let (provider, runs_in_this_process) = backend(config)?;
-                if let Some(provider) = runs_in_this_process {
-                    in_process.push(provider);
+        let mut delegations = BTreeMap::new();
+        let mut notes = Vec::new();
+        for config in configured {
+            match backend(config, facts) {
+                Ok((provider, runs_in_this_process)) => {
+                    if let Some(provider) = runs_in_this_process {
+                        in_process.push(provider);
+                    }
+                    delegations.insert(
+                        config.provider.clone(),
+                        Arc::new(SubagentDelegation::new(store.clone(), tools.clone(), provider)),
+                    );
                 }
-                Some((
-                    config.provider.clone(),
-                    Arc::new(SubagentDelegation::new(store.clone(), tools.clone(), provider)),
-                ))
-            })
-            .collect();
-        Self { parent, store, children, mode, delegations, in_process }
+                Err(reason) => notes.push(format!(
+                    "subagent provider '{}' is not started: {reason}",
+                    config.provider
+                )),
+            }
+        }
+        Self { parent, store, children, mode, delegations, in_process, notes }
+    }
+
+    /// The backends this run was configured with but could not start.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// Hand every in-process backend the run its children execute on.
@@ -497,6 +517,38 @@ impl SubagentToolProvider {
     fn offered(&self) -> Vec<String> {
         vec![TOOL_NAME.to_string(), WAIT_TOOL_NAME.to_string(), STATUS_TOOL_NAME.to_string()]
     }
+}
+
+/// What the parent knows about itself that a `self` child has to be told.
+///
+/// A `self` backend runs **this binary**, so the child's deployment facts are
+/// the parent's — but they travel as arguments rather than as an environment or
+/// a configuration file, because a child that read either could widen its own
+/// permissions (CONTRACT §7 #136). This is the list of everything it is told,
+/// and it is deliberately short enough to read: the program, where the session
+/// lives, how to reach a model, where the work may happen, and the parent's
+/// policy — the last only so that what a child is granted can be intersected
+/// with what its parent allows outright.
+pub struct SelfFacts {
+    /// The binary to start. `None` when this process cannot say what it is,
+    /// which is a refusal for a `self` backend rather than a guess at a path.
+    pub program: Option<PathBuf>,
+    pub workspace_root: PathBuf,
+    pub data_dir: PathBuf,
+    /// The provider kind, as `AGENT_MODEL_PROVIDER` names it.
+    pub provider_kind: String,
+    /// The model the parent's route asks for.
+    pub model: Option<String>,
+    /// The endpoint, when the provider kind needs one and one is configured.
+    pub base_url: Option<String>,
+    pub network_allowed: bool,
+    /// `on`, `gates` or `off`: the arm the parent runs, handed down so a child's
+    /// turn is judged the way its parent's is.
+    pub judgment: &'static str,
+    /// The parent's policy. A capability it allows **outright** is one a child
+    /// may be given; one it would stop and ask about is refused, because a child
+    /// that stopped would be asking nobody.
+    pub policy: PolicyEngine,
 }
 
 /// The configured backends whose working directory the boundary admits, with the
@@ -542,7 +594,7 @@ pub fn admit_backends(
             ));
             continue;
         }
-        if config.kind == SubagentKind::Stdio && !can_spawn {
+        if config.kind.is_a_process() && !can_spawn {
             notes.push(format!(
                 "subagent provider '{}' is not started: the execution sandbox provides no {}",
                 config.provider,
@@ -550,24 +602,51 @@ pub fn admit_backends(
             ));
             continue;
         }
-        match &config.cwd {
-            None => admitted.push(config.clone()),
-            Some(cwd) => match guard.resolve(cwd) {
-                Ok(path) => {
-                    let mut config = config.clone();
-                    config.cwd = Some(path.display().to_string());
-                    admitted.push(config);
-                }
-                Err(error) => {
-                    notes.push(format!(
-                        "subagent provider '{}' is not started: {error}",
-                        config.provider
-                    ));
-                }
-            },
+        match admitted_paths(config, guard) {
+            Ok(config) => admitted.push(config),
+            Err(error) => {
+                notes.push(format!(
+                    "subagent provider '{}' is not started: {error}",
+                    config.provider
+                ));
+            }
         }
     }
     (admitted, notes)
+}
+
+/// A backend with its configured paths resolved, or the reason it was refused.
+///
+/// Two kinds of path, one rule: a `cwd` is where the child *runs* and a `scope`
+/// is where it may *write*, and both are written in a configuration file
+/// relative to the workspace root. Resolving them here means the child is handed
+/// absolute paths it can compare against without knowing where the workspace is,
+/// and that a prefix landing outside the parent's writable face is refused at
+/// admission rather than at the child's first write.
+///
+/// The `scope` check is `write`: it is the parent asking its own boundary whether
+/// it could write there, which is the only thing that makes a child's write an
+/// extension of the parent's authority rather than a new one.
+fn admitted_paths(
+    config: &SubagentConfig,
+    guard: &ResourceGuard,
+) -> Result<SubagentConfig, String> {
+    let mut resolved = config.clone();
+    if let Some(cwd) = &config.cwd {
+        resolved.cwd =
+            Some(guard.resolve(cwd).map_err(|error| error.to_string())?.display().to_string());
+    }
+    if !resolved.scope.is_empty() {
+        let mut scopes = Vec::with_capacity(resolved.scope.len());
+        for prefix in &resolved.scope {
+            guard.check(prefix, true).map_err(|error| format!("its scope {prefix:?}: {error}"))?;
+            let path =
+                guard.resolve(prefix).map_err(|error| format!("its scope {prefix:?}: {error}"))?;
+            scopes.push(path.display().to_string());
+        }
+        resolved.scope = scopes;
+    }
+    Ok(resolved)
 }
 
 /// One configured backend, as the adapter its `kind` names, and — only for the
@@ -582,26 +661,180 @@ type Built = (Arc<dyn SubagentProvider>, Option<Arc<InProcessSubagentProvider>>)
 /// The ceiling is the configured one and never absent: a child with no deadline
 /// is a child the parent cannot bound, and the adapter's own default is what this
 /// build calls "no ceiling configured" — not what "no ceiling" means.
-fn backend(config: &SubagentConfig) -> Option<Built> {
-    if config.kind == SubagentKind::InProcess {
-        let ceiling = config.ceiling_ms.map(Duration::from_millis);
-        let provider = Arc::new(InProcessSubagentProvider::new(config.provider.clone(), ceiling));
-        return Some((provider.clone(), Some(provider)));
+///
+/// The `Err` is a backend that is configured but cannot be started, and the
+/// reason is said out loud by the caller ([`SubagentToolProvider::notes`]): a
+/// backend that vanished between "the run has one" and "the model can call it"
+/// would otherwise be a refusal nobody can explain.
+fn backend(config: &SubagentConfig, facts: &SelfFacts) -> Result<Built, String> {
+    match config.kind {
+        SubagentKind::InProcess => {
+            let ceiling = config.ceiling_ms.map(Duration::from_millis);
+            let provider =
+                Arc::new(InProcessSubagentProvider::new(config.provider.clone(), ceiling));
+            Ok((provider.clone(), Some(provider)))
+        }
+        SubagentKind::SelfHosted => self_backend(config, facts).map(|provider| (provider, None)),
+        SubagentKind::Stdio => {
+            // A stdio backend with no program has nothing to run. Resolution
+            // refuses the shape, so this is unreachable through configuration —
+            // and answered by leaving the backend off the surface rather than by
+            // starting an empty one.
+            let command = config
+                .command
+                .as_ref()
+                .filter(|command| !command.trim().is_empty())
+                .ok_or_else(|| "it names no command".to_string())?;
+            let mut provider = StdioSubagentProvider::new(config.provider.clone(), command.clone())
+                .with_args(config.args.clone())
+                .with_env(config.env.clone());
+            if let Some(cwd) = &config.cwd {
+                provider = provider.with_cwd(PathBuf::from(cwd));
+            }
+            if let Some(ceiling_ms) = config.ceiling_ms {
+                provider = provider.with_ceiling(Duration::from_millis(ceiling_ms));
+            }
+            Ok((Arc::new(provider), None))
+        }
     }
-    // A stdio backend with no program has nothing to run. Resolution refuses the
-    // shape, so this is unreachable through configuration — and answered by
-    // leaving the backend off the surface rather than by starting an empty one.
-    let command = config.command.as_ref().filter(|command| !command.trim().is_empty())?;
-    let mut provider = StdioSubagentProvider::new(config.provider.clone(), command.clone())
-        .with_args(config.args.clone())
-        .with_env(config.env.clone());
-    if let Some(cwd) = &config.cwd {
-        provider = provider.with_cwd(PathBuf::from(cwd));
+}
+
+/// The backend that runs **this binary** as the child (CONTRACT §7 #136).
+///
+/// Everything the child learns is on its command line: which session it
+/// continues, where the workspace and the store are, how to reach a model, what
+/// it is granted, and where it may write. Two of those are decided here rather
+/// than passed through from the configuration:
+///
+///   * **the grants** are the capabilities a child's surface could use,
+///     intersected with the capabilities this parent's policy allows outright —
+///     a capability the parent would stop and ask about is not granted, because
+///     a child that stopped would be asking nobody;
+///   * **the scopes** were resolved at admission, so the child is handed the very
+///     directories the parent's own boundary agreed it could write.
+///
+/// The credential is the one thing that does not travel as an argument. It is the
+/// name this backend's `env` table spelled out (`secret://env/…`), resolved here
+/// and admitted to the child's environment under the one-name exception
+/// `agent_ports::process_env` documents; a name that did not resolve is not
+/// passed at all, and the child says it has no key rather than starting without
+/// one and failing at the first request.
+fn self_backend(
+    config: &SubagentConfig,
+    facts: &SelfFacts,
+) -> Result<Arc<dyn SubagentProvider>, String> {
+    let program = facts.program.as_ref().ok_or_else(|| {
+        "this process cannot say which binary it is, so a `self` child cannot be started"
+            .to_string()
+    })?;
+
+    let read_only = config.scope.is_empty();
+    let surface = subagent_serve::surface_capabilities(&facts.workspace_root, read_only);
+    let grants = grants_within(&facts.policy, surface);
+    if grants.is_empty() {
+        return Err(
+            "the parent's policy allows none of what this child could use, so every call would \
+             only ever be refused"
+                .to_string(),
+        );
     }
+
+    let grants_line =
+        grants.iter().map(|grant| grant.as_str().to_string()).collect::<Vec<_>>().join(",");
+    let (env, admitted) = resolve_env(&config.env);
+
+    // The facts, rendered once and cloned per spawn: only the child's session
+    // id differs between one delegation and the next.
+    let mut base = vec![
+        "--workspace".to_string(),
+        facts.workspace_root.display().to_string(),
+        "--data-dir".to_string(),
+        facts.data_dir.display().to_string(),
+        "--provider".to_string(),
+        facts.provider_kind.clone(),
+        "--judgment".to_string(),
+        facts.judgment.to_string(),
+        "--network".to_string(),
+        if facts.network_allowed { "allow" } else { "deny" }.to_string(),
+        "--grants".to_string(),
+        grants_line,
+    ];
+    if let Some(model) = &facts.model {
+        base.push("--model".to_string());
+        base.push(model.clone());
+    }
+    if let Some(base_url) = &facts.base_url {
+        base.push("--base-url".to_string());
+        base.push(base_url.clone());
+    }
+    // Already absolute, already checked against the parent's writable face.
+    for scope in &config.scope {
+        base.push("--scope".to_string());
+        base.push(scope.clone());
+    }
+
+    let mut provider =
+        StdioSubagentProvider::new(config.provider.clone(), program.display().to_string())
+            .with_env(env)
+            .with_admitted_agent_env(admitted)
+            .with_kill_on_parent_close()
+            .with_cwd(facts.workspace_root.clone())
+            .with_identity_args(move |child, _turn| {
+                let mut argv = vec!["subagent".to_string(), subagent_serve::SERVE.to_string()];
+                argv.extend(base.iter().cloned());
+                argv.push("--child-session".to_string());
+                argv.push(child.to_string());
+                argv
+            });
     if let Some(ceiling_ms) = config.ceiling_ms {
         provider = provider.with_ceiling(Duration::from_millis(ceiling_ms));
     }
-    Some((Arc::new(provider), None))
+    Ok(Arc::new(provider))
+}
+
+/// The capabilities of `surface` this policy allows outright, in the order the
+/// surface declares them.
+///
+/// The question is asked with no context and no grants — [`PolicyEngine::evaluate`]'s
+/// one context-free reading — which is exactly "would the parent let this happen
+/// without asking anyone", the only authority a child can be given.
+fn grants_within(policy: &PolicyEngine, surface: Vec<Capability>) -> Vec<Capability> {
+    let mut granted: Vec<Capability> = Vec::new();
+    for capability in surface {
+        if granted.contains(&capability) {
+            continue;
+        }
+        if policy.evaluate(std::slice::from_ref(&capability), &[]) == PolicyDecision::Allow {
+            granted.push(capability);
+        }
+    }
+    granted
+}
+
+/// A backend's configured environment, with `secret://env/NAME` resolved, and the
+/// agent-namespace names that are therefore allowed to reach the child.
+///
+/// The reference is resolved here rather than in the child because the child
+/// never sees the parent's environment: it gets the allowlist plus these names.
+/// A reference whose variable is unset drops the pair — passing it unresolved
+/// would hand the child a literal string as its credential.
+fn resolve_env(configured: &[(String, String)]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut pairs = Vec::new();
+    let mut admitted = Vec::new();
+    for (name, value) in configured {
+        let value = match value.strip_prefix("secret://env/") {
+            Some(variable) => match std::env::var(variable) {
+                Ok(value) => value,
+                Err(_) => continue,
+            },
+            None => value.clone(),
+        };
+        if name.to_ascii_uppercase().starts_with("AGENT_") {
+            admitted.push(name.clone());
+        }
+        pairs.push((name.clone(), value));
+    }
+    (pairs, admitted)
 }
 
 #[async_trait::async_trait]

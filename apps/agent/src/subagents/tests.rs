@@ -2,7 +2,7 @@ use super::*;
 use agent_protocol::events::{Actor, EventDraft};
 use agent_protocol::ids::{EventId, SchemaVersion, TurnId};
 use agent_protocol::permissions::Workspace;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A backend that names a program nothing here starts.
 ///
@@ -19,6 +19,26 @@ fn config(provider: &str, cwd: Option<&str>) -> SubagentConfig {
         cwd: cwd.map(str::to_string),
         requires: Vec::new(),
         ceiling_ms: None,
+        scope: Vec::new(),
+    }
+}
+
+/// The deployment facts this process would hand a `self` child. No test here
+/// configures a `self` backend, so none of it starts a process; the value
+/// exists because the surface is handed the facts once per assembly.
+fn facts() -> SelfFacts {
+    SelfFacts {
+        // No program: a test that accidentally configured a `self` backend
+        // would be refused rather than launch this test binary as a child.
+        program: None,
+        workspace_root: PathBuf::from("."),
+        data_dir: PathBuf::from("."),
+        provider_kind: "echo".to_string(),
+        model: None,
+        base_url: None,
+        network_allowed: false,
+        judgment: "gates",
+        policy: PolicyEngine::new(),
     }
 }
 
@@ -146,6 +166,7 @@ fn provider() -> SubagentToolProvider {
         &[config("fake", None)],
         Arc::new(Children::new()),
         Delegation::Await,
+        &facts(),
     )
 }
 
@@ -459,6 +480,7 @@ fn waiting(
         &[],
         children,
         Delegation::Background,
+        &facts(),
     )
 }
 
@@ -708,6 +730,7 @@ fn admitting(store: Arc<agent_testkit::FakeEventStore>) -> SubagentToolProvider 
         &[config("fake", None)],
         Arc::new(Children::new()),
         Delegation::Background,
+        &facts(),
     )
 }
 

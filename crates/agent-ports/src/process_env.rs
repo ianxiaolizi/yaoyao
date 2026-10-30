@@ -100,11 +100,34 @@ pub fn child_environment_with(
     parent: &[(OsString, OsString)],
     explicit: &[(OsString, OsString)],
 ) -> Vec<(OsString, OsString)> {
+    child_environment_with_admitted(parent, explicit, &[])
+}
+
+/// The environment for a child that **is this agent** — a `self` subagent
+/// (CONTRACT §7 #136).
+///
+/// The allowlist is unchanged and nothing is inherited: a `self` child gets
+/// exactly what a tool child gets, plus the names in `admitted` when the
+/// backend's own configuration spells them out. An `AGENT_*` variable in the
+/// parent's environment is still never passed implicitly — the exception is an
+/// operator's line in a configuration file, not a property of the process.
+///
+/// Why it exists at all: a child agent needs the same model credential the
+/// parent has, and the credential is env-only (`SecretRef { source: "env" }`).
+/// The alternatives are a two-way wire so the parent can proxy the model (not
+/// built) or a child that reads the parent's configuration (a child that can
+/// widen its own permissions). One name, declared in one place, is the smallest
+/// hole that lets the child be an agent.
+pub fn child_environment_with_admitted(
+    parent: &[(OsString, OsString)],
+    explicit: &[(OsString, OsString)],
+    admitted: &[&str],
+) -> Vec<(OsString, OsString)> {
     let mut kept: Vec<(OsString, OsString)> =
         parent.iter().filter(|(name, _)| inheritable(name)).cloned().collect();
 
     for (name, value) in explicit {
-        if is_agent_variable(name) {
+        if is_agent_variable(name) && !is_admitted(name, admitted) {
             continue;
         }
         // A later entry wins, the way `Command::env` calls stack.
@@ -144,10 +167,21 @@ fn inheritable(name: &OsString) -> bool {
     }
 }
 
-/// The agent's own namespace, which no child sees.
+/// The agent's own namespace, which no child sees — except the names a `self`
+/// backend's configuration admitted, and only those.
 fn is_agent_variable(name: &OsString) -> bool {
     let upper = normalised(name);
     upper.starts_with("AGENT_")
+}
+
+/// Whether one of the explicitly admitted names is this one.
+///
+/// Compared the way the platform compares names, so an operator writing the
+/// name in either case gets the same answer on Windows and an exact one on
+/// POSIX — the same rule the allowlist uses.
+fn is_admitted(name: &OsString, admitted: &[&str]) -> bool {
+    let normalised_name = normalised(name);
+    admitted.iter().any(|allowed| normalised_name == normalised(&OsString::from(*allowed)))
 }
 
 /// Names that look like credentials. Unreachable for today's allowlist by
@@ -279,6 +313,43 @@ mod tests {
         let names = names(&env);
         assert!(names.contains(&"HOSTNAME_FOR_SERVER".to_string()));
         assert!(!names.contains(&"AGENT_MODEL_API_KEY".to_string()));
+    }
+
+    /// A `self` child may be given the one name its configuration admitted, and
+    /// still nothing else from the namespace.
+    #[test]
+    fn only_the_admitted_agent_name_reaches_a_self_child() {
+        let parent = vec![
+            pair("PATH", "/bin"),
+            pair("AGENT_MODEL_API_KEY", "sk-parent-secret"),
+            pair("AGENT_DATA_DIR", "/tmp/data"),
+        ];
+        let explicit = vec![
+            pair("AGENT_MODEL_API_KEY", "sk-configured"),
+            pair("AGENT_DATA_DIR", "/tmp/other"),
+        ];
+        let env = child_environment_with_admitted(&parent, &explicit, &["AGENT_MODEL_API_KEY"]);
+
+        // The configured value, not the inherited one: the operator's line is
+        // what was admitted, and the parent's key is not what it said.
+        assert_eq!(value_of(&env, "AGENT_MODEL_API_KEY").as_deref(), Some("sk-configured"));
+        assert!(!names(&env).contains(&"AGENT_DATA_DIR".to_string()));
+
+        // An empty admission is the tool rule, unchanged.
+        let strict = child_environment_with_admitted(&parent, &explicit, &[]);
+        assert!(!names(&strict).contains(&"AGENT_MODEL_API_KEY".to_string()));
+    }
+
+    /// Admission is a list, but the mechanism does not require it to grow: a
+    /// name nobody admitted is still refused, even one that looks harmless.
+    #[test]
+    fn an_agent_name_nobody_admitted_is_still_refused() {
+        let env = child_environment_with_admitted(
+            &[pair("PATH", "/bin")],
+            &[pair("AGENT_SANDBOX", "local")],
+            &["AGENT_MODEL_API_KEY"],
+        );
+        assert!(!names(&env).contains(&"AGENT_SANDBOX".to_string()));
     }
 
     #[test]

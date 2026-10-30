@@ -419,7 +419,7 @@ fn ended(
 /// deliberately never produced: the port reserves it for a child that says it
 /// did part of the job, and a parent that reads the child's stop reason still
 /// cannot know how much of the work was done.
-fn describe_report(
+pub(crate) fn describe_report(
     report: &agent_kernel::scheduler::RunReport,
     child: &SessionId,
 ) -> SubagentOutcome {

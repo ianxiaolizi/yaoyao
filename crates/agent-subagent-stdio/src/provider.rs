@@ -40,7 +40,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_ports::process_env::child_environment_with;
+use agent_ports::process_env::child_environment_with_admitted;
 use agent_ports::subagent::{
     SubagentError, SubagentFeature, SubagentFeatures, SubagentHandle, SubagentOutcome,
     SubagentProvider, SubagentRequest,
@@ -76,14 +76,47 @@ const STDERR_BOUND: Duration = Duration::from_millis(500);
 /// read by what it said on the way out, not by the part that went fine.
 const MAX_STDERR: usize = 4_096;
 
+/// Renders the arguments that are only known once a child exists: its session
+/// and the parent turn it was forked from.
+type IdentityArgs = Arc<dyn Fn(&SessionId, Option<&TurnId>) -> Vec<String> + Send + Sync>;
+
 /// A provider that runs each child as a child process.
 pub struct StdioSubagentProvider {
     name: String,
     program: String,
     args: Vec<String>,
+    /// Arguments that depend on *which* child this is — appended after `args`
+    /// and rendered per spawn.
+    ///
+    /// A backend that runs the parent's own binary has to tell it which session
+    /// it continues and which parent turn it was forked from, and neither is
+    /// known when the backend is built: the fork that assigns them happens at
+    /// delegation. Every other backend leaves this `None` and passes nothing,
+    /// because a program learns what it needs from the request line.
+    identity_args: Option<IdentityArgs>,
     env: Vec<(String, String)>,
+    /// Agent-namespace variable names this backend's own `env` may set.
+    ///
+    /// Empty for every external program, which is the rule `process_env`
+    /// states. A backend that runs the parent's own binary sets it to the one
+    /// name that binary needs to reach a model (CONTRACT §7 #136); the name is
+    /// still only passed when a value was configured here.
+    admitted_agent_env: Vec<String>,
     cwd: Option<PathBuf>,
     ceiling: Duration,
+    /// The job every child of this backend is put in, created once, so a child
+    /// dies with this process even when this process does not get to run a
+    /// destructor (CONTRACT §7 #136).
+    ///
+    /// Two states, both deliberate: an empty cell on a backend that never asked
+    /// for a guard, and a cell holding `None` after a creation that failed — in
+    /// which case the child is still started, because losing the lifetime guard
+    /// is not the same as losing the authority boundary, and a refusal here
+    /// would make a delegation impossible on a host that merely could not create
+    /// the object.
+    job: std::sync::OnceLock<Option<agent_sandbox_win::KillOnCloseJob>>,
+    /// Whether this backend asked for the guard at all.
+    guarded: bool,
     children: Mutex<HashMap<String, ChildState>>,
 }
 
@@ -107,15 +140,60 @@ impl StdioSubagentProvider {
             name: name.into(),
             program: program.into(),
             args: Vec::new(),
+            identity_args: None,
             env: Vec::new(),
+            admitted_agent_env: Vec::new(),
             cwd: None,
             ceiling: DEFAULT_CEILING,
+            job: std::sync::OnceLock::new(),
+            guarded: false,
             children: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Hold every child of this backend in a job that dies with this process.
+    ///
+    /// For a backend that runs **this binary**: a delegated agent is a turn of
+    /// work, not a service, and one still running after the session that
+    /// delegated it is gone would be writing into a log nobody reads. The kill
+    /// that `kill_on_drop` performs still happens; this is the case it cannot
+    /// cover, where the process ends without running a destructor.
+    ///
+    /// The job is created on the first spawn and kept: one job for the whole
+    /// backend, so the guard is as long-lived as the backend is.
+    pub fn with_kill_on_parent_close(mut self) -> Self {
+        self.guarded = true;
+        self
+    }
+
+    /// The job this backend's children are assigned to, created on first use.
+    ///
+    /// A creation failure is remembered as `None` rather than retried per child:
+    /// the conditions that make `CreateJobObject` fail do not change between one
+    /// delegation and the next.
+    fn job(&self) -> Option<&agent_sandbox_win::KillOnCloseJob> {
+        if !self.guarded {
+            return None;
+        }
+        self.job.get_or_init(|| agent_sandbox_win::KillOnCloseJob::new().ok()).as_ref()
+    }
+
     pub fn with_args(mut self, args: Vec<String>) -> Self {
         self.args = args;
+        self
+    }
+
+    /// Arguments rendered per child from the identity the delegation assigned.
+    ///
+    /// The renderer is called on every spawn with the child's session id and the
+    /// parent turn it was forked from — the two facts that do not exist until
+    /// the fork, and that a child which is *this binary* cannot be told any
+    /// other way (the wire has one request line and no identity in it).
+    pub fn with_identity_args(
+        mut self,
+        render: impl Fn(&SessionId, Option<&TurnId>) -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.identity_args = Some(Arc::new(render));
         self
     }
 
@@ -124,13 +202,30 @@ impl StdioSubagentProvider {
         self
     }
 
+    /// Admit one agent-namespace name this backend's `env` table may set.
+    ///
+    /// For a backend that runs *this* binary, which needs the model credential
+    /// and nothing else from the namespace. It changes nothing about what is
+    /// inherited: the parent's own value is still never passed, only a value
+    /// configured here.
+    pub fn with_admitted_agent_env(mut self, names: Vec<String>) -> Self {
+        self.admitted_agent_env = names;
+        self
+    }
+
     /// The environment a child is started with: the allowlist plus this
     /// backend's configured variables, with `AGENT_*` refused even when
-    /// configured (`agent_ports::process_env` says why).
+    /// configured (`agent_ports::process_env` says why) — except the names this
+    /// backend admitted.
     fn child_environment(&self) -> Vec<(OsString, OsString)> {
         let explicit: Vec<(OsString, OsString)> =
             self.env.iter().map(|(key, value)| (key.into(), value.into())).collect();
-        child_environment_with(&std::env::vars_os().collect::<Vec<_>>(), &explicit)
+        let admitted: Vec<&str> = self.admitted_agent_env.iter().map(String::as_str).collect();
+        child_environment_with_admitted(
+            &std::env::vars_os().collect::<Vec<_>>(),
+            &explicit,
+            &admitted,
+        )
     }
 
     pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
@@ -238,8 +333,11 @@ impl SubagentProvider for StdioSubagentProvider {
 
         let env = self.child_environment();
         let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        if let Some(render) = &self.identity_args {
+            command.args(render(child_session_id, parent_turn_id));
+        }
         command
-            .args(&self.args)
             .env_clear()
             .envs(env)
             .stdin(Stdio::piped())
@@ -256,6 +354,25 @@ impl SubagentProvider for StdioSubagentProvider {
             child_session_id: child_session_id.clone(),
             message: format!("'{}' could not be started: {error}", self.program),
         })?;
+
+        // Before anything is awaited: a parent that dies in the next line would
+        // otherwise leave a child running with nothing left to hear its ending.
+        // A backend that asked for the guard does not start a child without it —
+        // the guard is a promise, and a delegation quietly below it would be the
+        // same class of mistake as a boundary that reads as enforced and is not.
+        if let Some(job) = self.job() {
+            let attached = child.id().map(|pid| job.attach(pid));
+            if let Some(Err(error)) = attached {
+                stop(&mut child).await;
+                return Err(SubagentError::Spawn {
+                    child_session_id: child_session_id.clone(),
+                    message: format!(
+                        "the child was started but could not be held in this process's job \
+                         object: {error}"
+                    ),
+                });
+            }
+        }
 
         if let Err(message) = deliver(&mut child, &line).await {
             // The child is running but was never told what to do. It is put down

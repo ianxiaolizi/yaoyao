@@ -9,7 +9,10 @@ mod acl;
 mod cmdline;
 mod env_block;
 mod grant_record;
+mod job;
 mod process;
+
+pub use job::KillOnCloseJob;
 
 use std::ffi::OsString;
 use std::io;

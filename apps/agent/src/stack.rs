@@ -163,6 +163,18 @@ enum JudgmentArm {
     Off,
 }
 
+impl JudgmentArm {
+    /// The word `AGENT_JUDGMENT` accepts and a `self` child is told, so the two
+    /// halves of one run name the same arm.
+    fn as_flag(self) -> &'static str {
+        match self {
+            Self::Full => "on",
+            Self::Gates => "gates",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// The secrets a tool argument may name, from `AGENT_TOOL_SECRETS`.
 ///
 /// A comma-separated list of environment variable names. Host configuration
@@ -449,6 +461,38 @@ pub async fn assemble_with_delegation(
         writable_roots: vec![],
         external_directories: vec![],
     });
+    // Routing and the judgment arm are decided here rather than beside the loop
+    // because a `self` child is started before the loop exists: the child is
+    // this binary re-run, and the three facts it cannot discover for itself —
+    // which provider, which model, which arm — travel to it as arguments. A
+    // child told a different arm than its parent would judge by different rules
+    // than the run it belongs to. The selection itself is unchanged; it simply
+    // moved ahead of the surface that quotes it.
+    let selected = match model {
+        Some(selected) => selected,
+        None => providers::select(resolved.model.as_deref())?,
+    };
+    // The arms: `gates` (the default) keeps the deterministic refusals without
+    // the ledger's tool and advice, `on` adds the ledger for audit and the
+    // evaluation's full arm, and `off` is the baseline that predates the
+    // pipeline. The binary passes `judgment: true`; a test may pass false to
+    // state that it is not exercising the pipeline at all.
+    let arm = judgment_arm(judgment)?;
+    // What an in-process child can be told from here and what a `self` child
+    // must be told on its command line (CONTRACT §7 #136). The program is this
+    // executable, so the child is the same build the parent is; a binary that
+    // cannot name itself starts no `self` child rather than guessing a path.
+    let self_facts = subagents::SelfFacts {
+        program: std::env::current_exe().ok(),
+        workspace_root: workspace_root.clone(),
+        data_dir: data_dir.clone(),
+        provider_kind: providers::env_provider(),
+        model: Some(selected.route.model.clone()),
+        base_url: std::env::var(agent_model_openai::ENV_BASE_URL).ok(),
+        network_allowed,
+        judgment: arm.as_flag(),
+        policy: policy.clone(),
+    };
     // One tool surface over the built-in families and whatever the plugin
     // registry has been given, all on the same execution backend — so the file
     // boundary, the command deadline, and the output cap are the same ones
@@ -620,8 +664,18 @@ pub async fn assemble_with_delegation(
                 &subagents_config,
                 children.clone(),
                 delegation,
+                &self_facts,
             )))
         };
+    // A backend the configuration named but this run could not start is said
+    // out loud. It is not refused — the others still work — but a delegation
+    // tool that silently lacks the backend an operator configured is worse than
+    // one that says which and why.
+    if let Some(tools) = &subagent_tools {
+        for note in tools.notes() {
+            eprintln!("subagents: {note}");
+        }
+    }
     let tools: Arc<dyn ToolProvider> = match &subagent_tools {
         None => builtins.clone(),
         Some(subagent_tools) => Arc::new(
@@ -655,12 +709,8 @@ pub async fn assemble_with_delegation(
         ))),
     );
 
-    // Routing and shadow decisions are assembled here, next to the provider they
-    // are built from, and nowhere else decides which model a run talks to.
-    let selected = match model {
-        Some(selected) => selected,
-        None => providers::select(resolved.model.as_deref())?,
-    };
+    // Shadow decisions are assembled here, next to the provider they are built
+    // from, and nowhere else decides which model a run talks to.
     // The tiers the configuration named, pointed at the provider this run
     // selected. Every entry differs from `main` only in its model name: this
     // build speaks to one provider kind per run, and a route that named another
@@ -735,12 +785,6 @@ pub async fn assemble_with_delegation(
         }),
         None => engine,
     });
-    // The arms: `gates` (the default) keeps the deterministic refusals without
-    // the ledger's tool and advice, `on` adds the ledger for audit and the
-    // evaluation's full arm, and `off` is the baseline that predates the
-    // pipeline. The binary passes `judgment: true`; a test may pass false to
-    // state that it is not exercising the pipeline at all.
-    let arm = judgment_arm(judgment)?;
     let suite: Arc<dyn ToolGateway> = gateway.clone();
     let mut loop_ =
         DefaultAgentLoop::new(selected.provider.clone(), suite, context.clone(), router.clone())

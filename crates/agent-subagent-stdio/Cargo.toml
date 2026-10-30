@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 agent-protocol = { path = "../agent-protocol" }
 agent-ports = { path = "../agent-ports" }
+# The one thing this crate needs from the platform crate: the job object a
+# delegated child is held in so it dies with this process (CONTRACT §7 #136).
+# Everything else about a child is portable.
+agent-sandbox-win = { path = "../agent-sandbox-win" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -755,6 +755,7 @@ plugins = { enable = ["subagent.fake"] }
                 cwd: Some("/tmp".to_string()),
                 requires: caps(&["process.spawn"]),
                 ceiling_ms: Some(300_000),
+                scope: Vec::new(),
             }]
         );
         assert_eq!(resolved.plugin_versions["subagent.fake"], "1.0.0");
@@ -918,6 +919,87 @@ plugins = { enable = ["subagent.here"] }
         assert_eq!(config.command, None, "a child that runs here runs no program");
         assert_eq!(config.ceiling_ms, Some(120_000), "the ceiling still applies: it is a deadline");
         assert_eq!(config.requires, caps(&["subagent.spawn"]));
+    }
+
+    /// A `self` entry names no program — the program is this binary — and its
+    /// `scope` is what makes it a provider that can write.
+    ///
+    /// The scope is the whole declaration: no scope reads as read-and-answer,
+    /// a scope reads as work. There is no second switch to disagree with it.
+    #[test]
+    fn a_self_provider_is_this_binary_and_its_scope_is_what_it_may_write() {
+        let load = |spec: &str| {
+            let mut layers = no_layers();
+            layers.user = UserConfig::from_toml_str(&format!(
+                "capabilities = [\"subagent.spawn\", \"process.spawn\"]\n\
+                 plugins = [\"subagent.mine\"]\n\n[subagents.mine]\nkind = \"self\"\n{spec}\n\n\
+                 [profiles.p]\nplugins = {{ enable = [\"subagent.mine\"] }}\n"
+            ))
+            .unwrap();
+            layers.profile_override = Some("p".to_string());
+            resolve(layers).map(|resolved| resolved.subagents.into_iter().next().unwrap())
+        };
+
+        let read_only = load("").expect("a self provider with no scope is a read-answer child");
+        assert_eq!(read_only.kind, crate::resolve::SubagentKind::SelfHosted);
+        assert_eq!(read_only.kind.as_str(), "self");
+        assert_eq!(read_only.command, None, "the program is this binary");
+        assert!(read_only.scope.is_empty(), "no scope is what makes it read-only");
+
+        let work = load("scope = [\"src\", \"docs\"]\ntimeout = \"5m\"").expect("a work provider");
+        assert_eq!(work.scope, vec!["src".to_string(), "docs".to_string()]);
+        assert_eq!(work.ceiling_ms, Some(300_000));
+
+        // The program and its arguments are the delegation's, not the entry's:
+        // each would be a value the parent overwrites.
+        for (spec, field) in [
+            ("command = \"agent\"", "`command`"),
+            ("args = [\"subagent\"]", "`args`"),
+            ("cwd = \"src\"", "`cwd`"),
+        ] {
+            match load(spec) {
+                Err(ConfigError::InvalidSubagent { detail, .. }) => {
+                    assert!(detail.contains(field), "{detail} did not name {field}")
+                }
+                other => panic!("expected a refusal for {spec}, got {other:?}"),
+            }
+        }
+
+        // `env` is allowed: the one thing a self child may be configured with is
+        // the secret it needs to reach a model, and that is written here.
+        let with_env = load("env = { AGENT_MODEL_API_KEY = \"secret://env/AGENT_MODEL_API_KEY\" }")
+            .expect("a self provider may be given the one secret it needs");
+        assert_eq!(with_env.env.len(), 1);
+    }
+
+    /// A scope on a kind that has no writable face is refused, not dropped: the
+    /// entry asked for confinement this build cannot give it, and the run would
+    /// otherwise be a child writing wherever its program decided.
+    #[test]
+    fn a_scope_on_a_kind_with_no_writable_face_is_a_refusal() {
+        let load = |spec: &str| {
+            let mut layers = no_layers();
+            layers.user = UserConfig::from_toml_str(&format!(
+                "capabilities = [\"subagent.spawn\", \"process.spawn\"]\n\
+                 plugins = [\"subagent.other\"]\n\n[subagents.other]\n{spec}\n\n\
+                 [profiles.p]\nplugins = {{ enable = [\"subagent.other\"] }}\n"
+            ))
+            .unwrap();
+            layers.profile_override = Some("p".to_string());
+            resolve(layers).unwrap_err()
+        };
+
+        for (spec, expected) in [
+            ("kind = \"stdio\"\ncommand = \"fake\"\nscope = [\"src\"]", "`scope`"),
+            ("kind = \"in-process\"\nscope = [\"src\"]", "`scope`"),
+        ] {
+            match load(spec) {
+                ConfigError::InvalidSubagent { detail, .. } => {
+                    assert!(detail.contains(expected), "{detail} did not name {expected}")
+                }
+                other => panic!("expected a refusal for {spec}, got {other}"),
+            }
+        }
     }
 
     /// Each field that belongs to the other shape is refused, and the refusal

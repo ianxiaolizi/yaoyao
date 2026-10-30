@@ -218,7 +218,13 @@ pub enum SchemaPolicy {
     Warn,
 }
 
-/// How this build reaches a child (CONTRACT §7 #133).
+/// How this build reaches a child (CONTRACT §7 #133, #136).
+///
+/// The three kinds sit on one axis — where the child runs and who speaks the
+/// protocol with it — and the axis is what the names follow rather than what
+/// they bundle. `stdio` is a different program over a wire; `in-process` is a
+/// turn in this process; `self` is **this binary** in a process of its own,
+/// spoken to over the same wire the stdio kind uses.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SubagentKind {
     /// A program this build starts and speaks to in JSON lines. The only shape
@@ -229,6 +235,16 @@ pub enum SubagentKind {
     /// No process, no wire, and the only backend whose child can be held to its
     /// budget by the kernel.
     InProcess,
+    /// This binary, started again as `agent subagent serve`, in the session the
+    /// delegation forked. It carries the wire for the request and the answer,
+    /// and it is a real process for everything a process is needed for: it can
+    /// be stopped hard, it crashes without taking the parent's log with it, and
+    /// the operating system reaps it when the parent dies.
+    ///
+    /// The variant is not named `Self` because that word is taken in Rust; the
+    /// name a configuration writes is `self` ([`SubagentKind::as_str`]), which
+    /// is the name that has to be right.
+    SelfHosted,
 }
 
 impl SubagentKind {
@@ -237,15 +253,27 @@ impl SubagentKind {
         match self {
             Self::Stdio => "stdio",
             Self::InProcess => "in-process",
+            Self::SelfHosted => "self",
+        }
+    }
+
+    /// Whether a child of this kind is a process this build starts.
+    ///
+    /// The two process kinds need the execution sandbox to provide
+    /// `process.spawn`; the in-process kind asks it for nothing.
+    pub fn is_a_process(self) -> bool {
+        match self {
+            Self::Stdio | Self::SelfHosted => true,
+            Self::InProcess => false,
         }
     }
 }
 
 /// One subagent provider a run may delegate through.
 ///
-/// A value rather than a section of TOML. `kind` decides which of the two
+/// A value rather than a section of TOML. `kind` decides which of the three
 /// shapes it is, and the fields that only one shape has are `None` for the
-/// other — a mixture is refused where the section is read, not here.
+/// others — a mixture is refused where the section is read, not here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubagentConfig {
     /// The provider name — the half of the plugin id after `subagent.`, the
@@ -255,7 +283,7 @@ pub struct SubagentConfig {
     /// How a child is reached.
     pub kind: SubagentKind,
     /// The program to run. Always `Some` for [`SubagentKind::Stdio`] and always
-    /// `None` for [`SubagentKind::InProcess`].
+    /// `None` for the kinds that run this binary.
     pub command: Option<String>,
     pub args: Vec<String>,
     /// In name order, because a process environment is a set of pairs and two
@@ -266,6 +294,17 @@ pub struct SubagentConfig {
     pub requires: Vec<Capability>,
     /// The longest a child may live, as a duration in milliseconds.
     pub ceiling_ms: Option<u64>,
+    /// Where a `self` child may write, as workspace-relative directory
+    /// prefixes. Empty for the kinds that have no writable face to declare.
+    ///
+    /// This is the whole of a work child's authorization: the surface it is
+    /// given is read plus write inside these directories, and nothing else —
+    /// there is no path by which it can ask for more at run time. The parent
+    /// checks at admission that every prefix lies inside its own writable face;
+    /// what the child then receives is the resolved absolute prefixes, and its
+    /// own boundary is built over exactly those. Two live workers whose scopes
+    /// intersect is a later knife: nothing here refuses it yet.
+    pub scope: Vec<String>,
 }
 
 /// The decision sidecar this run attaches.
@@ -1133,16 +1172,18 @@ fn subagent_config(
     let kind = match spec.kind.as_deref() {
         None | Some("stdio") => SubagentKind::Stdio,
         Some("in-process") => SubagentKind::InProcess,
+        Some("self") => SubagentKind::SelfHosted,
         Some(other) => {
             return Err(refuse(format!(
-                "`kind` is '{other}'; this build reaches a child as 'stdio' or 'in-process'"
+                "`kind` is '{other}'; this build reaches a child as 'stdio', 'in-process' or \
+                 'self'"
             )));
         }
     };
-    // The fields that belong to the other shape are refused rather than
-    // dropped: a `command` beside an in-process provider, or `cwd` beside one
-    // that has no process to run in, is an entry saying two things at once, and
-    // the one it means is not something a reader can recover.
+    // The fields that belong to another shape are refused rather than dropped:
+    // a `command` beside an in-process provider, or `cwd` beside one that runs
+    // this binary, is an entry saying two things at once, and the one it means
+    // is not something a reader can recover.
     match kind {
         SubagentKind::Stdio => {
             let command = spec.command.as_deref().unwrap_or_default();
@@ -1153,6 +1194,14 @@ fn subagent_config(
                         .to_string(),
                 ));
             }
+            if !spec.scope.is_empty() {
+                return Err(refuse(
+                    "`scope` belongs to a `self` provider: an external program writes in \
+                     ways this build never sees, so it can be given a working directory but \
+                     not a writable face"
+                        .to_string(),
+                ));
+            }
         }
         SubagentKind::InProcess => {
             for (field, named) in [
@@ -1160,11 +1209,32 @@ fn subagent_config(
                 ("args", !spec.args.is_empty()),
                 ("env", !spec.env.is_empty()),
                 ("cwd", spec.cwd.is_some()),
+                ("scope", !spec.scope.is_empty()),
             ] {
                 if named {
                     return Err(refuse(format!(
                         "`{field}` belongs to a provider that runs a program; an \
                          `in-process` child runs in this process"
+                    )));
+                }
+            }
+        }
+        SubagentKind::SelfHosted => {
+            // This binary is the program, so naming one is a second answer to a
+            // question that has only one. `args` and `cwd` are the parent's own
+            // facts — they travel as the serve command's arguments and as the
+            // child's resolved working directory — so a configured value for
+            // either would be a value the parent overwrites.
+            for (field, named) in [
+                ("command", spec.command.is_some()),
+                ("args", !spec.args.is_empty()),
+                ("cwd", spec.cwd.is_some()),
+            ] {
+                if named {
+                    return Err(refuse(format!(
+                        "`{field}` does not belong to a `self` provider: the program is this \
+                         binary and its arguments come from the delegation. Set `scope` to \
+                         give a child somewhere to write"
                     )));
                 }
             }
@@ -1207,6 +1277,7 @@ fn subagent_config(
         cwd: spec.cwd.clone(),
         requires,
         ceiling_ms,
+        scope: spec.scope.clone(),
     })
 }
 
