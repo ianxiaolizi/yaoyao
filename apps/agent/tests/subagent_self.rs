@@ -747,3 +747,90 @@ fn a_child_dies_with_a_parent_killed_outright() {
     });
     let _ = parent.wait();
 }
+
+// ---------------------------------------------------------------------------
+// The AppContainer question (#136's one unmeasured claim).
+
+/// Whether a containerized agent can load the binary a `self` child runs.
+///
+/// A `self` child is the parent binary, so a parent that is confined confines
+/// the child before the child has run a line: the image itself has to load.
+/// The spawn answers from argv alone — `subagent serve` with nothing else
+/// exits 2 after reading no configuration and opening no store — so what the
+/// kernel says about the image is all this measures.
+///
+/// Measured 2026-10-31 on this machine: the copy inside the granted workspace
+/// exited 2 with `--child-session is required…`, so the image loaded. The
+/// spawn of the binary at its normal path outside the fixture's grants is
+/// reported but not asserted: whether an image outside the grants loads
+/// depends on that file's ACL and integrity label (this repo's build output is
+/// low-integrity, which a container can read), not on anything here.
+#[test]
+#[ignore = "needs AGENT_APPCONTAINER_TEST=1 and `agent sandbox setup`"]
+fn a_container_can_load_the_binary_a_self_child_runs() {
+    use std::ffi::OsString;
+
+    use agent_ports::process_env::child_environment;
+    use agent_ports::process_launcher::{ProcessLauncher, SpawnRequest, StdinMode};
+    use agent_sandbox_win::{AppContainerLauncher, PROFILE_NAME};
+
+    if std::env::var("AGENT_APPCONTAINER_TEST").ok().as_deref() != Some("1") {
+        eprintln!("skipped: set AGENT_APPCONTAINER_TEST=1");
+        return;
+    }
+
+    let (_data, workspace, home) = dirs();
+    let sandbox = home.path().join("sandbox");
+    let launcher = AppContainerLauncher::new(PROFILE_NAME, workspace.path(), &sandbox, false)
+        .expect("the machine has been set up");
+
+    let program_in = workspace.path().join("agent-copy.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_agent"), &program_in).expect("the binary is copied in");
+
+    let env: Vec<(OsString, OsString)> =
+        child_environment(&std::env::vars_os().collect::<Vec<_>>());
+    let probe = |program: &Path| {
+        let mut process = launcher
+            .spawn(SpawnRequest {
+                program: program.to_string_lossy().into_owned(),
+                args: vec!["subagent".to_string(), "serve".to_string()],
+                cwd: workspace.path().to_path_buf(),
+                env: env.clone(),
+                stdin: StdinMode::Closed,
+            })
+            .expect("the command starts");
+        let stdout = process.take_stdout().map(|mut r| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = r.read_to_string(&mut text);
+                text
+            })
+        });
+        let stderr = process.take_stderr().map(|mut r| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = r.read_to_string(&mut text);
+                text
+            })
+        });
+        let code = process.wait().expect("the process is waited on");
+        let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+        let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+        (code, stdout, stderr)
+    };
+
+    let outside = PathBuf::from(env!("CARGO_BIN_EXE_agent"));
+    let (outside_code, _, outside_err) = probe(&outside);
+    let (inside_code, _, inside_err) = probe(&program_in);
+    eprintln!("outside the grants: code={outside_code:?} stderr={outside_err:?}");
+
+    assert_eq!(
+        inside_code,
+        Some(2),
+        "a container could not load the agent binary inside its grants: {inside_err}"
+    );
+    assert!(
+        inside_err.contains("--child-session is required"),
+        "the image loaded but the answer was not the argv refusal: {inside_err}"
+    );
+}
