@@ -25,7 +25,7 @@ const ORDINARY_CEILING: usize = 2000;
 /// size on that day. Shrink freely; growth is the regression.
 const RATCHETS: &[(&str, usize)] = &[
     ("crates/agent-loop/src/default.rs", 7737),
-    ("crates/agent-kernel/src/scheduler.rs", 2931),
+    ("crates/agent-kernel/src/scheduler.rs", 2928),
     ("crates/agent-kernel/src/guarded.rs", 2226),
     ("crates/agent-kernel/src/resume.rs", 2074),
 ];

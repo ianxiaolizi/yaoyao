@@ -1630,6 +1630,184 @@ fn memory_forget_with_no_id_is_a_usage_error() {
     assert!(refused.err.contains("Usage: agent memory forget <id>"), "{}", refused.err);
 }
 
+// ---------------------------------------------------------------------------
+// memory tools: the same store, reached through the gateway a model's calls go
+// through. Off until a configuration turns them on; on, a write still asks.
+// ---------------------------------------------------------------------------
+
+/// The user configuration that turns the model's fact tools on.
+fn memory_on_config(home: &TempDir) -> String {
+    write_config(home, "memory.toml", "[memory]\nenabled = true\n")
+}
+
+/// The approval id out of the gateway's "approval pending" refusal.
+fn pending_approval_id(error: &str, tool: &str) -> String {
+    let marker = format!("approval pending for tool '{tool}': ");
+    error
+        .lines()
+        .find_map(|line| line.split_once(&marker))
+        .map(|(_, id)| id.trim().to_string())
+        .unwrap_or_else(|| panic!("no pending approval for {tool} in {error:?}"))
+}
+
+/// The id out of the tool's "remembered <id>  workspace/<key>" answer.
+fn tool_remembered_id(answer: &Ran) -> String {
+    answer
+        .out
+        .trim()
+        .strip_prefix("remembered ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no remembered id in {:?}", answer.out))
+}
+
+#[test]
+fn the_memory_tools_are_unknown_until_the_configuration_turns_them_on() {
+    let (data, workspace) = dirs();
+
+    for tool in ["memory.recall", "memory.remember", "memory.forget"] {
+        let refused = ran(
+            data.path(),
+            workspace.path(),
+            &["tool", tool, r#"{"text":"a fact","id":"mem_x"}"#],
+        );
+        assert_eq!(refused.code, Some(2), "{tool}: {}", refused.out);
+        assert!(
+            refused.err.contains(&format!("unknown tool '{tool}'")),
+            "a name nobody registered is not on the surface: {}",
+            refused.err
+        );
+    }
+}
+
+#[test]
+fn a_model_write_asks_once_and_then_shares_the_store_with_the_cli() {
+    let (data, workspace, home) = dirs_with_config();
+    let config = memory_on_config(&home);
+    let remember = r#"{"text":"the deploy window is Tuesday","key":"deploy-window"}"#;
+
+    // Nothing is written until a person says so.
+    let asked = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.remember", remember],
+    );
+    assert_eq!(asked.code, Some(2), "{}", asked.out);
+    let approval = pending_approval_id(&asked.err, "memory.remember");
+    assert!(
+        ran(data.path(), workspace.path(), &["memory", "list"])
+            .out
+            .contains("nothing is remembered"),
+        "the question left no fact behind"
+    );
+
+    let granted = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
+    assert!(granted.ok, "{}", granted.err);
+
+    let wrote = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.remember", remember],
+    );
+    assert!(wrote.ok, "{}", wrote.err);
+    let id = tool_remembered_id(&wrote);
+    assert!(id.starts_with("mem_"), "{id}");
+
+    // The person's own verbs read the store the model wrote.
+    let listed = ran(data.path(), workspace.path(), &["memory", "list"]);
+    assert!(listed.out.contains("the deploy window is Tuesday"), "{}", listed.out);
+
+    // Reading is allowed, so a recall goes straight through.
+    let recalled = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.recall", r#"{"query":"Tuesday"}"#],
+    );
+    assert!(recalled.ok, "{}", recalled.err);
+    assert!(recalled.out.contains(&id), "{}", recalled.out);
+
+    // The write grant is a grant for `memory.write`, so the delete does not
+    // ask again — that is what "always" means.
+    let forgotten = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.forget", &format!(r#"{{"id":"{id}"}}"#)],
+    );
+    assert!(forgotten.ok, "{}", forgotten.err);
+    assert!(forgotten.out.contains(&format!("forgot {id}")), "{}", forgotten.out);
+
+    let after = ran(data.path(), workspace.path(), &["memory", "list"]);
+    assert!(after.out.contains("nothing is remembered"), "{}", after.out);
+    let recalled = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.recall", r#"{"query":"Tuesday"}"#],
+    );
+    assert!(recalled.out.contains("nothing is remembered matching 'Tuesday'"), "{}", recalled.out);
+}
+
+#[test]
+fn a_delete_asks_before_it_happens_when_nobody_has_answered_yet() {
+    let (data, workspace, home) = dirs_with_config();
+    let config = memory_on_config(&home);
+    let forget = r#"{"id":"mem_nothing"}"#;
+
+    let asked = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.forget", forget],
+    );
+    assert_eq!(asked.code, Some(2), "{}", asked.out);
+    let approval = pending_approval_id(&asked.err, "memory.forget");
+
+    let granted = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
+    assert!(granted.ok, "{}", granted.err);
+
+    let forgotten = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.forget", forget],
+    );
+    assert!(forgotten.ok, "{}", forgotten.err);
+    assert!(
+        forgotten.out.contains("no fact with id 'mem_nothing'"),
+        "deleting what is already gone is an answer: {}",
+        forgotten.out
+    );
+}
+
+#[test]
+fn a_project_can_refuse_the_write_and_keep_the_read() {
+    let (data, workspace, home) = dirs_with_config();
+    write_project_config(workspace.path(), "[tools]\ndeny = [\"memory.write\"]\n");
+    let config = memory_on_config(&home);
+
+    let denied = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.remember", r#"{"text":"a fact"}"#],
+    );
+    assert_eq!(denied.code, Some(2), "{}", denied.out);
+    assert!(denied.err.contains("policy denied tool 'memory.remember'"), "{}", denied.err);
+
+    let recalled = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_USER_CONFIG", &config)],
+        &["tool", "memory.recall", "{}"],
+    );
+    assert!(recalled.ok, "{}", recalled.err);
+    assert!(recalled.out.contains("nothing is remembered yet"), "{}", recalled.out);
+}
+
 /// The blob the run writes and the blob `artifact get` reads are one store.
 ///
 /// This is the wiring the unit tests cannot see: the command resolves

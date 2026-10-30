@@ -147,6 +147,14 @@ pub struct ResolvedProfileSnapshot {
     /// the same configuration serializes to the same bytes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_routes: BTreeMap<String, ModelRoute>,
+    /// Whether this run offered the model the long-term memory tools.
+    ///
+    /// Absent when off, for the reason `model_routes` is: memory is off by
+    /// default, and a run that never turned it on must compare equal to the runs
+    /// that came before this field existed. When it is on, the tools were on the
+    /// surface, and that is a difference between two runs worth recording.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub memory_enabled: bool,
     /// The capabilities this run is authorized to use.
     pub capability_set: CapabilitySet,
     pub budget: RunBudget,
@@ -185,6 +193,7 @@ mod tests {
             decision_backends: Vec::new(),
             model_route: ModelRoute::new(ModelTier::Main, "echo", model),
             model_routes: BTreeMap::new(),
+            memory_enabled: false,
             capability_set: [Capability::new(Capability::FS_READ)].into_iter().collect(),
             budget: RunBudget::default(),
         }
@@ -233,6 +242,22 @@ mod tests {
         // differs only in a field a reader might not think to compare.
         assert_ne!(sealed.config_hash, snapshot("review", "deepseek-chat").sealed().config_hash);
         assert_ne!(sealed.config_hash, snapshot("coding", "other-model").sealed().config_hash);
+    }
+
+    #[test]
+    fn turning_memory_on_moves_the_hash_and_off_leaves_the_shape_alone() {
+        // Off is the default and must stay byte-identical to the snapshots
+        // written before this field existed, or every stored run would compare
+        // unequal to every new one for a reason nobody asked about.
+        let off = snapshot("coding", "m").sealed();
+        let json = serde_json::to_value(&off).unwrap();
+        assert!(json.get("memory_enabled").is_none(), "off is absent, not false: {json}");
+
+        let mut on = snapshot("coding", "m");
+        on.memory_enabled = true;
+        let on = on.sealed();
+        assert!(serde_json::to_value(&on).unwrap().get("memory_enabled").is_some());
+        assert_ne!(off.config_hash, on.config_hash, "the tools a run offered are part of it");
     }
 
     #[test]

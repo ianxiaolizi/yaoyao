@@ -18,9 +18,9 @@ pub mod layers;
 pub mod resolve;
 
 pub use layers::{
-    BudgetSpec, DecisionsSpec, Disposition, LayaSpec, ManagedPolicy, McpServer, McpSpec, ModelSpec,
-    PluginsSpec, PolicySpec, Profile, ProfileDecisions, SubagentSpec, ToolsSpec, UserConfig,
-    WorkspaceConfig, WorkspaceTools, parse_duration_ms,
+    BudgetSpec, DecisionsSpec, Disposition, LayaSpec, ManagedPolicy, McpServer, McpSpec,
+    MemorySpec, ModelSpec, PluginsSpec, PolicySpec, Profile, ProfileDecisions, SubagentSpec,
+    ToolsSpec, UserConfig, WorkspaceConfig, WorkspaceTools, parse_duration_ms,
 };
 pub use resolve::{
     Directive, Layers, McpServerConfig, McpTransport, ResolvedLaya, ResolvedPolicy,

@@ -376,6 +376,13 @@ impl Verdict {
 /// `memory.read` is allowed for the same reason `fs.read` is: it reads material
 /// the run already owns. The log this searches is the session's own history, so
 /// granting it adds no reach the run did not have when it wrote that history.
+///
+/// `memory.write` asks. Remembering a fact is the one thing here that outlives
+/// the session that did it — a later run, in a different conversation, reads
+/// back what this one wrote, and a delete is real. So the write goes through a
+/// person in the same way spawning a process does, and for the same reason: it
+/// changes something outside the run. A grant, once given, is what stops the
+/// question being asked again.
 pub fn default_policy() -> PolicyEngine {
     default_policy_with(&default_sandbox_capabilities())
 }
@@ -394,6 +401,7 @@ pub fn default_policy_with(advertised: &[Capability]) -> PolicyEngine {
             PolicyRule::allow(Capability::new(Capability::FS_WRITE)),
             PolicyRule::allow(Capability::new(Capability::GIT_STATUS)),
             PolicyRule::allow(Capability::new(Capability::MEMORY_READ)),
+            PolicyRule::ask(Capability::new(Capability::MEMORY_WRITE)),
             PolicyRule::ask(Capability::new(Capability::PROCESS_SPAWN)),
         ])
         .with_sandbox(advertised.iter().cloned())
@@ -757,6 +765,15 @@ mod tests {
         // Searching the session's own history is a read of what the run already
         // wrote, not a new reach.
         assert_eq!(engine.evaluate(&[cap(Capability::MEMORY_READ)], &[]), PolicyDecision::Allow);
+        // Remembering outlives the run, so it asks the same way spawning does —
+        // advertised, so an approval can be granted, and granted by nobody by
+        // default.
+        assert_eq!(engine.evaluate(&[cap(Capability::MEMORY_WRITE)], &[]), PolicyDecision::Ask);
+        assert_eq!(
+            engine.evaluate(&[cap(Capability::MEMORY_WRITE)], &[cap(Capability::MEMORY_WRITE)]),
+            PolicyDecision::Allow,
+            "a grant answers the next call without asking again"
+        );
         // Spawning still asks; the sandbox advertises it so an approval *can* be
         // granted, which is different from granting it.
         assert_eq!(engine.evaluate(&[cap(Capability::PROCESS_SPAWN)], &[]), PolicyDecision::Ask);

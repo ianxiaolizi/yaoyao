@@ -40,18 +40,20 @@ use agent_kernel::resume::Resume;
 use agent_kernel::scheduler::{Scheduler, SchedulerError};
 use agent_kernel::tools::CompositeToolProvider;
 use agent_loop::DefaultAgentLoop;
+use agent_memory_sqlite::{MemoryFactsToolProvider, SqliteMemoryStore};
 use agent_ports::agent_loop::TurnCapabilityFacts;
 use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::control::ControlHandler;
 use agent_ports::decision::DecisionAdvisor;
 use agent_ports::execution_environment::{ExecutionEnvironment, SandboxMode};
 use agent_ports::memory_index::MemoryIndex;
+use agent_ports::memory_store::MemoryStore;
 use agent_ports::model_router::ModelRouter;
 use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_protocol::ids::SessionId;
-use agent_protocol::permissions::{Capability, SecretRef, Workspace};
+use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef, Workspace};
 use agent_protocol::redactor::{HighEntropy, Redactor};
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
@@ -430,6 +432,13 @@ pub async fn assemble_with_delegation(
     // handed out. The policy and the plugin surface both ask this question and
     // must get the same answer.
     let advertised = env.advertised_capabilities();
+    // The policy is decided over what this run's backend actually advertises,
+    // not over what the build can do in principle: a read-only run must refuse
+    // a configured fs.write as unavailable rather than let a rule grant it.
+    // Built here rather than beside the gateway because the tool surface asks
+    // it one question too — which of its tools this run could never call — so a
+    // note about the surface and the gate decide from one engine, not two.
+    let policy = config::policy_engine(&resolved, &advertised);
     // The file boundary, built once, before anything that starts a process: the
     // configured working directory of a plugin or a backend is a path in a
     // configuration file and goes through the same guard as a path a tool is
@@ -478,6 +487,31 @@ pub async fn assemble_with_delegation(
     // and the composite is assembled from it, so a family cannot be added to
     // one and forgotten in the other.
     let mut builtin_families: Vec<Arc<dyn ToolProvider>> = vec![fs_tools, git_tools, memory_tools];
+    // Long-term memory is off unless the user configuration turned it on, and
+    // when it is off no provider is built at all: a tool that is not on the
+    // surface cannot be called by name, which is stronger than one that refuses.
+    // The store is the data directory's one `memory.db`, the same file the
+    // `agent memory` verbs write — the model and the person share it.
+    if resolved.memory_enabled {
+        // Whether *writes* are permitted is a policy question, and the gateway
+        // answers it by dropping any tool whose capabilities every call would
+        // fail. It is asked here only to say out loud what the model was not
+        // offered: a recall that works beside a remember that cannot is a
+        // difference a person should not have to discover at call time.
+        let write = Capability::new(Capability::MEMORY_WRITE);
+        if policy.evaluate(std::slice::from_ref(&write), &[]) == PolicyDecision::Deny {
+            eprintln!(
+                "memory: long-term memory is on, but {write} is refused in this run \
+                 (see the policy and the sandbox); only memory.recall is offered"
+            );
+        }
+        let facts: Arc<dyn MemoryStore> = Arc::new(SqliteMemoryStore::open(data_dir.clone()));
+        builtin_families.push(Arc::new(MemoryFactsToolProvider::new(
+            facts,
+            session.clone(),
+            Arc::new(crate::clock::now),
+        )));
+    }
     let mut reserved: BTreeSet<String> = builtin_families
         .iter()
         .flat_map(|provider| provider.definitions())
@@ -600,10 +634,6 @@ pub async fn assemble_with_delegation(
         )
     };
 
-    // The policy is decided over what this run's backend actually advertises,
-    // not over what the build can do in principle: a read-only run must refuse
-    // a configured fs.write as unavailable rather than let a rule grant it.
-    let policy = config::policy_engine(&resolved, &advertised);
     // One step's output is bounded by the window the run actually has: a
     // result larger than the working set cannot be compacted away afterwards,
     // because the newest group is kept whole. The gateway also decides what the

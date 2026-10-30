@@ -225,7 +225,7 @@ pub struct ListFacts {
 }
 
 /// Why a memory operation could not complete.
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum MemoryStoreError {
     /// The database could not be read or written.
     #[error("memory store: {0}")]

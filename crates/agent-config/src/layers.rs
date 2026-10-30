@@ -83,6 +83,31 @@ pub struct UserConfig {
     pub subagents: Option<BTreeMap<String, SubagentSpec>>,
     /// Decision backends this user defines.
     pub decisions: Option<DecisionsSpec>,
+    /// Long-term memory, as this user turns it on.
+    ///
+    /// Here rather than in a profile or a project for the same reason
+    /// `capabilities` is: the store is one file per data directory that every
+    /// session in it reads, so turning it on is a decision about the machine,
+    /// not about one scenario — and a repository must not be able to make its
+    /// own memories appear.
+    pub memory: Option<MemorySpec>,
+}
+
+/// The `[memory]` section: whether runs on this machine offer the model the
+/// long-term memory tools.
+///
+/// It is not a capability. `memory.write` is what a call is gated by; this says
+/// whether the tools are on the surface at all. Off by default: a store that
+/// outlives every session is something a person turns on, not something a run
+/// assumes on their behalf.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySpec {
+    /// Whether `memory.recall`, `memory.remember` and `memory.forget` are
+    /// offered to the model. The operator's own `agent memory …` verbs are
+    /// always available: a person typing a command is the authority here.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl UserConfig {
@@ -467,6 +492,29 @@ pub fn parse_duration_ms(layer: &str, text: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_is_off_unless_the_user_layer_says_otherwise() {
+        // Off is the default, and the section is a user-layer fact: a project
+        // config that wrote it is refused as an unknown key, which is what
+        // `deny_unknown_fields` on `WorkspaceConfig` already does for every
+        // grant it does not own.
+        let absent = UserConfig::from_toml_str("").expect("an empty configuration");
+        assert!(absent.memory.is_none());
+
+        let on = UserConfig::from_toml_str("[memory]\nenabled = true\n").expect("the section");
+        assert_eq!(on.memory.map(|memory| memory.enabled), Some(true));
+
+        let refused = WorkspaceConfig::from_toml_str("[memory]\nenabled = true\n");
+        assert!(refused.is_err(), "a project may not turn the store on");
+    }
+
+    #[test]
+    fn a_memory_section_with_a_typo_is_a_refusal_not_a_default() {
+        let error = UserConfig::from_toml_str("[memory]\nEnable = true\n")
+            .expect_err("a misspelled key must not read as off");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
 
     #[test]
     fn a_user_config_declares_capabilities_and_profiles() {

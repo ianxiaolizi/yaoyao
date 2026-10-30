@@ -594,6 +594,7 @@ mod tests {
                 "echo",
             ),
             model_routes: std::collections::BTreeMap::new(),
+            memory_enabled: false,
             capability_set: [agent_protocol::permissions::Capability::new(
                 agent_protocol::permissions::Capability::FS_READ,
             )]

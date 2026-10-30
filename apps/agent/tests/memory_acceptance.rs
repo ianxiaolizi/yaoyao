@@ -1,11 +1,12 @@
-//! Memory acceptance: the model searches the session's own history through the
-//! assembly the binary runs.
+//! Memory acceptance: the model searches the session's own history, and — when
+//! the configuration turns it on — reads and writes the facts that outlive it.
 //!
-//! The index itself is tested in `agent-index-sqlite`; what is checked here is
-//! the wiring the product ships: `stack::assemble` puts `memory.search` on the
-//! surface, the capability gate admits it under the default policy and refuses
-//! it under an explicit deny, and the ordinary tool event chain carries the
-//! call and its result — so a replay derives the conversation the model saw.
+//! The index and the fact store are tested in their own crates; what is checked
+//! here is the wiring the product ships: `stack::assemble` puts the tools on the
+//! surface, the capability gate admits them under the default policy and refuses
+//! them under an explicit deny or a sandbox that cannot back them, a write waits
+//! for a person, and the ordinary tool event chain carries each call and its
+//! result — so a replay derives the conversation the model saw.
 
 use std::sync::Arc;
 
@@ -14,6 +15,9 @@ use agent::stack::{self, Decisions};
 use agent_config::{Layers, ResolvedProfile, WorkspaceTools};
 use agent_ports::event_store::EventStore;
 use agent_ports::execution_environment::SandboxMode;
+// The fact store's methods are the port's, not inherent ones: the trait has to
+// be in scope for a test to read back what the run wrote.
+use agent_ports::memory_store::MemoryStore as _;
 use agent_ports::model_provider::ModelProvider;
 use agent_ports::model_router::{ModelRoute, ModelTier};
 use agent_protocol::events::{Actor, EventType, StoredEvent};
@@ -39,6 +43,15 @@ fn profile(layers: Layers) -> ResolvedProfile {
 
 /// Assemble the product's stack over a fake model, with the default profile.
 async fn harness(responses: Vec<ModelResponse>) -> Harness {
+    harness_with(Layers::default(), SandboxMode::LocalProcess, responses).await
+}
+
+/// The same, under a stated configuration and execution backend.
+async fn harness_with(
+    layers: Layers,
+    sandbox: SandboxMode,
+    responses: Vec<ModelResponse>,
+) -> Harness {
     let workspace = tempfile::tempdir().expect("temp workspace");
     let data_dir = tempfile::tempdir().expect("temp data dir");
     let session = SessionId::from_string("memory");
@@ -48,13 +61,13 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
         session: session.clone(),
         workspace_root: workspace.path().to_path_buf(),
         data_dir: data_dir.path().to_path_buf(),
-        resolved: profile(Layers::default()),
+        resolved: profile(layers),
         model: Some(SelectedProvider {
             provider,
             route: ModelRoute::new(ModelTier::Main, "fake", "fake-model"),
         }),
         decisions: Decisions::Unobserved,
-        sandbox: SandboxMode::LocalProcess,
+        sandbox,
         network_allowed: false,
         judgment: true,
     })
@@ -63,28 +76,43 @@ async fn harness(responses: Vec<ModelResponse>) -> Harness {
     Harness { stack, model, session, data_dir, _workspace: workspace }
 }
 
+/// Whether the first request the model saw offered `tool`.
+fn offered(harness: &Harness, tool: &str) -> bool {
+    harness
+        .model
+        .requests()
+        .first()
+        .expect("the model was asked at least once")
+        .tool_manifest
+        .entries
+        .iter()
+        .any(|entry| entry.tool_id == tool)
+}
+
 impl Harness {
-    async fn ask(&self, text: &str) -> (Option<String>, Vec<StoredEvent>) {
+    /// Queue one user turn and run it. `None` is a turn that stopped for an
+    /// answer — an approval — rather than reaching a final answer.
+    async fn drive(&self, text: &str) -> Option<agent_kernel::scheduler::RunReport> {
         self.stack
             .scheduler
             .inbox()
             .append(&self.session, InboxKind::NextTurn, json!({ "text": text }), 0, Actor::User)
             .await
             .expect("append input");
-        let report = self
-            .stack
-            .scheduler
-            .run_pending(&self.session, Utc::now())
-            .await
-            .expect("run pending")
-            .expect("a turn ran");
-        let log = self
-            .stack
+        self.stack.scheduler.run_pending(&self.session, Utc::now()).await.expect("run pending")
+    }
+
+    async fn log(&self) -> Vec<StoredEvent> {
+        self.stack
             .store
             .read_stream(&self.session, EventSeq::ZERO, usize::MAX)
             .await
-            .expect("read the log");
-        (report.final_content, log)
+            .expect("read the log")
+    }
+
+    async fn ask(&self, text: &str) -> (Option<String>, Vec<StoredEvent>) {
+        let report = self.drive(text).await.expect("a turn ran");
+        (report.final_content, self.log().await)
     }
 }
 
@@ -202,5 +230,185 @@ async fn an_explicit_policy_deny_keeps_the_tool_from_running() {
     assert!(
         !log.iter().any(|stored| stored.event.event_type.as_str() == EventType::TOOL_COMPLETED),
         "the denied call never ran"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Long-term memory: the facts that outlive the session. Off unless the
+// configuration turns them on; writes ask; reads are free.
+// ---------------------------------------------------------------------------
+
+/// Layers whose user configuration wrote `[memory] enabled = <on>`.
+fn memory_layers(on: bool) -> Layers {
+    Layers {
+        user: agent_config::UserConfig::from_toml_str(&format!("[memory]\nenabled = {on}\n"))
+            .expect("the user configuration"),
+        ..Layers::default()
+    }
+}
+
+/// The durable store the assembled run writes, opened the way the CLI opens it.
+fn store(harness: &Harness) -> agent_memory_sqlite::SqliteMemoryStore {
+    agent_memory_sqlite::SqliteMemoryStore::open(harness.data_dir.path().to_path_buf())
+}
+
+fn tool_events<'a>(log: &'a [StoredEvent], event_type: &str, tool: &str) -> Vec<&'a StoredEvent> {
+    log.iter()
+        .filter(|stored| {
+            stored.event.event_type.as_str() == event_type
+                && stored.event.payload["tool_name"].as_str() == Some(tool)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_fact_tools_are_off_the_surface_until_the_configuration_turns_them_on() {
+    // The default profile is what every run starts from: no `[memory]` section,
+    // so no provider is built and the names are not even registered.
+    let harness = harness(vec![
+        FakeModelProvider::tool_call("memory.remember", json!({"text": "a fact"})),
+        FakeModelProvider::answer("nothing was written"),
+    ])
+    .await;
+
+    let (_, log) = harness.ask("remember that the build is green").await;
+
+    assert!(offered(&harness, "memory.search"), "the session index is still there");
+    for name in ["memory.recall", "memory.remember", "memory.forget"] {
+        assert!(!offered(&harness, name), "{name} must not be offered by default");
+    }
+    let failed = tool_events(&log, EventType::TOOL_FAILED, "memory.remember");
+    assert_eq!(failed.len(), 1, "a name nobody registered cannot be called");
+    let content = failed[0].event.payload["content"].as_str().expect("a refusal string");
+    assert!(content.contains("unknown tool"), "{content}");
+    assert!(
+        tool_events(&log, EventType::TOOL_COMPLETED, "memory.remember").is_empty(),
+        "nothing ran"
+    );
+}
+
+#[tokio::test]
+async fn remembering_waits_for_a_person_even_when_memory_is_on() {
+    let harness = harness_with(
+        memory_layers(true),
+        SandboxMode::LocalProcess,
+        vec![
+            FakeModelProvider::tool_call(
+                "memory.remember",
+                json!({"text": "the deploy window is Tuesday", "key": "deploy-window"}),
+            ),
+            FakeModelProvider::answer("stored it"),
+        ],
+    )
+    .await;
+
+    // The call is on the surface — and it stops the turn, because `memory.write`
+    // is `ask` by default.
+    let stopped =
+        harness.drive("remember that deploys go out on Tuesday").await.expect("a turn ran");
+    assert_eq!(
+        stopped.stop_reason,
+        agent_ports::agent_loop::StopReason::NeedsUserInput,
+        "the turn stops at the question rather than deciding it"
+    );
+    let pending = harness.stack.approvals.pending(&harness.session).await.expect("pending");
+    assert_eq!(pending.len(), 1, "one call is waiting");
+    assert_eq!(pending[0].tool_name, "memory.remember");
+    assert_eq!(
+        pending[0].capability,
+        agent_protocol::permissions::Capability::new(
+            agent_protocol::permissions::Capability::MEMORY_WRITE
+        )
+    );
+    assert!(
+        store(&harness)
+            .recall(&agent_ports::memory_store::Recall::default(), Utc::now())
+            .await
+            .expect("recall")
+            .is_empty(),
+        "nothing is written before the answer"
+    );
+
+    let approval_id = pending[0].approval_id.clone();
+    harness
+        .stack
+        .approvals
+        .grant(
+            &harness.session,
+            &approval_id,
+            agent_protocol::permissions::ApprovalScope::AllowOnce,
+            "user",
+        )
+        .await
+        .expect("grant");
+    let outcome =
+        harness.stack.resume.resume(&harness.session, "yes, remember it").await.expect("resume");
+    assert!(
+        matches!(
+            outcome,
+            agent_kernel::resume::ResumeOutcome::Settled {
+                disposition: agent_kernel::resume::Disposition::Ran {
+                    status: agent_protocol::tool::ToolStatus::Completed
+                },
+                ..
+            }
+        ),
+        "the approved call runs on the continuation: {outcome:?}"
+    );
+
+    let log = harness.log().await;
+    let completed = tool_events(&log, EventType::TOOL_COMPLETED, "memory.remember");
+    assert_eq!(completed.len(), 1, "the call ran once");
+    let content = completed[0].event.payload["content"].as_str().expect("a result string");
+    assert!(content.contains("remembered mem_"), "{content}");
+
+    // The fact is in the store the CLI lists from, credited to this session and
+    // the model call that asked for it.
+    let facts = store(&harness)
+        .recall(&agent_ports::memory_store::Recall::default(), Utc::now())
+        .await
+        .expect("recall");
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].text, "the deploy window is Tuesday");
+    assert_eq!(facts[0].key.as_deref(), Some("deploy-window"));
+    assert_eq!(facts[0].origin, agent_ports::memory_store::MemoryOrigin::Agent);
+    let source = facts[0].source.as_ref().expect("a fact the model wrote carries its source");
+    assert_eq!(source.session, harness.session);
+    assert!(source.call.is_some(), "the tool-use id names the exchange in the log");
+}
+
+#[tokio::test]
+async fn a_read_only_run_offers_recall_and_not_the_writes() {
+    // Read-only removes `memory.write` from what the backend advertises, so the
+    // gateway drops every tool whose calls would all be refused. What stays is
+    // what the run can actually do.
+    let harness = harness_with(
+        memory_layers(true),
+        SandboxMode::ReadOnly,
+        vec![
+            FakeModelProvider::tool_call("memory.recall", json!({})),
+            FakeModelProvider::answer("nothing yet"),
+        ],
+    )
+    .await;
+
+    let (final_content, log) = harness.ask("what do you remember?").await;
+    assert_eq!(final_content.as_deref(), Some("nothing yet"));
+
+    assert!(offered(&harness, "memory.recall"), "reading changes nothing, so it stays");
+    for name in ["memory.remember", "memory.forget"] {
+        assert!(!offered(&harness, name), "{name} cannot run in a read-only run");
+    }
+    let completed = tool_events(&log, EventType::TOOL_COMPLETED, "memory.recall");
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].event.payload["content"].as_str(), Some("nothing is remembered yet"));
+    // A recall that found nothing wrote nothing: the store it opened is empty.
+    assert!(
+        store(&harness)
+            .list(&agent_ports::memory_store::ListFacts::default(), Utc::now())
+            .await
+            .expect("list")
+            .is_empty(),
+        "a read-only run changed no facts"
     );
 }

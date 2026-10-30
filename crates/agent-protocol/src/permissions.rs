@@ -92,6 +92,14 @@ impl Capability {
     /// conversation itself — the grant is about reading a log the run already
     /// owns, not about reaching outside it.
     pub const MEMORY_READ: &'static str = "memory.read";
+    /// Write to, or delete from, the long-term memory store (`memory.db`).
+    ///
+    /// Separate from `memory.read` because the two are different claims: reading
+    /// what was already remembered changes nothing, while a write outlives the
+    /// session that made it and a delete is real. The store sits beside the
+    /// session logs rather than inside one, so this is the one memory capability
+    /// that reaches past the run holding it.
+    pub const MEMORY_WRITE: &'static str = "memory.write";
 
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())

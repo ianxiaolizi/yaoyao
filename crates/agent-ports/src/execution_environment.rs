@@ -33,10 +33,12 @@ impl SandboxMode {
     ///
     /// This is the *advertisement*, not a grant: a capability listed here still
     /// needs a rule, and a rule naming a capability absent here is refused
-    /// before it is consulted (`CONTRACT.md` C2.2). Read-only removes the two
-    /// capabilities that write — `fs.write` and `process.spawn` — so a
-    /// configuration that reaches for them is refused as unavailable rather
-    /// than quietly attempted.
+    /// before it is consulted (`CONTRACT.md` C2.2). Read-only removes the
+    /// capabilities that write — `fs.write`, `memory.write` and
+    /// `process.spawn` — so a configuration that reaches for them is refused as
+    /// unavailable rather than quietly attempted. Remembering a fact is a write
+    /// like any other: it outlives the run, and a read-only run promises none of
+    /// that.
     ///
     /// `network.request` and `subagent.spawn` are build-level: the binary ships
     /// MCP-over-HTTP and subagent backends. A backend that cannot reach the
@@ -60,6 +62,7 @@ impl SandboxMode {
                     Capability::new(Capability::FS_WRITE),
                     Capability::new(Capability::GIT_STATUS),
                     Capability::new(Capability::MEMORY_READ),
+                    Capability::new(Capability::MEMORY_WRITE),
                     Capability::new(Capability::PROCESS_SPAWN),
                     Capability::new(Capability::NETWORK_REQUEST),
                     Capability::new(Capability::SUBAGENT_SPAWN),
@@ -273,12 +276,13 @@ mod tests {
             Capability::FS_WRITE,
             Capability::GIT_STATUS,
             Capability::MEMORY_READ,
+            Capability::MEMORY_WRITE,
             Capability::PROCESS_SPAWN,
             Capability::NETWORK_REQUEST,
             Capability::SUBAGENT_SPAWN,
         ] {
             assert!(names(&caps).contains(&expected), "{expected} is missing from {caps:?}");
         }
-        assert_eq!(caps.len(), 7, "an unadvertised capability is a capability a rule cannot grant");
+        assert_eq!(caps.len(), 8, "an unadvertised capability is a capability a rule cannot grant");
     }
 }

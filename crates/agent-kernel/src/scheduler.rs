@@ -1163,10 +1163,6 @@ mod tests {
         assert_eq!(decoded.as_str(), "abc");
     }
 
-    fn snapshot() -> ResolvedProfileSnapshot {
-        snapshot_with_budget(agent_protocol::profile::RunBudget::default())
-    }
-
     fn snapshot_with_budget(budget: agent_protocol::profile::RunBudget) -> ResolvedProfileSnapshot {
         ResolvedProfileSnapshot {
             profile_id: "coding".to_string(),
@@ -1180,6 +1176,7 @@ mod tests {
                 "echo",
             ),
             model_routes: std::collections::BTreeMap::new(),
+            memory_enabled: false,
             capability_set: agent_protocol::permissions::CapabilitySet::new(),
             budget,
         }
@@ -1195,7 +1192,7 @@ mod tests {
     #[tokio::test]
     async fn a_configured_run_records_the_configuration_it_started_under() {
         let (scheduler, store, sid) = scheduler();
-        let scheduler = scheduler.with_profile_snapshot(snapshot());
+        let scheduler = scheduler.with_profile_snapshot(snapshot_with_budget(Default::default()));
         scheduler
             .inbox
             .append(&sid, InboxKind::NextTurn, serde_json::json!({ "text": "hi" }), 0, Actor::User)

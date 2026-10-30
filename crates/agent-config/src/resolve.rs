@@ -65,6 +65,13 @@ pub struct ResolvedProfile {
     /// `--model` overrides `main` and nothing else, so a layer that names
     /// `fast` keeps it.
     pub model_tiers: BTreeMap<ModelTier, String>,
+    /// Whether this run offers the model the long-term memory tools.
+    ///
+    /// Read from the user layer's `[memory] enabled` and nowhere else. The
+    /// tools' *calls* are still gated by `memory.read` / `memory.write` — this
+    /// only decides whether they are on the surface at all — so a run with the
+    /// store off has no way to reach it even by naming a tool.
+    pub memory_enabled: bool,
     pub capability_set: CapabilitySet,
     pub plugin_versions: BTreeMap<String, String>,
     /// The MCP servers this run starts, one per enabled `mcp.<server>` plugin,
@@ -123,6 +130,7 @@ impl ResolvedProfile {
             policy_version: self.policy_version,
             model_route,
             model_routes,
+            memory_enabled: self.memory_enabled,
             capability_set: self.capability_set,
             budget: self.budget,
         }
@@ -337,6 +345,7 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
             .clone()
             .or_else(|| composed.model.as_ref().and_then(|model| model.main.clone())),
         model_tiers: model_tiers(&layers, composed.model.as_ref()),
+        memory_enabled: layers.user.memory.as_ref().is_some_and(|memory| memory.enabled),
         capability_set,
         plugin_versions,
         mcp_servers,

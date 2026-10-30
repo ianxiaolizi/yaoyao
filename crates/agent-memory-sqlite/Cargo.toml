@@ -11,6 +11,7 @@ agent-protocol = { path = "../agent-protocol" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }
+serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
