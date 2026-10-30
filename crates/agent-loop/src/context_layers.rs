@@ -473,3 +473,56 @@ pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
     bounded.push_str("...");
     bounded
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan that states an ordering reaches the task layer as a graph: the
+    /// names, the waits, and which steps may start now.
+    ///
+    /// The readiness line is the ledger's own rendering, so what this pins is
+    /// the wiring: the layer shows the plan as the protocol wrote it. The
+    /// dependency-free case is pinned where the layer's other text is
+    /// (`default::tests::a_plan_update_is_recorded_and_reaches_the_next_step_task_layer`).
+    #[test]
+    fn a_plan_with_dependencies_reaches_the_task_layer_as_a_graph() {
+        let plan = Plan::from_arguments(&serde_json::json!({
+            "goal": "ship the parser fix",
+            "items": [
+                { "id": "read", "text": "read the failing test", "status": "done" },
+                { "id": "fix", "text": "fix the tokenizer", "status": "todo",
+                  "depends_on": ["read"] },
+                { "text": "run the suite", "status": "todo", "depends_on": ["fix"] },
+            ],
+        }))
+        .expect("a valid plan");
+
+        let text = task_text(
+            &serde_json::json!({ "text": "do the work" }),
+            &facts(),
+            Some(&plan),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(text.contains("1. [done] read the failing test (id: read)"), "{text}");
+        assert!(text.contains("2. [todo] fix the tokenizer (id: fix, after: read)"), "{text}");
+        assert!(text.contains("3. [todo] run the suite (after: fix)"), "{text}");
+        assert!(text.contains("Ready now: 2 (fix)"), "{text}");
+    }
+
+    fn facts() -> TurnStateFacts {
+        TurnStateFacts {
+            started_at: chrono::Utc::now(),
+            queued_inputs: 0,
+            input_kind: TurnInputKind::User,
+            previous_turn: None,
+            resumed: None,
+            max_steps: 4,
+            budget: Default::default(),
+        }
+    }
+}
