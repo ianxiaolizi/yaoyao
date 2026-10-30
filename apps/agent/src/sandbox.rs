@@ -66,6 +66,15 @@ pub fn network_from_environment() -> Result<bool, SandboxError> {
     network(std::env::var(ENV_NETWORK).ok().as_deref())
 }
 
+/// Whether the host said anything about the network at all.
+///
+/// `deny` is the default, so "the policy has no effect here" is only worth
+/// telling an operator who asked for it: the unset case would otherwise put a
+/// line on every run's stderr.
+pub fn network_is_explicit() -> bool {
+    std::env::var(ENV_NETWORK).map(|value| !value.trim().is_empty()).unwrap_or(false)
+}
+
 /// The policy a value names. Unset means deny.
 pub fn network(value: Option<&str>) -> Result<bool, SandboxError> {
     match value.map(str::trim).filter(|value| !value.is_empty()) {

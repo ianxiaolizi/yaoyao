@@ -453,7 +453,8 @@ fn the_last_request_reports_the_capability_layer_it_carried() {
         "message_uid": "msg/capability/run-1",
         "text": "Capabilities in this run:\n\
                  - sandbox: local (commands run on the host, confined to the workspace)\n\
-                 - network for sandboxed commands: denied\n\
+                 - network for sandboxed commands: not bounded by this backend (a command \
+                   reaches the network as your user does)\n\
                  - 2 tools are available; full arguments are in the tool definitions:\n\
                  \u{20}\u{20}fs.glob — Find files by pattern",
     });
@@ -482,7 +483,7 @@ fn the_last_request_reports_the_capability_layer_it_carried() {
         value["last_request"]["context_capability"]["text"]
             .as_str()
             .expect("the full text")
-            .contains("- network for sandboxed commands: denied"),
+            .contains("- network for sandboxed commands: not bounded by this backend"),
         "{value}"
     );
 }

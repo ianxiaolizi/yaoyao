@@ -1629,7 +1629,12 @@ fn context_inspect_after_a_turn_reports_the_last_request() {
     let text = capability["text"].as_str().expect("a capability layer");
     assert!(text.starts_with("Capabilities in this run:\n"), "{doc}");
     assert!(text.contains("- sandbox: local"), "{doc}");
-    assert!(text.contains("- network for sandboxed commands: denied"), "{doc}");
+    // The local backend runs commands as the user: the layer says the network
+    // is not bounded rather than claiming a denial nothing enforces.
+    assert!(
+        text.contains("- network for sandboxed commands: not bounded by this backend"),
+        "{doc}"
+    );
     // This stack registers no tool providers, and the layer says so rather
     // than printing an empty index.
     assert!(text.contains("- no tools are available in this run."), "{doc}");

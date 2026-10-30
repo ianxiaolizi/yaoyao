@@ -1245,7 +1245,25 @@ fn capability_text(facts: &TurnCapabilityFacts, manifest: &ToolManifest) -> Stri
             "container (commands run inside a container, workspace mounted into it)"
         }
     };
-    let network = if facts.network_allowed { "allowed" } else { "denied" };
+    // What the backend can *keep*, not what the host asked for. The local
+    // backend runs commands as the user with the host's network, so the run's
+    // network policy has nothing to enforce it there — saying "denied" would
+    // be a promise the run cannot keep, and the model reads this line as fact.
+    // `AGENT_SANDBOX_NETWORK` still decides the modes whose confinement can
+    // take the network away.
+    let network = match facts.sandbox {
+        SandboxMode::ReadOnly => "not applicable (no commands run in this backend)",
+        SandboxMode::LocalProcess => {
+            "not bounded by this backend (a command reaches the network as your user does)"
+        }
+        SandboxMode::WorkspaceSandbox | SandboxMode::Container => {
+            if facts.network_allowed {
+                "allowed"
+            } else {
+                "denied"
+            }
+        }
+    };
     let mut text = format!(
         "Capabilities in this run:\n\
          - sandbox: {sandbox}\n\
@@ -7475,7 +7493,12 @@ mod tests {
         let text = messages[0].text_content();
         assert!(text.starts_with("Capabilities in this run:\n"), "{text}");
         assert!(text.contains("- sandbox: local (commands run on the host"), "{text}");
-        assert!(text.contains("- network for sandboxed commands: denied"), "{text}");
+        // This backend runs commands on the host; the run cannot deny the
+        // network, and the layer does not claim it does.
+        assert!(
+            text.contains("- network for sandboxed commands: not bounded by this backend"),
+            "{text}"
+        );
         // The gateway's two tools plus the loop's own `judgment.update` and
         // `plan.update`.
         assert!(
@@ -7720,6 +7743,36 @@ mod tests {
             .collect();
         assert_eq!(carriers.len(), 1, "the text is carried once: {:?}", requests[1].messages);
         assert_eq!(carriers[0].role, MessageRole::Tool, "and it travels as the tool's words");
+    }
+
+    /// The layer says what the backend can enforce, not what the host asked
+    /// for. The local backend runs commands as the user and has nothing to take
+    /// the network away with, so a run configured `deny` there must not be told
+    /// a boundary exists — while the modes that can enforce it still say so.
+    #[test]
+    fn the_capability_layer_claims_only_the_network_boundary_the_backend_has() {
+        let manifest = ToolManifest::empty();
+        let facts = |sandbox, network_allowed| TurnCapabilityFacts {
+            sandbox,
+            network_allowed,
+            tool_secrets: Vec::new(),
+        };
+        assert!(
+            capability_text(&facts(SandboxMode::LocalProcess, false), &manifest)
+                .contains("- network for sandboxed commands: not bounded by this backend"),
+        );
+        assert!(
+            capability_text(&facts(SandboxMode::WorkspaceSandbox, false), &manifest)
+                .contains("- network for sandboxed commands: denied"),
+        );
+        assert!(
+            capability_text(&facts(SandboxMode::WorkspaceSandbox, true), &manifest)
+                .contains("- network for sandboxed commands: allowed"),
+        );
+        assert!(
+            capability_text(&facts(SandboxMode::ReadOnly, true), &manifest)
+                .contains("not applicable (no commands run in this backend)"),
+        );
     }
 
     /// An index entry is one bounded line: a long description is cut rather

@@ -264,7 +264,17 @@ fn environment_for(
 ) -> Result<Arc<dyn ExecutionEnvironment>, StackError> {
     match mode {
         SandboxMode::ReadOnly => Ok(Arc::new(LocalExecutionEnvironment::read_only(workspace_root))),
-        SandboxMode::LocalProcess => Ok(Arc::new(LocalExecutionEnvironment::new(workspace_root))),
+        SandboxMode::LocalProcess => {
+            // The flag is parsed for every mode so a typo is caught, but this
+            // backend has nothing to enforce it with: say so once, rather than
+            // let a `deny` read as a boundary that is not there.
+            if let Some(notice) =
+                network_notice(mode, network_allowed, sandbox::network_is_explicit())
+            {
+                eprintln!("{notice}");
+            }
+            Ok(Arc::new(LocalExecutionEnvironment::new(workspace_root)))
+        }
         SandboxMode::WorkspaceSandbox => {
             // The launcher is built here, before anything else: deriving the
             // package SID, checking that the machine's one-time setup ran, and
@@ -300,6 +310,27 @@ fn environment_for(
             mode: sandbox::label(mode),
             reason: "this build ships no Docker backend".to_string(),
         }),
+    }
+}
+
+/// The warning a host gets when its network policy has nothing to enforce it.
+///
+/// Only the local backend qualifies: it runs commands as the user, so a
+/// command reaches the network whatever `AGENT_SANDBOX_NETWORK` says. And only
+/// an explicit setting is worth answering — `deny` is the default, so warning
+/// on the unset case would put a line on every run's stderr. Returned rather
+/// than printed so the decision can be tested without capturing stderr.
+fn network_notice(
+    mode: SandboxMode,
+    network_allowed: bool,
+    explicit: bool,
+) -> Option<&'static str> {
+    match (mode, network_allowed, explicit) {
+        (SandboxMode::LocalProcess, false, true) => Some(
+            "sandbox: the local backend cannot restrict the network; \
+             AGENT_SANDBOX_NETWORK=deny has no effect here",
+        ),
+        _ => None,
     }
 }
 
@@ -728,6 +759,19 @@ mod tests {
                 SecretRef { source: "env".to_string(), name: "B_TOKEN".to_string() },
             ]
         );
+    }
+
+    /// A policy the selected backend cannot enforce is said out loud, once, at
+    /// assembly — and only where it is true: the confinement backends do honour
+    /// the flag, so they get no notice.
+    #[test]
+    fn a_network_policy_the_backend_cannot_enforce_is_announced() {
+        assert!(network_notice(SandboxMode::LocalProcess, false, true).is_some());
+        // The default `deny` says nothing: it is what every run has.
+        assert!(network_notice(SandboxMode::LocalProcess, false, false).is_none());
+        assert!(network_notice(SandboxMode::LocalProcess, true, true).is_none());
+        assert!(network_notice(SandboxMode::WorkspaceSandbox, false, true).is_none());
+        assert!(network_notice(SandboxMode::ReadOnly, false, true).is_none());
     }
 
     #[test]
