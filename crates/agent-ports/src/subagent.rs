@@ -179,6 +179,17 @@ pub struct SubagentRequest {
     /// How long the child may run, in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// The plan step this child carries, if the parent named one.
+    ///
+    /// The parent's own bookkeeping rather than something asked of the child:
+    /// it rides the request because the request is what the parent's log
+    /// records at the moment the child starts, and a reader asking "which step
+    /// is this child doing?" reads it from there. It is not a negotiated
+    /// feature — a backend that ignores it still runs the child the same way —
+    /// and it is skipped when unset so a request that names no step keeps the
+    /// bytes it always had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
 }
 
 impl SubagentRequest {

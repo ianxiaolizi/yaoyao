@@ -365,6 +365,34 @@ impl Plan {
     /// tells the model the ledger exists and nothing has been recorded, which
     /// is what a plan tool is for.
     pub fn render(&self) -> String {
+        self.render_with(&[])
+    }
+
+    /// The plan, with the workers this session started for its steps.
+    ///
+    /// A step a worker is carrying is not ready: `todo` says nobody has
+    /// started it, and a step with a child running is the opposite. The block
+    /// after the plan says what each worker is and what to do about it — the
+    /// sentence is advice, not a gate: the kernel cannot tell a child that
+    /// answered from a step that is finished, and the model is the one that
+    /// writes statuses.
+    ///
+    /// With no workers this is [`Self::render`] to the byte, so a session that
+    /// never named a step reads exactly as it always did.
+    pub fn render_with(&self, workers: &[StepWorker]) -> String {
+        let running: Vec<&str> = workers
+            .iter()
+            .filter(|worker| worker.state == WorkState::Running)
+            .map(|worker| worker.step.as_str())
+            .collect();
+        let mut text = self.render_plan(&running);
+        text.push_str(&workers_text(workers));
+        text
+    }
+
+    /// The plan text without the worker block; `running` names the steps whose
+    /// worker has not ended, which are therefore not ready.
+    fn render_plan(&self, running: &[&str]) -> String {
         if self.is_empty() {
             return String::from("Plan: none recorded yet.");
         }
@@ -398,9 +426,26 @@ impl Plan {
             // a plain list it would say every `todo` step is ready, which the
             // list already says.
             if self.has_dependencies() {
-                let ready = self.ready_indices();
+                let open = self.ready_indices();
+                let ready: Vec<usize> = open
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        self.items[index].id.as_deref().is_none_or(|id| !running.contains(&id))
+                    })
+                    .collect();
                 if ready.is_empty() {
-                    text.push_str("\nReady now: none; every open step is waiting on another.");
+                    // Which of the two reasons applies is worth saying: a step
+                    // held by its own ordering needs nothing, a step already
+                    // being worked needs its worker collected.
+                    if open.len() > ready.len() {
+                        text.push_str(
+                            "\nReady now: none; every open step is waiting on another or already \
+                             has a worker running.",
+                        );
+                    } else {
+                        text.push_str("\nReady now: none; every open step is waiting on another.");
+                    }
                 } else {
                     let names: Vec<String> = ready
                         .into_iter()
@@ -436,6 +481,100 @@ impl Plan {
         }
         self
     }
+}
+
+/// Where a worker a step was given stands.
+///
+/// `Running` is the only state that is not an ending: a step whose worker is
+/// still running is not ready, and a step whose worker ended is the model's to
+/// mark. The vocabulary follows the settlement events, so a reader can match a
+/// worker to the fact that ended it without a translation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl WorkState {
+    /// The wire word, matching the serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A child this session started for one step of its plan.
+///
+/// The pairing lives in the ledger — `subagent/spawned` names the step on the
+/// request, the settlement names the child — and this is the fold of the two:
+/// what a reader of the task layer needs to tell a step nobody has started
+/// from a step being worked from a step whose worker has come back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepWorker {
+    /// The step the child was started for, as the request named it.
+    pub step: String,
+    /// The child's session id, which is what `subagent.wait` takes.
+    pub child: String,
+    pub state: WorkState,
+}
+
+impl StepWorker {
+    /// The line this worker adds to the task layer.
+    ///
+    /// What to do about it comes after the fact and is phrased as advice: the
+    /// kernel knows the child ended, not that the step is finished, and only
+    /// the model writes statuses.
+    pub fn line(&self) -> String {
+        match self.state {
+            WorkState::Running => format!(
+                "- step {}: subagent {} is running; collect it with subagent.wait \
+                 (child_session_id: \"{}\").",
+                self.step, self.child, self.child
+            ),
+            WorkState::Completed => format!(
+                "- step {}: subagent {} completed; mark the step done in plan.update once its \
+                 work is finished.",
+                self.step, self.child
+            ),
+            WorkState::Failed => {
+                format!(
+                    "- step {}: subagent {} failed; the step is not done.",
+                    self.step, self.child
+                )
+            }
+            WorkState::Cancelled => {
+                format!(
+                    "- step {}: subagent {} was cancelled; the step is not done.",
+                    self.step, self.child
+                )
+            }
+        }
+    }
+}
+
+/// The worker block of the task layer, or nothing when there is no worker.
+///
+/// Separate from [`Plan::render_with`] because the block stands on its own: a
+/// session can hold workers for a plan it has since replaced, and a reader
+/// still has to be told about children that are running.
+pub fn workers_text(workers: &[StepWorker]) -> String {
+    let mut text = String::new();
+    if workers.is_empty() {
+        return text;
+    }
+    text.push_str("\nWorkers:");
+    for worker in workers {
+        text.push('\n');
+        text.push_str(&worker.line());
+    }
+    text
 }
 
 /// A step's colour during the cycle search.
@@ -924,6 +1063,88 @@ mod tests {
              Facts:\n\
              - the failure is in tokenize()"
         );
+    }
+
+    #[test]
+    fn a_plan_with_no_workers_renders_exactly_as_it_always_did() {
+        let plan = Plan::from_arguments(&a_plan()).expect("a valid plan");
+        assert_eq!(plan.render_with(&[]), plan.render());
+    }
+
+    #[test]
+    fn a_step_a_worker_is_carrying_is_not_ready_and_says_how_to_collect_it() {
+        let plan = Plan::from_arguments(&serde_json::json!({
+            "goal": "ship it",
+            "items": [
+                { "text": "read the failing test", "status": "done", "id": "read" },
+                { "text": "fix the tokenizer", "status": "todo", "id": "fix",
+                  "depends_on": ["read"] },
+            ],
+        }))
+        .expect("a valid plan");
+        let running = vec![StepWorker {
+            step: String::from("fix"),
+            child: String::from("child-1"),
+            state: WorkState::Running,
+        }];
+
+        let text = plan.render_with(&running);
+
+        assert!(
+            text.contains("Ready now: none; every open step is waiting on another or already has a worker running."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Workers:\n- step fix: subagent child-1 is running; collect it with \
+                           subagent.wait (child_session_id: \"child-1\")."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_ended_worker_names_the_step_and_leaves_the_decision_to_the_model() {
+        let plan = Plan::from_arguments(&serde_json::json!({
+            "goal": "ship it",
+            "items": [{ "text": "fix the tokenizer", "status": "todo", "id": "fix" }],
+        }))
+        .expect("a valid plan");
+        let ended = |state| {
+            vec![StepWorker { step: String::from("fix"), child: String::from("child-1"), state }]
+        };
+
+        let completed = plan.render_with(&ended(WorkState::Completed));
+        assert!(
+            completed.contains("subagent child-1 completed; mark the step done"),
+            "{completed}"
+        );
+        let failed = plan.render_with(&ended(WorkState::Failed));
+        assert!(failed.contains("subagent child-1 failed; the step is not done"), "{failed}");
+        let cancelled = plan.render_with(&ended(WorkState::Cancelled));
+        assert!(cancelled.contains("subagent child-1 was cancelled"), "{cancelled}");
+        // An ended worker is not a running one: the plain readiness line is
+        // back, because nothing is holding the step any more.
+        assert!(!failed.contains("already has a worker running"), "{failed}");
+    }
+
+    #[test]
+    fn workers_are_told_about_even_when_the_plan_they_named_is_gone() {
+        let workers = vec![StepWorker {
+            step: String::from("fix"),
+            child: String::from("child-1"),
+            state: WorkState::Running,
+        }];
+        let text = workers_text(&workers);
+        assert!(
+            text.starts_with(
+                "
+Workers:"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("step fix"), "{text}");
+        assert_eq!(workers_text(&[]), "");
     }
 
     #[test]

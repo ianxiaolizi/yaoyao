@@ -61,8 +61,9 @@ use agent_protocol::usertext::UserText;
 use chrono::Utc;
 
 use crate::context_layers::{
-    ContextLayers, ContextNotice, StaleRead, ToolAdvice, capability_text, context_notice,
-    stale_read, state_text, task_text, tool_source, truncate, user_text,
+    ContextLayers, ContextNotice, PendingFailure, StaleRead, TaskLedger, ToolAdvice,
+    capability_text, context_notice, repair_note, stale_read, state_text, task_text, tool_source,
+    truncate, user_text,
 };
 
 /// Longest provider error text persisted in a durable attempt event.
@@ -944,35 +945,9 @@ impl LoopTurn {
     }
 }
 
-/// A call that failed for a reason the next step could act on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingFailure {
-    call_id: String,
-    tool: String,
-    detail: String,
-}
-
 /// The advice this turn's task layer carries, from its frozen tool sets.
 fn tool_advice(turn: &LoopTurn) -> ToolAdvice {
     ToolAdvice::new(&turn.irreversible_tools, &turn.write_tools, &turn.read_tools)
-}
-
-/// What a repair posture asks the next step to do.
-///
-/// The note is derived, not generic: it names the call that failed and what the
-/// tool said, so "change one variable" is a sentence about this failure rather
-/// than a maxim. It goes into the task layer only after the posture switches,
-/// and it is bounded like every other line in that layer.
-fn repair_note(failure: Option<&PendingFailure>, because: &str) -> String {
-    let opening = match failure {
-        Some(failure) => format!(
-            "Repair posture: `{}` failed ({}).",
-            failure.tool,
-            truncate(&failure.detail, 100)
-        ),
-        None => format!("Repair posture: {because}."),
-    };
-    format!("{opening} Change one variable in the next call; if you stop, say what you checked.")
 }
 
 /// Enter a posture that differs from the one the turn opened in.
@@ -1002,7 +977,7 @@ fn refresh_task_layer(turn: &mut LoopTurn, ledger: bool) {
     let text = task_text(
         &turn.ctx.user_input,
         facts,
-        turn.plan_view.as_ref(),
+        TaskLedger { plan: turn.plan_view.as_ref(), workers: &turn.ctx.workers },
         turn.judgment.as_ref(),
         turn.stale.as_ref(),
         ledger.then_some(&advice),
@@ -1255,7 +1230,7 @@ impl AgentLoop for DefaultAgentLoop {
                 task: task_text(
                     &ctx.user_input,
                     facts,
-                    ctx.plan.as_ref(),
+                    TaskLedger { plan: ctx.plan.as_ref(), workers: &ctx.workers },
                     if self.judgment_ledger { ctx.judgment.as_ref() } else { None },
                     stale.as_ref(),
                     if self.judgment_ledger { Some(&advice) } else { None },
@@ -3331,6 +3306,7 @@ mod tests {
             state: None,
             capability: None,
             plan: None,
+            workers: Vec::new(),
             judgment: None,
             pending_failure: None,
         }
@@ -6943,7 +6919,15 @@ mod tests {
             messages[3],
             ModelMessage::task_for_turn(
                 &turn.turn_id,
-                task_text(&turn.user_input, &facts(), None, None, None, None, None),
+                task_text(
+                    &turn.user_input,
+                    &facts(),
+                    TaskLedger::default(),
+                    None,
+                    None,
+                    None,
+                    None
+                ),
             )
         );
         assert_eq!(messages[4], ModelMessage::user_for_turn(&turn.turn_id, "hi"));
@@ -7477,8 +7461,15 @@ mod tests {
         let facts =
             TurnStateFacts { input_kind: TurnInputKind::Scheduled, max_steps: 1, ..facts() };
         let long = "x".repeat(MAX_TASK_CHARS + 10);
-        let text =
-            task_text(&serde_json::json!({ "text": long }), &facts, None, None, None, None, None);
+        let text = task_text(
+            &serde_json::json!({ "text": long }),
+            &facts,
+            TaskLedger::default(),
+            None,
+            None,
+            None,
+            None,
+        );
 
         assert!(text.contains("Task for this turn: \"xxx"), "{text}");
         assert!(text.contains("...\""), "cut text is marked: {text}");

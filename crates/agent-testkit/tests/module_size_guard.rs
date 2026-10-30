@@ -24,8 +24,8 @@ const ORDINARY_CEILING: usize = 2000;
 /// Files that were already over the ceiling when the guard landed, at their
 /// size on that day. Shrink freely; growth is the regression.
 const RATCHETS: &[(&str, usize)] = &[
-    ("crates/agent-loop/src/default.rs", 7746),
-    ("crates/agent-kernel/src/scheduler.rs", 2954),
+    ("crates/agent-loop/src/default.rs", 7737),
+    ("crates/agent-kernel/src/scheduler.rs", 2931),
     ("crates/agent-kernel/src/guarded.rs", 2226),
     ("crates/agent-kernel/src/resume.rs", 2074),
 ];

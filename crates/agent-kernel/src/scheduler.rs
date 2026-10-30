@@ -19,9 +19,7 @@ use agent_ports::control::{ControlError, ControlHandler, ControlOutcome, Control
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
 use agent_ports::instructions::{InstructionError, InstructionSource};
 use agent_protocol::events::{Actor, EventDraft, EventType};
-use agent_protocol::ids::{
-    EventId, EventSeq, InboxItemId, RunId, SchemaVersion, SessionId, StepId, TurnId,
-};
+use agent_protocol::ids::{EventSeq, InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::inbox::{InboxItem, InboxKind};
 use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget};
 use chrono::{DateTime, Utc};
@@ -33,9 +31,11 @@ use crate::lifecycle;
 use crate::plan;
 use crate::session_lifecycle;
 
+mod draft;
 mod endings;
 mod journal;
 
+pub(crate) use draft::draft;
 use endings::{Ending, Gate};
 use journal::{SessionJournal, close_failed_turn};
 
@@ -435,8 +435,11 @@ impl Scheduler {
         // The plan ledger as of this boundary. `Some` even when nothing has
         // been recorded: the Scheduler keeps the ledger, and "none recorded
         // yet" is a fact worth placing, unlike a caller that has no ledger at
-        // all (`None`).
-        let plan = plan::current(&history)?.unwrap_or_default();
+        // all (`None`). The workers are folded from the same history: the plan
+        // is what the model said it is doing, and they are which steps a child
+        // is already carrying.
+        let (plan, workers) =
+            (plan::current(&history)?.unwrap_or_default(), plan::workers(&history));
         // The judgment record, on the same terms: the Scheduler keeps the
         // ledger, and "none recorded yet" is a fact worth placing.
         let judgment = judgment::current(&history)?.unwrap_or_default();
@@ -486,6 +489,7 @@ impl Scheduler {
             state: Some(state),
             capability: self.capability.clone(),
             plan: Some(plan),
+            workers,
             judgment: Some(judgment),
             pending_failure,
         };
@@ -826,33 +830,6 @@ impl Scheduler {
     async fn next_seq(&self, session_id: &SessionId) -> Result<EventSeq, SchedulerError> {
         let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
         Ok(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO))
-    }
-}
-
-fn draft(
-    session_id: &SessionId,
-    event_type: &str,
-    payload: serde_json::Value,
-    actor: Actor,
-    run_id: Option<&RunId>,
-    turn_id: Option<&TurnId>,
-    step_id: Option<&StepId>,
-) -> EventDraft {
-    EventDraft {
-        event_id: EventId::new(),
-        event_type: EventType::new(event_type),
-        schema_version: SchemaVersion::current(),
-        session_id: session_id.clone(),
-        run_id: run_id.cloned(),
-        turn_id: turn_id.cloned(),
-        step_id: step_id.cloned(),
-        actor,
-        created_at: Utc::now(),
-        causation_id: None,
-        correlation_id: None,
-        payload,
-        metadata: serde_json::json!({}),
-        ignorable: false,
     }
 }
 

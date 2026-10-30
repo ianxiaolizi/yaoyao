@@ -36,6 +36,18 @@
 //! ([`Children::drain`], called from `support::watch`) so a child is never left
 //! with its process gone and its ending unrecorded.
 //!
+//! ## A child can be a step's worker
+//!
+//! A call may name a step of the session's plan (`step`), which turns the graph
+//! from something the model reads into something that decides what may start:
+//! the step has to exist, still be open, and have every dependency done, and a
+//! step one worker already carries refuses a second. The check reads the log at
+//! the moment of the call, not the turn's opening, so a plan written earlier in
+//! the same turn governs. What it does *not* do is finish the step: the ending
+//! is reported against the step in the next turn's task layer, and marking it
+//! done stays the model's act — a child saying it is finished is not the same
+//! fact as the step being finished.
+//!
 //! ## What the call costs, and who agrees to it
 //!
 //! The tool declares `subagent.spawn` and it is the only thing standing between
@@ -77,6 +89,7 @@ use agent_ports::tool_provider::{
 use agent_protocol::events::EventType;
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::permissions::Capability;
+use agent_protocol::plan::{PlanItemStatus, WorkState};
 use agent_subagent_stdio::StdioSubagentProvider;
 use serde::Deserialize;
 use serde_json::json;
@@ -109,7 +122,8 @@ const RUN_DESCRIPTION: &str = "Delegate one self-contained objective to a child 
      arrives later. Use `subagent.wait` to wait for that ending, or `subagent.status` to see what \
      is running. Use it for work that is separable from the current step, especially work you can \
      do while going on to something else, and call it more than once in one step to run children in \
-     parallel.";
+     parallel. When the plan names the step this child carries, pass its `step` id: a step the plan \
+     has not reached refuses a worker, and a step one worker already carries refuses a second.";
 
 /// What a model reads when deciding whether to wait.
 const WAIT_DESCRIPTION: &str = "Wait for a child started by `subagent.run` in this run and return \
@@ -162,6 +176,9 @@ struct RunArgs {
     timeout_ms: Option<u64>,
     #[serde(default)]
     budget: Option<agent_protocol::profile::RunBudget>,
+    /// The plan step this child carries, if the caller named one.
+    #[serde(default)]
+    step: Option<String>,
 }
 
 impl RunArgs {
@@ -174,6 +191,7 @@ impl RunArgs {
             budget: self.budget,
             output_schema: self.output_schema,
             timeout_ms: self.timeout_ms,
+            step: self.step,
         }
     }
 }
@@ -603,6 +621,98 @@ impl ToolProvider for SubagentToolProvider {
 }
 
 impl SubagentToolProvider {
+    /// Whether the plan says `step` may start a worker now.
+    ///
+    /// Read from the log at the moment of the call rather than from the turn's
+    /// opening: a plan written earlier in the same turn is the one that
+    /// governs, and a second worker on a step the first one is carrying is the
+    /// mistake this check exists for. Every refusal names what to do instead,
+    /// because the caller is a model that can act on it.
+    async fn admit_step(&self, step: &str) -> Result<(), ToolProviderError> {
+        let events =
+            self.store.read_stream(&self.parent, EventSeq::ZERO, usize::MAX).await.map_err(
+                |error| refused(TOOL_NAME, format!("cannot read the session log: {error}")),
+            )?;
+        let plan = agent_kernel::plan::current(&events)
+            .map_err(|error| {
+                refused(TOOL_NAME, format!("the session's plan will not read: {error}"))
+            })?
+            .unwrap_or_default();
+        let known: Vec<&str> = plan.items.iter().filter_map(|item| item.id.as_deref()).collect();
+        if known.is_empty() {
+            return Err(refused(
+                TOOL_NAME,
+                format!(
+                    "`step` is {step:?}, but this session's plan names no step ids; give the \
+                     step an `id` in plan.update, or drop `step`"
+                ),
+            ));
+        }
+        let Some(item) = plan.items.iter().find(|item| item.id.as_deref() == Some(step)) else {
+            return Err(refused(
+                TOOL_NAME,
+                format!(
+                    "`step` is {step:?}, which is not a step in this session's plan; the ids are: {}",
+                    known.join(", ")
+                ),
+            ));
+        };
+        if let Some(worker) = agent_kernel::plan::workers(&events)
+            .into_iter()
+            .find(|worker| worker.step == step && worker.state == WorkState::Running)
+        {
+            return Err(refused(
+                TOOL_NAME,
+                format!(
+                    "{step:?} already has a worker: subagent {}. Collect it with {WAIT_TOOL_NAME} \
+                     before starting another — two children on one step is the same work done \
+                     twice.",
+                    worker.child
+                ),
+            ));
+        }
+        match item.status {
+            PlanItemStatus::Done => {
+                return Err(refused(
+                    TOOL_NAME,
+                    format!("{step:?} is already done; a worker is for a step that still has work"),
+                ));
+            }
+            PlanItemStatus::Doing => {
+                return Err(refused(
+                    TOOL_NAME,
+                    format!(
+                        "{step:?} is already doing; a worker is for a step nobody has started — \
+                         call plan.update to say what that work is, or drop `step`"
+                    ),
+                ));
+            }
+            PlanItemStatus::Todo => {}
+        }
+        let waiting: Vec<&str> = item
+            .depends_on
+            .iter()
+            .filter(|dep| {
+                !plan.items.iter().any(|other| {
+                    other.id.as_deref() == Some(dep.as_str())
+                        && other.status == PlanItemStatus::Done
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        if !waiting.is_empty() {
+            return Err(refused(
+                TOOL_NAME,
+                format!(
+                    "{step:?} waits on {}, which is not done; starting a worker now would work \
+                     on a step the plan has not reached",
+                    waiting.join(", ")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// `subagent.run`: start a child, and either wait for it or hand back a
     /// receipt naming it.
     async fn run(&self, invocation: &ToolInvocation) -> Result<ToolResult, ToolProviderError> {
@@ -622,10 +732,22 @@ impl SubagentToolProvider {
             ));
         };
 
+        // Naming a step is asking the plan to admit the work: the graph is the
+        // ordering, and a step whose dependencies are not done is one the plan
+        // says has not been reached. Read before the clock because a refused
+        // call starts no child at all.
+        if let Some(step) = &args.step {
+            self.admit_step(step).await?;
+        }
+
         // The clock covers the delegation and not the argument parsing: what a
         // caller wants to know is what the child cost, and the child starts at
         // the fork.
         let started = Instant::now();
+
+        // Held past the request because the receipt names the step, and the
+        // request is consumed by the delegation.
+        let step = args.step.clone();
 
         // `None` is the parent's most recent closed turn, which is the only
         // boundary a fork will copy up to: a child delegated mid-turn inherits
@@ -668,7 +790,7 @@ impl SubagentToolProvider {
                 let child = self.children.started(delegation.clone(), self.parent.clone(), &handle);
                 Ok(ToolResult {
                     status: ToolStatus::Completed,
-                    content: receipt(child.id()),
+                    content: receipt(child.id(), step.as_deref()),
                     artifacts: Vec::new(),
                     truncated: false,
                     facts: Default::default(),
@@ -909,6 +1031,14 @@ impl SubagentToolProvider {
                     "description": "Bound what the child may spend. A backend that enforces no \
                                     budget refuses the delegation instead of dropping the limit.",
                 },
+                "step": {
+                    "type": "string",
+                    "description": "The id of the plan step this child carries. Optional, and \
+                                    checked against the plan when given: the step must exist, \
+                                    still be open, and have no dependency left undone. Naming \
+                                    it is what lets the task layer say which step a worker is \
+                                    working on, and what lets two ready steps run at once.",
+                },
             },
             "required": ["provider", "objective"],
             "additionalProperties": false,
@@ -963,9 +1093,13 @@ fn settlement(payload: &serde_json::Value) -> String {
 /// and it is what `subagent.wait` and `subagent.status` name it by. Saying that
 /// the call did not wait is not decoration: a model that reads a receipt as an
 /// answer will carry on believing it has the result.
-fn receipt(child: &SessionId) -> String {
+fn receipt(child: &SessionId, step: Option<&str>) -> String {
+    let carrying = match step {
+        Some(step) => format!(" It carries step {step:?} of this session's plan."),
+        None => String::new(),
+    };
     format!(
-        "subagent {child}: started and running in the background.\n\
+        "subagent {child}: started and running in the background.{carrying}\n\
          Collect its ending with {WAIT_TOOL_NAME} (child_session_id: \"{child}\"); \
          {STATUS_TOOL_NAME} shows it without waiting."
     )
@@ -1650,5 +1784,199 @@ mod tests {
             ignorable: false,
         };
         store.append(session, seq, vec![draft]).await.expect("an append");
+    }
+
+    /// A provider over a log this test fills, for the admission checks.
+    ///
+    /// Nothing here ever reaches a child: every case below is decided before
+    /// the fork, which is the point of admitting a step at all.
+    fn admitting(store: Arc<agent_testkit::FakeEventStore>) -> SubagentToolProvider {
+        SubagentToolProvider::new(
+            store,
+            Arc::new(agent_testkit::FakeToolProvider::new()),
+            SessionId::from_string("parent"),
+            &[config("fake", None)],
+            Arc::new(Children::new()),
+            Delegation::Background,
+        )
+    }
+
+    async fn plan_of(store: &agent_testkit::FakeEventStore, plan: serde_json::Value) {
+        append(
+            store,
+            &SessionId::from_string("parent"),
+            EventType::PLAN_UPDATED,
+            json!({ "plan": plan }),
+        )
+        .await;
+    }
+
+    /// The step two of the tests below share: open, and waiting on `read`.
+    fn a_graph() -> serde_json::Value {
+        json!({
+            "goal": "ship it",
+            "items": [
+                { "text": "read the failing test", "status": "done", "id": "read" },
+                { "text": "fix the tokenizer", "status": "todo", "id": "fix", "depends_on": ["read"] },
+                { "text": "run the suite", "status": "todo", "id": "test", "depends_on": ["fix"] },
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_step_is_refused_while_the_step_it_waits_on_is_open() {
+        let store = Arc::new(agent_testkit::FakeEventStore::new());
+        plan_of(store.as_ref(), a_graph()).await;
+
+        let error = admitting(store)
+            .invoke(&ToolInvocation::proposed(
+                TOOL_NAME,
+                json!({ "provider": "fake", "objective": "run it", "step": "test" }),
+            ))
+            .await
+            .expect_err("a step the plan has not reached was admitted");
+
+        let message = error.to_string();
+        assert!(message.contains("waits on fix"), "{message}");
+        assert!(message.contains("not done"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_step_one_worker_already_carries_refuses_a_second() {
+        // Two children on one step is the same work done twice, and the second
+        // one is invisible in the task layer: the fold keeps the first child's
+        // entry and the second only looks like a delegation.
+        let store = Arc::new(agent_testkit::FakeEventStore::new());
+        plan_of(store.as_ref(), a_graph()).await;
+        append(
+            store.as_ref(),
+            &SessionId::from_string("parent"),
+            EventType::SUBAGENT_SPAWNED,
+            json!({
+                "child_session_id": "child-1",
+                "provider": "fake",
+                "request": { "objective": "fix it", "step": "fix" },
+            }),
+        )
+        .await;
+
+        let error = admitting(store)
+            .invoke(&ToolInvocation::proposed(
+                TOOL_NAME,
+                json!({ "provider": "fake", "objective": "fix it again", "step": "fix" }),
+            ))
+            .await
+            .expect_err("a step with a worker was given another");
+
+        let message = error.to_string();
+        assert!(message.contains("already has a worker: subagent child-1"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_step_the_plan_does_not_name_lists_the_ones_it_does() {
+        let store = Arc::new(agent_testkit::FakeEventStore::new());
+        plan_of(store.as_ref(), a_graph()).await;
+
+        let error = admitting(store)
+            .invoke(&ToolInvocation::proposed(
+                TOOL_NAME,
+                json!({ "provider": "fake", "objective": "x", "step": "deploy" }),
+            ))
+            .await
+            .expect_err("a step the plan does not have was admitted");
+
+        let message = error.to_string();
+        assert!(message.contains("read, fix, test"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn naming_a_step_in_a_session_with_no_plan_says_to_write_one() {
+        let store = Arc::new(agent_testkit::FakeEventStore::new());
+
+        let error = admitting(store)
+            .invoke(&ToolInvocation::proposed(
+                TOOL_NAME,
+                json!({ "provider": "fake", "objective": "x", "step": "fix" }),
+            ))
+            .await
+            .expect_err("a step was admitted with no plan at all");
+
+        let message = error.to_string();
+        assert!(message.contains("names no step ids"), "{message}");
+        assert!(message.contains("plan.update"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_step_that_is_done_or_already_doing_is_not_a_worker_s_step() {
+        let store = Arc::new(agent_testkit::FakeEventStore::new());
+        plan_of(
+            store.as_ref(),
+            json!({
+                "goal": "ship it",
+                "items": [
+                    { "text": "read", "status": "done", "id": "read" },
+                    { "text": "fix", "status": "doing", "id": "fix" },
+                ],
+            }),
+        )
+        .await;
+        let provider = admitting(store);
+
+        for (step, expected) in [("read", "already done"), ("fix", "already doing")] {
+            let error = provider
+                .invoke(&ToolInvocation::proposed(
+                    TOOL_NAME,
+                    json!({ "provider": "fake", "objective": "x", "step": step }),
+                ))
+                .await
+                .expect_err("a step with no work left was given a worker");
+            assert!(error.to_string().contains(expected), "{step}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ready_step_passes_admission_and_the_request_carries_it() {
+        // The gate opening is what this checks: what happens next is the fork,
+        // and this session has no closed turn for one, so the call fails there
+        // rather than here — with a reason that says so.
+        let store = Arc::new(agent_testkit::FakeEventStore::new());
+        plan_of(store.as_ref(), a_graph()).await;
+        let provider = admitting(store);
+
+        provider.admit_step("fix").await.expect("a ready step is admitted");
+
+        let error = provider
+            .invoke(&ToolInvocation::proposed(
+                TOOL_NAME,
+                json!({ "provider": "fake", "objective": "fix it", "step": "fix" }),
+            ))
+            .await
+            .expect_err("no closed turn to fork from");
+        assert!(!error.to_string().contains("already"), "the gate let it through: {error}");
+    }
+
+    #[test]
+    fn a_request_that_names_a_step_carries_it_and_one_that_does_not_stays_byte_identical() {
+        let named: RunArgs =
+            serde_json::from_value(json!({ "provider": "fake", "objective": "x", "step": "fix" }))
+                .expect("arguments");
+        assert_eq!(named.into_request().step.as_deref(), Some("fix"));
+
+        let plain: RunArgs =
+            serde_json::from_value(json!({ "provider": "fake", "objective": "x" }))
+                .expect("arguments");
+        let request = plain.into_request();
+        assert_eq!(request.step, None);
+        assert!(
+            !serde_json::to_string(&request).expect("serialize").contains("step"),
+            "an unnamed step is not written at all"
+        );
+    }
+
+    #[test]
+    fn the_receipt_names_the_step_the_child_carries() {
+        let child = SessionId::from_string("child-1");
+        assert!(receipt(&child, Some("fix")).contains("It carries step \"fix\""));
+        assert!(!receipt(&child, None).contains("carries"), "a plain receipt is unchanged");
     }
 }

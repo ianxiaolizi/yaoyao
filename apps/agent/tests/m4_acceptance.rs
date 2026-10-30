@@ -1094,3 +1094,83 @@ async fn a_child_left_running_is_collected_by_the_drain_before_the_process_ends(
     assert!(h.stack.children.drain().await.is_empty());
     assert_eq!(h.events_of(EventType::SUBAGENT_COMPLETED).await.len(), 1);
 }
+
+/// M4: the plan's graph decides which steps may start, and the step a worker
+/// carries is visible in the task layer of the turn after.
+///
+/// The three facts this checks are the ones that only exist when the pieces are
+/// wired together: a step the graph has not reached refuses a worker before any
+/// child is forked, the child that does start records which step it carries, and
+/// the next turn's task layer says so — including that the step is no longer
+/// ready, because a worker has it.
+#[tokio::test]
+async fn a_turn_starts_a_worker_on_the_step_the_plan_says_is_ready() {
+    let responses = vec![
+        // The fork boundary: a session has to have finished a turn before it can
+        // delegate, so the plan is written in the second turn.
+        Scripted::Ok(answer_body("ready")),
+        Scripted::Ok(tool_call_body(
+            "call-1",
+            "plan.update",
+            serde_json::json!({
+                "goal": "ship the tokenizer fix",
+                "items": [
+                    { "text": "fix the tokenizer", "status": "todo", "id": "fix" },
+                    { "text": "run the suite", "status": "todo", "id": "test",
+                      "depends_on": ["fix"] },
+                ],
+            }),
+        )),
+        Scripted::Ok(answer_body("planned")),
+        // `test` waits on `fix`, which is still open: the call is refused
+        // before any child exists.
+        Scripted::Ok(tool_call_body(
+            "call-2",
+            "subagent.run",
+            serde_json::json!({ "provider": "fake", "objective": "run the suite", "step": "test" }),
+        )),
+        Scripted::Ok(tool_call_body(
+            "call-3",
+            "subagent.run",
+            serde_json::json!({
+                "provider": "fake",
+                "objective": "fix the tokenizer",
+                "step": "fix",
+            }),
+        )),
+        Scripted::Ok(answer_body("started")),
+        Scripted::Ok(answer_body("still working")),
+    ];
+    let workspace = Arc::new(tempfile::tempdir().expect("temp workspace"));
+    let h = harness_with(workspace, responses, false, delegating_profile()).await;
+    h.ask("warm up").await;
+    h.ask("plan the fix").await;
+    let report = h.ask("start the fix").await;
+    assert_eq!(report.stop_reason, StopReason::FinalAnswer, "{report:?}");
+
+    // The refusal reached the model, and it names the step it waits on.
+    let bodies = h.sent_bodies();
+    assert!(bodies[4].contains("waits on fix"), "{}", bodies[4]);
+
+    // One child started, and it carries the step it was started for.
+    let spawned = h.events_of(EventType::SUBAGENT_SPAWNED).await;
+    assert_eq!(spawned.len(), 1, "{:?}", h.types().await);
+    assert_eq!(spawned[0].event.payload["request"]["step"], "fix");
+
+    // The turn after opens on a task layer that says which step the worker is
+    // carrying. The fold reads the parent's log at the boundary, so it is a
+    // turn that opens with the child still running that has to show it.
+    let opening_index = h.sent_bodies().len();
+    h.ask("check on it").await;
+    let opening = h.sent_bodies()[opening_index].clone();
+    assert!(opening.contains("- step fix: subagent "), "{opening}");
+    assert!(opening.contains("is running; collect it with subagent.wait"), "{opening}");
+    assert!(
+        opening.contains("already has a worker running") || !opening.contains("Ready now: none"),
+        "the readiness line accounts for the worker: {opening}"
+    );
+
+    // Release the child, so the test does not leave a process running.
+    h.stack.children.drain().await;
+    assert_eq!(h.events_of(EventType::SUBAGENT_COMPLETED).await.len(), 1);
+}

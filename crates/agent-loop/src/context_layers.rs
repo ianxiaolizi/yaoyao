@@ -14,7 +14,7 @@ use agent_ports::context_engine::ContextUsage;
 use agent_ports::execution_environment::SandboxMode;
 use agent_ports::model_provider::{ContentBlock, ModelMessage, ToolManifest};
 use agent_protocol::judgment::Judgment;
-use agent_protocol::plan::Plan;
+use agent_protocol::plan::{Plan, StepWorker};
 use agent_protocol::tool::ToolSource;
 use chrono::SecondsFormat;
 
@@ -133,6 +133,35 @@ pub(crate) fn state_text(facts: &TurnStateFacts) -> String {
     )
 }
 
+/// A call that failed for a reason the next step could act on.
+///
+/// It lives here, beside the sentences that are made from it, rather than with
+/// the turn that carries it: what the loop needs from a failure is its words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingFailure {
+    pub(crate) call_id: String,
+    pub(crate) tool: String,
+    pub(crate) detail: String,
+}
+
+/// What a repair posture asks the next step to do.
+///
+/// The note is derived, not generic: it names the call that failed and what the
+/// tool said, so "change one variable" is a sentence about this failure rather
+/// than a maxim. It goes into the task layer only after the posture switches,
+/// and it is bounded like every other line in that layer.
+pub(crate) fn repair_note(failure: Option<&PendingFailure>, because: &str) -> String {
+    let opening = match failure {
+        Some(failure) => format!(
+            "Repair posture: `{}` failed ({}).",
+            failure.tool,
+            truncate(&failure.detail, 100)
+        ),
+        None => format!("Repair posture: {because}."),
+    };
+    format!("{opening} Change one variable in the next call; if you stop, say what you checked.")
+}
+
 /// The task layer's text: what this turn is for, how it began, the run's step
 /// ceiling, and the session's plan. The input is quoted and bounded; the user
 /// message after the layers still carries it whole.
@@ -140,10 +169,23 @@ pub(crate) fn state_text(facts: &TurnStateFacts) -> String {
 /// A plan that replaces the previous one changes this text, so the task
 /// message is rewritten in place when the ledger moves — the layer the next
 /// step sends is the one the model just wrote.
+/// The ledger the task layer shows: the plan the model wrote, and the workers
+/// this session started for its steps.
+///
+/// One parameter rather than two because they are read together — a step with a
+/// running worker is not ready, which is a sentence about the plan and the
+/// workers at once — and because a text function that takes every fact
+/// separately stops being readable long before it stops compiling.
+#[derive(Default)]
+pub(crate) struct TaskLedger<'a> {
+    pub(crate) plan: Option<&'a Plan>,
+    pub(crate) workers: &'a [StepWorker],
+}
+
 pub(crate) fn task_text(
     input: &serde_json::Value,
     facts: &TurnStateFacts,
-    plan: Option<&Plan>,
+    ledger: TaskLedger<'_>,
     judgment: Option<&Judgment>,
     stale: Option<&StaleRead>,
     advice: Option<&ToolAdvice>,
@@ -178,9 +220,13 @@ pub(crate) fn task_text(
              then. Re-read anything the answer depends on before answering.",
         );
     }
-    if let Some(plan) = plan {
+    if let Some(plan) = ledger.plan {
         text.push('\n');
-        text.push_str(&plan.render());
+        text.push_str(&plan.render_with(ledger.workers));
+    } else if !ledger.workers.is_empty() {
+        // No ledger, but children are running: the worker block says what a
+        // step name means and how to collect it, so it is placed on its own.
+        text.push_str(&agent_protocol::plan::workers_text(ledger.workers));
     }
     if let Some(judgment) = judgment {
         text.push('\n');
@@ -501,7 +547,7 @@ mod tests {
         let text = task_text(
             &serde_json::json!({ "text": "do the work" }),
             &facts(),
-            Some(&plan),
+            TaskLedger { plan: Some(&plan), workers: &[] },
             None,
             None,
             None,
@@ -512,6 +558,35 @@ mod tests {
         assert!(text.contains("2. [todo] fix the tokenizer (id: fix, after: read)"), "{text}");
         assert!(text.contains("3. [todo] run the suite (after: fix)"), "{text}");
         assert!(text.contains("Ready now: 2 (fix)"), "{text}");
+    }
+
+    #[test]
+    fn the_task_layer_says_which_step_a_worker_is_carrying() {
+        let plan = Plan::from_arguments(&serde_json::json!({
+            "goal": "ship the parser fix",
+            "items": [{ "id": "fix", "text": "fix the tokenizer", "status": "todo" }],
+        }))
+        .expect("a valid plan");
+        let workers = vec![StepWorker {
+            step: String::from("fix"),
+            child: String::from("child-1"),
+            state: agent_protocol::plan::WorkState::Running,
+        }];
+
+        let text = task_text(
+            &serde_json::json!({ "text": "do the work" }),
+            &facts(),
+            TaskLedger { plan: Some(&plan), workers: &workers },
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            text.contains("- step fix: subagent child-1 is running; collect it with subagent.wait"),
+            "{text}"
+        );
     }
 
     fn facts() -> TurnStateFacts {

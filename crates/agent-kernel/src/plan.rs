@@ -7,7 +7,7 @@
 //! history.
 
 use agent_protocol::events::{EventType, StoredEvent};
-use agent_protocol::plan::Plan;
+use agent_protocol::plan::{Plan, StepWorker, WorkState};
 
 /// The plan the session currently carries, if any.
 ///
@@ -24,6 +24,61 @@ pub fn current(events: &[StoredEvent]) -> Result<Option<Plan>, serde_json::Error
         return Ok(Some(plan));
     }
     Ok(None)
+}
+
+/// The workers this session started for its plan's steps.
+///
+/// Two events make one worker: the spawn names the child and the step on its
+/// request, and the first settlement naming that child ends it. Both are
+/// matched by the child's session id — the thing `subagent.wait` takes — so a
+/// session that delegates to the same backend twice keeps its workers apart.
+///
+/// A spawn that names no step is not a worker: a child the plan does not know
+/// about is a delegation, not a step being carried, and putting it in the
+/// table would make the task layer talk about work nobody ordered.
+pub fn workers(events: &[StoredEvent]) -> Vec<StepWorker> {
+    let mut workers: Vec<StepWorker> = Vec::new();
+    for stored in events {
+        let event_type = stored.event.event_type.as_str();
+        if !event_type.starts_with("subagent/") {
+            continue;
+        }
+        let payload = &stored.event.payload;
+        let Some(child) = payload.get("child_session_id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        if event_type == EventType::SUBAGENT_SPAWNED {
+            let step = payload
+                .get("request")
+                .and_then(|request| request.get("step"))
+                .and_then(|step| step.as_str());
+            if let Some(step) = step {
+                workers.push(StepWorker {
+                    step: step.to_string(),
+                    child: child.to_string(),
+                    state: WorkState::Running,
+                });
+            }
+            continue;
+        }
+        let Some(worker) = workers
+            .iter_mut()
+            .rev()
+            .find(|worker| worker.child == child && worker.state == WorkState::Running)
+        else {
+            continue;
+        };
+        worker.state = match event_type {
+            EventType::SUBAGENT_COMPLETED => WorkState::Completed,
+            EventType::SUBAGENT_FAILED => WorkState::Failed,
+            EventType::SUBAGENT_CANCELLED => WorkState::Cancelled,
+            // A settlement this fold does not know is not guessed at: the
+            // worker stays running, which is the safe reading — a step whose
+            // ending is unknown is not ready to start again.
+            _ => continue,
+        };
+    }
+    workers
 }
 
 #[cfg(test)]
@@ -82,5 +137,83 @@ mod tests {
     fn a_plan_event_without_a_readable_plan_is_an_error() {
         let broken = stored(1, EventType::PLAN_UPDATED, serde_json::json!({}));
         assert!(current(&[broken]).is_err());
+    }
+
+    fn spawned(seq: u64, child: &str, step: Option<&str>) -> StoredEvent {
+        let mut request = serde_json::json!({ "objective": "carry the step" });
+        if let Some(step) = step {
+            request["step"] = serde_json::json!(step);
+        }
+        stored(
+            seq,
+            EventType::SUBAGENT_SPAWNED,
+            serde_json::json!({
+                "child_session_id": child,
+                "provider": "fake",
+                "request": request,
+            }),
+        )
+    }
+
+    fn settled(seq: u64, child: &str, event_type: &str) -> StoredEvent {
+        stored(
+            seq,
+            event_type,
+            serde_json::json!({
+                "child_session_id": child,
+                "provider": "fake",
+                "outcome": { "status": "completed" },
+            }),
+        )
+    }
+
+    #[test]
+    fn a_spawn_naming_a_step_is_a_worker_until_its_settlement_arrives() {
+        let events =
+            vec![spawned(1, "child-1", Some("build")), spawned(2, "child-2", Some("test"))];
+        let found = workers(&events);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].step, "build");
+        assert_eq!(found[0].child, "child-1");
+        assert_eq!(found[0].state, WorkState::Running);
+        assert_eq!(found[1].state, WorkState::Running);
+
+        let events = [events, vec![settled(3, "child-1", EventType::SUBAGENT_COMPLETED)]].concat();
+        let found = workers(&events);
+        assert_eq!(found[0].state, WorkState::Completed, "the settlement follows the child");
+        assert_eq!(found[1].state, WorkState::Running, "the other child is untouched");
+    }
+
+    #[test]
+    fn a_settlement_under_each_family_names_the_state_it_means() {
+        for (event_type, state) in [
+            (EventType::SUBAGENT_COMPLETED, WorkState::Completed),
+            (EventType::SUBAGENT_FAILED, WorkState::Failed),
+            (EventType::SUBAGENT_CANCELLED, WorkState::Cancelled),
+        ] {
+            let events =
+                vec![spawned(1, "child-1", Some("build")), settled(2, "child-1", event_type)];
+            assert_eq!(workers(&events)[0].state, state, "{event_type}");
+        }
+    }
+
+    #[test]
+    fn a_delegation_that_named_no_step_is_not_a_worker() {
+        // A child the plan does not know about is a delegation, not a step being
+        // carried: putting it in the table would make the task layer talk about
+        // work nobody ordered.
+        let events =
+            vec![spawned(1, "child-1", None), settled(2, "child-1", EventType::SUBAGENT_COMPLETED)];
+        assert!(workers(&events).is_empty());
+    }
+
+    #[test]
+    fn a_settlement_for_a_child_this_fold_never_saw_start_is_ignored() {
+        // The parent's log can hold a settlement whose spawn was trimmed away or
+        // written by a build that did not record the step. There is no worker to
+        // end, and inventing one would put a step in the table that no plan
+        // named.
+        let events = vec![settled(1, "child-1", EventType::SUBAGENT_COMPLETED)];
+        assert!(workers(&events).is_empty());
     }
 }

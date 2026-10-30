@@ -117,6 +117,15 @@ pub struct TurnContext {
     /// and has nothing recorded yet — the loop then says so, which is what
     /// tells the model the ledger exists and it may write to it.
     pub plan: Option<agent_protocol::plan::Plan>,
+    /// The workers this session started for its plan's steps, as of this
+    /// turn's opening.
+    ///
+    /// The fold of `subagent/spawned` and the settlements that answer it, kept
+    /// beside the plan because that is where it is read: a step being carried
+    /// by a child is not ready, and the step whose worker has come back is the
+    /// one the model has to decide about. Empty is the ordinary case, and it
+    /// renders exactly like a turn that never had a worker.
+    pub workers: Vec<agent_protocol::plan::StepWorker>,
     /// The session's judgment record as of this turn's opening.
     ///
     /// Same convention as `plan`: `None` means the caller keeps no record and
