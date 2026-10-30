@@ -4,6 +4,7 @@
 //! table, the argument loop — and the commands live here so a handler can be
 //! read as the thing it answers rather than as a branch in a match.
 
+pub(crate) mod approval;
 pub(crate) mod plugin;
 pub(crate) mod schedule;
 pub(crate) mod session;
