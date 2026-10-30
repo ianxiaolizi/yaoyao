@@ -264,8 +264,21 @@ impl ArtifactRef {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactionMetadata {
     pub redacted: bool,
-    /// The redaction patterns applied (e.g. `api_key`, `token`), not the values.
+    /// The redaction patterns actually applied (e.g. `api_key`, `token`), not
+    /// the values. A name here means the text was changed.
     pub patterns: Vec<String>,
+    /// Findings recorded *without* changing the text — the dry-run layer.
+    ///
+    /// The high-entropy detector reports here by default: a long mixed-class
+    /// token may be a secret or may be a base64 blob in ordinary code, and the
+    /// default is to say so rather than mangle a result whose meaning the
+    /// caller cannot recover. A name here therefore never means "removed";
+    /// `patterns` is the list that does.
+    ///
+    /// Absent from payloads written before this field existed, which is why it
+    /// reads back as empty rather than as a malformed log.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// A logical workspace: where reads and writes are allowed.

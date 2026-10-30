@@ -671,6 +671,18 @@ fn recorded_result(
             }),
         ));
     }
+    if !result.redaction_metadata.warnings.is_empty() {
+        drafts.push(tool_draft(
+            session_id,
+            held,
+            EventType::TOOL_RESULT_HIGH_ENTROPY,
+            serde_json::json!({
+                "tool_name": held.tool_name,
+                "provider_tool_call_id": held.tool_call_id,
+                "warnings": result.redaction_metadata.warnings,
+            }),
+        ));
+    }
 
     let event_type = match result.status {
         ToolStatus::Completed => EventType::TOOL_COMPLETED,

@@ -165,6 +165,15 @@ impl EventType {
     pub const CONTEXT_COMPACTED: &'static str = "context/compacted";
     pub const TOOL_RESULT_TRUNCATED: &'static str = "tool/result.truncated";
     pub const TOOL_RESULT_REDACTED: &'static str = "tool/result.redacted";
+    /// A tool result carried a token the high-entropy layer flagged but did
+    /// not remove.
+    ///
+    /// Separate from `tool/result.redacted` because the two answer different
+    /// questions: that event says what was taken out, this one says what a
+    /// reader may want to look at. The content in `tool/completed` is
+    /// unchanged — a warning is an observation, and merging it into the
+    /// redaction event would make "redacted" mean two things.
+    pub const TOOL_RESULT_HIGH_ENTROPY: &'static str = "tool/result.high_entropy";
     pub const TOOL_RESULT_ARTIFACT_OFFLOADED: &'static str = "tool/result.artifact_offloaded";
     pub const APPROVAL_REQUESTED: &'static str = "approval/requested";
     pub const APPROVAL_GRANTED: &'static str = "approval/granted";
@@ -272,6 +281,7 @@ impl EventType {
         Self::CONTEXT_COMPACTED,
         Self::TOOL_RESULT_TRUNCATED,
         Self::TOOL_RESULT_REDACTED,
+        Self::TOOL_RESULT_HIGH_ENTROPY,
         Self::TOOL_RESULT_ARTIFACT_OFFLOADED,
         Self::APPROVAL_REQUESTED,
         Self::APPROVAL_GRANTED,

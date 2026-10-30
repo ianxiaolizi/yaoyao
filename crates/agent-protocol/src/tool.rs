@@ -381,6 +381,7 @@ mod tests {
             redaction_metadata: RedactionMetadata {
                 redacted: true,
                 patterns: vec!["token".to_string()],
+                warnings: Vec::new(),
             },
             duration_ms: Some(12),
         };

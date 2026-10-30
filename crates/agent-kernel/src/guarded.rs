@@ -111,6 +111,17 @@ impl GuardedToolProvider {
         self
     }
 
+    /// Use `redactor` for results, arguments and approval summaries.
+    ///
+    /// The default is the same redactor the loop uses; this exists so the
+    /// process-level setting (`HighEntropy` policy) reaches the boundary that
+    /// writes tool results into the log, rather than being decided twice in
+    /// two places.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
+    }
+
     /// Bound one result to `max_bytes` inline.
     ///
     /// The caller derives this from the run's working set
@@ -1962,5 +1973,25 @@ mod tests {
         let text = error.to_string();
         assert!(!text.contains("s3cret-value"), "secret leaked: {text}");
         assert!(text.contains("***"));
+    }
+
+    #[tokio::test]
+    async fn a_high_entropy_token_in_a_result_is_reported_but_not_removed() {
+        // No known prefix: the value is only recognisable by shape, which is
+        // exactly the case the prefix list cannot see.
+        const TOKEN: &str = "Zk3vQ9mR7tY1pL5nB8cF2hJ6sD4gW0xE7uI9oP1a";
+        let tools = Arc::new(RecordingTools::new(&format!("bearer {TOKEN}")));
+        let gateway =
+            gateway_any(ResourceGuard::new(workspace()), tools, allowing(Capability::FS_READ));
+
+        let result = gateway.execute(&sid(), &invocation("fs.read")).await.expect("allow runs it");
+
+        // The default layer reports; it does not edit an answer the caller
+        // did not ask to have rewritten.
+        assert_eq!(result.content, format!("bearer {TOKEN}"));
+        assert!(!result.redaction_metadata.redacted);
+        assert_eq!(result.redaction_metadata.warnings, vec!["high_entropy".to_string()]);
+        let encoded = serde_json::to_string(&result.redaction_metadata).unwrap();
+        assert!(!encoded.contains(TOKEN), "the value reached the metadata: {encoded}");
     }
 }

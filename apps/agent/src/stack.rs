@@ -52,6 +52,7 @@ use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_protocol::ids::SessionId;
 use agent_protocol::permissions::{Capability, SecretRef, Workspace};
+use agent_protocol::redactor::{HighEntropy, Redactor};
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
 use agent_store_secret::EnvSecretProvider;
@@ -140,6 +141,11 @@ pub enum StackError {
     /// a typo must not silently pick the expensive pipeline or the baseline.
     #[error("judgment mode '{0}' is not one of `on`, `gates` or `off`")]
     JudgmentMode(String),
+    /// `AGENT_REDACT_HIGH_ENTROPY` names a policy this build does not know.
+    /// Fail closed for the same reason: a typo must not quietly turn the
+    /// detector off, nor start mangling results the reader asked for.
+    #[error("redaction mode '{0}' is not one of `off`, `warn` or `redact`")]
+    RedactionMode(String),
 }
 
 /// Which part of the thinking pipeline a run gets.
@@ -174,6 +180,22 @@ fn tool_secret_refs(raw: Option<&str>) -> Vec<SecretRef> {
     names.sort();
     names.dedup();
     names.into_iter().map(|name| SecretRef { source: "env".to_string(), name }).collect()
+}
+
+/// The high-entropy layer's setting, from `AGENT_REDACT_HIGH_ENTROPY`.
+///
+/// Host configuration, like the sandbox mode: whether to report or replace a
+/// token nobody taught the redactor is a property of the machine and the
+/// workspace being read, not of the workspace itself. Unset is `warn` — the
+/// detector reports in the tool result's metadata and leaves the text alone.
+fn high_entropy_from(raw: Option<&str>) -> Result<HighEntropy, StackError> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(HighEntropy::Warn),
+        Some(value) if value.eq_ignore_ascii_case("off") => Ok(HighEntropy::Off),
+        Some(value) if value.eq_ignore_ascii_case("warn") => Ok(HighEntropy::Warn),
+        Some(value) if value.eq_ignore_ascii_case("redact") => Ok(HighEntropy::Redact),
+        Some(other) => Err(StackError::RedactionMode(other.to_string())),
+    }
 }
 
 /// Read the arm from `AGENT_JUDGMENT` (default `gates`).
@@ -339,6 +361,11 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     // What the gateway may resolve when a tool argument names a reference. The
     // same list is what the model is told it may name, one fact read once.
     let tool_secrets = tool_secret_refs(std::env::var("AGENT_TOOL_SECRETS").ok().as_deref());
+    // One redactor for the whole assembly: the loop and the tool boundary must
+    // not disagree about whether a long mixed token is reported or replaced.
+    let redactor = Redactor::new().with_high_entropy(high_entropy_from(
+        std::env::var("AGENT_REDACT_HIGH_ENTROPY").ok().as_deref(),
+    )?);
     // What this backend actually provides, read once before the environment is
     // handed out. The policy and the plugin surface both ask this question and
     // must get the same answer.
@@ -518,6 +545,7 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
             artifacts.clone(),
         )
         .with_offload_limit(resolved.budget.tool_output_limit_bytes())
+        .with_redactor(redactor.clone())
         .with_secrets(Arc::new(EnvSecretProvider::new(
             tool_secrets.iter().map(|secret| secret.name.clone()),
         ))),
@@ -605,7 +633,8 @@ pub async fn assemble(inputs: Inputs) -> Result<Runtime, StackError> {
     });
     let suite: Arc<dyn ToolGateway> = gateway.clone();
     let mut loop_ = DefaultAgentLoop::new(selected.provider, suite, context, router)
-        .with_live_bus(live_bus.clone());
+        .with_live_bus(live_bus.clone())
+        .with_redactor(redactor);
     if let Some(advisor) = advisor {
         loop_ = loop_.with_decisions(advisor);
     }
@@ -699,6 +728,20 @@ mod tests {
                 SecretRef { source: "env".to_string(), name: "B_TOKEN".to_string() },
             ]
         );
+    }
+
+    #[test]
+    fn the_redaction_mode_is_warn_unless_told_otherwise_and_refuses_typos() {
+        assert_eq!(high_entropy_from(None).unwrap(), HighEntropy::Warn);
+        assert_eq!(high_entropy_from(Some("  ")).unwrap(), HighEntropy::Warn);
+        assert_eq!(high_entropy_from(Some("OFF")).unwrap(), HighEntropy::Off);
+        assert_eq!(high_entropy_from(Some("Warn")).unwrap(), HighEntropy::Warn);
+        assert_eq!(high_entropy_from(Some("redact")).unwrap(), HighEntropy::Redact);
+
+        match high_entropy_from(Some("warn-ish")) {
+            Err(StackError::RedactionMode(value)) => assert_eq!(value, "warn-ish"),
+            other => panic!("a typo must be refused, not defaulted: {other:?}"),
+        }
     }
 
     #[test]

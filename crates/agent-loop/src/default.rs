@@ -280,6 +280,14 @@ pub struct DefaultAgentLoop {
     live_bus: Option<Arc<dyn LiveEventBus>>,
     /// Monotonic across turns so a subscriber can order live events.
     live_seq: Arc<AtomicU64>,
+    /// What the loop scrubs before a proposal, a response or a ledger entry is
+    /// written to the log.
+    ///
+    /// One redactor shared with the gateway in the assembled binary: the tool
+    /// boundary and the loop must not disagree about what a secret looks like,
+    /// or about whether the high-entropy layer is reporting or replacing. The
+    /// default is the same policy a caller that never says anything gets.
+    redactor: Redactor,
     /// Whether the judgment ledger, its tool and its advice are part of this
     /// loop.
     ///
@@ -314,9 +322,16 @@ impl DefaultAgentLoop {
             decisions: None,
             live_bus: None,
             live_seq: Arc::new(AtomicU64::new(0)),
+            redactor: Redactor::new(),
             judgment_ledger: true,
             judgment_gates: true,
         }
+    }
+
+    /// Use `redactor` for everything this loop writes into the log.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Turn the thinking pipeline off: no ledger, no advice, no gates.
@@ -520,7 +535,7 @@ impl DefaultAgentLoop {
         // The summary is model-authored text headed for the durable log and
         // every later request, so it is scrubbed like tool output — and the
         // message the next step sends is the same scrubbed text the log holds.
-        let (text, redaction) = Redactor::new().redact(&response.text_content());
+        let (text, redaction) = self.redactor.redact(&response.text_content());
         if text.trim().is_empty() {
             events.push(draft(
                 &ctx,
@@ -705,10 +720,11 @@ impl DefaultAgentLoop {
                 "elided": failures.elided,
             });
         }
-        if redaction.redacted {
+        if redaction.redacted || !redaction.warnings.is_empty() {
             payload["redaction"] = serde_json::json!({
-                "redacted": true,
+                "redacted": redaction.redacted,
                 "patterns": redaction.patterns,
+                "warnings": redaction.warnings,
             });
         }
         events.push(draft(&ctx, step_id, EventType::CONTEXT_COMPACTED, payload, Actor::Agent));
@@ -2080,7 +2096,7 @@ impl AgentLoop for DefaultAgentLoop {
             }
 
             let sink = self.sink(ctx);
-            let redactor = Redactor::new();
+            let redactor = &self.redactor;
             let (response, response_event_id) =
                 match self.model.stream(&request, sink.as_ref()).await {
                     Ok(response) => {
@@ -2089,7 +2105,7 @@ impl AgentLoop for DefaultAgentLoop {
                         // a long-lived log (§7 row 4). `response` keeps its raw
                         // arguments — the live turn shows the model what it actually
                         // asked for, and only the record is redacted.
-                        let durable = redacted_proposal(&response, &redactor);
+                        let durable = redacted_proposal(&response, redactor);
                         let recorded = draft(
                             ctx,
                             &step_id,
@@ -2542,12 +2558,15 @@ impl AgentLoop for DefaultAgentLoop {
                     "provider_tool_call_id": call.tool_call_id,
                     "arguments": arguments,
                 });
-                if redaction.redacted {
+                if redaction.redacted || !redaction.warnings.is_empty() {
                     // Same convention as `TOOL_RESULT_REDACTED`: a reader can
-                    // tell that what it sees is not the whole of what was asked.
+                    // tell that what it sees is not the whole of what was asked
+                    // — and, when only `warnings` is non-empty, that it *is*
+                    // whole and something in it looked like a secret.
                     payload["redaction"] = serde_json::json!({
-                        "redacted": true,
+                        "redacted": redaction.redacted,
                         "patterns": redaction.patterns,
+                        "warnings": redaction.warnings,
                     });
                 }
                 events.push(draft(ctx, &step_id, EventType::TOOL_STARTED, payload, Actor::Tool));
@@ -2573,10 +2592,11 @@ impl AgentLoop for DefaultAgentLoop {
                                 "provider_tool_call_id": call.tool_call_id,
                                 "plan": &plan,
                             });
-                            if redaction.redacted {
+                            if redaction.redacted || !redaction.warnings.is_empty() {
                                 payload["redaction"] = serde_json::json!({
-                                    "redacted": true,
+                                    "redacted": redaction.redacted,
                                     "patterns": redaction.patterns,
+                                    "warnings": redaction.warnings,
                                 });
                             }
                             events.push(draft(
@@ -2747,10 +2767,11 @@ impl AgentLoop for DefaultAgentLoop {
                                             "provider_tool_call_id": call.tool_call_id,
                                             "judgment": &merged,
                                         });
-                                        if redaction.redacted {
+                                        if redaction.redacted || !redaction.warnings.is_empty() {
                                             payload["redaction"] = serde_json::json!({
-                                                "redacted": true,
+                                                "redacted": redaction.redacted,
                                                 "patterns": redaction.patterns,
+                                                "warnings": redaction.warnings,
                                             });
                                         }
                                         events.push(draft(
@@ -2916,6 +2937,19 @@ impl AgentLoop for DefaultAgentLoop {
                                     "tool_name": call.tool_name,
                                     "provider_tool_call_id": call.tool_call_id,
                                     "patterns": result.redaction_metadata.patterns,
+                                }),
+                                Actor::Tool,
+                            ));
+                        }
+                        if !result.redaction_metadata.warnings.is_empty() {
+                            events.push(draft(
+                                ctx,
+                                &step_id,
+                                EventType::TOOL_RESULT_HIGH_ENTROPY,
+                                serde_json::json!({
+                                    "tool_name": call.tool_name,
+                                    "provider_tool_call_id": call.tool_call_id,
+                                    "warnings": result.redaction_metadata.warnings,
                                 }),
                                 Actor::Tool,
                             ));
@@ -5672,6 +5706,7 @@ mod tests {
             redaction_metadata: RedactionMetadata {
                 redacted: true,
                 patterns: vec!["token".to_string()],
+                warnings: Vec::new(),
             },
             duration_ms: Some(12),
         };
@@ -5730,6 +5765,60 @@ mod tests {
             .find(|e| e.event_type.as_str() == EventType::TOOL_RESULT_REDACTED)
             .expect("a redaction was recorded");
         assert_eq!(redacted.payload["patterns"][0], "token");
+    }
+
+    #[tokio::test]
+    async fn a_high_entropy_warning_is_recorded_without_changing_the_result() {
+        use agent_protocol::permissions::RedactionMetadata;
+        const TOKEN: &str = "Zk3vQ9mR7tY1pL5nB8cF2hJ6sD4gW0xE7uI9oP1a";
+        let mut reply = ToolResult::completed(format!("bearer {TOKEN}"));
+        reply.redaction_metadata = RedactionMetadata {
+            redacted: false,
+            patterns: Vec::new(),
+            warnings: vec!["high_entropy".to_string()],
+        };
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("dump", serde_json::json!({})),
+            FakeModelProvider::answer("done"),
+        ]));
+        let tools =
+            Arc::new(FakeToolProvider::new().with_result("dump", reply, ToolSideEffect::Read));
+        let loop_ = DefaultAgentLoop::new(
+            model,
+            Arc::new(FakeToolGateway::new(tools)),
+            no_context(),
+            one_model_router(),
+        );
+
+        let outcome = run_turn(&loop_, &ctx()).await;
+
+        let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            types.contains(&EventType::TOOL_RESULT_HIGH_ENTROPY),
+            "the warning was not recorded: {types:?}"
+        );
+        // A warning is not a redaction: the event that means "text was taken
+        // out" must not fire, or a reader would look for text that is not gone.
+        assert!(!types.contains(&EventType::TOOL_RESULT_REDACTED), "{types:?}");
+
+        let warning = outcome
+            .events
+            .iter()
+            .find(|e| e.event_type.as_str() == EventType::TOOL_RESULT_HIGH_ENTROPY)
+            .expect("the warning event exists");
+        assert_eq!(warning.payload["warnings"][0], "high_entropy");
+
+        let completed = outcome
+            .events
+            .iter()
+            .find(|e| e.event_type.as_str() == EventType::TOOL_COMPLETED)
+            .expect("the call completed");
+        assert_eq!(completed.payload["content"], format!("bearer {TOKEN}"));
+
+        // The warning names the finding, never the value — the result still
+        // carries the token because warn mode deliberately does not edit it.
+        let warning = serde_json::to_string(&warning.payload).unwrap();
+        assert!(!warning.contains(TOKEN), "the value reached the warning: {warning}");
     }
 
     #[tokio::test]
