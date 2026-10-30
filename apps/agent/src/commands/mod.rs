@@ -5,4 +5,5 @@
 //! read as the thing it answers rather than as a branch in a match.
 
 pub(crate) mod plugin;
+pub(crate) mod schedule;
 pub(crate) mod session;
