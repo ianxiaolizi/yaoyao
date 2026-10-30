@@ -2141,6 +2141,69 @@ mod tests {
         assert!(text.contains("***"));
     }
 
+    /// The scrub runs before the offload, so an oversized result carries `***`
+    /// into the blob store rather than the value it replaced.
+    ///
+    /// `finalize` redacts, then offloads — and until this test nothing pinned
+    /// that order. Reverse it and the result the model sees is clean while the
+    /// artifact keeps the plaintext: the model never notices, the log never
+    /// notices, and the secret sits on disk under a content hash. The artifact
+    /// is a durable surface, so the audit's "a secret does not appear in an
+    /// artifact" is checked on the bytes, not on what the caller was handed.
+    #[tokio::test]
+    async fn a_resolved_secret_is_scrubbed_before_the_result_becomes_an_artifact() {
+        const SECRET: &str = "s3cret-value-12345";
+        // Past the offload limit, with the value the tool echoes inside it.
+        let mut reply = "echoed line\n".repeat(6_000);
+        reply.push_str("the token is s3cret-value-12345\n");
+        reply.push_str(&"trailing line\n".repeat(6_000));
+        assert!(reply.len() > OFFLOAD_MAX_BYTES, "the premise: this is offloaded");
+
+        let tools = Arc::new(RecordingTools::new(&reply));
+        let artifacts = Arc::new(agent_testkit::InMemoryArtifactStore::default());
+        let gateway = GuardedToolProvider::new(
+            tools,
+            allowing(Capability::FS_READ),
+            Arc::new(ApprovalService::new(Arc::new(FakeEventStore::new()))),
+            ResourceGuard::new(workspace()),
+            artifacts.clone(),
+        )
+        .with_secrets(Arc::new(OneSecret));
+        let invocation = secret_invocation(serde_json::json!({
+            "path": "notes.txt",
+            "command": "echo 'Bearer secret://env/TOOL_TOKEN'",
+        }));
+
+        // A secret-using call stops for approval; nothing runs before it.
+        let pending = gateway.execute(&sid(), &invocation).await.unwrap_err();
+        assert!(matches!(pending, ToolGatewayError::ApprovalPending { .. }), "{pending:?}");
+
+        let result = gateway.execute_approved(&invocation).await.unwrap();
+        assert_eq!(result.artifacts.len(), 1, "the full output was offloaded");
+        assert!(
+            !result.content.contains(SECRET),
+            "the preview the model keeps still has the value: {}",
+            result.content
+        );
+
+        let stored = artifacts.get(&result.artifacts[0]).expect("read the blob back");
+        let stored = String::from_utf8(stored).expect("the artifact is text");
+        assert!(!stored.contains(SECRET), "the resolved secret landed in the artifact store");
+        assert!(stored.contains("***"), "the blob holds the scrubbed text");
+
+        // What the metadata names is the reference, never the value, and the
+        // metadata is what a summary or an export reads.
+        assert!(
+            result
+                .redaction_metadata
+                .patterns
+                .iter()
+                .any(|pattern| pattern == "secret://env/TOOL_TOKEN")
+        );
+        let metadata = serde_json::to_string(&result.redaction_metadata).unwrap();
+        assert!(!metadata.contains(SECRET), "the value reached the metadata: {metadata}");
+    }
+
     #[tokio::test]
     async fn a_high_entropy_token_in_a_result_is_reported_but_not_removed() {
         // No known prefix: the value is only recognisable by shape, which is
