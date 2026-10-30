@@ -303,8 +303,7 @@ fn a_long_answer_reaches_the_parent_as_a_locator_that_reads_back_whole() {
     // 8 KiB is the floor a run's tool-output limit is clamped to, and this is
     // past it while still fitting a Windows command line.
     let objective = "the notes say the sentinel is RHUBARB-7731.\n".repeat(260);
-    let request =
-        serde_json::json!({ "provider": "inner", "objective": objective }).to_string();
+    let request = serde_json::json!({ "provider": "inner", "objective": objective }).to_string();
 
     let r = ran(
         data.path(),
