@@ -481,18 +481,46 @@ async function main() {
   await page.goto(`${origin}/#t=${token}`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#newTask', { timeout: 15_000 });
   await page.click('#newTask');
-  const settled = (count) =>
-    page.waitForFunction(
-      (want) => {
-        const blocks = document.querySelectorAll('#timeline > .tblock[data-key^="turn:"]');
-        return (
-          blocks.length >= want &&
-          Boolean(document.querySelector('#timeline > .tblock:last-child .end [data-why]'))
-        );
-      },
-      count,
-      { timeout: 20_000 },
-    );
+  // A timeout here says only that something did not settle, and this step is the
+  // one that fails when the run is slow rather than broken — three of twenty CI
+  // runs had it before anyone could tell which. So the timeout is caught and
+  // answered with the timeline as it stood: the block keys, the last block's
+  // ending rows, and the answers that did arrive. Nothing here changes what the
+  // step waits for; it changes what a failure says.
+  const settled = async (count) => {
+    try {
+      await page.waitForFunction(
+        (want) => {
+          const blocks = document.querySelectorAll('#timeline > .tblock[data-key^="turn:"]');
+          return (
+            blocks.length >= want &&
+            Boolean(document.querySelector('#timeline > .tblock:last-child .end [data-why]'))
+          );
+        },
+        count,
+        { timeout: 20_000 },
+      );
+    } catch (error) {
+      const seen = await page
+        .evaluate(() => {
+          const blocks = [...document.querySelectorAll('#timeline > .tblock[data-key^="turn:"]')];
+          const last = blocks.at(-1);
+          return {
+            keys: blocks.map((node) => node.dataset.key),
+            lastEndings: last
+              ? [...last.querySelectorAll('.end')].map((node) => node.outerHTML.slice(0, 300))
+              : [],
+            answers: [...document.querySelectorAll('.ans')].map((node) =>
+              (node.textContent || '').slice(0, 80),
+            ),
+          };
+        })
+        .catch((failure) => ({ unreadable: String(failure) }));
+      throw new Error(
+        `timeline did not settle at ${count} turn(s): ${JSON.stringify(seen)}\n${error.message}`,
+      );
+    }
+  };
   for (const [index, prompt] of ['one', 'two', 'three'].entries()) {
     await page.fill('#input', `turn ${prompt}`);
     await page.click('#sendBtn');
