@@ -20,6 +20,7 @@ members = [
     "crates/agent-sandbox-win",
     "crates/agent-model-openai",
     "crates/agent-index-sqlite",
+    "crates/agent-memory-sqlite",
     "crates/agent-testkit",
     "crates/agent-cli",
     "crates/agent-web",

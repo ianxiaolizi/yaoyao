@@ -7,11 +7,16 @@ use std::time::Duration;
 
 use agent_cli::args::Args;
 use agent_cli::context::run_context_inspect;
-use agent_cli::memory::{DEFAULT_SEARCH_LIMIT, run_memory_reindex, run_memory_search};
+use agent_cli::memory::{
+    DEFAULT_SEARCH_LIMIT, run_memory_export, run_memory_forget, run_memory_list,
+    run_memory_reindex, run_memory_remember, run_memory_search,
+};
 use agent_cli::run_artifact_get;
 use agent_index_sqlite::SqliteMemoryIndex;
+use agent_memory_sqlite::SqliteMemoryStore;
 use agent_ports::context_engine::ContextEngine;
 use agent_ports::event_store::EventStore;
+use agent_ports::memory_store::{ListFacts, MemoryOrigin, MemorySensitivity, Remember};
 use agent_protocol::ids::EventSeq;
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
@@ -28,20 +33,21 @@ use crate::{EXIT_DID_NOT_RUN, exit_on, positionals, usage};
 /// do, and neither command starts a turn. `--events` is refused because nothing
 /// here appends: a search that wrote would make the model's history depend on
 /// who looked.
+///
+/// `remember`, `list`, `forget` and `export` are the other half: the facts kept
+/// in the memory store, which a person writes here and the model writes through
+/// `memory.remember`. They also write no events — the fact store is durable on
+/// its own, and the session log's job is the conversation, not the memory.
 pub(crate) async fn memory(args: &Args) {
-    let words: Vec<&String> =
-        args.command_args().iter().filter(|word| !word.starts_with("--")).collect();
-    match words.first().map(|word| word.as_str()) {
+    let words = memory_words(args);
+    match words.first().map(String::as_str) {
         Some("search") => {
-            let query = words[1..].iter().map(|word| word.as_str()).collect::<Vec<_>>().join(" ");
+            let query = words[1..].join(" ");
             if query.trim().is_empty() {
                 eprintln!("Usage: agent memory search <text>");
                 std::process::exit(EXIT_DID_NOT_RUN);
             }
-            if args.events {
-                eprintln!("memory search does not support --events; it writes no events");
-                std::process::exit(EXIT_DID_NOT_RUN);
-            }
+            refuse_events(args, "memory search");
             let index = memory_index();
             let outcome = match run_memory_search(
                 &index,
@@ -59,15 +65,116 @@ pub(crate) async fn memory(args: &Args) {
             exit_on(outcome.verdict);
         }
         Some("reindex") => {
-            if args.events {
-                eprintln!("memory reindex does not support --events; it writes no events");
-                std::process::exit(EXIT_DID_NOT_RUN);
-            }
+            refuse_events(args, "memory reindex");
             let index = memory_index();
             let outcome = match run_memory_reindex(&index, &args.session, args.json).await {
                 Ok(outcome) => outcome,
                 Err(e) => fail(args, &e),
             };
+            print(&outcome.output);
+            exit_on(outcome.verdict);
+        }
+        Some("remember") => {
+            refuse_events(args, "memory remember");
+            let text = words[1..].join(" ");
+            if text.trim().is_empty() {
+                eprintln!(
+                    "Usage: agent memory remember <text> [--key <key>] [--namespace <ns>] \
+                     [--confidence <0..1>] [--private] [--supersedes <id>] \
+                     [--expires-in-days <n>]"
+                );
+                std::process::exit(EXIT_DID_NOT_RUN);
+            }
+            let confidence = match option(args, "--confidence") {
+                None => None,
+                Some(text) => match text.parse::<f32>() {
+                    Ok(confidence) => Some(confidence),
+                    Err(_) => {
+                        eprintln!("--confidence needs a number between 0 and 1, got '{text}'");
+                        std::process::exit(EXIT_DID_NOT_RUN);
+                    }
+                },
+            };
+            let expires_at = match option(args, "--expires-in-days") {
+                None => None,
+                Some(text) => match text.parse::<i64>() {
+                    Ok(days) if days > 0 => {
+                        Some(agent::clock::now() + chrono::Duration::days(days))
+                    }
+                    _ => {
+                        eprintln!(
+                            "--expires-in-days needs a positive number of days, got '{text}'"
+                        );
+                        std::process::exit(EXIT_DID_NOT_RUN);
+                    }
+                },
+            };
+            let request = Remember {
+                namespace: option(args, "--namespace"),
+                key: option(args, "--key"),
+                text,
+                confidence,
+                origin: MemoryOrigin::User,
+                source: None,
+                sensitivity: if args.command_args().iter().any(|word| word == "--private") {
+                    MemorySensitivity::Private
+                } else {
+                    MemorySensitivity::Normal
+                },
+                supersedes: option(args, "--supersedes"),
+                expires_at,
+            };
+            let store = memory_store();
+            let outcome =
+                match run_memory_remember(&store, request, agent::clock::now(), args.json).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => fail(args, &e),
+                };
+            print(&outcome.output);
+            exit_on(outcome.verdict);
+        }
+        Some("list") => {
+            refuse_events(args, "memory list");
+            let all = args.command_args().iter().any(|word| word == "--all");
+            let filter = ListFacts {
+                namespace: option(args, "--namespace"),
+                include_superseded: all,
+                include_expired: all,
+            };
+            let store = memory_store();
+            let outcome =
+                match run_memory_list(&store, &filter, agent::clock::now(), args.json).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => fail(args, &e),
+                };
+            print(&outcome.output);
+            exit_on(outcome.verdict);
+        }
+        Some("forget") => {
+            refuse_events(args, "memory forget");
+            let Some(id) = words.get(1) else {
+                eprintln!("Usage: agent memory forget <id>");
+                std::process::exit(EXIT_DID_NOT_RUN);
+            };
+            let store = memory_store();
+            let outcome = match run_memory_forget(&store, id, args.json).await {
+                Ok(outcome) => outcome,
+                Err(e) => fail(args, &e),
+            };
+            print(&outcome.output);
+            exit_on(outcome.verdict);
+        }
+        Some("export") => {
+            refuse_events(args, "memory export");
+            let out = option(args, "--out");
+            let store = memory_store();
+            let outcome =
+                match run_memory_export(&store, agent::clock::now(), out.as_deref(), args.json)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(e) => fail(args, &e),
+                };
             print(&outcome.output);
             exit_on(outcome.verdict);
         }
@@ -79,10 +186,46 @@ pub(crate) async fn memory(args: &Args) {
         None => {
             eprintln!(
                 "Usage: agent memory search <text>\n       \
-                 agent memory reindex"
+                 agent memory reindex\n       \
+                 agent memory remember <text> [--key <key>] [--supersedes <id>]\n       \
+                 agent memory list [--all]\n       \
+                 agent memory forget <id>\n       \
+                 agent memory export [--out <path>]"
             );
             std::process::exit(EXIT_DID_NOT_RUN);
         }
+    }
+}
+
+/// The words of a `memory` subcommand, with that subcommand's own value flags
+/// and their values taken out.
+///
+/// The shared parser leaves a command's own options in place, so a `--key` and
+/// the word after it would otherwise both read as text — and `remember` would
+/// store the key as part of the sentence.
+fn memory_words(args: &Args) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] =
+        &["--key", "--namespace", "--confidence", "--supersedes", "--expires-in-days", "--out"];
+    let mut words = Vec::new();
+    let mut rest = args.command_args().iter();
+    while let Some(word) = rest.next() {
+        if word.starts_with("--") {
+            if !word.contains('=') && VALUE_FLAGS.contains(&word.as_str()) {
+                rest.next();
+            }
+            continue;
+        }
+        words.push(word.clone());
+    }
+    words
+}
+
+/// These verbs write to the memory store, not to a log, so a caller asking for
+/// the chain would be asking for something that will not exist.
+fn refuse_events(args: &Args, command: &str) {
+    if args.events {
+        eprintln!("{command} does not support --events; it writes no events");
+        std::process::exit(EXIT_DID_NOT_RUN);
     }
 }
 
@@ -90,6 +233,12 @@ pub(crate) async fn memory(args: &Args) {
 fn memory_index() -> SqliteMemoryIndex {
     let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::new(data_dir()));
     SqliteMemoryIndex::open(store, data_dir())
+}
+
+/// The fact store those verbs read and write: beside the session logs, so every
+/// session in this data directory sees the same facts.
+fn memory_store() -> SqliteMemoryStore {
+    SqliteMemoryStore::open(data_dir())
 }
 
 /// `context inspect`: what the next request would carry, measured but not sent.

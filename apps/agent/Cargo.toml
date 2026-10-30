@@ -27,6 +27,7 @@ agent-context = { path = "../../crates/agent-context" }
 agent-decision = { path = "../../crates/agent-decision" }
 agent-decision-laya = { path = "../../crates/agent-decision-laya" }
 agent-index-sqlite = { path = "../../crates/agent-index-sqlite" }
+agent-memory-sqlite = { path = "../../crates/agent-memory-sqlite" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }

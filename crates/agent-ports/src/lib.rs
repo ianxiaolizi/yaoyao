@@ -16,6 +16,7 @@ pub mod execution_environment;
 pub mod instructions;
 pub mod live_event_bus;
 pub mod memory_index;
+pub mod memory_store;
 pub mod model_provider;
 pub mod model_router;
 pub mod process_env;

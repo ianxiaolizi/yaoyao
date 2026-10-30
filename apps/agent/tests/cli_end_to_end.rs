@@ -1500,6 +1500,136 @@ fn memory_reindex_rebuilds_the_index_and_search_still_works() {
     assert_eq!(after["hits"], before["hits"], "same log, same index, same hits");
 }
 
+// ---------------------------------------------------------------------------
+// memory facts: the store that outlives a session. This is not the index — a
+// forgotten fact cannot be rebuilt from any log, because no log holds it.
+// ---------------------------------------------------------------------------
+
+/// The id out of a `--json` answer, which is the only handle `forget` takes.
+fn remembered_id(answer: &Ran) -> String {
+    let doc: serde_json::Value = serde_json::from_str(&answer.out).expect("one JSON object");
+    doc["id"].as_str().expect("a remembered fact has an id").to_string()
+}
+
+#[test]
+fn memory_remember_keeps_a_fact_every_session_can_list() {
+    let (data, workspace) = dirs();
+    let remembered =
+        ran(data.path(), workspace.path(), &["memory", "remember", "prefers Chinese", "--json"]);
+
+    assert!(remembered.ok, "{}", remembered.err);
+    assert_eq!(remembered.code, Some(0));
+    let id = remembered_id(&remembered);
+    assert!(id.starts_with("mem_"), "{id}");
+
+    let listed = ran(data.path(), workspace.path(), &["memory", "list"]);
+    assert!(listed.ok, "{}", listed.err);
+    assert!(listed.out.contains("prefers Chinese"), "{}", listed.out);
+
+    // Facts are not session state: another session of the same data directory
+    // sees the same ones.
+    let other =
+        ran(data.path(), workspace.path(), &["memory", "list", "--session", "someone-else"]);
+    assert!(other.out.contains("prefers Chinese"), "{}", other.out);
+}
+
+#[test]
+fn a_second_fact_for_an_active_key_is_refused_until_it_is_superseded() {
+    let (data, workspace) = dirs();
+    let first = ran(
+        data.path(),
+        workspace.path(),
+        &["memory", "remember", "uses tabs", "--key", "indent", "--json"],
+    );
+    assert!(first.ok, "{}", first.err);
+    let id = remembered_id(&first);
+
+    let refused = ran(
+        data.path(),
+        workspace.path(),
+        &["memory", "remember", "uses spaces", "--key", "indent"],
+    );
+    assert_eq!(refused.code, Some(2), "a conflict is a request that could not run");
+    assert!(refused.err.contains(&id), "the refusal names the id to supersede: {}", refused.err);
+
+    let replaced = ran(
+        data.path(),
+        workspace.path(),
+        &["memory", "remember", "uses spaces", "--key", "indent", "--supersedes", &id],
+    );
+    assert!(replaced.ok, "{}", replaced.err);
+
+    let current = ran(data.path(), workspace.path(), &["memory", "list"]);
+    assert!(current.out.contains("uses spaces"), "{}", current.out);
+    assert!(!current.out.contains("uses tabs"), "{}", current.out);
+    let history = ran(data.path(), workspace.path(), &["memory", "list", "--all"]);
+    assert!(history.out.contains("uses tabs"), "{}", history.out);
+    assert!(history.out.contains("(replaced)"), "{}", history.out);
+}
+
+#[test]
+fn memory_forget_deletes_the_fact_and_export_no_longer_holds_it() {
+    let (data, workspace) = dirs();
+    let remembered = ran(
+        data.path(),
+        workspace.path(),
+        &["memory", "remember", "the draft lives in the attic", "--json"],
+    );
+    let id = remembered_id(&remembered);
+
+    let forgotten = ran(data.path(), workspace.path(), &["memory", "forget", &id]);
+
+    assert!(forgotten.ok, "{}", forgotten.err);
+    assert!(forgotten.out.contains(&format!("forgot {id}")), "{}", forgotten.out);
+    let exported = ran(data.path(), workspace.path(), &["memory", "export"]);
+    let facts: serde_json::Value = serde_json::from_str(&exported.out).expect("a JSON array");
+    assert_eq!(facts.as_array().map(Vec::len), Some(0), "{}", exported.out);
+    let listed = ran(data.path(), workspace.path(), &["memory", "list"]);
+    assert!(listed.out.contains("nothing is remembered"), "{}", listed.out);
+
+    let again = ran(data.path(), workspace.path(), &["memory", "forget", &id]);
+    assert_eq!(again.code, Some(0), "forgetting twice is an answer, not a failure");
+    assert!(again.out.contains("no fact with id"), "{}", again.out);
+}
+
+#[test]
+fn memory_export_writes_the_json_array_to_the_named_file() {
+    let (data, workspace) = dirs();
+    ran(data.path(), workspace.path(), &["memory", "remember", "the release is on Thursday"]);
+    let path = data.path().join("facts.json");
+
+    let exported = ran(
+        data.path(),
+        workspace.path(),
+        &["memory", "export", "--out", path.to_str().expect("a utf8 path")],
+    );
+
+    assert!(exported.ok, "{}", exported.err);
+    assert!(exported.out.contains("wrote 1 fact(s)"), "{}", exported.out);
+    let text = std::fs::read_to_string(&path).expect("the export file");
+    let facts: serde_json::Value = serde_json::from_str(&text).expect("a JSON array");
+    assert_eq!(facts[0]["text"], "the release is on Thursday");
+    assert_eq!(facts[0]["origin"], "user");
+}
+
+#[test]
+fn memory_facts_refuse_events_because_they_write_none() {
+    let (data, workspace) = dirs();
+    let refused = ran(data.path(), workspace.path(), &["memory", "remember", "a fact", "--events"]);
+
+    assert_eq!(refused.code, Some(2));
+    assert!(refused.err.contains("does not support --events"), "{}", refused.err);
+}
+
+#[test]
+fn memory_forget_with_no_id_is_a_usage_error() {
+    let (data, workspace) = dirs();
+    let refused = ran(data.path(), workspace.path(), &["memory", "forget"]);
+
+    assert_eq!(refused.code, Some(2));
+    assert!(refused.err.contains("Usage: agent memory forget <id>"), "{}", refused.err);
+}
+
 /// The blob the run writes and the blob `artifact get` reads are one store.
 ///
 /// This is the wiring the unit tests cannot see: the command resolves

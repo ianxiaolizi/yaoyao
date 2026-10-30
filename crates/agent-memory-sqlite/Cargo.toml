@@ -1,0 +1,19 @@
+[package]
+name = "agent-memory-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-ports = { path = "../agent-ports" }
+agent-protocol = { path = "../agent-protocol" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -116,6 +116,7 @@ fn workspace_members_match_spec() {
         "crates/agent-sandbox-win",
         "crates/agent-model-openai",
         "crates/agent-index-sqlite",
+        "crates/agent-memory-sqlite",
         "crates/agent-testkit",
         "crates/agent-cli",
         "crates/agent-web",
@@ -174,6 +175,10 @@ fn dependency_direction_matches_spec() {
         // not see the kernel that owns the log, nor the projection that is the
         // model's history. Its only truth is what it reads through `EventStore`.
         ("crates/agent-index-sqlite", &["agent-protocol", "agent-ports"]),
+        // The durable fact store: one port and the vocabulary of the facts it
+        // keeps. It reads no log, so unlike the index it names neither
+        // `EventStore` nor the store that implements one.
+        ("crates/agent-memory-sqlite", &["agent-protocol", "agent-ports"]),
         ("crates/agent-testkit", &["agent-protocol", "agent-ports"]),
         ("crates/agent-cli", &["agent-protocol", "agent-ports", "agent-kernel"]),
         // The front door: a transport, the read model over the log, and the
@@ -217,6 +222,7 @@ fn dependency_direction_matches_spec() {
                 "agent-decision",
                 "agent-decision-laya",
                 "agent-index-sqlite",
+                "agent-memory-sqlite",
                 "agent-web",
             ],
         ),
@@ -285,6 +291,9 @@ const DEV_MATRIX: &[(&str, &[&str])] = &[
     // The adapter is tested against a real log it did not author: the index is
     // only meaningful relative to the store's own records.
     ("crates/agent-index-sqlite", &["agent-testkit", "agent-store-jsonl"]),
+    // The store's tests use their own temp directory; the durable file needs no
+    // other crate in the workspace to drive it.
+    ("crates/agent-memory-sqlite", &[]),
     ("crates/agent-testkit", &[]),
     // End-to-end CLI tests run through the real loop.
     ("crates/agent-cli", &["agent-testkit", "agent-loop"]),

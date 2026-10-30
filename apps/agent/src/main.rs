@@ -183,6 +183,10 @@ pub(crate) fn usage() {
          web [--port <n>]           Serve the GUI on loopback, token printed once\n  \
          memory search <text>       Find events whose text contains <text>\n  \
          memory reindex             Rebuild the searchable index from the session log\n  \
+         memory remember <text>     Keep a fact across sessions (--key, --supersedes, --private)\n  \
+         memory list [--all]        Show remembered facts (--all includes replaced and expired)\n  \
+         memory forget <id>         Delete a remembered fact for good\n  \
+         memory export [--out]      Every remembered fact as JSON\n  \
          context inspect            Show what the next request would carry (size, kinds, budget)\n  \
          metrics [--out <path>]     Count turns, tools, approvals, tokens and time\n                              from the event log (every session unless --session names one)\n  \
          artifact get <ref> [--out] Fetch a stored blob (locator or hash). Text to stdout otherwise\n  \
