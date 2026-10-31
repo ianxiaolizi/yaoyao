@@ -438,10 +438,8 @@ impl DefaultAgentLoop {
         // main route's million-token working set would send the fast model a
         // request it cannot accept. The frozen summary budget is the number
         // that request must fit; everything else uses the turn's own budget.
-        let mut request_route = route.clone();
-        let (mut profile_context, mut profile_effort) =
-            budget::summary_route_profile(turn, &request_route);
-        let mut route_fallback: Option<&'static str> = None;
+        let (mut request_route, mut route_fallback, mut profile_context, mut profile_effort) =
+            budget::summary_route_selection(turn, route);
         let original_candidate_tokens = candidate.estimated_tokens;
         if !candidate.messages.is_empty() {
             let fit = |context: ResolvedContextBudget| {
@@ -5874,6 +5872,7 @@ mod tests {
             .expect("a compaction start event");
         assert_eq!(started.payload["route"]["model"], "small");
         assert_eq!(started.payload["route"]["tier"], "fast");
+        assert!(started.payload.get("route_fallback").is_none());
 
         // The turn's own attempt still says it was routed to `main`: the two
         // calls are told apart in the log, not by trusting the event order.

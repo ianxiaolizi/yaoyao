@@ -168,6 +168,14 @@ async fn assemble_with(
     resolved: ResolvedProfile,
     models: String,
 ) -> Harness {
+    try_assemble_with(responses, resolved, models).await.expect("the assembly the binary runs")
+}
+
+async fn try_assemble_with(
+    responses: Vec<(u16, String)>,
+    resolved: ResolvedProfile,
+    models: String,
+) -> Result<Harness, stack::StackError> {
     let workspace = tempfile::tempdir().expect("temp workspace");
     let data_dir = tempfile::tempdir().expect("temp data dir");
     let transport = Arc::new(ScriptedTransport::new(responses, models));
@@ -190,15 +198,14 @@ async fn assemble_with(
         network_allowed: false,
         judgment: true,
     })
-    .await
-    .expect("the assembly the binary runs");
-    Harness {
+    .await?;
+    Ok(Harness {
         stack,
         session_id: SessionId::from_string("budget"),
         transport,
         _workspace: workspace,
         _data_dir: data_dir,
-    }
+    })
 }
 
 impl Harness {
@@ -449,4 +456,62 @@ async fn assembled_summary_route_budget_is_derived_from_the_fast_model() {
         profile.budget_sources.get("context_window_tokens").map(String::as_str),
         Some("provider:/models")
     );
+}
+
+/// The fast model offers both depths but defaults to `high`; an explicit
+/// `low` must be honored rather than silently replaced by the model default.
+#[tokio::test]
+async fn an_explicit_summary_depth_the_fast_model_supports_is_honored() {
+    let mut profile = summary_route_profile();
+    profile.budget.reasoning_effort = Some(agent_protocol::model::ReasoningEffort::Low);
+    let h = try_assemble_with(Vec::new(), profile, two_model_catalog_with_fast_default_high())
+        .await
+        .expect("the supported explicit depth assembles");
+    let snapshot = h.stack.profile_snapshot();
+    let summary = snapshot.budget.summary.as_ref().expect("the fast route's budget");
+    assert_eq!(summary.reasoning_effort, Some(agent_protocol::model::ReasoningEffort::Low));
+    assert_eq!(
+        snapshot.budget_sources.get("summary.reasoning_effort").map(String::as_str),
+        Some("explicit"),
+        "the recorded source must show that the configured depth won"
+    );
+}
+
+/// An explicit depth that the fast model never declared must refuse assembly
+/// instead of quietly sending a different depth to the wrong model.
+#[tokio::test]
+async fn an_explicit_summary_depth_the_fast_model_lacks_is_refused() {
+    let mut profile = summary_route_profile();
+    profile.budget.reasoning_effort = Some(agent_protocol::model::ReasoningEffort::Max);
+    let result = try_assemble_with(Vec::new(), profile, two_model_catalog()).await;
+    let error = match result {
+        Ok(_) => panic!("unsupported fast effort must fail assembly"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("small") && error.contains("max"),
+        "the refusal names the fast model and rejected depth: {error}"
+    );
+}
+
+fn two_model_catalog_with_fast_default_high() -> String {
+    serde_json::json!({
+        "data": [
+            {
+                "id": "scripted-model",
+                "context_window": 1_048_576,
+                "max_output_tokens": 393_216,
+                "reasoning_efforts": ["low", "high", "max"],
+                "default_reasoning_effort": "high",
+            },
+            {
+                "id": "small",
+                "context_window": 131_072,
+                "max_output_tokens": 8_192,
+                "reasoning_efforts": ["low", "high"],
+                "default_reasoning_effort": "high",
+            }
+        ]
+    })
+    .to_string()
 }

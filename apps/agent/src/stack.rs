@@ -676,7 +676,11 @@ pub async fn assemble_with_delegation(
                         .map_err(|source| StackError::Budget { route: route_key(route), source })?;
                 // A summary is its own request. Do not inherit the main
                 // route's effort: the fast model may not even offer it.
-                let (effort, source) = reasoning_effort_for(&None, caps, &route_key(route))?;
+                let (effort, source) = reasoning_effort_for(
+                    &resolved.budget.reasoning_effort,
+                    caps,
+                    &route_key(route),
+                )?;
                 (resolution, caps, effort, source)
             }
             // With no fast route the summary is asked of the main model, so it

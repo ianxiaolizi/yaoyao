@@ -193,3 +193,26 @@ pub(super) fn summary_route_profile(
         _ => (turn.budget.context, turn.budget.reasoning_effort),
     }
 }
+
+/// Resolve the route and profile for a summary request.
+///
+/// A cap-only budget from an older snapshot names fast but has no frozen fast
+/// budget. It falls back to main and records why instead of pairing a fast
+/// route with the main model's window and effort.
+pub(super) fn summary_route_selection(
+    turn: &LoopTurn,
+    requested: ModelRoute,
+) -> (
+    ModelRoute,
+    Option<&'static str>,
+    Option<ResolvedContextBudget>,
+    Option<agent_protocol::model::ReasoningEffort>,
+) {
+    let missing_summary_budget = requested.tier == ModelTier::Fast
+        && turn.budget.summary.is_none()
+        && turn.budget.summary_max_output_tokens.is_some();
+    let route = if missing_summary_budget { turn.route.clone() } else { requested };
+    let fallback = missing_summary_budget.then_some("missing_summary_budget");
+    let (context, effort) = summary_route_profile(turn, &route);
+    (route, fallback, context, effort)
+}

@@ -136,24 +136,17 @@ pub(super) fn compress_for_overflow(
             })
             .collect();
         let previous_history = turn.history_end.saturating_sub(turn.history_start);
-        let removed_from_history = removed
-            .iter()
-            .map(|group| {
-                turn.messages[group.start..=group.end]
-                    .iter()
-                    .filter(|message| {
-                        let uid = message.message_uid.as_str();
-                        removed_uids.contains(uid)
-                    })
-                    .count()
-            })
-            .sum::<usize>();
-        let replacement_in_history =
-            first_removed >= turn.history_start && first_removed < turn.history_end;
+        let removed_ranges: Vec<(usize, usize)> =
+            removed.iter().map(|group| (group.start, group.end + 1)).collect();
+        let new_history_end = history_end_after_removal(
+            turn.history_start,
+            turn.history_end,
+            &removed_ranges,
+            Some(first_removed),
+        );
+        let new_history = new_history_end.saturating_sub(turn.history_start);
         turn.messages = candidate;
-        let retained_history = previous_history.saturating_sub(removed_from_history);
-        let new_history = retained_history + usize::from(replacement_in_history);
-        turn.history_end = turn.history_start + new_history;
+        turn.history_end = new_history_end;
         turn.context_message_count =
             turn.context_message_count.saturating_sub(previous_history).saturating_add(new_history);
 
@@ -342,6 +335,36 @@ fn stopped(
     })
 }
 
+/// The history boundary after removing message ranges expressed in original
+/// transcript indices.
+///
+/// In-flight traffic shares the transcript with settled history but not the
+/// history range. Counting an in-flight removal as a history removal would
+/// shrink `history_end` past messages that are still present, so only overlap
+/// with `history_start..history_end` is charged here.
+fn history_end_after_removal(
+    history_start: usize,
+    history_end: usize,
+    removed_ranges: &[(usize, usize)],
+    replacement_at: Option<usize>,
+) -> usize {
+    let previous_history = history_end.saturating_sub(history_start);
+    let removed_from_history = removed_ranges
+        .iter()
+        .map(|(start, end)| {
+            let overlap_start = (*start).max(history_start);
+            let overlap_end = (*end).min(history_end);
+            overlap_end.saturating_sub(overlap_start)
+        })
+        .sum::<usize>();
+    let retained_history = previous_history.saturating_sub(removed_from_history);
+    let replacement_in_history =
+        replacement_at.is_some_and(|at| at >= history_start && at < history_end);
+    history_start
+        .saturating_add(retained_history)
+        .saturating_add(usize::from(replacement_in_history))
+}
+
 fn request_fits(turn: &LoopTurn, target: usize) -> bool {
     budget::estimated_request_tokens(&turn.messages, &turn.manifest) <= target
 }
@@ -378,4 +401,27 @@ fn with_replacement(
         out.push(message.clone());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mixed_removal_counts_only_messages_that_were_in_history() {
+        assert_eq!(
+            history_end_after_removal(2, 7, &[(2, 3), (8, 10)], Some(2)),
+            7,
+            "only the settled-history group may reduce the history range"
+        );
+    }
+
+    #[test]
+    fn a_replacement_outside_history_does_not_change_history_end() {
+        assert_eq!(
+            history_end_after_removal(2, 7, &[(8, 10)], Some(8)),
+            7,
+            "an in-flight-only removal keeps every historical message"
+        );
+    }
 }

@@ -594,3 +594,11 @@ git commit -m "test: close provider overflow and summary route gaps"
 Tasks 1 and 2 are independent and may be implemented in parallel. Task 3 consumes Task 1's typed error and is the critical path. Task 4 consumes all three and is the final acceptance gate.
 
 Recommended execution method: **subagent-driven development**, because the provider classification, route-budget assembly, and loop recovery touch separate boundaries and each benefits from an independent review before the assembled-product acceptance run.
+
+---
+
+## Post-Review Hardening
+
+- [x] **Mixed overflow trimming preserves the history boundary.** `history_end` now subtracts only the removed ranges that overlap the original settled-history range; in-flight removals no longer shrink it. Regression tests: `a_mixed_removal_counts_only_messages_that_were_in_history`, `a_replacement_outside_history_does_not_change_history_end`.
+- [x] **Explicit fast reasoning effort is honored or refused.** Assembly resolves the configured depth against the fast model's declared list; supported values win, unsupported values refuse startup. Regression tests: `an_explicit_summary_depth_the_fast_model_supports_is_honored`, `an_explicit_summary_depth_the_fast_model_lacks_is_refused`.
+- [x] **Cap-only old fast routes fall back to main.** A resumed snapshot that has `summary_max_output_tokens` but lacks `RunBudget.summary` no longer sends a summary to the fast route with main-route numbers; it records `route_fallback = "missing_summary_budget"`. Regression test: `a_fast_summary_without_a_frozen_budget_falls_back_to_main`.

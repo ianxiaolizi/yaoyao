@@ -142,3 +142,65 @@ async fn a_large_summary_candidate_is_clipped_to_the_fast_route_budget() {
         .expect("a compaction event");
     assert_eq!(compacted.payload["strategy"], "summary");
 }
+
+/// A resumed snapshot can name a fast route but predate the frozen summary
+/// budget. Without the fast model's numbers, the only safe summary route is
+/// the main one; borrowing the main budget while still naming fast is exactly
+/// the overflow this change is meant to prevent.
+#[tokio::test]
+async fn a_fast_summary_without_a_frozen_budget_falls_back_to_main() {
+    let candidates = vec![candidate_message(0), candidate_message(1)];
+    let candidate = CompactionCandidate {
+        messages: candidates.clone(),
+        estimated_tokens: candidates.iter().map(estimate_message).sum(),
+        retained_tokens: 0,
+        budget_tokens: 10_000,
+        trigger_tokens: 5_000,
+        observed_input_tokens: None,
+        scope: CompactionScope::Settled,
+    };
+    let context =
+        Arc::new(FakeContextEngine::new(candidates, EventSeq::new(3)).with_compaction(candidate));
+    let model = Arc::new(FakeModelProvider::new(vec![
+        FakeModelProvider::answer("summarized"),
+        FakeModelProvider::answer("done"),
+    ]));
+    let gateway = Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new())));
+    let main_route = ModelRoute::new(ModelTier::Main, "test-provider", "test-model");
+    let fast_route = ModelRoute::new(ModelTier::Fast, "test-provider", "fast-model");
+    let router = Arc::new(SummarizeOnFast { main: main_route.clone(), fast: fast_route });
+    let loop_ = DefaultAgentLoop::new(model.clone(), gateway, context, router);
+    let mut turn = ctx();
+    turn.state = Some(TurnStateFacts {
+        budget: RunBudget {
+            context: Some(context_budget(10_000)),
+            reasoning_effort: Some(ReasoningEffort::High),
+            supported_reasoning_efforts: vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ],
+            summary: None,
+            summary_max_output_tokens: Some(64),
+            ..RunBudget::default()
+        },
+        ..facts()
+    });
+
+    let outcome = run_turn(&loop_, &turn).await;
+    assert_eq!(outcome.stop_reason, StopReason::FinalAnswer);
+    let requests = model.requests();
+    let summary_request = &requests[0];
+    assert_eq!(
+        summary_request.model_route.as_ref().map(|route| route.tier),
+        Some(ModelTier::Main),
+        "without a fast budget the request must not be sent to the fast route"
+    );
+    assert_eq!(summary_request.budget.reasoning_effort, Some(ReasoningEffort::High));
+    let compacted = outcome
+        .events
+        .iter()
+        .find(|event| event.event_type.as_str() == EventType::CONTEXT_COMPACTED)
+        .expect("the main-route fallback still compacts");
+    assert_eq!(compacted.payload["route_fallback"], "missing_summary_budget");
+}
