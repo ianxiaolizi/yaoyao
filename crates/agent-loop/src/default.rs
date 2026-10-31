@@ -72,17 +72,16 @@ use crate::context_layers::{
 };
 use event_drafts::{draft, draft_turn, reason_event};
 use loop_call::{LoopCallAnswer, answer_loop_call};
-
 mod budget;
 mod completion;
 mod event_drafts;
 mod loop_call;
 mod output_recovery;
+use output_recovery::RecoveryOutcome;
 mod settle;
 mod settlement;
 mod stall;
 mod work_state;
-
 /// Longest provider error text persisted in a durable attempt event.
 const MAX_ERROR_CHARS: usize = 500;
 
@@ -1839,7 +1838,7 @@ impl AgentLoop for DefaultAgentLoop {
             // thinking. The verdict says so once, instead of calling a request
             // that produced no content a truncated answer.
             let reasoning_exhausted;
-            let (response, response_event_id) =
+            let (response, response_event_id, output_limit) =
                 match self.model.stream(&request, sink.as_ref()).await {
                     Ok(first) => {
                         // A reasoning model can spend the whole completion on
@@ -1849,7 +1848,7 @@ impl AgentLoop for DefaultAgentLoop {
                         // answer, so the step re-asks once with more room — or,
                         // at the model's own ceiling, less depth. `output_recovery`
                         // owns that ask, including why it happens at most once.
-                        let response = match self
+                        let (response, output_limit) = match self
                             .recover_output(
                                 ctx,
                                 &step_id,
@@ -1863,8 +1862,10 @@ impl AgentLoop for DefaultAgentLoop {
                             )
                             .await?
                         {
-                            output_recovery::RecoveryOutcome::Settled(response) => response,
-                            output_recovery::RecoveryOutcome::Failed(stop) => {
+                            RecoveryOutcome::Settled { response, output_limit } => {
+                                (response, output_limit)
+                            }
+                            RecoveryOutcome::Failed(stop) => {
                                 return Ok(StepOutcome {
                                     step_id,
                                     events,
@@ -1896,7 +1897,7 @@ impl AgentLoop for DefaultAgentLoop {
                         // unrecorded gap between two kernel decisions.
                         let recorded_id = recorded.event_id.as_str().to_string();
                         events.push(recorded);
-                        (response, recorded_id)
+                        (response, recorded_id, output_limit)
                     }
                     Err(error) => {
                         // The attempt's deltas stayed live-only; no partial response
@@ -2212,7 +2213,7 @@ impl AgentLoop for DefaultAgentLoop {
                     &answer_text,
                     &verdict::Facts {
                         halt: verdict::Halt::of(&response),
-                        output_limit: turn.budget.max_output_tokens,
+                        output_limit,
                         undispatched_calls: 0,
                         unmet_action: turn.dispatched == 0 && turn.mode.stance == Stance::Act,
                         criterion_observed: turn.criterion_observed,
@@ -2256,12 +2257,7 @@ impl AgentLoop for DefaultAgentLoop {
                 let calls = tool_calls.len() as u32;
                 let read = verdict::answer(
                     &text,
-                    &verdict::Facts::halted(
-                        halt,
-                        turn.budget.max_output_tokens,
-                        calls,
-                        reasoning_exhausted,
-                    ),
+                    &verdict::Facts::halted(halt, output_limit, calls, reasoning_exhausted),
                 );
                 let verdict = turn.reason.node(
                     ReasonKind::Verdict,
@@ -2275,7 +2271,15 @@ impl AgentLoop for DefaultAgentLoop {
                     ReasonSource::Model,
                 );
                 events.push(reason_event(ctx, Some(&step_id), &verdict));
-                refuse_undispatched(ctx, &step_id, turn, &mut events, &tool_calls, &read.stop);
+                refuse_undispatched(
+                    ctx,
+                    &step_id,
+                    turn,
+                    &mut events,
+                    &tool_calls,
+                    &read.stop,
+                    output_limit,
+                );
                 events.push(draft(
                     ctx,
                     &step_id,
@@ -3096,6 +3100,7 @@ impl AgentLoop for DefaultAgentLoop {
                     &mut events,
                     &tool_calls[index..],
                     &reason,
+                    turn.budget.max_output_tokens,
                 );
                 events.push(draft(
                     ctx,
@@ -3182,6 +3187,7 @@ fn refuse_undispatched(
     events: &mut Vec<EventDraft>,
     calls: &[ToolCall],
     reason: &StopReason,
+    output_limit: Option<u32>,
 ) {
     let content = match reason {
         StopReason::MaxToolCalls => format!(
@@ -3196,7 +3202,7 @@ fn refuse_undispatched(
             "This tool call was never dispatched: the provider stopped the response at the \
              run's output-token limit ({}), so the calls in it may be incomplete. Nothing ran; \
              raise `max_output_tokens` and propose them again if the work still needs doing.",
-            turn.budget.max_output_tokens.unwrap_or_default()
+            output_limit.unwrap_or_default()
         ),
         StopReason::ContentFiltered => String::from(
             "This tool call was never dispatched: the provider withheld the response under its \

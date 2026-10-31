@@ -244,6 +244,13 @@ async fn a_one_million_window_model_gets_a_model_derived_budget() {
         profile.budget_sources.get("input_working_set_tokens").map(String::as_str),
         Some("preset:balanced")
     );
+    assert_eq!(
+        profile
+            .budget_sources
+            .get("model_capabilities:scripted-endpoint/scripted-model")
+            .map(String::as_str),
+        Some("provider:/models")
+    );
 }
 
 /// A reasoning-only `length` response is retried once; the turn settles on the

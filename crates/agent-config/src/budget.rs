@@ -23,8 +23,8 @@ use crate::{ConfigError, Result};
 const WINDOW_SAFETY_PERCENT: u64 = 95;
 /// The auto completion cap as a share of the window, in percent.
 const COMPLETION_SHARE_PERCENT: u64 = 25;
-/// The auto compaction headroom as a share of the window, in percent.
-const HEADROOM_SHARE_PERCENT: u64 = 6;
+/// The auto compaction headroom is one sixteenth of the window.
+const HEADROOM_DIVISOR: u32 = 16;
 /// Floor for the auto compaction headroom, in tokens.
 const HEADROOM_FLOOR_TOKENS: u32 = 32_768;
 /// The default share of the working set at which compaction triggers.
@@ -161,7 +161,7 @@ pub fn resolve_context_budget(
     };
 
     // B: headroom kept free for compaction text.
-    let auto_headroom = HEADROOM_FLOOR_TOKENS.max(ratio(window, HEADROOM_SHARE_PERCENT, 100));
+    let auto_headroom = HEADROOM_FLOOR_TOKENS.max(window / HEADROOM_DIVISOR);
     let (headroom, headroom_source) = match policy.compaction_headroom_tokens {
         Some(headroom) => {
             if headroom == 0 || headroom >= window.saturating_sub(completion) {
@@ -277,11 +277,16 @@ pub fn resolve_context_budget(
         None => (auto_retained, "derived:0.16W".to_string()),
     };
 
+    // Recovery may grow the completion cap, but only into room the request
+    // actually has: the model ceiling and this run's 95% window budget are both
+    // hard limits. When no room remains, recovery lowers reasoning effort.
+    let recovery_ceiling =
+        caps.capabilities.max_output_tokens.min(window_limit.saturating_sub(input)).max(completion);
     let budget = ResolvedContextBudget {
         context_window_tokens: window,
         input_working_set_tokens: input,
         completion_cap_tokens: completion,
-        completion_cap_ceiling_tokens: caps.capabilities.max_output_tokens,
+        completion_cap_ceiling_tokens: recovery_ceiling,
         compaction_headroom_tokens: headroom,
         compaction_trigger_tokens: trigger,
         retain_recent_tokens: retained,
@@ -341,6 +346,7 @@ mod tests {
         assert_eq!(resolution.budget.context_window_tokens, 1_048_576);
         assert_eq!(resolution.budget.completion_cap_tokens, 262_144);
         assert_eq!(resolution.budget.input_working_set_tokens, 262_144);
+        assert_eq!(resolution.budget.compaction_headroom_tokens, 65_536);
         assert_eq!(resolution.budget.compaction_trigger_tokens, 209_715);
         assert_eq!(resolution.budget.retain_recent_tokens, 125_829);
     }
@@ -366,6 +372,20 @@ mod tests {
         assert_eq!(frugal.budget.completion_cap_tokens, 262_144);
     }
 
+    #[test]
+    fn the_recovery_ceiling_cannot_spend_room_the_working_set_does_not_have() {
+        let mut caps = deepseek_flash_caps();
+        caps.capabilities.context_window_tokens = 100_000;
+        caps.capabilities.max_output_tokens = 50_000;
+        let policy = BudgetPolicy {
+            input_working_set_tokens: Some(60_000),
+            completion_cap_tokens: Some(20_000),
+            ..BudgetPolicy::balanced()
+        };
+        let resolution = resolve_context_budget(&caps, &policy).unwrap();
+        assert_eq!(resolution.budget.completion_cap_tokens, 20_000);
+        assert_eq!(resolution.budget.completion_cap_ceiling_tokens, 35_000);
+    }
     #[test]
     fn an_explicit_cap_larger_than_the_model_allows_is_refused() {
         let caps = deepseek_flash_caps();

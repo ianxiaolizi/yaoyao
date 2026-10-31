@@ -23,7 +23,10 @@ use agent_protocol::profile::{ResolvedContextBudget, RunBudget};
 
 use crate::context_layers::truncate;
 
-use super::{DefaultAgentLoop, LoopTurn, MAX_ERROR_CHARS, NullSink, budget, draft, step_failed};
+use super::{
+    DefaultAgentLoop, LoopTurn, MAX_ERROR_CHARS, NullSink, budget, draft, redacted_proposal,
+    step_failed,
+};
 
 /// What the loop should do with a response the output limit ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +131,10 @@ pub(super) fn recovery_budget(budget: &RunBudget) -> Option<ResolvedContextBudge
 
 /// What the step does with the response the provider settled.
 pub(super) enum RecoveryOutcome {
-    /// The response the step keeps — the first one when no retry was earned.
-    Settled(ModelResponse),
+    /// The response the step keeps and the completion cap it was produced
+    /// under. The first response keeps the run's cap; a recovery keeps the
+    /// larger cap it actually asked for so the terminal verdict names it.
+    Settled { response: ModelResponse, output_limit: Option<u32> },
     /// The recovery request itself failed; the step ends on this stop.
     Failed(StopReason),
 }
@@ -158,7 +163,10 @@ impl DefaultAgentLoop {
     ) -> Result<RecoveryOutcome, AgentLoopError> {
         let response = first;
         let Some(recovery_budget) = recovery_budget(&turn.budget) else {
-            return Ok(RecoveryOutcome::Settled(response));
+            return Ok(RecoveryOutcome::Settled {
+                response,
+                output_limit: turn.budget.max_output_tokens,
+            });
         };
         let decision = decision(
             &response,
@@ -168,8 +176,28 @@ impl DefaultAgentLoop {
             false,
         );
         let RecoveryDecision::Retry { max_tokens, reasoning_effort } = decision else {
-            return Ok(RecoveryOutcome::Settled(response));
+            return Ok(RecoveryOutcome::Settled {
+                response,
+                output_limit: turn.budget.max_output_tokens,
+            });
         };
+        // The first attempt reached a real response, so it must reach a
+        // terminal event before the retry opens a second attempt. Its content
+        // is empty by the recovery precondition; `discarded` distinguishes the
+        // record from the response the step actually kept.
+        let discarded = redacted_proposal(&response, &self.redactor);
+        events.push(draft(
+            ctx,
+            step_id,
+            EventType::MODEL_RESPONSE_COMPLETED,
+            serde_json::json!({
+                "attempt_id": *attempt_id,
+                "response": serde_json::to_value(&discarded)?,
+                "output_recovery": "reasoning_only",
+                "discarded": true,
+            }),
+            Actor::Agent,
+        ));
         // The first response's tokens were really spent: the budget reads cost,
         // not value, so they are recorded even though the response itself is
         // discarded.
@@ -200,7 +228,9 @@ impl DefaultAgentLoop {
         // the live turn already had its one stream of thinking from the
         // attempt that ran out of room.
         match self.model.stream(&retried_request, &NullSink).await {
-            Ok(second) => Ok(RecoveryOutcome::Settled(second)),
+            Ok(second) => {
+                Ok(RecoveryOutcome::Settled { response: second, output_limit: Some(max_tokens) })
+            }
             Err(error) => {
                 let cancelled = error.is_cancelled();
                 events.push(draft(

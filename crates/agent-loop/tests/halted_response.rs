@@ -116,6 +116,7 @@ async fn a_truncated_response_dispatches_none_of_its_calls() {
     );
     let verdict = verdict_of(&outcome.events);
     assert_eq!(verdict.rule, "verdict/output-truncated");
+
     assert!(verdict.claim.contains("1 proposed call not dispatched"), "{}", verdict.claim);
 }
 
@@ -223,14 +224,18 @@ async fn the_loop_retries_once_before_treating_output_as_final() {
     assert_eq!(prepared[1].payload["output_recovery"], "reasoning_only");
     assert!(prepared[0].payload.get("output_recovery").is_none(), "the first ask is ordinary");
 
-    // Only the settled response is durable: the truncated one is discarded
-    // rather than recorded as an answer the turn kept.
+    // Both attempts reach a terminal event. The truncated response is marked
+    // as discarded rather than left as a dangling attempt or mistaken for the
+    // settled answer.
     let responses: Vec<_> = outcome
         .events
         .iter()
         .filter(|event| event.event_type.as_str() == EventType::MODEL_RESPONSE_COMPLETED)
         .collect();
-    assert_eq!(responses.len(), 1);
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0].payload["discarded"], true);
+    assert_eq!(responses[0].payload["output_recovery"], "reasoning_only");
+    assert!(responses[1].payload.get("discarded").is_none());
 }
 
 #[tokio::test]
@@ -250,6 +255,11 @@ async fn a_second_reasoning_only_truncation_ends_as_max_output_tokens() {
     assert_eq!(outcome.stop_reason, StopReason::MaxOutputTokens);
     let verdict = verdict_of(&outcome.events);
     assert_eq!(verdict.rule, "verdict/output-truncated");
+    assert!(
+        verdict.claim.contains("393216"),
+        "the verdict names the cap the recovery actually used: {}",
+        verdict.claim
+    );
     assert!(
         verdict.claim.starts_with("reasoning budget exhausted"),
         "the verdict says where the budget went: {}",

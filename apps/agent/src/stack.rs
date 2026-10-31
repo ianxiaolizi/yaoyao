@@ -54,7 +54,9 @@ use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_protocol::ids::SessionId;
-use agent_protocol::model::{ModelCapabilities, ModelRoute, ModelTier, ReasoningEffort};
+use agent_protocol::model::{
+    ModelCapabilities, ModelCapabilitySource, ModelRoute, ModelTier, ReasoningEffort,
+};
 use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef, Workspace};
 use agent_protocol::profile::ResolvedProfileSnapshot;
 use agent_protocol::redactor::{HighEntropy, Redactor};
@@ -267,6 +269,17 @@ struct DiscoveredCapabilities {
     resolved: BTreeMap<String, ResolvedModelCapabilities>,
 }
 
+/// A discovered capability set should be named in the snapshot's audit
+/// map. The source is as important as the numbers: a fallback that reads like
+/// a provider fact is the failure this label prevents.
+fn capability_source_label(source: ModelCapabilitySource) -> &'static str {
+    match source {
+        ModelCapabilitySource::Provider => "provider:/models",
+        ModelCapabilitySource::Bundled => "bundled",
+        ModelCapabilitySource::Fallback => "fallback",
+    }
+}
+
 /// How a route is named in the audit trail.
 fn route_key(route: &ModelRoute) -> String {
     format!("{}/{}", route.provider, route.model)
@@ -329,7 +342,7 @@ fn reasoning_effort_for(
         return Ok((Some(*effort), "explicit"));
     }
     if let Some(default) = capabilities.capabilities.default_reasoning_effort
-        && (declared.is_empty() || declared.contains(&default))
+        && declared.contains(&default)
     {
         return Ok((Some(default), "model_default"));
     }
@@ -662,6 +675,16 @@ pub async fn assemble_with_delegation(
     let context_budget = resolution.budget;
     let mut budget_sources = resolution.sources;
     budget_sources.insert("reasoning_effort".to_string(), reasoning_source.to_string());
+    // The budget-source map is the snapshot's audit trail. Record the source
+    // for every route's capability set, not only the main route's window: a
+    // fallback remains visible even when an explicit window override makes the
+    // derived `context_window_tokens` source say "explicit".
+    for (route, capabilities) in &discovered.resolved {
+        budget_sources.insert(
+            format!("model_capabilities:{route}"),
+            capability_source_label(capabilities.source).to_string(),
+        );
+    }
     resolved.budget.context = Some(context_budget);
     // The provider is asked for this cap, not for the build's old completion
     // default: a cap sized for prose is a cap that ends a reasoning model
@@ -1122,6 +1145,21 @@ pub async fn assemble_with_delegation(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_reasoning_default_without_a_declared_depth_is_not_sent() {
+        let caps = ResolvedModelCapabilities {
+            capabilities: ModelCapabilities {
+                context_window_tokens: 1_000,
+                max_output_tokens: 100,
+                reasoning_efforts: Vec::new(),
+                default_reasoning_effort: Some(ReasoningEffort::High),
+            },
+            source: agent_protocol::model::ModelCapabilitySource::Fallback,
+        };
+        let (effort, source) = reasoning_effort_for(&None, &caps, "route").unwrap();
+        assert_eq!(effort, None);
+        assert_eq!(source, "unsupported");
+    }
     #[test]
     fn tool_secrets_are_a_sorted_deduplicated_env_list() {
         assert!(tool_secret_refs(None).is_empty());

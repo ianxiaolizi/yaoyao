@@ -1311,6 +1311,13 @@ async fn a_route_whose_capabilities_cannot_be_discovered_records_the_fallback() 
     );
     assert_eq!(
         profile
+            .budget_sources
+            .get("model_capabilities:scripted-endpoint/scripted-model")
+            .map(String::as_str),
+        Some("fallback")
+    );
+    assert_eq!(
+        profile
             .model_capabilities
             .get("scripted-endpoint/scripted-model")
             .map(|caps| caps.context_window_tokens),
