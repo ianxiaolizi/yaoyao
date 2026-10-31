@@ -51,8 +51,9 @@ struct LastRequest {
     estimated_tool_tokens: Option<u64>,
     /// Messages plus tools: the number to compare with provider input.
     estimated_request_tokens: Option<u64>,
-    max_input_tokens: Option<u64>,
-    reserved_output_tokens: Option<u64>,
+    /// The input working set the run was fitted to, as the prepared record
+    /// carried it.
+    input_working_set_tokens: Option<u64>,
     tool_manifest_id: Option<String>,
     tool_count: Option<u64>,
     /// The definitions behind `tool_manifest_id`, in full, from the
@@ -136,8 +137,7 @@ impl LastRequest {
             "estimated_messages_tokens": self.estimated_messages_tokens,
             "estimated_tool_tokens": self.estimated_tool_tokens,
             "estimated_request_tokens": self.estimated_request_tokens,
-            "max_input_tokens": self.max_input_tokens,
-            "reserved_output_tokens": self.reserved_output_tokens,
+            "input_working_set_tokens": self.input_working_set_tokens,
             "tool_manifest_id": self.tool_manifest_id,
             "tool_count": self.tool_count,
             "tool_definitions": self.tool_definitions,
@@ -420,27 +420,47 @@ fn compaction_line(compaction: &LastCompaction) -> String {
 }
 
 fn budget_line(report: &ContextUsageReport) -> String {
-    let Some(max) = report.max_input_tokens else {
-        return String::from("budget: not configured; history is sent untrimmed");
+    let Some(budget) = report.budget_tokens else {
+        return String::from("budget: no resolved context budget; history is sent untrimmed");
     };
-    let reserved = report.reserved_output_tokens.unwrap_or(0);
-    let budget = report.budget_tokens.unwrap_or(0);
     let percent = report.percent_used.map(|value| value.to_string()).unwrap_or_else(|| "?".into());
     let remaining = report.remaining_tokens.unwrap_or(0);
     let over = report.estimated_tokens.saturating_sub(budget);
-    if over > 0 {
+    let mut line = if over > 0 {
         format!(
-            "budget: {max} input tokens, {reserved} reserved, {budget} usable; about {} used \
-             ({percent}%), 0 left (over the usable budget by {over})",
+            "budget: {budget}-token input working set; about {} used ({percent}%), 0 left \
+             (over the working set by {over})",
             report.estimated_tokens
         )
     } else {
         format!(
-            "budget: {max} input tokens, {reserved} reserved, {budget} usable; about {} used \
-             ({percent}%), {remaining} left",
+            "budget: {budget}-token input working set; about {} used ({percent}%), \
+             {remaining} left",
             report.estimated_tokens
         )
+    };
+    let resolved = [
+        ("context window", report.context_window_tokens),
+        ("completion cap", report.completion_cap_tokens),
+        ("compaction trigger", report.compaction_trigger_tokens),
+        ("retained recent", report.retain_recent_tokens),
+    ];
+    let parts: Vec<String> = resolved
+        .into_iter()
+        .filter_map(|(label, value)| value.map(|value| format!("{label} {value}")))
+        .collect();
+    if !parts.is_empty() {
+        line.push_str(&format!("; {}", parts.join(", ")));
     }
+    if !report.budget_sources.is_empty() {
+        let sources: Vec<String> = report
+            .budget_sources
+            .iter()
+            .map(|(field, source)| format!("{field}={source}"))
+            .collect();
+        line.push_str(&format!("; sources {}", sources.join(", ")));
+    }
+    line
 }
 
 /// The last prepared request, with the response that settled the same attempt.
@@ -476,8 +496,7 @@ fn last_request(events: &[StoredEvent]) -> Option<LastRequest> {
                     estimated_messages_tokens: number_field(payload, "estimated_messages_tokens"),
                     estimated_tool_tokens: number_field(payload, "estimated_tool_tokens"),
                     estimated_request_tokens: number_field(payload, "estimated_request_tokens"),
-                    max_input_tokens: number_field(payload, "max_input_tokens"),
-                    reserved_output_tokens: number_field(payload, "reserved_output_tokens"),
+                    input_working_set_tokens: number_field(payload, "input_working_set_tokens"),
                     tool_manifest_id: string_field(payload, "tool_manifest_id"),
                     tool_count: number_field(payload, "tool_count"),
                     tool_definitions: definitions.map(|(_, seq, frozen)| {

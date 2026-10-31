@@ -456,7 +456,7 @@ pub(crate) struct ContextNotice {
     pub(crate) kind: ContextNoticeKind,
     pub(crate) dropped_messages: usize,
     pub(crate) estimated_tokens: usize,
-    pub(crate) max_input_tokens: u32,
+    pub(crate) input_working_set_tokens: u32,
     pub(crate) percent: u32,
     pub(crate) text: String,
 }
@@ -484,7 +484,7 @@ impl ContextNotice {
             "kind": self.kind.as_str(),
             "dropped_messages": self.dropped_messages,
             "estimated_tokens": self.estimated_tokens,
-            "max_input_tokens": self.max_input_tokens,
+            "input_working_set_tokens": self.input_working_set_tokens,
             "percent": self.percent,
             "text": self.text,
         })
@@ -569,9 +569,11 @@ impl BudgetNotice {
 /// settlement in `default::settle` is what bounds those. "About" is
 /// deliberate.
 pub(crate) fn context_notice(usage: &ContextUsage, request_tokens: usize) -> Option<ContextNotice> {
-    let max_input_tokens = usage.max_input_tokens?;
-    let budget =
-        max_input_tokens.saturating_sub(usage.reserved_output_tokens.unwrap_or(0)) as usize;
+    // The resolved working set, not the model's physical window and not a
+    // share of it recomputed here: the run already decided what it will spend
+    // on input, and the notice speaks in that unit.
+    let input_working_set_tokens = usage.input_working_set_tokens?;
+    let budget = input_working_set_tokens as usize;
     if budget == 0 {
         return None;
     }
@@ -610,7 +612,7 @@ pub(crate) fn context_notice(usage: &ContextUsage, request_tokens: usize) -> Opt
         kind,
         dropped_messages: dropped,
         estimated_tokens: used,
-        max_input_tokens,
+        input_working_set_tokens,
         percent,
         text,
     })

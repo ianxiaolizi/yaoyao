@@ -390,6 +390,22 @@ impl DefaultAgentLoop {
         let input_uid =
             input_message.as_ref().map(|message| message.message_uid.as_str().to_string());
 
+        // The answer cap for the summary is the summary route's own when
+        // assembly resolved one, else the main completion cap. The turn's
+        // `max_output_tokens` is the wrong number twice over: it is sized for a
+        // reasoning model this request may not be routed to, and a summary is
+        // prose, not a train of thought.
+        let summary_cap = turn
+            .budget
+            .summary_max_output_tokens
+            .or(turn.budget.context.map(|context| context.completion_cap_tokens));
+        let summary_budget = |mut budget: ModelBudget| {
+            if summary_cap.is_some() {
+                budget.max_tokens = summary_cap;
+            }
+            budget
+        };
+
         // A summarizer is not the turn. It is asked a different question with a
         // different request, so it gets its own route: a configuration that
         // named a cheaper tier for summarization means this call, and reusing
@@ -405,7 +421,7 @@ impl DefaultAgentLoop {
             // The compaction request asks nothing of the provider beyond text:
             // the same empty list the request below carries.
             required_capabilities: Vec::new(),
-            budget: turn.model_budget(),
+            budget: summary_budget(turn.model_budget()),
         });
 
         events.push(draft(
@@ -458,7 +474,7 @@ impl DefaultAgentLoop {
             capabilities: Vec::new(),
             response_format: None,
             model_route: Some(route),
-            budget: turn.model_budget(),
+            budget: summary_budget(turn.model_budget()),
             tool_manifest: ToolManifest::empty(),
         };
 
@@ -1687,8 +1703,7 @@ impl AgentLoop for DefaultAgentLoop {
                 "estimated_messages_tokens": estimated_messages_tokens,
                 "estimated_tool_tokens": estimated_tool_tokens,
                 "estimated_request_tokens": estimated_request_tokens,
-                "max_input_tokens": turn.context_usage.max_input_tokens,
-                "reserved_output_tokens": turn.context_usage.reserved_output_tokens,
+                "input_working_set_tokens": turn.context_usage.input_working_set_tokens,
                 "messages": message_refs,
                 "messages_hash": messages_hash,
                 "tool_manifest_id": request.tool_manifest.manifest_id,
@@ -5270,8 +5285,7 @@ mod tests {
                 // built-in tool definitions alone (plan, state, judgment) are
                 // over a thousand tokens that a small window would report as
                 // near-limit too.
-                max_input_tokens: Some(4_000),
-                reserved_output_tokens: Some(100),
+                input_working_set_tokens: Some(3_900),
             }),
         );
         let loop_ = DefaultAgentLoop::new(
@@ -5287,8 +5301,7 @@ mod tests {
         assert_eq!(payload["context_message_count"], 1);
         assert_eq!(payload["dropped_message_count"], 4);
         assert_eq!(payload["estimated_context_tokens"], 120);
-        assert_eq!(payload["max_input_tokens"], 4_000);
-        assert_eq!(payload["reserved_output_tokens"], 100);
+        assert_eq!(payload["input_working_set_tokens"], 3_900);
         assert_eq!(
             payload["message_count"], 4,
             "one kept message, the identity layer, the trim notice, and this turn's input"
@@ -5703,6 +5716,7 @@ mod tests {
             estimated_tokens: 1200,
             retained_tokens: 300,
             budget_tokens: 2000,
+            trigger_tokens: 1600,
             observed_input_tokens: None,
             scope: CompactionScope::Settled,
         };
@@ -5834,6 +5848,7 @@ mod tests {
             estimated_tokens: 1200,
             retained_tokens: 300,
             budget_tokens: 2000,
+            trigger_tokens: 1600,
             observed_input_tokens: None,
             scope: CompactionScope::Settled,
         };
@@ -5906,6 +5921,7 @@ mod tests {
             estimated_tokens: 1200,
             retained_tokens: 300,
             budget_tokens: 2000,
+            trigger_tokens: 1600,
             observed_input_tokens: None,
             scope: CompactionScope::Settled,
         };
@@ -5999,6 +6015,7 @@ mod tests {
             estimated_tokens: 1200,
             retained_tokens: 300,
             budget_tokens: 2000,
+            trigger_tokens: 1600,
             observed_input_tokens: None,
             scope: CompactionScope::Settled,
         };
@@ -6071,6 +6088,7 @@ mod tests {
             estimated_tokens: 1200,
             retained_tokens: 300,
             budget_tokens: 2000,
+            trigger_tokens: 1600,
             observed_input_tokens: None,
             scope: CompactionScope::Settled,
         };
@@ -6147,6 +6165,7 @@ mod tests {
             estimated_tokens: 1200,
             retained_tokens: 300,
             budget_tokens: 2000,
+            trigger_tokens: 1600,
             observed_input_tokens: None,
             scope: CompactionScope::Settled,
         };
@@ -6224,8 +6243,7 @@ mod tests {
             ContextUsage {
                 dropped_messages: 0,
                 estimated_tokens: 0,
-                max_input_tokens: Some(3_000),
-                reserved_output_tokens: Some(0),
+                input_working_set_tokens: Some(3_000),
             },
         ));
         let model = Arc::new(FakeModelProvider::new(vec![
@@ -6319,8 +6337,7 @@ mod tests {
             ContextUsage {
                 dropped_messages: 0,
                 estimated_tokens: 0,
-                max_input_tokens: Some(3_000),
-                reserved_output_tokens: Some(0),
+                input_working_set_tokens: Some(3_000),
             },
         ));
         // Four tool steps, each adding a result far past the 70% settle share
@@ -7077,8 +7094,7 @@ mod tests {
                 ContextUsage {
                     dropped_messages: 0,
                     estimated_tokens: 480,
-                    max_input_tokens: Some(500),
-                    reserved_output_tokens: Some(0),
+                    input_working_set_tokens: Some(500),
                 },
             ));
         let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));

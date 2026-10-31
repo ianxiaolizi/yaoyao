@@ -26,8 +26,7 @@ fn windowed(window: u32) -> Arc<dyn ContextEngine> {
     Arc::new(FakeContextEngine::new(Vec::new(), EventSeq::new(1)).with_usage(ContextUsage {
         dropped_messages: 0,
         estimated_tokens: 0,
-        max_input_tokens: Some(window),
-        reserved_output_tokens: Some(0),
+        input_working_set_tokens: Some(window),
     }))
 }
 

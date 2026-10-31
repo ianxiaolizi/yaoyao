@@ -287,19 +287,34 @@ pub(crate) async fn context(args: &Args) {
         eprintln!("configuration: {note}");
     }
 
-    // The same policy `stack::assemble` builds from the same configuration: a
-    // report measured against a default window would describe a request this
-    // build would never send.
     let data_dir = PathBuf::from(data_dir());
     let store: Arc<dyn EventStore> =
         Arc::new(JsonlEventStore::new(&data_dir).with_lease_wait(Duration::ZERO));
+    // The log is read first, because the numbers this report is measured
+    // against are the ones the run froze at assembly: the last
+    // `profile/resolved` record carries the resolved context budget and where
+    // each field came from. Re-deriving a policy from today's configuration
+    // would measure the context against a request this run never sent.
+    let events = match store.read_stream(&args.session, EventSeq::ZERO, usize::MAX).await {
+        Ok(events) => events,
+        Err(e) => {
+            eprintln!("context log read failed: {e}");
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    };
+    let recorded = recorded_budget(&events);
+
+    // The engine still needs a policy to derive against: the recorded budget
+    // when the log has one, and the explicit configuration only for a log
+    // written before the record existed. A run with neither measures nothing,
+    // exactly as before.
+    let policy = match &recorded {
+        Some(recorded) => Some(agent_context::trim::ContextPolicy::resolved(recorded.budget)),
+        None => legacy_policy(&resolved.budget),
+    };
     let engine = agent_context::ProjectionContextEngine::new(store.clone(), &data_dir);
-    let engine = match resolved.budget.max_input_tokens {
-        Some(max_input_tokens) => engine.with_context_policy(agent_context::trim::ContextPolicy {
-            max_input_tokens,
-            reserved_output_tokens: resolved.budget.reserved_output_tokens.unwrap_or(0),
-            compact_at_percent: resolved.budget.compact_at_percent,
-        }),
+    let engine = match policy {
+        Some(policy) => engine.with_context_policy(policy),
         None => engine,
     };
 
@@ -310,18 +325,14 @@ pub(crate) async fn context(args: &Args) {
             std::process::exit(EXIT_DID_NOT_RUN);
         }
     };
-    let report = agent_context::inspect::report(&derived.messages, &derived.usage, top);
+    let mut report = agent_context::inspect::report(&derived.messages, &derived.usage, top);
+    if let Some(recorded) = &recorded {
+        report = agent_context::inspect::with_budget(report, &recorded.budget, &recorded.sources);
+    }
 
     // The final section is read back from the log rather than recomputed: what
     // the last request actually carried is a recorded fact, and a prediction
     // would answer a different question.
-    let events = match store.read_stream(&args.session, EventSeq::ZERO, usize::MAX).await {
-        Ok(events) => events,
-        Err(e) => {
-            eprintln!("context log read failed: {e}");
-            std::process::exit(EXIT_DID_NOT_RUN);
-        }
-    };
     let outcome =
         match run_context_inspect(&report, &args.session, derived.revision, &events, args.json) {
             Ok(outcome) => outcome,
@@ -329,6 +340,67 @@ pub(crate) async fn context(args: &Args) {
         };
     print(&outcome.output);
     exit_on(outcome.verdict);
+}
+
+/// The context budget a run froze, read from its `profile/resolved` record.
+struct RecordedBudget {
+    budget: agent_protocol::profile::ResolvedContextBudget,
+    sources: std::collections::BTreeMap<String, String>,
+}
+
+/// The last resolved context budget in the log, if the run recorded one.
+///
+/// The snapshot is the run's own statement of what it derived; a missing
+/// `context` field means the record predates model-adaptive budgets (or the
+/// run never discovered a window), and the caller falls back to the explicit
+/// configuration. The sources are read from the snapshot's canonical map, so a
+/// report can say which field was declared and which was derived.
+fn recorded_budget(events: &[agent_protocol::events::StoredEvent]) -> Option<RecordedBudget> {
+    let payload = events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event.event_type.as_str() == agent_protocol::events::EventType::PROFILE_RESOLVED
+        })
+        .map(|event| &event.event.payload)?;
+    let budget = payload.get("budget")?;
+    let context = serde_json::from_value(budget.get("context")?.clone()).ok()?;
+    let sources = budget
+        .get("budget_sources")
+        .and_then(|sources| serde_json::from_value(sources.clone()).ok())
+        .unwrap_or_default();
+    Some(RecordedBudget { budget: context, sources })
+}
+
+/// The policy the explicit configuration would have produced, for a log that
+/// predates `profile/resolved`.
+///
+/// A best effort: the old fields carry a window and a reservation, not the
+/// trigger and retention a resolved budget derives from them. The trigger
+/// keeps the configured percentage, and retention is half the working set —
+/// the summarizer's old default share.
+fn legacy_policy(
+    budget: &agent_protocol::profile::RunBudget,
+) -> Option<agent_context::trim::ContextPolicy> {
+    let window = budget.max_input_tokens?;
+    let reserved = budget.reserved_output_tokens.unwrap_or(0);
+    let working = window.saturating_sub(reserved);
+    if working == 0 {
+        return None;
+    }
+    let trigger = budget
+        .compact_at_percent
+        .map(|percent| {
+            u32::try_from(u64::from(working) * u64::from(percent) / 100).unwrap_or(working)
+        })
+        .unwrap_or(working);
+    Some(agent_context::trim::ContextPolicy {
+        context_window_tokens: window,
+        input_working_set_tokens: working,
+        completion_cap_tokens: reserved,
+        compaction_trigger_tokens: trigger,
+        retain_recent_tokens: working / 2,
+    })
 }
 
 /// `metrics`: count what the event logs say happened.

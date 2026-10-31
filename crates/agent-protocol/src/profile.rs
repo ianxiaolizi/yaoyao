@@ -187,20 +187,26 @@ impl RunBudget {
     /// Compaction keeps the newest group whole, so an output that alone
     /// exceeds the working set cannot be rescued by summarizing history: the
     /// only place to bound it is where it is appended. The limit is therefore
-    /// a quarter of the usable window, converted at the estimator's usual ~4
-    /// bytes per token, floored at 8 KiB so an ordinary file still arrives
-    /// whole and capped at the historical 50 KiB. A run with no configured
-    /// window keeps the historical limit.
+    /// a quarter of the input working set, converted at the estimator's usual
+    /// ~4 bytes per token, floored at 8 KiB so an ordinary file still arrives
+    /// whole and capped at the historical 50 KiB. The resolved budget is the
+    /// window the trimmer actually fits into; the legacy fields are read only
+    /// for a run assembled before that budget existed. A run with neither
+    /// keeps the historical limit.
     pub fn tool_output_limit_bytes(&self) -> usize {
         const FLOOR_BYTES: usize = 8 * 1024;
         const CEILING_BYTES: usize = 50 * 1024;
         const BYTES_PER_TOKEN: usize = 4;
-        let Some(max_input_tokens) = self.max_input_tokens else {
-            return CEILING_BYTES;
+        let working_set = match self.context {
+            Some(context) => context.input_working_set_tokens as usize,
+            None => match self.max_input_tokens {
+                Some(max_input_tokens) => max_input_tokens
+                    .saturating_sub(self.reserved_output_tokens.unwrap_or(0))
+                    as usize,
+                None => return CEILING_BYTES,
+            },
         };
-        let usable =
-            max_input_tokens.saturating_sub(self.reserved_output_tokens.unwrap_or(0)) as usize;
-        (usable / 4 * BYTES_PER_TOKEN).clamp(FLOOR_BYTES, CEILING_BYTES)
+        (working_set / 4 * BYTES_PER_TOKEN).clamp(FLOOR_BYTES, CEILING_BYTES)
     }
 }
 
@@ -442,21 +448,48 @@ mod tests {
 
     #[test]
     fn the_tool_output_limit_follows_the_working_set() {
-        // A quarter of the usable window, at four bytes per token: 32k in,
-        // 8k tokens of output, 32,000 bytes.
+        // A quarter of the resolved working set, at four bytes per token:
+        // 32k in, 8k tokens of output, 32,000 bytes.
         let budget = RunBudget {
+            context: Some(ResolvedContextBudget {
+                input_working_set_tokens: 32_000,
+                ..ResolvedContextBudget::default()
+            }),
+            ..RunBudget::default()
+        };
+        assert_eq!(budget.tool_output_limit_bytes(), 32_000);
+        // The resolved budget wins over the legacy fields beside it: they are
+        // aliases, and the run's own derivation is the number that was used.
+        let both = RunBudget {
+            max_input_tokens: Some(100_000),
+            context: Some(ResolvedContextBudget {
+                input_working_set_tokens: 32_000,
+                ..ResolvedContextBudget::default()
+            }),
+            ..RunBudget::default()
+        };
+        assert_eq!(both.tool_output_limit_bytes(), 32_000);
+        // A log assembled before the resolved budget still reads the old
+        // window, so an old configuration keeps its limit.
+        let legacy = RunBudget {
             max_input_tokens: Some(34_000),
             reserved_output_tokens: Some(2_000),
             ..RunBudget::default()
         };
-        assert_eq!(budget.tool_output_limit_bytes(), 32_000);
+        assert_eq!(legacy.tool_output_limit_bytes(), 32_000);
         // Nothing configured keeps the limit the gateway has always used.
         assert_eq!(RunBudget::default().tool_output_limit_bytes(), 50 * 1024);
         // A window too small to quarter meaningfully still admits a file.
         let tiny = RunBudget { max_input_tokens: Some(3_200), ..RunBudget::default() };
         assert_eq!(tiny.tool_output_limit_bytes(), 8 * 1024);
         // A huge window does not raise the ceiling.
-        let huge = RunBudget { max_input_tokens: Some(1_048_576), ..RunBudget::default() };
+        let huge = RunBudget {
+            context: Some(ResolvedContextBudget {
+                input_working_set_tokens: 1_048_576,
+                ..ResolvedContextBudget::default()
+            }),
+            ..RunBudget::default()
+        };
         assert_eq!(huge.tool_output_limit_bytes(), 50 * 1024);
     }
 

@@ -981,20 +981,15 @@ pub async fn assemble_with_delegation(
     // keeps. The engine is built here because this is the only layer allowed to
     // see both the loop's port and the projection behind it.
     //
-    // A window is applied only when the configuration names one. A reservation
-    // without a window is not a policy — there is nothing to reserve from — so
-    // it is ignored rather than translated into a made-up ceiling.
+    // The trimmer runs on the numbers the run resolved above, not on the
+    // legacy `max_input_tokens` spelling: window, working set, trigger and
+    // retention are one derivation, and splitting them here would let the
+    // engine and the loop disagree about the window they protect.
     let engine = ProjectionContextEngine::new(store.clone(), &data_dir);
-    let context = Arc::new(match resolved.budget.max_input_tokens {
-        Some(max_input_tokens) => engine.with_context_policy(agent_context::trim::ContextPolicy {
-            max_input_tokens,
-            reserved_output_tokens: resolved.budget.reserved_output_tokens.unwrap_or(0),
-            // Resolution refuses a trigger without a window, so this is only
-            // ever `Some` alongside a usable budget.
-            compact_at_percent: resolved.budget.compact_at_percent,
-        }),
-        None => engine,
-    });
+    let context =
+        Arc::new(engine.with_context_policy(agent_context::trim::ContextPolicy::resolved(
+            resolved.budget.context.expect("the context budget is resolved before the engine"),
+        )));
     let suite: Arc<dyn ToolGateway> = gateway.clone();
     let mut loop_ =
         DefaultAgentLoop::new(selected.provider.clone(), suite, context.clone(), router.clone())

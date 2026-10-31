@@ -10,6 +10,8 @@
 //! after the loop returns (so a loop failure leaves the inbox item pending), so
 //! the current turn's input is the caller's to place.
 
+use std::collections::BTreeMap;
+
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::model::{MessageRole, ModelMessage};
 use serde::{Deserialize, Serialize};
@@ -27,10 +29,12 @@ pub struct ContextUsage {
     pub dropped_messages: usize,
     /// Estimated tokens of the messages that were kept.
     pub estimated_tokens: usize,
-    /// The configured ceiling, if one was.
-    pub max_input_tokens: Option<u32>,
-    /// The part of the ceiling set aside for the answer, if a policy was set.
-    pub reserved_output_tokens: Option<u32>,
+    /// The resolved input working set history may use, when a policy was set.
+    ///
+    /// The number that was kept against — not the model's physical window and
+    /// not a share of it recomputed here: the resolver already decided what
+    /// this run is willing to spend on input.
+    pub input_working_set_tokens: Option<u32>,
 }
 
 /// One kind of content in the model-visible context.
@@ -156,9 +160,19 @@ pub struct ContextUsageReport {
     pub dropped_messages: usize,
     /// The trimmer's estimate for the messages that remain.
     pub estimated_tokens: usize,
-    pub max_input_tokens: Option<u32>,
-    pub reserved_output_tokens: Option<u32>,
-    /// `max_input_tokens - reserved_output_tokens`, when a window is set.
+    /// The resolved budget this report was measured against, field by field.
+    ///
+    /// Every one of these is a frozen number from the run's resolved context
+    /// budget, not a share recomputed by the reporter: a report that re-derived
+    /// would describe a different run than the one whose log it is reading.
+    pub context_window_tokens: Option<u32>,
+    pub input_working_set_tokens: Option<u32>,
+    pub completion_cap_tokens: Option<u32>,
+    pub compaction_trigger_tokens: Option<u32>,
+    pub retain_recent_tokens: Option<u32>,
+    /// Where each of the numbers above came from, from the profile snapshot.
+    pub budget_sources: BTreeMap<String, String>,
+    /// The input working set history may use, when a budget was resolved.
     pub budget_tokens: Option<usize>,
     /// Room left under the usable budget; zero when the newest group overflowed.
     pub remaining_tokens: Option<usize>,
@@ -208,8 +222,12 @@ pub struct CompactionCandidate {
     pub estimated_tokens: usize,
     /// The estimate that remains once `messages` are replaced by the summary.
     pub retained_tokens: usize,
-    /// The usable budget the proposal was made against.
+    /// The input working set the proposal was made against.
     pub budget_tokens: usize,
+    /// The resolved trigger measure that fired: the whole request's estimated
+    /// (or provider-reported) tokens had to reach this for the proposal to
+    /// exist.
+    pub trigger_tokens: u32,
     /// The provider's own input count for the request that crossed the trigger,
     /// when it reported one. `None` means the proposal was made on the estimate
     /// alone — the trigger fired on a provider with no usage reporting, or the

@@ -17,6 +17,35 @@ use super::*;
 /// configuration that omitted the field.
 pub(super) const DEFAULT_SETTLE_PERCENT: u32 = 70;
 
+/// The input working set this run was resolved with.
+///
+/// The run budget is the authority: assembly froze the resolved numbers beside
+/// the route. A harness, or a run from before the derivation existed, may only
+/// have the engine's own report of the window it trimmed against, so that is
+/// the fallback. A run with neither has no window, and nothing is bounded.
+pub(super) fn working_set(turn: &LoopTurn) -> Option<u32> {
+    turn.budget
+        .context
+        .as_ref()
+        .map(|budget| budget.input_working_set_tokens)
+        .or(turn.context_usage.input_working_set_tokens)
+}
+
+/// How many of the newest tokens a compaction keeps whole.
+///
+/// The resolved budget states it. A run that only has the engine's report falls
+/// back to the share the trimmer has always used, so an old snapshot compacts
+/// rather than not at all.
+pub(super) fn retain_recent(turn: &LoopTurn, budget: usize) -> usize {
+    match turn.budget.context.as_ref() {
+        Some(resolved) => resolved.retain_recent_tokens as usize,
+        None => {
+            budget.saturating_mul(agent_protocol::compaction::COMPACTION_KEEP_PERCENT as usize)
+                / 100
+        }
+    }
+}
+
 /// This turn's own step traffic, proposed for one of its mid-turn compactions.
 ///
 /// The range starts after this turn's input and covers every assistant/tool
@@ -38,9 +67,7 @@ pub(super) fn in_flight_candidate(
     turn: &LoopTurn,
     estimated_request_tokens: usize,
 ) -> Option<CompactionCandidate> {
-    let max_input = turn.context_usage.max_input_tokens?;
-    let budget =
-        max_input.saturating_sub(turn.context_usage.reserved_output_tokens.unwrap_or(0)) as usize;
+    let budget = working_set(turn)? as usize;
     if budget == 0 {
         return None;
     }
@@ -55,8 +82,7 @@ pub(super) fn in_flight_candidate(
         turn.messages.iter().position(|message| message.message_uid.as_str() == input_uid)?;
     let traffic = &turn.messages[input + 1..];
     let groups = agent_protocol::compaction::groups(traffic);
-    let keep_target =
-        budget.saturating_mul(agent_protocol::compaction::COMPACTION_KEEP_PERCENT as usize) / 100;
+    let keep_target = retain_recent(turn, budget);
     let (keep_from, retained) =
         agent_protocol::compaction::keep_from(traffic, &groups, 0, keep_target)?;
 
@@ -78,6 +104,9 @@ pub(super) fn in_flight_candidate(
         messages: candidate,
         retained_tokens: retained,
         budget_tokens: budget,
+        // The settle share, not the settled-history trigger: this proposal is
+        // this turn's own traffic and fires on the run's `settle_at_percent`.
+        trigger_tokens: u32::try_from(threshold).unwrap_or(u32::MAX),
         observed_input_tokens: None,
         scope: CompactionScope::InFlight,
     })

@@ -329,9 +329,11 @@ async fn a_windowed_history_sends_the_kept_suffix_plus_this_turns_input() {
         model,
         plain_gateway(tools),
         Some(ContextPolicy {
-            max_input_tokens: 18,
-            reserved_output_tokens: 0,
-            compact_at_percent: None,
+            context_window_tokens: 18,
+            input_working_set_tokens: 18,
+            completion_cap_tokens: 0,
+            compaction_trigger_tokens: 0,
+            retain_recent_tokens: 9,
         }),
     );
     h.ask("first").await;
@@ -421,8 +423,7 @@ async fn a_windowed_history_sends_the_kept_suffix_plus_this_turns_input() {
     assert_eq!(prepared.event.payload["context_message_count"], 3);
     assert_eq!(prepared.event.payload["dropped_message_count"], 1);
     assert_eq!(prepared.event.payload["estimated_context_tokens"], 17);
-    assert_eq!(prepared.event.payload["max_input_tokens"], 18);
-    assert_eq!(prepared.event.payload["reserved_output_tokens"], 0);
+    assert_eq!(prepared.event.payload["input_working_set_tokens"], 18);
     assert_eq!(prepared.event.payload["context_notice"]["kind"], "trimmed+near-limit");
     // The percentage is measured over the whole request — tool definitions
     // included — since 2026-10-31, and this fixture's 18-token window could
@@ -1034,9 +1035,11 @@ async fn a_repeated_identical_read_is_collapsed_at_the_turn_boundary() {
         model,
         plain_gateway(tools),
         Some(ContextPolicy {
-            max_input_tokens: 100_000,
-            reserved_output_tokens: 0,
-            compact_at_percent: None,
+            context_window_tokens: 100_000,
+            input_working_set_tokens: 100_000,
+            completion_cap_tokens: 0,
+            compaction_trigger_tokens: 0,
+            retain_recent_tokens: 50_000,
         }),
     );
 

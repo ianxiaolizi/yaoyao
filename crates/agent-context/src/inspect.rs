@@ -19,10 +19,13 @@
 //! per-turn notice back. Counting them here as always-zero categories would
 //! claim the report measures something it does not see.
 
+use std::collections::BTreeMap;
+
 use agent_ports::context_engine::{
     ContextCategoryKind, ContextCategoryUsage, ContextUsage, ContextUsageReport, LargestMessage,
 };
 use agent_protocol::model::{ContentBlock, MessageRole, ModelMessage};
+use agent_protocol::profile::ResolvedContextBudget;
 
 use crate::trim::{FRAME_TOKENS, estimate_block, estimate_message};
 
@@ -76,37 +79,69 @@ pub fn report(messages: &[ModelMessage], usage: &ContextUsage, top: usize) -> Co
         .map(|(index, estimated_tokens)| largest_message(&messages[index], estimated_tokens))
         .collect();
 
-    // The usable budget is what the answer does not reserve. A reservation
-    // without a window is not a policy, so it contributes nothing here either.
-    let budget_tokens = usage.max_input_tokens.map(|max| {
-        (u64::from(max).saturating_sub(u64::from(usage.reserved_output_tokens.unwrap_or(0))))
-            as usize
-    });
+    // The working set the derivation was fitted into. The other resolved
+    // numbers are attached by [`with_budget`] when the caller has them.
+    let budget_tokens = usage.input_working_set_tokens.map(|tokens| tokens as usize);
     let remaining_tokens =
         budget_tokens.map(|budget| budget.saturating_sub(usage.estimated_tokens));
-    let percent_used = budget_tokens.and_then(|budget| {
-        if budget == 0 {
-            // A zero budget has no percentage: anything divided by it would be
-            // a made-up number. The config layer refuses this window anyway.
-            None
-        } else {
-            let percent = (usage.estimated_tokens as u64).saturating_mul(100) / budget as u64;
-            Some(u32::try_from(percent.min(u64::from(u32::MAX))).unwrap_or(u32::MAX))
-        }
-    });
 
     ContextUsageReport {
         message_count: messages.len(),
         dropped_messages: usage.dropped_messages,
         estimated_tokens: usage.estimated_tokens,
-        max_input_tokens: usage.max_input_tokens,
-        reserved_output_tokens: usage.reserved_output_tokens,
+        context_window_tokens: None,
+        input_working_set_tokens: usage.input_working_set_tokens,
+        completion_cap_tokens: None,
+        compaction_trigger_tokens: None,
+        retain_recent_tokens: None,
+        budget_sources: BTreeMap::new(),
         budget_tokens,
         remaining_tokens,
-        percent_used,
+        percent_used: percent_used(usage.estimated_tokens, budget_tokens),
         categories,
         largest_messages,
     }
+}
+
+/// Attach the resolved budget and its sources to a measured report.
+///
+/// `context inspect` reads these from the run's own `profile/resolved` record:
+/// the numbers a report is measured against must be the ones the run actually
+/// used, not a policy re-derived by the reporter. The three derived figures
+/// (usable budget, room left, percentage) are recomputed because the working
+/// set may differ from the one the derivation reported.
+pub fn with_budget(
+    mut report: ContextUsageReport,
+    budget: &ResolvedContextBudget,
+    sources: &BTreeMap<String, String>,
+) -> ContextUsageReport {
+    report.context_window_tokens = Some(budget.context_window_tokens);
+    report.input_working_set_tokens = Some(budget.input_working_set_tokens);
+    report.completion_cap_tokens = Some(budget.completion_cap_tokens);
+    report.compaction_trigger_tokens = Some(budget.compaction_trigger_tokens);
+    report.retain_recent_tokens = Some(budget.retain_recent_tokens);
+    report.budget_sources = sources.clone();
+    let budget_tokens = Some(budget.input_working_set_tokens as usize);
+    report.budget_tokens = budget_tokens;
+    report.remaining_tokens =
+        budget_tokens.map(|tokens| tokens.saturating_sub(report.estimated_tokens));
+    report.percent_used = percent_used(report.estimated_tokens, budget_tokens);
+    report
+}
+
+/// Estimated share of the usable budget, as a whole percent.
+///
+/// A zero budget has no percentage: anything divided by it would be a made-up
+/// number. The resolver refuses a zero working set anyway.
+fn percent_used(estimated_tokens: usize, budget_tokens: Option<usize>) -> Option<u32> {
+    budget_tokens.and_then(|budget| {
+        if budget == 0 {
+            None
+        } else {
+            let percent = (estimated_tokens as u64).saturating_mul(100) / budget as u64;
+            Some(u32::try_from(percent.min(u64::from(u32::MAX))).unwrap_or(u32::MAX))
+        }
+    })
 }
 
 /// Which category one block belongs to.
@@ -296,17 +331,44 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_takes_the_reservation_out_before_measuring() {
+    fn the_report_measures_against_the_resolved_working_set() {
         let messages = mixed();
         let mut usage = usage(&messages);
-        usage.max_input_tokens = Some(1000);
-        usage.reserved_output_tokens = Some(200);
+        usage.input_working_set_tokens = Some(1000);
         usage.estimated_tokens = 400;
 
         let report = report(&messages, &usage, 3);
-        assert_eq!(report.budget_tokens, Some(800));
-        assert_eq!(report.remaining_tokens, Some(400));
-        assert_eq!(report.percent_used, Some(50));
+        assert_eq!(report.budget_tokens, Some(1000));
+        assert_eq!(report.remaining_tokens, Some(600));
+        assert_eq!(report.percent_used, Some(40));
+    }
+
+    #[test]
+    fn the_snapshot_budget_and_its_sources_are_shown_field_by_field() {
+        let messages = mixed();
+        let mut usage = usage(&messages);
+        usage.estimated_tokens = 400;
+        let budget = ResolvedContextBudget {
+            context_window_tokens: 1_048_576,
+            input_working_set_tokens: 262_144,
+            completion_cap_tokens: 262_144,
+            compaction_trigger_tokens: 209_715,
+            retain_recent_tokens: 125_829,
+            ..ResolvedContextBudget::default()
+        };
+        let sources = BTreeMap::from([(
+            "input_working_set_tokens".to_string(),
+            "preset:balanced".to_string(),
+        )]);
+
+        let report = with_budget(report(&messages, &usage, 3), &budget, &sources);
+        assert_eq!(report.context_window_tokens, Some(1_048_576));
+        assert_eq!(report.input_working_set_tokens, Some(262_144));
+        assert_eq!(report.completion_cap_tokens, Some(262_144));
+        assert_eq!(report.compaction_trigger_tokens, Some(209_715));
+        assert_eq!(report.retain_recent_tokens, Some(125_829));
+        assert_eq!(report.budget_tokens, Some(262_144));
+        assert_eq!(report.budget_sources["input_working_set_tokens"], "preset:balanced");
     }
 
     #[test]
@@ -323,8 +385,7 @@ mod tests {
     fn a_context_over_its_budget_has_no_remaining_room_but_still_reports_usage() {
         let messages = mixed();
         let mut usage = usage(&messages);
-        usage.max_input_tokens = Some(100);
-        usage.reserved_output_tokens = Some(0);
+        usage.input_working_set_tokens = Some(100);
         usage.estimated_tokens = 250;
 
         let report = report(&messages, &usage, 3);

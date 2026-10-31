@@ -36,12 +36,11 @@ const SETTLE_KEEP_PERCENT: usize = 40;
 /// the provider's own count for the previous request is the backstop, since it
 /// is the only measure that cannot be wrong about what the window really held.
 pub(super) fn trigger(turn: &LoopTurn, estimated_request_tokens: usize) -> Option<&'static str> {
-    let max_input = turn.context_usage.max_input_tokens? as u64;
-    if turn.observed_input_tokens.is_some_and(|observed| observed > max_input) {
+    let working_set = u64::from(super::settle::working_set(turn)?);
+    if turn.observed_input_tokens.is_some_and(|observed| observed > working_set) {
         return Some("observed_input");
     }
-    let budget =
-        max_input.saturating_sub(turn.context_usage.reserved_output_tokens.unwrap_or(0) as u64);
+    let budget = working_set;
     if budget == 0 {
         return None;
     }
@@ -68,11 +67,10 @@ pub(super) fn settle(
     let Some(work) = turn.work.clone() else {
         return Ok(false);
     };
-    let Some(max_input) = turn.context_usage.max_input_tokens else {
+    let Some(budget) = super::settle::working_set(turn) else {
         return Ok(false);
     };
-    let budget =
-        (max_input.saturating_sub(turn.context_usage.reserved_output_tokens.unwrap_or(0))) as usize;
+    let budget = budget as usize;
     if budget == 0 {
         return Ok(false);
     }

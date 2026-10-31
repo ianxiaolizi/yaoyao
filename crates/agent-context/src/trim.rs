@@ -26,6 +26,7 @@
 use agent_ports::context_engine::{CompactionCandidate, CompactionScope, ContextUsage};
 use agent_protocol::compaction::{Group, groups, keep_from, leading_system_len};
 use agent_protocol::model::ModelMessage;
+use agent_protocol::profile::ResolvedContextBudget;
 
 // The estimator lives in `agent-protocol` because the loop, which records a
 // per-request estimate, may not depend on this crate. Re-exported here so the
@@ -37,16 +38,40 @@ pub use agent_protocol::model::{FRAME_TOKENS, estimate_block, estimate_message, 
 // trimmer's callers keep one name for it.
 pub use agent_protocol::compaction::COMPACTION_KEEP_PERCENT;
 
-/// How much history one request may carry.
+/// The resolved budget history is fitted into.
+///
+/// Every field is a frozen number from one run's [`ResolvedContextBudget`]; the
+/// policy does no arithmetic of its own. The old form asked the trimmer to
+/// derive a usable window from `max_input_tokens - reserved_output_tokens` and
+/// a percentage, which is how a 1M-token model came to be trimmed against 8,000
+/// tokens and compacted at a share of that (CONTRACT §7 #138).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextPolicy {
-    /// The whole window this request may use, including the answer.
-    pub max_input_tokens: u32,
-    /// The part of it set aside for the answer, never offered to history.
-    pub reserved_output_tokens: u32,
-    /// The share of the usable window at which older history is proposed for
-    /// summarization. `None` keeps the trimmer as the only protection.
-    pub compact_at_percent: Option<u32>,
+    /// The model's physical window, for display only: history is never fitted
+    /// against this number.
+    pub context_window_tokens: u32,
+    /// The most estimated input tokens one request may carry.
+    pub input_working_set_tokens: u32,
+    /// The completion cap that leaves the window beside the working set.
+    pub completion_cap_tokens: u32,
+    /// The whole-request size at which older history is proposed for
+    /// summarization.
+    pub compaction_trigger_tokens: u32,
+    /// How many of the newest tokens compaction keeps whole.
+    pub retain_recent_tokens: u32,
+}
+
+impl ContextPolicy {
+    /// The policy one resolved budget describes.
+    pub fn resolved(budget: ResolvedContextBudget) -> Self {
+        Self {
+            context_window_tokens: budget.context_window_tokens,
+            input_working_set_tokens: budget.input_working_set_tokens,
+            completion_cap_tokens: budget.completion_cap_tokens,
+            compaction_trigger_tokens: budget.compaction_trigger_tokens,
+            retain_recent_tokens: budget.retain_recent_tokens,
+        }
+    }
 }
 
 /// The kept messages and what keeping them cost.
@@ -70,7 +95,7 @@ pub fn apply(messages: Vec<ModelMessage>, policy: Option<ContextPolicy>) -> Trim
         };
     };
 
-    let budget = policy.max_input_tokens.saturating_sub(policy.reserved_output_tokens) as usize;
+    let budget = policy.input_working_set_tokens as usize;
 
     // Leading system messages that are not summaries stay unconditionally and
     // are charged first: they are the run's instructions, not conversation, and
@@ -114,8 +139,7 @@ pub fn apply(messages: Vec<ModelMessage>, policy: Option<ContextPolicy>) -> Trim
         usage: ContextUsage {
             dropped_messages,
             estimated_tokens: used,
-            max_input_tokens: Some(policy.max_input_tokens),
-            reserved_output_tokens: Some(policy.reserved_output_tokens),
+            input_working_set_tokens: Some(policy.input_working_set_tokens),
         },
     }
 }
@@ -142,15 +166,15 @@ pub fn compaction_candidate(
     policy: &ContextPolicy,
     observed_input_tokens: Option<u32>,
 ) -> Option<CompactionCandidate> {
-    let percent = policy.compact_at_percent?;
-    let budget = policy.max_input_tokens.saturating_sub(policy.reserved_output_tokens) as usize;
-    if budget == 0 {
+    let budget = policy.input_working_set_tokens as usize;
+    let trigger = policy.compaction_trigger_tokens as usize;
+    if budget == 0 || trigger == 0 {
         return None;
     }
     let estimated_total: usize = messages.iter().map(estimate_message).sum();
     let observed = observed_input_tokens.filter(|tokens| *tokens > 0);
     let measured = observed.map(|tokens| tokens as usize).unwrap_or(estimated_total);
-    if measured.saturating_mul(100) < budget.saturating_mul(percent as usize) {
+    if measured < trigger {
         return None;
     }
 
@@ -160,8 +184,8 @@ pub fn compaction_candidate(
     let history_groups = groups(history);
 
     // The newest group is kept whatever it costs; then keep whole groups going
-    // backwards while they still fit the retention target.
-    let keep_target = budget.saturating_mul(COMPACTION_KEEP_PERCENT as usize) / 100;
+    // backwards while they still fit the resolved retention target.
+    let keep_target = policy.retain_recent_tokens as usize;
     let (keep_from, retained) = keep_from(history, &history_groups, preamble_cost, keep_target)?;
 
     let candidate: Vec<ModelMessage> = history_groups[..keep_from]
@@ -177,6 +201,7 @@ pub fn compaction_candidate(
         messages: candidate,
         retained_tokens: retained,
         budget_tokens: budget,
+        trigger_tokens: policy.compaction_trigger_tokens,
         observed_input_tokens: observed,
         scope: CompactionScope::Settled,
     })
@@ -226,14 +251,52 @@ mod tests {
         user(&"a".repeat(400))
     }
 
+    /// A resolved budget shaped like the derived DeepSeek one: a 1M window, a
+    /// quarter of it as the working set, compaction at 80% of that, and the
+    /// newest eighth of the window kept whole.
+    fn deepseek_budget() -> ResolvedContextBudget {
+        ResolvedContextBudget {
+            context_window_tokens: 1_048_576,
+            input_working_set_tokens: 262_144,
+            completion_cap_tokens: 262_144,
+            completion_cap_ceiling_tokens: 393_216,
+            compaction_headroom_tokens: 65_536,
+            compaction_trigger_tokens: 209_715,
+            retain_recent_tokens: 125_829,
+        }
+    }
+
+    /// A policy that fits history into `working_set` tokens, triggers at that
+    /// same number, and keeps the newest half as recent history.
+    fn fitted(working_set: u32) -> ContextPolicy {
+        ContextPolicy {
+            context_window_tokens: working_set.saturating_mul(4),
+            input_working_set_tokens: working_set,
+            completion_cap_tokens: working_set / 4,
+            compaction_trigger_tokens: working_set,
+            retain_recent_tokens: working_set / 2,
+        }
+    }
+
+    /// A policy whose trigger and retention are stated directly, so a test can
+    /// place the two boundaries where it wants them.
+    fn compacting(trigger: u32, working_set: u32, retain: u32) -> ContextPolicy {
+        ContextPolicy {
+            context_window_tokens: working_set.saturating_mul(4),
+            input_working_set_tokens: working_set,
+            completion_cap_tokens: working_set / 4,
+            compaction_trigger_tokens: trigger,
+            retain_recent_tokens: retain,
+        }
+    }
+
     #[test]
     fn with_no_policy_the_history_is_untouched_and_only_measured() {
         let messages = vec![user("one"), assistant("two"), user("three")];
         let trimmed = apply(messages.clone(), None);
         assert_eq!(trimmed.messages, messages);
         assert_eq!(trimmed.usage.dropped_messages, 0);
-        assert_eq!(trimmed.usage.max_input_tokens, None);
-        assert_eq!(trimmed.usage.reserved_output_tokens, None);
+        assert_eq!(trimmed.usage.input_working_set_tokens, None);
         assert!(trimmed.usage.estimated_tokens > 0);
         assert_eq!(
             trimmed.usage.estimated_tokens,
@@ -241,19 +304,24 @@ mod tests {
         );
     }
 
+    /// The working set is the number history is fitted into. There is no
+    /// reservation subtracted here any more: the resolver already took the
+    /// completion cap out of the window when it chose the working set.
+    #[test]
+    fn history_is_fitted_into_the_resolved_working_set() {
+        let messages = vec![user("aaaaaaaaaa"), user("bbbbbbbbbb")];
+        let cost = estimate_message(&messages[1]);
+        let trimmed = apply(messages.clone(), Some(fitted((cost + 1) as u32)));
+        assert_eq!(uids(&trimmed.messages), vec![messages[1].message_uid.as_str()]);
+        assert_eq!(trimmed.usage.input_working_set_tokens, Some((cost + 1) as u32));
+    }
+
     #[test]
     fn the_oldest_messages_go_first_and_the_newest_stay() {
         let messages = vec![user("old"), assistant("older answer"), user("new")];
         let newest_cost = estimate_message(messages.last().unwrap());
         // Room for the newest message only.
-        let trimmed = apply(
-            messages.clone(),
-            Some(ContextPolicy {
-                max_input_tokens: 10,
-                reserved_output_tokens: 0,
-                compact_at_percent: None,
-            }),
-        );
+        let trimmed = apply(messages.clone(), Some(fitted(10)));
         assert_eq!(uids(&trimmed.messages), vec![messages[2].message_uid.as_str()]);
         assert_eq!(trimmed.usage.dropped_messages, 2);
         assert_eq!(trimmed.usage.estimated_tokens, newest_cost);
@@ -266,11 +334,7 @@ mod tests {
         let answer_cost = estimate_message(&messages[3]);
         // Enough for the newest answer and the pair, but not for the opening
         // user message as well.
-        let policy = ContextPolicy {
-            max_input_tokens: (call_cost + answer_cost + 1) as u32,
-            reserved_output_tokens: 0,
-            compact_at_percent: None,
-        };
+        let policy = fitted((call_cost + answer_cost + 1) as u32);
         let trimmed = apply(messages.clone(), Some(policy));
         assert_eq!(
             uids(&trimmed.messages),
@@ -292,12 +356,7 @@ mod tests {
         // drop the whole pair, and never emit the orphaned result.
         let messages = vec![user("ask"), call("c1"), result("c1"), assistant("answer")];
         let answer_cost = estimate_message(&messages[3]);
-        let policy = ContextPolicy {
-            max_input_tokens: (answer_cost + 1) as u32,
-            reserved_output_tokens: 0,
-            compact_at_percent: None,
-        };
-        let trimmed = apply(messages.clone(), Some(policy));
+        let trimmed = apply(messages.clone(), Some(fitted((answer_cost + 1) as u32)));
         assert_eq!(uids(&trimmed.messages), vec![messages[3].message_uid.as_str()]);
     }
 
@@ -305,14 +364,7 @@ mod tests {
     fn an_orphan_result_anywhere_is_never_kept() {
         let messages = vec![user("ask"), result("ghost"), assistant("answer")];
         // Plenty of budget: the point is that the orphan is excluded by shape.
-        let trimmed = apply(
-            messages.clone(),
-            Some(ContextPolicy {
-                max_input_tokens: 10_000,
-                reserved_output_tokens: 0,
-                compact_at_percent: None,
-            }),
-        );
+        let trimmed = apply(messages.clone(), Some(fitted(10_000)));
         assert_eq!(
             uids(&trimmed.messages),
             vec![messages[0].message_uid.as_str(), messages[2].message_uid.as_str()]
@@ -323,14 +375,7 @@ mod tests {
     #[test]
     fn the_newest_group_stays_even_when_it_alone_overflows() {
         let messages = vec![user("old"), big()];
-        let trimmed = apply(
-            messages.clone(),
-            Some(ContextPolicy {
-                max_input_tokens: 5,
-                reserved_output_tokens: 0,
-                compact_at_percent: None,
-            }),
-        );
+        let trimmed = apply(messages.clone(), Some(fitted(5)));
         assert_eq!(uids(&trimmed.messages), vec![messages[1].message_uid.as_str()]);
         assert!(trimmed.usage.estimated_tokens > 5);
     }
@@ -396,14 +441,7 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
     #[test]
     fn the_leading_system_message_survives_a_budget_too_small_for_the_history() {
         let messages = vec![system("you are yaoyao"), user("ask"), assistant("answer")];
-        let trimmed = apply(
-            messages.clone(),
-            Some(ContextPolicy {
-                max_input_tokens: 1,
-                reserved_output_tokens: 0,
-                compact_at_percent: None,
-            }),
-        );
+        let trimmed = apply(messages.clone(), Some(fitted(1)));
         // Whatever the budget, the run's instructions lead the request.
         assert_eq!(uids(&trimmed.messages)[0], messages[0].message_uid.as_str());
         assert_eq!(
@@ -426,14 +464,7 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
         let messages = vec![system(&"s".repeat(400)), big(), big()];
         let system_cost = estimate_message(&messages[0]);
         let message_cost = estimate_message(&messages[1]);
-        let trimmed = apply(
-            messages.clone(),
-            Some(ContextPolicy {
-                max_input_tokens: (system_cost + message_cost) as u32,
-                reserved_output_tokens: 0,
-                compact_at_percent: None,
-            }),
-        );
+        let trimmed = apply(messages.clone(), Some(fitted((system_cost + message_cost) as u32)));
         assert_eq!(
             uids(&trimmed.messages),
             vec![messages[0].message_uid.as_str(), messages[2].message_uid.as_str()]
@@ -442,58 +473,87 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
     }
 
     #[test]
-    fn the_reservation_comes_out_of_the_window_before_history_is_kept() {
-        let messages = vec![user("aaaaaaaaaa"), user("bbbbbbbbbb")];
-        let cost = estimate_message(&messages[1]);
-        let policy = ContextPolicy {
-            max_input_tokens: (cost + 1) as u32,
-            reserved_output_tokens: 1,
-            compact_at_percent: None,
-        };
-        let trimmed = apply(messages.clone(), Some(policy));
-        assert_eq!(uids(&trimmed.messages), vec![messages[1].message_uid.as_str()]);
-        assert_eq!(trimmed.usage.reserved_output_tokens, Some(1));
+    fn compaction_uses_the_resolved_trigger_not_a_percentage_of_the_old_reservation() {
+        // The old rule compacted at a share of `max_input_tokens - reservation`
+        // (75% of 8,000 on the shipped configuration). The resolved trigger is a
+        // number of its own: a request of about 216,000 estimated tokens fires
+        // it, and the working set the proposal reports is the resolved 262,144 —
+        // neither is a percentage of anything.
+        let policy = ContextPolicy::resolved(deepseek_budget());
+        let messages = vec![user(&"a".repeat(1_200_000)), user("recent")];
+        let candidate = compaction_candidate(&messages, &policy, None).expect("the trigger fired");
+        assert_eq!(candidate.budget_tokens, 262_144);
+        assert_eq!(candidate.trigger_tokens, 209_715);
+        assert_eq!(candidate.scope, CompactionScope::Settled);
     }
 
-    fn compacting(percent: u32, budget: u32) -> ContextPolicy {
-        ContextPolicy {
-            max_input_tokens: budget,
-            reserved_output_tokens: 0,
-            compact_at_percent: Some(percent),
+    /// Retention keeps the newest whole groups, and never splits a call from
+    /// its result, until the resolved retained budget is reached.
+    #[test]
+    fn retention_keeps_the_newest_balanced_groups() {
+        let policy = ContextPolicy::resolved(deepseek_budget());
+        let mut messages = Vec::new();
+        for index in 0..40 {
+            messages.push(user(&format!("ask {index}")));
+            messages.push(call(&format!("c{index}")));
+            messages.push(result(&format!("c{index}")));
+            messages.push(assistant(&"a".repeat(80_000)));
+        }
+        let trimmed = apply(messages.clone(), Some(policy));
+        assert!(trimmed.usage.estimated_tokens <= 262_144, "{}", trimmed.usage.estimated_tokens);
+        assert!(trimmed.usage.dropped_messages > 0, "the history had to shrink");
+        // Every kept result has its call before it and every kept call has its
+        // result after it: the boundary never falls inside a pair.
+        let kept = &trimmed.messages;
+        for (index, message) in kept.iter().enumerate() {
+            if let Some((id, _, _)) = message.content.iter().find_map(|b| b.as_tool_use()) {
+                assert!(
+                    kept.get(index + 1).is_some_and(|next| next
+                        .content
+                        .iter()
+                        .any(|b| b.as_tool_result().is_some_and(|r| r.0 == id))),
+                    "kept a call without its result"
+                );
+            }
+            if let Some((id, _, _, _)) = message.content.iter().find_map(|b| b.as_tool_result()) {
+                assert!(
+                    kept[..index].iter().any(|before| before
+                        .content
+                        .iter()
+                        .any(|b| b.as_tool_use().is_some_and(|c| c.0 == id))),
+                    "kept a result without its call"
+                );
+            }
         }
     }
 
     #[test]
-    fn no_trigger_means_no_proposal() {
+    fn a_zero_trigger_keeps_the_trimmer_as_the_only_protection() {
         let messages = vec![big(), big(), big()];
-        let policy = ContextPolicy {
-            max_input_tokens: 10,
-            reserved_output_tokens: 0,
-            compact_at_percent: None,
-        };
+        let policy = compacting(0, 10, 5);
         assert!(compaction_candidate(&messages, &policy, None).is_none());
     }
 
     #[test]
     fn below_the_trigger_nothing_is_proposed() {
-        // Two 76-token messages are 152 estimated tokens in all; a 90% share
-        // of 400 is 360, so the policy has not been reached.
+        // Two 76-token messages are 152 estimated tokens in all; the trigger is
+        // 360, so the policy has not been reached.
         let messages = vec![big(), big()];
-        assert!(compaction_candidate(&messages, &compacting(90, 400), None).is_none());
+        assert!(compaction_candidate(&messages, &compacting(360, 400, 200), None).is_none());
     }
 
     #[test]
     fn real_usage_triggers_before_the_estimate_reaches_the_threshold() {
         // The estimate covers only the derived messages; a real request also
         // carries the stable head, the per-turn layers, and the tool
-        // definitions. Here the messages estimate about 640 tokens, below 80%
-        // of 1,000, but the provider says the last request was 900 input
-        // tokens. The user message alone exceeds the 500-token retention
+        // definitions. Here the messages estimate about 640 tokens, below the
+        // 800-token trigger, but the provider says the last request was 900
+        // input tokens. The user message alone exceeds the 500-token retention
         // target, so it is the part proposed for summarizing.
         let messages = vec![user(&"a".repeat(3500)), assistant("recent")];
-        assert!(compaction_candidate(&messages, &compacting(80, 1000), None).is_none());
+        assert!(compaction_candidate(&messages, &compacting(800, 1000, 500), None).is_none());
 
-        let candidate = compaction_candidate(&messages, &compacting(80, 1000), Some(900))
+        let candidate = compaction_candidate(&messages, &compacting(800, 1000, 500), Some(900))
             .expect("real usage reaches the trigger");
         assert_eq!(candidate.observed_input_tokens, Some(900));
         assert_eq!(candidate.scope, CompactionScope::Settled);
@@ -507,19 +567,19 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
         // count says the request is small, so there is nothing to do — a
         // threshold read off the estimate is the one that can be wrong.
         let messages = vec![user(&"a".repeat(400)), assistant(&"b".repeat(400))];
-        let policy = compacting(50, 100);
+        let policy = compacting(50, 100, 50);
         assert!(compaction_candidate(&messages, &policy, None).is_some());
         assert!(compaction_candidate(&messages, &policy, Some(10)).is_none());
     }
 
     #[test]
     fn the_oldest_groups_are_proposed_and_the_newest_stays() {
-        // Three 80-token groups against a 300-token window at 50%: the
-        // trigger (150) is reached, and the retention target (150) fits the
+        // Three 80-token groups against a 300-token working set at a 150-token
+        // trigger: the trigger is reached, and the 150-token retention fits the
         // newest group only, so the two oldest are summarized.
         let messages = vec![user(&"a".repeat(400)), user(&"b".repeat(400)), user(&"c".repeat(400))];
         let candidate =
-            compaction_candidate(&messages, &compacting(50, 300), None).expect("a proposal");
+            compaction_candidate(&messages, &compacting(150, 300, 150), None).expect("a proposal");
         assert_eq!(
             uids(&candidate.messages),
             vec![messages[0].message_uid.as_str(), messages[1].message_uid.as_str()]
@@ -530,16 +590,17 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
         );
         assert_eq!(candidate.retained_tokens, estimate_message(&messages[2]));
         assert_eq!(candidate.budget_tokens, 300);
+        assert_eq!(candidate.trigger_tokens, 150);
     }
 
     #[test]
     fn a_tool_call_and_its_result_are_proposed_together() {
-        // The retention target fits the newest answer only, so the call/result
-        // pair and the user message before them are summarized as whole
-        // groups — never a call without its result.
+        // The retention fits the newest answer only, so the call/result pair
+        // and the user message before them are summarized as whole groups —
+        // never a call without its result.
         let messages = vec![user("old"), call("c1"), result("c1"), assistant(&"a".repeat(600))];
         let candidate =
-            compaction_candidate(&messages, &compacting(50, 220), None).expect("a proposal");
+            compaction_candidate(&messages, &compacting(110, 220, 110), None).expect("a proposal");
         assert_eq!(
             uids(&candidate.messages),
             vec![
@@ -553,12 +614,12 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
 
     #[test]
     fn a_call_and_its_result_are_kept_together_on_the_other_side() {
-        // Here the pair fits the retention target and stays; only the user
-        // message before it is proposed. The boundary still never falls
-        // between the call and its result.
+        // Here the pair fits the retention and stays; only the user message
+        // before it is proposed. The boundary still never falls between the
+        // call and its result.
         let messages = vec![user(&"a".repeat(500)), call("c1"), result("c1"), assistant("done")];
         let candidate =
-            compaction_candidate(&messages, &compacting(50, 200), None).expect("a proposal");
+            compaction_candidate(&messages, &compacting(100, 200, 100), None).expect("a proposal");
         assert_eq!(uids(&candidate.messages), vec![messages[0].message_uid.as_str()]);
         assert!(
             candidate.messages.iter().all(|message| message.role != MessageRole::Assistant),
@@ -570,14 +631,14 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
     fn the_newest_group_is_never_proposed() {
         // One message over the trigger: there is nothing older to summarize.
         let messages = vec![big()];
-        assert!(compaction_candidate(&messages, &compacting(50, 100), None).is_none());
+        assert!(compaction_candidate(&messages, &compacting(50, 100, 50), None).is_none());
     }
 
     #[test]
     fn the_leading_system_message_is_never_proposed() {
         let messages = vec![system("you are yaoyao"), big(), big()];
         let candidate =
-            compaction_candidate(&messages, &compacting(50, 300), None).expect("a proposal");
+            compaction_candidate(&messages, &compacting(150, 300, 150), None).expect("a proposal");
         assert_eq!(uids(&candidate.messages), vec![messages[1].message_uid.as_str()]);
     }
 
@@ -591,7 +652,7 @@ usize::try_from(units.div_ceil(UNITS_PER_TOKEN)).unwrap_or(usize::MAX)\n}\n";
             ModelMessage::summary_for(&agent_protocol::ids::AttemptId::new(), "old summary");
         let messages = vec![instruction.clone(), summary.clone(), big(), big()];
         let candidate =
-            compaction_candidate(&messages, &compacting(50, 300), None).expect("a proposal");
+            compaction_candidate(&messages, &compacting(150, 300, 150), None).expect("a proposal");
         let proposed = uids(&candidate.messages);
         assert!(
             proposed.contains(&summary.message_uid.as_str()),

@@ -205,8 +205,7 @@ fn notice_context(
     Arc::new(FakeContextEngine::new(history, EventSeq::new(3)).with_usage(ContextUsage {
         dropped_messages: 0,
         estimated_tokens: settled,
-        max_input_tokens: Some(window),
-        reserved_output_tokens: Some(0),
+        input_working_set_tokens: Some(window),
     }))
 }
 
@@ -260,7 +259,7 @@ async fn a_context_near_the_budget_is_reminded_once_after_history() {
     let payload = prepared_payload(&outcome);
     assert_eq!(payload["context_notice"]["kind"], "near-limit");
     assert_eq!(payload["context_notice"]["percent"], 96);
-    assert_eq!(payload["context_notice"]["max_input_tokens"], window);
+    assert_eq!(payload["context_notice"]["input_working_set_tokens"], window);
 
     let request = &model.requests()[0];
     assert_eq!(request.messages[0].role, MessageRole::System);
@@ -305,8 +304,7 @@ async fn a_context_without_a_configured_window_carries_no_notice() {
         Arc::new(FakeContextEngine::new(vec![], EventSeq::new(1)).with_usage(ContextUsage {
             dropped_messages: 0,
             estimated_tokens: 1_000_000,
-            max_input_tokens: None,
-            reserved_output_tokens: None,
+            input_working_set_tokens: None,
         }));
     let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
     let loop_ = DefaultAgentLoop::new(

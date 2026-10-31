@@ -47,8 +47,7 @@ fn prepared(seq: u64, attempt: &str, notice: Option<serde_json::Value>) -> Store
         "estimated_messages_tokens": 420,
         "estimated_tool_tokens": 60,
         "estimated_request_tokens": 480,
-        "max_input_tokens": 1000,
-        "reserved_output_tokens": 200,
+        "input_working_set_tokens": 800,
         "tool_manifest_id": "manifest-1",
         "tool_count": 4,
         "messages": [
@@ -127,8 +126,15 @@ fn report() -> ContextUsageReport {
         message_count: 3,
         dropped_messages: 2,
         estimated_tokens: 500,
-        max_input_tokens: Some(1000),
-        reserved_output_tokens: Some(200),
+        context_window_tokens: Some(1000),
+        input_working_set_tokens: Some(800),
+        completion_cap_tokens: Some(200),
+        compaction_trigger_tokens: Some(640),
+        retain_recent_tokens: Some(400),
+        budget_sources: std::collections::BTreeMap::from([(
+            String::from("input_working_set_tokens"),
+            String::from("preset:balanced"),
+        )]),
         budget_tokens: Some(800),
         remaining_tokens: Some(300),
         percent_used: Some(62),
@@ -174,10 +180,19 @@ fn the_text_shows_the_budget_every_kind_and_the_largest_message() {
 
     assert!(text.contains("messages: 3 in context; 2 dropped by the window"), "{text}");
     assert!(
-        text.contains(
-            "budget: 1000 input tokens, 200 reserved, 800 usable; about 500 used (62%), 300 left"
-        ),
+        text.contains("budget: 800-token input working set; about 500 used (62%), 300 left"),
         "{text}"
+    );
+    assert!(
+        text.contains(
+            "context window 1000, completion cap 200, compaction trigger 640, \
+             retained recent 400"
+        ),
+        "every resolved number is shown: {text}"
+    );
+    assert!(
+        text.contains("sources input_working_set_tokens=preset:balanced"),
+        "the source of each field is shown: {text}"
     );
     for kind in ContextCategoryKind::ALL {
         assert!(text.contains(kind.as_str()), "missing kind {}: {text}", kind.as_str());
@@ -209,8 +224,12 @@ fn the_text_shows_the_budget_every_kind_and_the_largest_message() {
 #[test]
 fn a_context_without_a_window_says_so_instead_of_inventing_one() {
     let mut report = report();
-    report.max_input_tokens = None;
-    report.reserved_output_tokens = None;
+    report.context_window_tokens = None;
+    report.input_working_set_tokens = None;
+    report.completion_cap_tokens = None;
+    report.compaction_trigger_tokens = None;
+    report.retain_recent_tokens = None;
+    report.budget_sources.clear();
     report.budget_tokens = None;
     report.remaining_tokens = None;
     report.percent_used = None;
@@ -218,7 +237,10 @@ fn a_context_without_a_window_says_so_instead_of_inventing_one() {
     let outcome = run_context_inspect(&report, &session(), EventSeq::ZERO, &[], false).unwrap();
     let text = text_of(outcome);
 
-    assert!(text.contains("budget: not configured; history is sent untrimmed"), "{text}");
+    assert!(
+        text.contains("budget: no resolved context budget; history is sent untrimmed"),
+        "{text}"
+    );
     assert!(
         text.contains("last request: none (no model request in this log)"),
         "an empty log is an answer, not a failure: {text}"
