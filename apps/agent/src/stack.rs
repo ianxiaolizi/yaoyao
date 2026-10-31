@@ -58,7 +58,7 @@ use agent_protocol::model::{
     ModelCapabilities, ModelCapabilitySource, ModelRoute, ModelTier, ReasoningEffort,
 };
 use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef, Workspace};
-use agent_protocol::profile::ResolvedProfileSnapshot;
+use agent_protocol::profile::{ResolvedProfileSnapshot, SummaryRouteBudget};
 use agent_protocol::redactor::{HighEntropy, Redactor};
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
@@ -659,18 +659,38 @@ pub async fn assemble_with_delegation(
         .map_err(|source| StackError::Budget { route: main_route.clone(), source })?;
     let (reasoning_effort, reasoning_source) =
         reasoning_effort_for(&resolved.budget.reasoning_effort, main_capabilities, &main_route)?;
-    // A compaction summary may be routed to a faster model, so its cap has to
-    // fit *that* model's window rather than borrow the main one's. The preset
-    // carries over because it is a cost choice about the run; the explicit
-    // numbers do not, because they were chosen for the main model.
-    let summary_cap = routes
+    // A compaction summary may be routed to a faster model, so its whole
+    // budget — working set, completion cap, and reasoning depth — has to fit
+    // *that* model rather than borrow the main one's. The preset carries over
+    // because it is a cost choice about the run; the explicit numbers do not,
+    // because they were chosen for the main model.
+    let summary_selection = routes
         .get(ModelTier::Fast.as_str())
-        .and_then(|route| discovered.resolved.get(&route_key(route)))
-        .and_then(|caps| {
-            resolve_context_budget(caps, &preset_only_policy(resolved.budget.preset)).ok()
-        })
-        .map(|resolution| resolution.budget.completion_cap_tokens)
-        .unwrap_or(resolution.budget.completion_cap_tokens);
+        .and_then(|route| discovered.resolved.get(&route_key(route)).map(|caps| (route, caps)));
+
+    let (summary_resolution, summary_capabilities, summary_effort, summary_effort_source) =
+        match summary_selection {
+            Some((route, caps)) => {
+                let resolution =
+                    resolve_context_budget(caps, &preset_only_policy(resolved.budget.preset))
+                        .map_err(|source| StackError::Budget {
+                            route: route_key(route),
+                            source,
+                        })?;
+                // A summary is its own request. Do not inherit the main
+                // route's effort: the fast model may not even offer it.
+                let (effort, source) = reasoning_effort_for(&None, caps, &route_key(route))?;
+                (resolution, caps, effort, source)
+            }
+            // With no fast route the summary is asked of the main model, so it
+            // uses the main route's budget and the depth already chosen there.
+            None => (
+                resolution.clone(),
+                main_capabilities,
+                reasoning_effort,
+                reasoning_source,
+            ),
+        };
 
     let context_budget = resolution.budget;
     let mut budget_sources = resolution.sources;
@@ -690,7 +710,21 @@ pub async fn assemble_with_delegation(
     // default: a cap sized for prose is a cap that ends a reasoning model
     // mid-thought (CONTRACT §7 #131).
     resolved.budget.max_output_tokens = Some(context_budget.completion_cap_tokens);
-    resolved.budget.summary_max_output_tokens = Some(summary_cap);
+    // The summary route's complete budget, frozen beside the main one so the
+    // loop never has to guess which window its summary request must fit.
+    resolved.budget.summary = Some(SummaryRouteBudget {
+        context: summary_resolution.budget,
+        reasoning_effort: summary_effort,
+        supported_reasoning_efforts: summary_capabilities
+            .capabilities
+            .reasoning_efforts
+            .clone(),
+    });
+    resolved.budget.summary_max_output_tokens = Some(summary_resolution.budget.completion_cap_tokens);
+    for (field, source) in &summary_resolution.sources {
+        budget_sources.insert(format!("summary.{field}"), source.clone());
+    }
+    budget_sources.insert("summary.reasoning_effort".to_string(), summary_effort_source.to_string());
     resolved.budget.reasoning_effort = reasoning_effort;
     // What the model declared it accepts, frozen beside the depth chosen from
     // it: output recovery may step down, and a lower depth the model never
@@ -1160,6 +1194,57 @@ mod tests {
         assert_eq!(effort, None);
         assert_eq!(source, "unsupported");
     }
+    #[test]
+    fn the_fast_route_gets_its_own_complete_summary_budget() {
+        // The main model holds a million tokens; the fast one that writes the
+        // summary holds 131,072. The summary budget must be the fast model's
+        // own — its working set, its cap, and a depth it declared — not the
+        // main route's numbers borrowed wholesale.
+        let fast = ResolvedModelCapabilities {
+            capabilities: ModelCapabilities {
+                context_window_tokens: 131_072,
+                max_output_tokens: 8_192,
+                reasoning_efforts: vec![ReasoningEffort::Low],
+                default_reasoning_effort: Some(ReasoningEffort::Low),
+            },
+            source: agent_protocol::model::ModelCapabilitySource::Provider,
+        };
+        let resolution = resolve_context_budget(
+            &fast,
+            &preset_only_policy(agent_protocol::model::BudgetPreset::Balanced),
+        )
+        .expect("the fast budget resolves");
+        assert_eq!(resolution.budget.input_working_set_tokens, 32_768);
+        assert_eq!(resolution.budget.completion_cap_tokens, 8_192);
+        assert_eq!(
+            resolution.sources.get("input_working_set_tokens").map(String::as_str),
+            Some("preset:balanced")
+        );
+        let (effort, _) = reasoning_effort_for(&None, &fast, "fast-route").expect("a depth");
+        assert_eq!(effort, Some(ReasoningEffort::Low));
+        // The main route keeps its own independent values.
+        let main = ResolvedModelCapabilities {
+            capabilities: ModelCapabilities {
+                context_window_tokens: 1_048_576,
+                max_output_tokens: 393_216,
+                reasoning_efforts: vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max,
+                ],
+                default_reasoning_effort: Some(ReasoningEffort::High),
+            },
+            source: agent_protocol::model::ModelCapabilitySource::Provider,
+        };
+        let main_resolution = resolve_context_budget(
+            &main,
+            &preset_only_policy(agent_protocol::model::BudgetPreset::Balanced),
+        )
+        .expect("the main budget resolves");
+        assert_eq!(main_resolution.budget.completion_cap_tokens, 262_144);
+        assert_eq!(main_resolution.budget.input_working_set_tokens, 262_144);
+    }
+
     #[test]
     fn tool_secrets_are_a_sorted_deduplicated_env_list() {
         assert!(tool_secret_refs(None).is_empty());

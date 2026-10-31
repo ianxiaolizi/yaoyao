@@ -36,9 +36,10 @@ use agent_ports::model_provider::{
     ContentBlock, MessageRole, ModelBudget, ModelCapability, ModelMessage, ModelProvider,
     ModelRequest, ModelResponse, ModelStreamError, ModelStreamEvent, ModelStreamSink, ToolManifest,
 };
-use agent_ports::model_router::{ModelRoute, ModelRouter, RouteRequest, TaskClass};
+use agent_ports::model_router::{ModelRoute, ModelRouter, ModelTier, RouteRequest, TaskClass};
 use agent_ports::tool_gateway::{ToolGateway, ToolGatewayError};
 use agent_ports::tool_provider::{ToolInvocation, ToolResult, ToolStatus};
+use agent_protocol::compaction::fit_leading_groups;
 use agent_protocol::digest;
 use agent_protocol::events::{Actor, EventDraft, EventType, LiveEvent};
 use agent_protocol::failures::Failures;
@@ -48,7 +49,7 @@ use agent_protocol::ledger::Ledger;
 use agent_protocol::model::{ToolCall, estimate_message};
 use agent_protocol::permissions::ArtifactRef;
 use agent_protocol::plan::{self, Plan, PlanItemStatus};
-use agent_protocol::profile::{RunBudget, Spent};
+use agent_protocol::profile::{ResolvedContextBudget, RunBudget, Spent};
 use agent_protocol::reason::{
     self as reason_record, Basis, Mode, ReasonKind, ReasonSource, Recorder, Situation, SpeechAct,
     Stance,
@@ -357,22 +358,12 @@ impl DefaultAgentLoop {
         &self,
         turn: &mut LoopTurn,
         step_id: &StepId,
-        candidate: CompactionCandidate,
+        mut candidate: CompactionCandidate,
         fallback: &'static str,
         events: &mut Vec<EventDraft>,
     ) -> Result<(), AgentLoopError> {
         let ctx = turn.ctx.clone();
         let attempt_id = AttemptId::new();
-
-        let mut refs = Vec::with_capacity(candidate.messages.len());
-        for message in &candidate.messages {
-            refs.push(serde_json::json!({
-                "message_uid": message.message_uid.as_str(),
-                "role": message.role.as_str(),
-                "hash": digest::json(&serde_json::to_value(message)?),
-            }));
-        }
-        let summarized_hash = digest::json(&serde_json::Value::Array(refs.clone()));
 
         // An in-flight candidate is this turn's own traffic, and user text is
         // never part of it — the input stays verbatim in the request that
@@ -423,47 +414,133 @@ impl DefaultAgentLoop {
             budget: summary_budget(turn.model_budget()),
         });
 
+        // The fixed parts of the summary request: the prompt, the in-flight
+        // input shown as context, and the closing instruction. They are always
+        // sent, so the room left for the candidate is what remains after them.
+        let prompt_message = ModelMessage::new(
+            MessageRole::System,
+            vec![ContentBlock::text(COMPACTION_PROMPT)],
+        );
+        let instruction_message = ModelMessage::new(
+            MessageRole::User,
+            vec![ContentBlock::text(COMPACTION_INSTRUCTION)],
+        );
+        let fixed_tokens = estimate_message(&prompt_message)
+            + input_message.as_ref().map(estimate_message).unwrap_or_default()
+            + estimate_message(&instruction_message);
+
+        // A summary routed to the fast tier is answered by a different model
+        // with its own window, depths, and cap. Fitting the candidate to the
+        // main route's million-token working set would send the fast model a
+        // request it cannot accept. The frozen summary budget is the number
+        // that request must fit; everything else uses the turn's own budget.
+        let mut request_route = route.clone();
+        let (mut profile_context, mut profile_effort) = summary_route_profile(turn, &request_route);
+        let mut route_fallback: Option<&'static str> = None;
+        let original_candidate_tokens = candidate.estimated_tokens;
+        if !candidate.messages.is_empty() {
+            let fit = |context: ResolvedContextBudget| {
+                let available = (context.input_working_set_tokens as usize)
+                    .saturating_sub(fixed_tokens);
+                fit_leading_groups(&candidate.messages, available)
+            };
+            let mut fitted = profile_context.map(fit);
+            // A candidate larger than the fast model's window may still fit
+            // the model that wrote the history, so the turn's route is the
+            // second chance before the compaction is abandoned.
+            if fitted.as_ref().is_some_and(|selected| selected.is_empty())
+                && request_route.tier == ModelTier::Fast
+            {
+                request_route = turn.route.clone();
+                (profile_context, profile_effort) = summary_route_profile(turn, &request_route);
+                fitted = profile_context.map(fit);
+                if fitted.as_ref().is_some_and(|selected| !selected.is_empty()) {
+                    route_fallback = Some("input_working_set");
+                }
+            }
+            if let Some(selected) = fitted {
+                if selected.is_empty() {
+                    events.push(draft(
+                        &ctx,
+                        step_id,
+                        EventType::CONTEXT_COMPACTION_FAILED,
+                        serde_json::json!({
+                            "attempt_id": attempt_id,
+                            "error_kind": "summary_input_too_large",
+                            "message": "the summary request does not fit any route's input budget",
+                        }),
+                        Actor::Agent,
+                    ));
+                    return Ok(());
+                }
+                // Only the selected prefix is summarized and removed; the
+                // newer messages stay in the transcript as ordinary history.
+                candidate.messages = selected;
+                candidate.estimated_tokens =
+                    candidate.messages.iter().map(estimate_message).sum();
+                candidate.retained_tokens = candidate
+                    .retained_tokens
+                    .saturating_add(original_candidate_tokens)
+                    .saturating_sub(candidate.estimated_tokens);
+            }
+        }
+
+        let mut refs = Vec::with_capacity(candidate.messages.len());
+        for message in &candidate.messages {
+            refs.push(serde_json::json!({
+                "message_uid": message.message_uid.as_str(),
+                "role": message.role.as_str(),
+                "hash": digest::json(&serde_json::to_value(message)?),
+            }));
+        }
+        let summarized_hash = digest::json(&serde_json::Value::Array(refs.clone()));
+
+        let mut started = serde_json::json!({
+            "attempt_id": attempt_id,
+            "provider": self.model.provider_id(),
+            "route": serde_json::to_value(&request_route)?,
+            "context_revision": turn.context_revision.as_u64(),
+            "prompt_version": "summary/5",
+            "prompt": COMPACTION_PROMPT,
+            "instruction": COMPACTION_INSTRUCTION,
+            "message_count": refs.len(),
+            "messages": refs,
+            "messages_hash": summarized_hash,
+            "estimated_tokens": candidate.estimated_tokens,
+            "retained_tokens": candidate.retained_tokens,
+            "budget_tokens": candidate.budget_tokens,
+            // Which measure proposed this compaction: the provider's own
+            // input count when it reported one, `null` when the estimate
+            // was the only measure there was.
+            "observed_input_tokens": candidate.observed_input_tokens,
+            "scope": candidate.scope.as_str(),
+            // The input shown to the summarizer as context but not
+            // summarized: an in-flight proposal never covers user text.
+            "context_message_uid": input_uid,
+        });
+        if let Some(fallback) = route_fallback {
+            started["route_fallback"] = serde_json::json!(fallback);
+        }
         events.push(draft(
             &ctx,
             step_id,
             EventType::CONTEXT_COMPACTION_STARTED,
-            serde_json::json!({
-                "attempt_id": attempt_id,
-                "provider": self.model.provider_id(),
-                "route": serde_json::to_value(&route)?,
-                "context_revision": turn.context_revision.as_u64(),
-                "prompt_version": "summary/5",
-                "prompt": COMPACTION_PROMPT,
-                "instruction": COMPACTION_INSTRUCTION,
-                "message_count": refs.len(),
-                "messages": refs,
-                "messages_hash": summarized_hash,
-                "estimated_tokens": candidate.estimated_tokens,
-                "retained_tokens": candidate.retained_tokens,
-                "budget_tokens": candidate.budget_tokens,
-                // Which measure proposed this compaction: the provider's own
-                // input count when it reported one, `null` when the estimate
-                // was the only measure there was.
-                "observed_input_tokens": candidate.observed_input_tokens,
-                "scope": candidate.scope.as_str(),
-                // The input shown to the summarizer as context but not
-                // summarized: an in-flight proposal never covers user text.
-                "context_message_uid": input_uid,
-            }),
+            started,
             Actor::Agent,
         ));
 
         let mut request_messages = Vec::with_capacity(candidate.messages.len() + 3);
-        request_messages.push(ModelMessage::new(
-            MessageRole::System,
-            vec![ContentBlock::text(COMPACTION_PROMPT)],
-        ));
+        request_messages.push(prompt_message);
         request_messages.extend(input_message);
         request_messages.extend(candidate.messages.iter().cloned());
-        request_messages.push(ModelMessage::new(
-            MessageRole::User,
-            vec![ContentBlock::text(COMPACTION_INSTRUCTION)],
-        ));
+        request_messages.push(instruction_message);
+        // The request carries the profile's own cap and depth, not the turn's:
+        // a depth the fast model never declared must not be sent to it.
+        let mut request_budget = turn.model_budget();
+        if let Some(context) = profile_context {
+            request_budget.max_tokens = Some(context.completion_cap_tokens);
+        }
+        request_budget.reasoning_effort = profile_effort;
         let request = ModelRequest {
             session_id: ctx.session_id.clone(),
             turn_id: ctx.turn_id.clone(),
@@ -472,8 +549,8 @@ impl DefaultAgentLoop {
             messages: request_messages,
             capabilities: Vec::new(),
             response_format: None,
-            model_route: Some(route),
-            budget: summary_budget(turn.model_budget()),
+            model_route: Some(request_route),
+            budget: request_budget,
             tool_manifest: ToolManifest::empty(),
         };
 
@@ -653,6 +730,9 @@ impl DefaultAgentLoop {
             "observed_input_tokens": candidate.observed_input_tokens,
             "truncated": truncated,
         });
+        if let Some(fallback) = route_fallback {
+            payload["route_fallback"] = serde_json::json!(fallback);
+        }
         if !ledger.is_empty() {
             payload["ledger"] = serde_json::json!({
                 "message_uid": format!("msg/ledger/{attempt_id}"),
@@ -951,6 +1031,22 @@ impl LoopTurn {
             }),
             ..ModelBudget::default()
         }
+    }
+}
+
+/// The context budget and reasoning depth a summary request must use.
+///
+/// A summary routed to the fast tier answers under that route's frozen budget:
+/// its window, its completion cap, and a depth it actually declared — never
+/// the main route's. Any other route (including the main one a run without a
+/// fast tier falls back to) uses the turn's own budget.
+fn summary_route_profile(
+    turn: &LoopTurn,
+    route: &ModelRoute,
+) -> (Option<ResolvedContextBudget>, Option<agent_protocol::model::ReasoningEffort>) {
+    match (route.tier, turn.budget.summary.as_ref()) {
+        (ModelTier::Fast, Some(summary)) => (Some(summary.context), summary.reasoning_effort),
+        _ => (turn.budget.context, turn.budget.reasoning_effort),
     }
 }
 
@@ -3374,6 +3470,9 @@ mod tests {
 
     /// The operator's criterion, asked at a step boundary.
     mod completion;
+
+    /// What a summary request may send to the fast route.
+    mod summary_route;
 
     use agent_ports::agent_loop::TurnFailureFacts;
     use agent_ports::agent_loop::{TurnCapabilityFacts, TurnStateFacts};

@@ -62,7 +62,11 @@ impl Spent {
 }
 
 /// The step and spend limits a run starts with.
+///
+/// Missing fields decode to [`RunBudget::default`], so a snapshot written
+/// before a field existed still reads as the budget that run actually had.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunBudget {
     /// How many steps a turn may take before it stops as `MaxSteps`.
     pub max_steps: u32,
@@ -174,8 +178,19 @@ pub struct RunBudget {
     pub retain_recent_tokens: Option<u32>,
     /// The answer limit for a compaction summary request. Defaults to the main
     /// completion cap when absent.
+    ///
+    /// Kept readable for one compatibility window; new code reads
+    /// [`Self::summary`], which carries the fast route's whole budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_max_output_tokens: Option<u32>,
+    /// The complete budget of the fast route that writes summaries.
+    ///
+    /// A summary is its own request against its own model, so it cannot inherit
+    /// the main route's working set, completion cap, or reasoning depth. `None`
+    /// on a run assembled before this field existed, or when no separate fast
+    /// route was configured; readers then fall back to the main route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SummaryRouteBudget>,
     /// Where each derived budget number came from, for the audit trail.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub budget_sources: BTreeMap<String, String>,
@@ -239,9 +254,30 @@ impl Default for RunBudget {
             compaction_headroom_tokens: None,
             retain_recent_tokens: None,
             summary_max_output_tokens: None,
+            summary: None,
             budget_sources: BTreeMap::new(),
         }
     }
+}
+
+/// The frozen budget of the route that writes compaction summaries.
+///
+/// Deriving these from the fast route's own capabilities keeps a summary
+/// request inside the window of the model that answers it: the main route may
+/// hold a million tokens while the fast model holds 131,072, and the main
+/// route's reasoning depth may not even be offered there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryRouteBudget {
+    /// The fast route's concrete context budget.
+    pub context: ResolvedContextBudget,
+    /// The depth to ask the fast model for; never inherited from the main
+    /// route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The depths the fast model declared, so recovery never sends one it did
+    /// not offer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_reasoning_efforts: Vec<ReasoningEffort>,
 }
 
 /// The context budget one run derived from its model's capabilities.
@@ -436,6 +472,16 @@ mod tests {
             budget_sources: BTreeMap::new(),
             completion: None,
         }
+    }
+
+    #[test]
+    fn an_old_budget_with_only_a_summary_cap_still_deserializes() {
+        let budget: RunBudget = serde_json::from_value(serde_json::json!({
+            "summary_max_output_tokens": 4096
+        }))
+        .unwrap();
+        assert_eq!(budget.summary_max_output_tokens, Some(4096));
+        assert!(budget.summary.is_none());
     }
 
     #[test]

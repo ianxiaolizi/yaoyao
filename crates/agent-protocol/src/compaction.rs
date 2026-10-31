@@ -116,6 +116,31 @@ pub fn keep_from(
     Some((keep_from, retained))
 }
 
+/// The longest run of whole oldest groups that fits `available_tokens`.
+///
+/// Used when the loop has to clip a summary candidate into the fast route's
+/// input working set: the prefix is taken group by group from the oldest end,
+/// so a tool call and its result are always kept or dropped together. Orphan
+/// groups carry no call and are skipped rather than paid for. An empty result
+/// means even the first eligible group does not fit — the caller then decides
+/// whether a larger route can answer.
+pub fn fit_leading_groups(messages: &[ModelMessage], available_tokens: usize) -> Vec<ModelMessage> {
+    let mut fitted = Vec::new();
+    let mut spent = 0usize;
+    for group in groups(messages) {
+        if !group.keep {
+            continue;
+        }
+        let cost = group.cost(messages);
+        if spent.saturating_add(cost) > available_tokens {
+            break;
+        }
+        spent += cost;
+        fitted.extend_from_slice(&messages[group.start..=group.end]);
+    }
+    fitted
+}
+
 fn tool_use_ids(message: &ModelMessage) -> Vec<String> {
     message
         .content
@@ -207,6 +232,51 @@ mod tests {
             keep_from(&messages, &groups, 0, 1).expect("the older group is proposed");
         assert_eq!(keep_from, 1);
         assert_eq!(retained, estimate_message(&messages[1]));
+    }
+
+    fn text_with_uid(role: MessageRole, uid: &str, text: &str) -> ModelMessage {
+        ModelMessage {
+            message_uid: crate::ids::MessageUid::from_string(uid),
+            role,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
+    fn call_with_uid(id: &str) -> ModelMessage {
+        let mut message = call(id, "fs.read");
+        message.message_uid = crate::ids::MessageUid::from_string(format!("call_{id}"));
+        message
+    }
+
+    fn result_with_uid(id: &str) -> ModelMessage {
+        let mut message = result(id, "fs.read");
+        message.message_uid = crate::ids::MessageUid::from_string(format!("result_{id}"));
+        message
+    }
+
+    fn uids(messages: &[ModelMessage]) -> Vec<&str> {
+        messages.iter().map(|message| message.message_uid.as_str()).collect()
+    }
+
+    #[test]
+    fn fitting_leading_groups_keeps_whole_oldest_groups() {
+        let messages = vec![
+            text_with_uid(MessageRole::User, "old", "old"),
+            call_with_uid("1"),
+            result_with_uid("1"),
+            text_with_uid(MessageRole::User, "new", "new"),
+        ];
+        let groups = groups(&messages);
+        let available = groups[0].cost(&messages) + groups[1].cost(&messages);
+        assert!(available < groups[0].cost(&messages) + groups[1].cost(&messages) + groups[2].cost(&messages));
+        let fitted = fit_leading_groups(&messages, available);
+        assert_eq!(uids(&fitted), vec!["old", "call_1", "result_1"]);
+    }
+
+    #[test]
+    fn fitting_leading_groups_never_splits_a_tool_call_from_its_result() {
+        let messages = vec![call_with_uid("1"), result_with_uid("1"), text_with_uid(MessageRole::User, "new", "new")];
+        assert!(fit_leading_groups(&messages, 1).is_empty());
     }
 
     #[test]
