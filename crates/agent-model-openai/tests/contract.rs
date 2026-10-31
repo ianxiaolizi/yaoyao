@@ -1104,7 +1104,8 @@ async fn provider_reports_a_vendors_error_message_on_a_non_200() {
 #[tokio::test]
 async fn a_413_is_a_context_overflow() {
     let (provider, _) = provider_over(FakeTransport::status(413, "payload too large"));
-    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    let error =
+        provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
     assert!(error.is_context_overflow(), "{error:?}");
 }
 
@@ -1112,14 +1113,16 @@ async fn a_413_is_a_context_overflow() {
 async fn a_context_length_400_is_a_context_overflow() {
     let body = r#"{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}"#;
     let (provider, _) = provider_over(FakeTransport::status(400, body));
-    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    let error =
+        provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
     assert!(error.is_context_overflow(), "{error:?}");
 }
 
 #[tokio::test]
 async fn an_unrelated_400_remains_an_http_error() {
     let (provider, _) = provider_over(FakeTransport::status(400, "bad tool schema"));
-    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    let error =
+        provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
     assert!(matches!(error, ModelProviderError::Http { status: 400, .. }), "{error:?}");
 }
 

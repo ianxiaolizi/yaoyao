@@ -111,10 +111,7 @@ async fn a_large_summary_candidate_is_clipped_to_the_fast_route_budget() {
     assert_eq!(requests.len(), 2, "one summary request, then the step's own");
     let summary_request = &requests[0];
 
-    assert_eq!(
-        summary_request.model_route.as_ref().map(|r| r.tier),
-        Some(ModelTier::Fast)
-    );
+    assert_eq!(summary_request.model_route.as_ref().map(|r| r.tier), Some(ModelTier::Fast));
     let estimated: usize = summary_request.messages.iter().map(estimate_message).sum();
     assert!(
         estimated <= fast_input as usize,
@@ -128,10 +125,8 @@ async fn a_large_summary_candidate_is_clipped_to_the_fast_route_budget() {
     let body = &summary_request.messages;
     assert_eq!(body.first().map(|m| m.role), Some(MessageRole::System));
     assert_eq!(body.last().map(|m| m.role), Some(MessageRole::User));
-    let sent: Vec<&str> = body[1..body.len() - 1]
-        .iter()
-        .map(|message| message.message_uid.as_str())
-        .collect();
+    let sent: Vec<&str> =
+        body[1..body.len() - 1].iter().map(|message| message.message_uid.as_str()).collect();
     assert!(!sent.is_empty(), "the fast route must still select something");
     assert!(sent.len() < candidates.len(), "the oversized tail must be dropped");
     let expected: Vec<&str> =

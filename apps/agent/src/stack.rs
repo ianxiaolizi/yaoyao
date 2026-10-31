@@ -673,10 +673,7 @@ pub async fn assemble_with_delegation(
             Some((route, caps)) => {
                 let resolution =
                     resolve_context_budget(caps, &preset_only_policy(resolved.budget.preset))
-                        .map_err(|source| StackError::Budget {
-                            route: route_key(route),
-                            source,
-                        })?;
+                        .map_err(|source| StackError::Budget { route: route_key(route), source })?;
                 // A summary is its own request. Do not inherit the main
                 // route's effort: the fast model may not even offer it.
                 let (effort, source) = reasoning_effort_for(&None, caps, &route_key(route))?;
@@ -684,12 +681,7 @@ pub async fn assemble_with_delegation(
             }
             // With no fast route the summary is asked of the main model, so it
             // uses the main route's budget and the depth already chosen there.
-            None => (
-                resolution.clone(),
-                main_capabilities,
-                reasoning_effort,
-                reasoning_source,
-            ),
+            None => (resolution.clone(), main_capabilities, reasoning_effort, reasoning_source),
         };
 
     let context_budget = resolution.budget;
@@ -715,16 +707,15 @@ pub async fn assemble_with_delegation(
     resolved.budget.summary = Some(SummaryRouteBudget {
         context: summary_resolution.budget,
         reasoning_effort: summary_effort,
-        supported_reasoning_efforts: summary_capabilities
-            .capabilities
-            .reasoning_efforts
-            .clone(),
+        supported_reasoning_efforts: summary_capabilities.capabilities.reasoning_efforts.clone(),
     });
-    resolved.budget.summary_max_output_tokens = Some(summary_resolution.budget.completion_cap_tokens);
+    resolved.budget.summary_max_output_tokens =
+        Some(summary_resolution.budget.completion_cap_tokens);
     for (field, source) in &summary_resolution.sources {
         budget_sources.insert(format!("summary.{field}"), source.clone());
     }
-    budget_sources.insert("summary.reasoning_effort".to_string(), summary_effort_source.to_string());
+    budget_sources
+        .insert("summary.reasoning_effort".to_string(), summary_effort_source.to_string());
     resolved.budget.reasoning_effort = reasoning_effort;
     // What the model declared it accepts, frozen beside the depth chosen from
     // it: output recovery may step down, and a lower depth the model never

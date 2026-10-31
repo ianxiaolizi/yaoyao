@@ -268,14 +268,21 @@ mod tests {
         ];
         let groups = groups(&messages);
         let available = groups[0].cost(&messages) + groups[1].cost(&messages);
-        assert!(available < groups[0].cost(&messages) + groups[1].cost(&messages) + groups[2].cost(&messages));
+        assert!(
+            available
+                < groups[0].cost(&messages) + groups[1].cost(&messages) + groups[2].cost(&messages)
+        );
         let fitted = fit_leading_groups(&messages, available);
         assert_eq!(uids(&fitted), vec!["old", "call_1", "result_1"]);
     }
 
     #[test]
     fn fitting_leading_groups_never_splits_a_tool_call_from_its_result() {
-        let messages = vec![call_with_uid("1"), result_with_uid("1"), text_with_uid(MessageRole::User, "new", "new")];
+        let messages = vec![
+            call_with_uid("1"),
+            result_with_uid("1"),
+            text_with_uid(MessageRole::User, "new", "new"),
+        ];
         assert!(fit_leading_groups(&messages, 1).is_empty());
     }
 

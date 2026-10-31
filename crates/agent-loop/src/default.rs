@@ -75,6 +75,7 @@ use event_drafts::{draft, draft_turn, reason_event};
 use loop_call::{LoopCallAnswer, answer_loop_call};
 mod budget;
 mod completion;
+mod context_recovery;
 mod event_drafts;
 mod loop_call;
 mod output_recovery;
@@ -417,14 +418,10 @@ impl DefaultAgentLoop {
         // The fixed parts of the summary request: the prompt, the in-flight
         // input shown as context, and the closing instruction. They are always
         // sent, so the room left for the candidate is what remains after them.
-        let prompt_message = ModelMessage::new(
-            MessageRole::System,
-            vec![ContentBlock::text(COMPACTION_PROMPT)],
-        );
-        let instruction_message = ModelMessage::new(
-            MessageRole::User,
-            vec![ContentBlock::text(COMPACTION_INSTRUCTION)],
-        );
+        let prompt_message =
+            ModelMessage::new(MessageRole::System, vec![ContentBlock::text(COMPACTION_PROMPT)]);
+        let instruction_message =
+            ModelMessage::new(MessageRole::User, vec![ContentBlock::text(COMPACTION_INSTRUCTION)]);
         let fixed_tokens = estimate_message(&prompt_message)
             + input_message.as_ref().map(estimate_message).unwrap_or_default()
             + estimate_message(&instruction_message);
@@ -440,8 +437,8 @@ impl DefaultAgentLoop {
         let original_candidate_tokens = candidate.estimated_tokens;
         if !candidate.messages.is_empty() {
             let fit = |context: ResolvedContextBudget| {
-                let available = (context.input_working_set_tokens as usize)
-                    .saturating_sub(fixed_tokens);
+                let available =
+                    (context.input_working_set_tokens as usize).saturating_sub(fixed_tokens);
                 fit_leading_groups(&candidate.messages, available)
             };
             let mut fitted = profile_context.map(fit);
@@ -476,8 +473,7 @@ impl DefaultAgentLoop {
                 // Only the selected prefix is summarized and removed; the
                 // newer messages stay in the transcript as ordinary history.
                 candidate.messages = selected;
-                candidate.estimated_tokens =
-                    candidate.messages.iter().map(estimate_message).sum();
+                candidate.estimated_tokens = candidate.messages.iter().map(estimate_message).sum();
                 candidate.retained_tokens = candidate
                     .retained_tokens
                     .saturating_add(original_candidate_tokens)
@@ -1740,7 +1736,7 @@ impl AgentLoop for DefaultAgentLoop {
             let stall_notice = stall::place_stall_notice(turn, &ctx.turn_id);
             let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id);
 
-            let request = ModelRequest {
+            let mut request = ModelRequest {
                 session_id: ctx.session_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 step_id: step_id.clone(),
@@ -1763,15 +1759,7 @@ impl AgentLoop for DefaultAgentLoop {
             // context on every step. The hash is what makes a reference
             // checkable: a read-back can prove the message it found is the one
             // this request carried.
-            let mut message_refs = Vec::with_capacity(request.messages.len());
-            for message in &request.messages {
-                message_refs.push(serde_json::json!({
-                    "message_uid": message.message_uid.as_str(),
-                    "role": message.role.as_str(),
-                    "hash": digest::json(&serde_json::to_value(message)?),
-                }));
-            }
-            let messages_hash = digest::json(&serde_json::Value::Array(message_refs.clone()));
+            let (message_refs, messages_hash) = message_references(&request.messages)?;
 
             // What this request costs, on the same estimate the context engine
             // uses. `estimated_context_tokens` above describes only the settled
@@ -1781,7 +1769,7 @@ impl AgentLoop for DefaultAgentLoop {
             let estimated_messages_tokens: usize =
                 request.messages.iter().map(estimate_message).sum();
             let estimated_tool_tokens = budget::estimated_tool_tokens(&request.tool_manifest);
-            let estimated_request_tokens = estimated_messages_tokens + estimated_tool_tokens;
+            let mut estimated_request_tokens = estimated_messages_tokens + estimated_tool_tokens;
 
             let mut attempt_id = AttemptId::new();
             let mut prepared = serde_json::json!({
@@ -1930,104 +1918,226 @@ impl AgentLoop for DefaultAgentLoop {
 
             let sink = self.sink(ctx);
             let redactor = &self.redactor;
+            // The first try. A typed context overflow is the one failure the
+            // loop can repair itself: the request was too large, and no repeat
+            // of the same bytes can help. Everything else keeps its ordinary
+            // fatal path.
+            let first = match self.model.stream(&request, sink.as_ref()).await {
+                Ok(first) => first,
+                Err(error) if error.is_context_overflow() => {
+                    events.push(draft(
+                        ctx,
+                        &step_id,
+                        EventType::MODEL_ATTEMPT_FAILED,
+                        serde_json::json!({
+                            "attempt_id": attempt_id,
+                            "error_kind": error.kind(),
+                            "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
+                        }),
+                        Actor::Agent,
+                    ));
+                    let recovered = match turn.budget.context {
+                        Some(context) => {
+                            let target = context_recovery::safe_target(&context);
+                            if context_recovery::compress_for_overflow(
+                                turn,
+                                target,
+                                &step_id,
+                                &mut events,
+                            )? {
+                                // The compressed transcript is what the retry
+                                // sends. It is a new attempt: its own id, its
+                                // own prepared record, exactly one send.
+                                request.messages = turn.messages.clone();
+                                attempt_id = AttemptId::new();
+                                let (refs, hash) = message_references(&request.messages)?;
+                                let messages_tokens: usize =
+                                    request.messages.iter().map(estimate_message).sum();
+                                let tool_tokens =
+                                    budget::estimated_tool_tokens(&request.tool_manifest);
+                                let request_tokens = messages_tokens + tool_tokens;
+                                let mut retry_prepared = prepared.clone();
+                                retry_prepared["attempt_id"] = serde_json::json!(attempt_id);
+                                retry_prepared["message_count"] =
+                                    serde_json::json!(request.messages.len());
+                                retry_prepared["context_message_count"] =
+                                    serde_json::json!(turn.context_message_count);
+                                retry_prepared["estimated_messages_tokens"] =
+                                    serde_json::json!(messages_tokens);
+                                retry_prepared["estimated_tool_tokens"] =
+                                    serde_json::json!(tool_tokens);
+                                retry_prepared["estimated_request_tokens"] =
+                                    serde_json::json!(request_tokens);
+                                retry_prepared["messages"] = serde_json::Value::Array(refs);
+                                retry_prepared["messages_hash"] = serde_json::json!(hash);
+                                retry_prepared["context_recovery"] =
+                                    serde_json::json!("max_safe_compression");
+                                retry_prepared["original_error_kind"] =
+                                    serde_json::json!("context_overflow");
+                                prepared = retry_prepared.clone();
+                                estimated_request_tokens = request_tokens;
+                                events.push(draft(
+                                    ctx,
+                                    &step_id,
+                                    EventType::MODEL_REQUEST_PREPARED,
+                                    retry_prepared,
+                                    Actor::Agent,
+                                ));
+                                events.push(draft(
+                                    ctx,
+                                    &step_id,
+                                    EventType::MODEL_ATTEMPT_STARTED,
+                                    serde_json::json!({
+                                        "attempt_id": attempt_id,
+                                        "provider": self.model.provider_id(),
+                                        "route": serde_json::to_value(&request.model_route)?,
+                                    }),
+                                    Actor::Agent,
+                                ));
+                                Some(self.model.stream(&request, sink.as_ref()).await)
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+                    match recovered {
+                        Some(Ok(response)) => response,
+                        // A second rejection after a maximum safe compression
+                        // ends the step: there is nothing left to remove, so a
+                        // third attempt would send the same rejected request.
+                        Some(Err(second)) => {
+                            let cancelled = second.is_cancelled();
+                            events.push(draft(
+                                ctx,
+                                &step_id,
+                                if cancelled {
+                                    EventType::MODEL_ATTEMPT_CANCELLED
+                                } else {
+                                    EventType::MODEL_ATTEMPT_FAILED
+                                },
+                                serde_json::json!({
+                                    "attempt_id": attempt_id,
+                                    "error_kind": second.kind(),
+                                    "message": truncate(&second.to_string(), MAX_ERROR_CHARS),
+                                }),
+                                Actor::Agent,
+                            ));
+                            events.push(step_failed(ctx, &step_id));
+                            return Ok(StepOutcome {
+                                step_id,
+                                events,
+                                stop: Some(if cancelled {
+                                    StopReason::UserCancelled
+                                } else {
+                                    StopReason::FatalError
+                                }),
+                                final_content: None,
+                                spent: turn.spent,
+                            });
+                        }
+                        None => {
+                            events.push(step_failed(ctx, &step_id));
+                            return Ok(StepOutcome {
+                                step_id,
+                                events,
+                                stop: Some(StopReason::FatalError),
+                                final_content: None,
+                                spent: turn.spent,
+                            });
+                        }
+                    }
+                }
+                Err(error) => {
+                    // The attempt's deltas stayed live-only; no partial response
+                    // is written, and the failure is a first-class fact.
+                    let cancelled = error.is_cancelled();
+                    events.push(draft(
+                        ctx,
+                        &step_id,
+                        if cancelled {
+                            EventType::MODEL_ATTEMPT_CANCELLED
+                        } else {
+                            EventType::MODEL_ATTEMPT_FAILED
+                        },
+                        serde_json::json!({
+                            "attempt_id": attempt_id,
+                            "error_kind": error.kind(),
+                            "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
+                        }),
+                        Actor::Agent,
+                    ));
+                    events.push(step_failed(ctx, &step_id));
+                    return Ok(StepOutcome {
+                        step_id,
+                        events,
+                        stop: Some(if cancelled {
+                            StopReason::UserCancelled
+                        } else {
+                            StopReason::FatalError
+                        }),
+                        final_content: None,
+                        spent: turn.spent,
+                    });
+                }
+            };
+
             // Whether the step ended on a response that spent the whole cap
             // thinking. The verdict says so once, instead of calling a request
             // that produced no content a truncated answer.
-            let reasoning_exhausted;
-            let (response, response_event_id, output_limit) =
-                match self.model.stream(&request, sink.as_ref()).await {
-                    Ok(first) => {
-                        // A reasoning model can spend the whole completion on
-                        // tokens that never become content (2026-10-31: 8,000
-                        // of 8,000 output tokens reasoning, `finish_reason:
-                        // length`, no text). The cap, not the model, ended the
-                        // answer, so the step re-asks once with more room — or,
-                        // at the model's own ceiling, less depth. `output_recovery`
-                        // owns that ask, including why it happens at most once.
-                        let (response, output_limit) = match self
-                            .recover_output(
-                                ctx,
-                                &step_id,
-                                turn,
-                                &request,
-                                &prepared,
-                                &mut attempt_id,
-                                first,
-                                estimated_request_tokens,
-                                &mut events,
-                            )
-                            .await?
-                        {
-                            RecoveryOutcome::Settled { response, output_limit } => {
-                                (response, output_limit)
-                            }
-                            RecoveryOutcome::Failed(stop) => {
-                                return Ok(StepOutcome {
-                                    step_id,
-                                    events,
-                                    stop: Some(stop),
-                                    final_content: None,
-                                    spent: turn.spent,
-                                });
-                            }
-                        };
-                        reasoning_exhausted = output_recovery::is_reasoning_only(&response);
-                        // The durable copy is scrubbed: a proposal's arguments are
-                        // the model's, and a secret copied into them must not sit in
-                        // a long-lived log (§7 row 4). `response` keeps its raw
-                        // arguments — the live turn shows the model what it actually
-                        // asked for, and only the record is redacted.
-                        let durable = redacted_proposal(&response, redactor);
-                        let recorded = draft(
-                            ctx,
-                            &step_id,
-                            EventType::MODEL_RESPONSE_COMPLETED,
-                            serde_json::json!({
-                                "attempt_id": attempt_id,
-                                "response": serde_json::to_value(&durable)?,
-                            }),
-                            Actor::Agent,
-                        );
-                        // Kept so an action can cite the response that proposed it:
-                        // the model's choice is a node in the chain, not an
-                        // unrecorded gap between two kernel decisions.
-                        let recorded_id = recorded.event_id.as_str().to_string();
-                        events.push(recorded);
-                        (response, recorded_id, output_limit)
-                    }
-                    Err(error) => {
-                        // The attempt's deltas stayed live-only; no partial response
-                        // is written, and the failure is a first-class fact.
-                        let cancelled = error.is_cancelled();
-                        events.push(draft(
-                            ctx,
-                            &step_id,
-                            if cancelled {
-                                EventType::MODEL_ATTEMPT_CANCELLED
-                            } else {
-                                EventType::MODEL_ATTEMPT_FAILED
-                            },
-                            serde_json::json!({
-                                "attempt_id": attempt_id,
-                                "error_kind": error.kind(),
-                                "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
-                            }),
-                            Actor::Agent,
-                        ));
-                        events.push(step_failed(ctx, &step_id));
-                        return Ok(StepOutcome {
-                            step_id,
-                            events,
-                            stop: Some(if cancelled {
-                                StopReason::UserCancelled
-                            } else {
-                                StopReason::FatalError
-                            }),
-                            final_content: None,
-                            spent: turn.spent,
-                        });
-                    }
-                };
+            // A reasoning model can spend the whole completion on tokens that
+            // never become content (2026-10-31: 8,000 of 8,000 output tokens
+            // reasoning, `finish_reason: length`, no text). The cap, not the
+            // model, ended the answer, so the step re-asks once with more room
+            // — or, at the model's own ceiling, less depth. `output_recovery`
+            // owns that ask, including why it happens at most once.
+            let (response, output_limit) = match self
+                .recover_output(
+                    ctx,
+                    &step_id,
+                    turn,
+                    &request,
+                    &prepared,
+                    &mut attempt_id,
+                    first,
+                    estimated_request_tokens,
+                    &mut events,
+                )
+                .await?
+            {
+                RecoveryOutcome::Settled { response, output_limit } => (response, output_limit),
+                RecoveryOutcome::Failed(stop) => {
+                    return Ok(StepOutcome {
+                        step_id,
+                        events,
+                        stop: Some(stop),
+                        final_content: None,
+                        spent: turn.spent,
+                    });
+                }
+            };
+            let reasoning_exhausted = output_recovery::is_reasoning_only(&response);
+            // The durable copy is scrubbed: a proposal's arguments are the
+            // model's, and a secret copied into them must not sit in a
+            // long-lived log (§7 row 4). `response` keeps its raw arguments —
+            // the live turn shows the model what it actually asked for, and
+            // only the record is redacted.
+            let durable = redacted_proposal(&response, redactor);
+            let recorded = draft(
+                ctx,
+                &step_id,
+                EventType::MODEL_RESPONSE_COMPLETED,
+                serde_json::json!({
+                    "attempt_id": attempt_id,
+                    "response": serde_json::to_value(&durable)?,
+                }),
+                Actor::Agent,
+            );
+            // Kept so an action can cite the response that proposed it: the
+            // model's choice is a node in the chain, not an unrecorded gap
+            // between two kernel decisions.
+            let response_event_id = recorded.event_id.as_str().to_string();
+            events.push(recorded);
 
             // What this response cost, added before anything else this step
             // does, so every later boundary in the step sees it.
@@ -3249,6 +3359,28 @@ fn redacted_proposal(response: &ModelResponse, redactor: &Redactor) -> ModelResp
         }
     }
     durable
+}
+
+/// The ordered messages a request carries, as checkable references.
+///
+/// Their content is durable elsewhere already — run instructions, this turn's
+/// layers, the input item, the folded history, every tool result — and
+/// repeating it on each step would make the log grow with the whole context on
+/// every step. The per-message hash is what makes a reference checkable, and
+/// the aggregate hash covers the order.
+fn message_references(
+    messages: &[ModelMessage],
+) -> Result<(Vec<serde_json::Value>, String), AgentLoopError> {
+    let mut refs = Vec::with_capacity(messages.len());
+    for message in messages {
+        refs.push(serde_json::json!({
+            "message_uid": message.message_uid.as_str(),
+            "role": message.role.as_str(),
+            "hash": digest::json(&serde_json::to_value(message)?),
+        }));
+    }
+    let hash = digest::json(&serde_json::Value::Array(refs.clone()));
+    Ok((refs, hash))
 }
 
 /// A result's offloaded artifacts as locators a reader can follow, rather than
