@@ -40,7 +40,7 @@ impl Scheduler {
     /// afterwards with [`rebudgeted`](Self::rebudgeted), so each replacement is
     /// stated once.
     pub fn relooped(&self, loop_: Arc<dyn AgentLoop>) -> Self {
-        self.rebuilt(loop_, self.budget)
+        self.rebuilt(loop_, self.budget.clone())
     }
 
     /// Every field of `self`, with `loop_` and `budget` replacing the two that

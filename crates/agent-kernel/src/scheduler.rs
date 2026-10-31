@@ -207,7 +207,7 @@ impl Scheduler {
     pub fn with_profile_snapshot(mut self, snapshot: ResolvedProfileSnapshot) -> Self {
         // The profile's budget is what the run executes under; the step limit
         // stays the one `new` was given, which is how a harness states it.
-        self.budget = snapshot.budget;
+        self.budget = snapshot.budget.clone();
         self.completion = snapshot.completion.clone();
         self.profile = Some(snapshot);
         self
@@ -481,7 +481,7 @@ impl Scheduler {
             previous_turn,
             resumed: decision,
             max_steps: self.max_steps,
-            budget: self.budget,
+            budget: self.budget.clone(),
             completion: self.completion.clone(),
         };
         // The turn's journal: the same log every other write goes to, committed

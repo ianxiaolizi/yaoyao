@@ -1252,7 +1252,7 @@ impl AgentLoop for DefaultAgentLoop {
         // The run's limits, as the caller resolved them. The wall clock is
         // measured from the moment the turn opens; a harness with no facts has
         // the default budget, where only the step count is set.
-        let budget = ctx.state.as_ref().map(|facts| facts.budget).unwrap_or_default();
+        let budget = ctx.state.as_ref().map(|facts| facts.budget.clone()).unwrap_or_default();
         let completion = ctx.state.as_ref().and_then(|facts| facts.completion.clone());
         let deadline = budget
             .wall_clock_ms

@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 
 use crate::{ConfigError, Result};
+use agent_protocol::model::ReasoningEffort;
 use agent_protocol::versioning::{self, Version, VersionError, formats};
 use serde::Deserialize;
 
@@ -263,6 +264,11 @@ pub struct ModelSpec {
     /// old configurations keep parsing and are not refused for a fact they
     /// never claimed.
     pub context_window: Option<u32>,
+    /// How deeply the main model should reason, when a layer chooses.
+    ///
+    /// Absent means the model's own default. A provider that does not declare
+    /// reasoning support refuses an explicit value rather than ignoring it.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// What a profile's tools may do.
@@ -339,20 +345,33 @@ pub struct BudgetSpec {
     /// How much a cache-hit input token counts in the displayed billable total.
     /// Omit for 10. The enforced limit remains the raw total.
     pub cache_hit_weight_percent: Option<u32>,
-    /// The most estimated input tokens one request may carry. Omit to send the
-    /// settled history whole.
-    pub max_input_tokens: Option<u32>,
-    /// How much of `max_input_tokens` to reserve for the answer. Defaults to
-    /// zero; must be smaller than `max_input_tokens` when both are set.
+    /// The most estimated input tokens one request may carry. Omit to derive
+    /// it from the model's window and the preset.
+    ///
+    /// `max_input_tokens` is the pre-refactor spelling and is accepted as an
+    /// alias: old configuration files keep parsing without being rewritten.
+    #[serde(alias = "max_input_tokens")]
+    pub input_working_set_tokens: Option<u32>,
+    /// The most completion tokens one request may ask the provider for,
+    /// reasoning included. Omit to derive it from the model's ceiling.
+    ///
+    /// `max_output_tokens` is the pre-refactor spelling and remains an alias.
+    #[serde(alias = "max_output_tokens")]
+    pub completion_cap_tokens: Option<u32>,
+    /// How much of the window to reserve for compaction handover text. Omit
+    /// to derive it.
+    pub compaction_headroom_tokens: Option<u32>,
+    /// How many recent tokens compaction keeps whole. Omit to derive it.
+    pub retain_recent_tokens: Option<u32>,
+    /// How much of the working set is reserved for the answer. Kept only so an
+    /// old file parses; it no longer enters any budget arithmetic.
     pub reserved_output_tokens: Option<u32>,
-    /// The most completion tokens one request may ask the provider for. Omit
-    /// for the shipped default (8,000); independent of the window, and it is
-    /// what the request's `max_tokens` carries.
-    pub max_output_tokens: Option<u32>,
     /// The share of the usable window at which older history is summarized
-    /// before a request is sent. Omit to keep the trimmer as the only
-    /// protection. Requires `max_input_tokens`; 1..=99.
+    /// before a request is sent. Omit for 80. 1..=99.
     pub compact_at_percent: Option<u32>,
+    /// How much of the model's window to spend on input: `frugal`,
+    /// `balanced` (default), `deep`, or `max`.
+    pub preset: Option<agent_protocol::model::BudgetPreset>,
 }
 
 /// Which plugins a scenario turns on.

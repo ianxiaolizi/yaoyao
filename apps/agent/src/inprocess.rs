@@ -200,7 +200,7 @@ impl SubagentProvider for InProcessSubagentProvider {
         // none keeps the budget the profile gave the run, which is the only
         // stated limit there is.
         let scheduler = match &request.budget {
-            Some(budget) => Arc::new(template.rebudgeted(*budget)),
+            Some(budget) => Arc::new(template.rebudgeted(budget.clone())),
             None => template,
         };
         let deadline_in = self.effective_timeout(&request);

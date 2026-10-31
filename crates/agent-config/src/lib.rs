@@ -14,8 +14,11 @@
 
 #![deny(unsafe_code)]
 
+pub mod budget;
 pub mod layers;
 pub mod resolve;
+
+pub use budget::{BudgetPolicy, BudgetResolution, resolve_context_budget};
 
 pub use layers::{
     BudgetSpec, DecisionsSpec, Disposition, LayaSpec, ManagedPolicy, McpServer, McpSpec,
@@ -170,20 +173,25 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_names_no_window_gets_the_shipped_working_set() {
+    fn a_run_that_names_no_window_is_left_to_derive_one_from_the_model() {
+        // No layer named a window, so nothing is invented here: the working
+        // set and the completion cap are derived from the model's capabilities
+        // when the route is known. The old 8,000/2,000 pair is gone — it was a
+        // constant sized for no particular model, and its cap truncated
+        // reasoning (CONTRACT §7 #131).
         let budget = resolve(no_layers()).unwrap().budget;
-        assert_eq!(budget.max_input_tokens, Some(8_000));
-        assert_eq!(budget.reserved_output_tokens, Some(2_000));
-        assert_eq!(budget.compact_at_percent, Some(75));
-        assert_eq!(budget.max_output_tokens, Some(8_000));
+        assert_eq!(budget.max_input_tokens, None);
+        assert_eq!(budget.reserved_output_tokens, None);
+        assert_eq!(budget.max_output_tokens, None);
+        assert_eq!(budget.preset, agent_protocol::model::BudgetPreset::Balanced);
+        assert!(budget.compact_at_percent.is_none());
     }
 
     #[test]
-    fn the_output_cap_is_not_the_window_s_reservation() {
-        // The two numbers answer different questions and are set apart: the
-        // reservation is room kept in the working set, the cap is how long an
-        // answer may be. A 2,000-token reservation with an 8,000-token cap is
-        // the shipped shape; a layer that names one does not move the other.
+    fn an_explicit_cap_is_carried_and_a_reservation_is_only_a_note() {
+        // `max_output_tokens` still names the completion cap (through its new
+        // alias), while `reserved_output_tokens` is accepted for old files and
+        // then ignored with a note.
         let mut layers = no_layers();
         layers.user = UserConfig::from_toml_str(
             r#"
@@ -194,8 +202,8 @@ budget = { max_input_tokens = 1000 }
         .unwrap();
         layers.profile_override = Some("p".to_string());
         let budget = resolve(layers).unwrap().budget;
-        assert_eq!(budget.reserved_output_tokens, None, "the reservation stays unset");
-        assert_eq!(budget.max_output_tokens, Some(8_000), "the cap is filled in anyway");
+        assert_eq!(budget.reserved_output_tokens, None);
+        assert_eq!(budget.max_output_tokens, None, "no cap is invented here");
 
         let mut layers = no_layers();
         layers.user = UserConfig::from_toml_str(
@@ -206,15 +214,20 @@ budget = { max_input_tokens = 24000, reserved_output_tokens = 2000, max_output_t
         )
         .unwrap();
         layers.profile_override = Some("p".to_string());
-        let budget = resolve(layers).unwrap().budget;
-        assert_eq!(budget.reserved_output_tokens, Some(2_000));
-        assert_eq!(budget.max_output_tokens, Some(12_000), "an explicit cap wins");
+        let resolved = resolve(layers).unwrap();
+        assert_eq!(resolved.budget.reserved_output_tokens, Some(2_000));
+        assert_eq!(resolved.budget.max_output_tokens, Some(12_000), "an explicit cap wins");
+        assert!(
+            resolved.notes.iter().any(|note| note.contains("reserved_output_tokens")),
+            "the ignored reservation is recorded: {:?}",
+            resolved.notes
+        );
     }
 
     #[test]
-    fn a_profile_that_only_sets_limits_still_gets_the_working_set() {
+    fn a_profile_that_only_sets_limits_still_leaves_the_window_to_the_model() {
         // Step and tool-call limits say nothing about the window; tightening
-        // them must not turn the shipped working set off.
+        // them must not invent a working set either.
         let mut layers = no_layers();
         layers.user = UserConfig::from_toml_str(
             r#"
@@ -227,12 +240,12 @@ budget = { max_steps = 4, max_tool_calls = 6 }
         let budget = resolve(layers).unwrap().budget;
         assert_eq!(budget.max_steps, 4);
         assert_eq!(budget.max_tool_calls, Some(6));
-        assert_eq!(budget.max_input_tokens, Some(8_000));
-        assert_eq!(budget.compact_at_percent, Some(75));
+        assert_eq!(budget.max_input_tokens, None);
+        assert_eq!(budget.preset, agent_protocol::model::BudgetPreset::Balanced);
     }
 
     #[test]
-    fn an_explicit_window_opts_out_of_the_shipped_reservation() {
+    fn an_explicit_window_is_carried_without_a_reservation() {
         // The old small-window configurations stay valid: naming only a window
         // must not inherit a 2,000-token reservation it never asked for.
         let mut layers = no_layers();
@@ -248,6 +261,17 @@ budget = { max_input_tokens = 1000 }
         assert_eq!(budget.max_input_tokens, Some(1000));
         assert_eq!(budget.reserved_output_tokens, None);
         assert_eq!(budget.compact_at_percent, None);
+    }
+
+    #[test]
+    fn old_budget_names_still_deserialize_as_aliases() {
+        let budget: BudgetSpec = toml::from_str(
+            "max_input_tokens = 24000\nmax_output_tokens = 32768\nreserved_output_tokens = 2000",
+        )
+        .unwrap();
+        assert_eq!(budget.input_working_set_tokens, Some(24_000));
+        assert_eq!(budget.completion_cap_tokens, Some(32_768));
+        assert_eq!(budget.reserved_output_tokens, Some(2_000));
     }
 
     #[test]
@@ -1702,10 +1726,10 @@ decisions = { laya = true }
     }
 
     #[test]
-    fn a_reservation_is_checked_against_the_window_after_both_layers_have_spoken() {
-        // Neither layer is wrong alone: the project names a window and the
-        // profile names a reservation. Checking each layer on its own would
-        // accept a pair that leaves nothing for history.
+    fn a_reservation_from_another_layer_is_carried_but_not_checked_against_the_window() {
+        // Neither layer is refused: the reservation no longer enters budget
+        // arithmetic, so pairing it with a window cannot leave nothing for
+        // history. It is recorded with a deprecation note instead.
         let split = |reserved: &str| {
             let mut layers = no_layers();
             layers.workspace =
@@ -1718,16 +1742,13 @@ decisions = { laya = true }
             resolve(layers)
         };
 
-        match split("1000").unwrap_err() {
-            ConfigError::InvalidBudget { detail, .. } => {
-                assert!(detail.contains("not smaller"), "{detail} did not say why");
-            }
-            other => panic!("a window of 1000 with 1000 reserved must be refused, got {other}"),
+        for reserved in ["999", "1000", "1001"] {
+            let resolved = split(reserved).unwrap_or_else(|error| {
+                panic!("a reservation of {reserved} no longer invalidates the window: {error}")
+            });
+            assert_eq!(resolved.budget.max_input_tokens, Some(1000));
+            assert!(resolved.notes.iter().any(|note| note.contains("deprecated")));
         }
-        assert!(split("1001").is_err(), "a reservation larger than the window is refused too");
-        let accepted = split("999").unwrap().budget;
-        assert_eq!(accepted.max_input_tokens, Some(1000));
-        assert_eq!(accepted.reserved_output_tokens, Some(999));
     }
 
     #[test]
@@ -1771,23 +1792,16 @@ decisions = { laya = true }
     }
 
     #[test]
-    fn a_compaction_trigger_without_a_window_is_refused() {
-        // A share of nothing is not a threshold. Accepting it would leave the
-        // field set in the run record while no window exists to take a share of.
+    fn a_compaction_trigger_without_a_named_window_is_carried_to_the_resolver() {
+        // The window comes from the model now, so a share with no window in
+        // the file is meaningful: it overrides the 80% default against
+        // whatever working set the model's capabilities derive.
         let mut layers = no_layers();
         layers.user =
             UserConfig::from_toml_str("[profiles.p]\nbudget = { compact_at_percent = 85 }\n")
                 .unwrap();
         layers.profile_override = Some("p".to_string());
-        match resolve(layers).unwrap_err() {
-            ConfigError::InvalidBudget { detail, .. } => {
-                assert!(
-                    detail.contains("max_input_tokens"),
-                    "{detail} did not name the missing window"
-                );
-            }
-            other => panic!("expected a refusal without a window, got {other}"),
-        }
+        assert_eq!(resolve(layers).unwrap().budget.compact_at_percent, Some(85));
     }
 
     #[test]
@@ -1840,7 +1854,7 @@ max_output_tokens = 32768
     }
 
     #[test]
-    fn a_working_set_over_ninety_percent_of_the_model_window_is_refused() {
+    fn a_working_set_over_ninety_five_percent_of_the_model_window_is_refused() {
         // The estimator is allowed to be wrong; it is not allowed to be wrong
         // past the provider's physical ceiling. 95k + 8k on a 100k model is
         // 103% of the window even before the estimate's error.
@@ -1860,7 +1874,7 @@ max_output_tokens = 8000
         match resolve(layers).unwrap_err() {
             ConfigError::InvalidBudget { detail, .. } => {
                 assert!(detail.contains("context_window"), "{detail} did not name the window");
-                assert!(detail.contains("90000"), "{detail} did not name the 90% ceiling");
+                assert!(detail.contains("95000"), "{detail} did not name the 95% ceiling");
             }
             other => panic!("expected a refusal over the model window, got {other}"),
         }
@@ -1898,10 +1912,11 @@ max_output_tokens = 8000
     }
 
     #[test]
-    fn an_unset_window_is_not_written_so_the_config_hash_does_not_move() {
-        // A run that sets no window must serialize exactly as one from before
-        // the fields existed; otherwise every existing `config_hash` changes
-        // the moment this build runs, and profiles stop comparing equal.
+    fn an_unset_window_is_not_written_but_the_preset_is() {
+        // Window numbers stay absent when unset, so a reader can tell "not
+        // configured" from "configured to zero". The preset is written even at
+        // its default because it is part of how a run's budget was derived:
+        // two runs with different presets must not compare equal.
         let default = serde_json::to_value(agent_protocol::profile::RunBudget::default()).unwrap();
         assert_eq!(
             default,
@@ -1909,6 +1924,7 @@ max_output_tokens = 8000
                 "max_steps": 8,
                 "max_tool_calls": null,
                 "wall_clock_ms": null,
+                "preset": "balanced",
             })
         );
     }

@@ -101,6 +101,9 @@ pub struct ResolvedProfile {
     /// files back.
     pub decision_backends: Vec<String>,
     pub budget: RunBudget,
+    /// The physical window a layer claimed for the main model, when it stated
+    /// one. Used by assembly to cap the resolved budget; never sent anywhere.
+    pub model_context_window: Option<u32>,
     /// The operator's completion criterion, when the profile names one.
     pub completion: Option<CompletionSpec>,
     pub policy: ResolvedPolicy,
@@ -375,6 +378,20 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
     };
 
     let mut notes = Vec::new();
+    // `reserved_output_tokens` is read so old configuration files keep parsing,
+    // and then deliberately ignored. Saying so is the difference between a
+    // deprecated field and a silently dead one.
+    let reserved_mentioned = [layers.workspace.budget.as_ref(), composed.budget.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|spec| spec.reserved_output_tokens.is_some());
+    if reserved_mentioned {
+        notes.push(
+            "`reserved_output_tokens` is deprecated and no longer affects the budget; use \
+             `completion_cap_tokens` for the answer limit, and let the working set be derived"
+                .to_string(),
+        );
+    }
     let granted = authorized(&layers, &composed, &profile_id)?;
     let managed_deny = managed_deny(&layers.managed);
     let capability_set = without_managed_deny(granted, &managed_deny, &mut notes);
@@ -412,6 +429,9 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
     // against the policy this run would actually enforce.
     let completion =
         completion(composed.completion.as_ref(), &capability_set, &composed, &profile_id)?;
+    let mut budget = budget(&layers.workspace, &composed)?;
+    budget.reasoning_effort = composed.model.as_ref().and_then(|model| model.reasoning_effort);
+    let model_context_window = composed.model.as_ref().and_then(|model| model.context_window);
 
     Ok(ResolvedProfile {
         profile_id,
@@ -427,7 +447,8 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
         subagents,
         laya,
         decision_backends,
-        budget: budget(&layers.workspace, &composed)?,
+        budget,
+        model_context_window,
         completion,
         policy,
         policy_version,
@@ -510,6 +531,7 @@ fn merge(base: Profile, above: Profile) -> Profile {
             fast: above.fast.or(base.fast),
             thinking: above.thinking.or(base.thinking),
             context_window: above.context_window.or(base.context_window),
+            reasoning_effort: above.reasoning_effort.or(base.reasoning_effort),
         }),
         tools: merge_with(base.tools, above.tools, |base, above| ToolsSpec {
             allow: pick(base.allow, above.allow),
@@ -531,10 +553,17 @@ fn merge(base: Profile, above: Profile) -> Profile {
             cache_hit_weight_percent: above
                 .cache_hit_weight_percent
                 .or(base.cache_hit_weight_percent),
-            max_input_tokens: above.max_input_tokens.or(base.max_input_tokens),
+            input_working_set_tokens: above
+                .input_working_set_tokens
+                .or(base.input_working_set_tokens),
+            completion_cap_tokens: above.completion_cap_tokens.or(base.completion_cap_tokens),
+            compaction_headroom_tokens: above
+                .compaction_headroom_tokens
+                .or(base.compaction_headroom_tokens),
+            retain_recent_tokens: above.retain_recent_tokens.or(base.retain_recent_tokens),
             reserved_output_tokens: above.reserved_output_tokens.or(base.reserved_output_tokens),
-            max_output_tokens: above.max_output_tokens.or(base.max_output_tokens),
             compact_at_percent: above.compact_at_percent.or(base.compact_at_percent),
+            preset: above.preset.or(base.preset),
         }),
         // One object rather than a set of knobs: a child that names any part of
         // the criterion states the whole criterion, so the closer layer's
@@ -697,31 +726,6 @@ fn with_rules(
     policy
 }
 
-/// The working set a run gets when no layer names one.
-///
-/// A run that configured no budget used to send its history whole. That is
-/// not a safe product default: the history grows with every turn, every step
-/// resends it, and nothing bounds a single tool result. The values are the
-/// regular profile from CONTRACT #51, checked by the four-tier comparison in
-/// `项目工作区/真实使用_2026-10-19/four-tier-2026-10-20/` and recorded in
-/// CONTRACT #52. A layer that names any window field opts out entirely, so a
-/// small explicit window keeps its own reservation and trigger — including
-/// the refusal of a trigger with no window.
-const DEFAULT_MAX_INPUT_TOKENS: u32 = 8_000;
-const DEFAULT_RESERVED_OUTPUT_TOKENS: u32 = 2_000;
-const DEFAULT_COMPACT_AT_PERCENT: u32 = 75;
-
-/// The completion cap a run gets when no layer names one.
-///
-/// Not a share of the window and not tied to the reservation: reasoning models
-/// bill their reasoning tokens to the same budget, so a cap sized to the prose
-/// can end a response before a single word of it is written. The 2,000 the
-/// reservation has always used was doing this job after CONTRACT §7 #111 mapped
-/// it to `max_tokens`, and on 2026-10-30 a real run spent all 2,000 on reasoning
-/// and returned an empty answer (§7 #131). 8,000 is the value the round retested
-/// that task with: 4/4, with no single response passing 4.9k output tokens.
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_000;
-
 /// The step ceiling a profile gets when it configured a primary limit but no
 /// step count. The limit is the plan; this is the backstop that stops a loop
 /// whose other limits never fire.
@@ -739,34 +743,17 @@ const DEFAULT_STALL_STEPS: u32 = 8;
 /// How much a cached input token counts in the displayed billable total.
 const DEFAULT_CACHE_HIT_WEIGHT_PERCENT: u32 = 10;
 
-/// Whether a layer said anything about the window.
-///
-/// Step and tool-call limits do not count: a profile that only tightens how
-/// many steps a turn may take still gets the shipped working set.
-fn names_a_window(spec: Option<&BudgetSpec>) -> bool {
-    spec.is_some_and(|spec| {
-        spec.max_input_tokens.is_some()
-            || spec.reserved_output_tokens.is_some()
-            || spec.compact_at_percent.is_some()
-    })
-}
-
 /// The run's limits: the project's layer first, then the profile's on top.
+///
+/// Window numbers are left unset when no layer names them. They are no longer
+/// filled with the old 8,000/2,000 pair: the working set and the completion cap
+/// are derived from the model's own capabilities once the route is known, and a
+/// value invented here would override that derivation with a constant sized for
+/// no particular model (the 8k cap that truncated reasoning, CONTRACT §7 #131).
 fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> {
     let mut budget = RunBudget::default();
     apply_budget(&mut budget, workspace.budget.as_ref())?;
     apply_budget(&mut budget, composed.budget.as_ref())?;
-    if !names_a_window(workspace.budget.as_ref()) && !names_a_window(composed.budget.as_ref()) {
-        budget.max_input_tokens = Some(DEFAULT_MAX_INPUT_TOKENS);
-        budget.reserved_output_tokens = Some(DEFAULT_RESERVED_OUTPUT_TOKENS);
-        budget.compact_at_percent = Some(DEFAULT_COMPACT_AT_PERCENT);
-    }
-    // The completion cap is not part of the window, so it is filled in whether
-    // or not a layer named a window: a run that configured its own working set
-    // still needs an answer limit that is not that set's reservation.
-    if budget.max_output_tokens.is_none() {
-        budget.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
-    }
     // A primary limit (token budget or wall clock) is what makes the step
     // ceiling a backstop rather than the plan: a run meant to last an hour
     // must not die at the eighth step because nobody raised it. Only a profile
@@ -793,61 +780,30 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
         budget.cache_hit_weight_percent = Some(DEFAULT_CACHE_HIT_WEIGHT_PERCENT);
     }
     // The model's physical window and the run's working set are different
-    // numbers: `max_input_tokens` is a cost/latency choice, `context_window`
-    // is what the provider will accept. A working set plus its completion cap
-    // that exceeds 90% of the physical window leaves no room for the estimator
-    // being wrong, so it is refused only when a layer actually stated the
-    // window. A profile that does not state one keeps the old behaviour.
+    // numbers. A working set plus its completion cap that exceeds 95% of a
+    // window a layer stated leaves no room for the estimator being wrong, so
+    // it is refused here; a window the layer did not state is checked against
+    // the discovered capabilities when the budget is resolved.
     if let (Some(window), Some(input)) =
         (composed.model.as_ref().and_then(|model| model.context_window), budget.max_input_tokens)
     {
         let output = budget.max_output_tokens.unwrap_or(0);
-        let ceiling = u64::from(window) * 90 / 100;
+        let ceiling = u64::from(window) * 95 / 100;
         if u64::from(input) + u64::from(output) > ceiling {
             return Err(ConfigError::InvalidBudget {
                 layer: "budget".to_string(),
                 detail: format!(
-                    "`max_input_tokens` ({input}) + `max_output_tokens` ({output}) exceeds 90% \
-                     of the configured `context_window` ({window}); keep the working set plus \
-                     its completion cap under {ceiling}, or raise `context_window` if the model \
-                     really accepts more"
+                    "`input_working_set_tokens` ({input}) + `completion_cap_tokens` ({output}) \
+                     exceeds 95% of the configured `context_window` ({window}); keep the working \
+                     set plus its completion cap under {ceiling}, or raise `context_window` if \
+                     the model really accepts more"
                 ),
             });
         }
     }
-    // The pair is checked once both layers have had their say: one layer may
-    // name the window and another the reservation, and each is unremarkable
-    // until it meets the other.
-    if let (Some(max), Some(reserved)) = (budget.max_input_tokens, budget.reserved_output_tokens)
-        && reserved >= max
-    {
-        return Err(ConfigError::InvalidBudget {
-            layer: "budget".to_string(),
-            detail: format!(
-                "`reserved_output_tokens` ({reserved}) is not smaller than `max_input_tokens` \
-                 ({max}); the whole window would be reserved for the answer"
-            ),
-        });
-    }
-    // A trigger with no window would fire on zero tokens: there is nothing to
-    // measure the share against, and a silently ignored setting is worse than
-    // a refusal that says why.
-    if budget.compact_at_percent.is_some() && budget.max_input_tokens.is_none() {
-        return Err(ConfigError::InvalidBudget {
-            layer: "budget".to_string(),
-            detail: "`compact_at_percent` needs `max_input_tokens`: without a window there is \
-                     no budget to take a share of"
-                .to_string(),
-        });
-    }
-    if budget.settle_at_percent.is_some() && budget.max_input_tokens.is_none() {
-        return Err(ConfigError::InvalidBudget {
-            layer: "budget".to_string(),
-            detail: "`settle_at_percent` needs `max_input_tokens`: without a window there is no \
-                     working set to settle"
-                .to_string(),
-        });
-    }
+    // A trigger and a settlement share are meaningful against the budget the
+    // assembly derives, so naming one without naming a window is no longer an
+    // error: the window comes from the model.
     if budget.finalize_at_percent.is_some() && !primary_limit {
         return Err(ConfigError::InvalidBudget {
             layer: "budget".to_string(),
@@ -1100,12 +1056,12 @@ fn apply_budget(budget: &mut RunBudget, spec: Option<&BudgetSpec>) -> Result<()>
     if let Some(weight) = spec.cache_hit_weight_percent {
         budget.cache_hit_weight_percent = Some(weight);
     }
-    if let Some(max) = spec.max_input_tokens {
+    if let Some(max) = spec.input_working_set_tokens {
         if max == 0 {
             return Err(ConfigError::InvalidBudget {
                 layer: "budget".to_string(),
-                detail: "`max_input_tokens` is zero, which leaves no room for even the turn's \
-                         own input; omit it to send the history untrimmed"
+                detail: "`input_working_set_tokens` is zero, which leaves no room for even the \
+                         turn's own input; omit it to derive the working set from the model"
                     .to_string(),
             });
         }
@@ -1120,18 +1076,31 @@ fn apply_budget(budget: &mut RunBudget, spec: Option<&BudgetSpec>) -> Result<()>
                     .to_string(),
             });
         }
+        // Accepted so an old file parses, and recorded so a reader can see what
+        // the configuration said — but it never enters the budget arithmetic
+        // again: the completion cap is its own number, and the working set is
+        // derived, so there is nothing left for a reservation to reserve.
         budget.reserved_output_tokens = Some(reserved);
     }
-    if let Some(output) = spec.max_output_tokens {
+    if let Some(output) = spec.completion_cap_tokens {
         if output == 0 {
             return Err(ConfigError::InvalidBudget {
                 layer: "budget".to_string(),
-                detail: "`max_output_tokens` is zero, which asks the provider for no answer at \
-                         all; omit it for the shipped default"
+                detail: "`completion_cap_tokens` is zero, which asks the provider for no answer \
+                         at all; omit it to derive the cap from the model"
                     .to_string(),
             });
         }
         budget.max_output_tokens = Some(output);
+    }
+    if let Some(headroom) = spec.compaction_headroom_tokens {
+        budget.compaction_headroom_tokens = Some(headroom);
+    }
+    if let Some(retained) = spec.retain_recent_tokens {
+        budget.retain_recent_tokens = Some(retained);
+    }
+    if let Some(preset) = spec.preset {
+        budget.preset = preset;
     }
     if let Some(percent) = spec.compact_at_percent {
         if !(1..=99).contains(&percent) {

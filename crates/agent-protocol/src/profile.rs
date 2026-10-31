@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use crate::digest;
-use crate::model::ModelRoute;
+use crate::model::{BudgetPreset, ModelRoute, ReasoningEffort};
 use crate::permissions::CapabilitySet;
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +62,7 @@ impl Spent {
 }
 
 /// The step and spend limits a run starts with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunBudget {
     /// How many steps a turn may take before it stops as `MaxSteps`.
     pub max_steps: u32,
@@ -140,6 +140,35 @@ pub struct RunBudget {
     /// only protection. Only meaningful with `max_input_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_at_percent: Option<u32>,
+    /// How much of the model's window this run chooses to spend on input.
+    ///
+    /// A cost/latency choice, not a capability: the window says what fits, the
+    /// preset says what is worth paying for. Written down because it is part
+    /// of how a run's budget was derived.
+    #[serde(default)]
+    pub preset: BudgetPreset,
+    /// How deeply the model should think. `None` means the model's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The concrete budget derived from the model capabilities.
+    ///
+    /// Frozen when the route is known; every consumer reads these numbers
+    /// instead of re-deriving a policy from the old window fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ResolvedContextBudget>,
+    /// Room kept for compaction handover text, when stated explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_headroom_tokens: Option<u32>,
+    /// How many recent tokens compaction keeps whole, when stated explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_recent_tokens: Option<u32>,
+    /// The answer limit for a compaction summary request. Defaults to the main
+    /// completion cap when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_max_output_tokens: Option<u32>,
+    /// Where each derived budget number came from, for the audit trail.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub budget_sources: BTreeMap<String, String>,
 }
 
 impl RunBudget {
@@ -187,6 +216,13 @@ impl Default for RunBudget {
             reserved_output_tokens: None,
             max_output_tokens: None,
             compact_at_percent: None,
+            preset: BudgetPreset::Balanced,
+            reasoning_effort: None,
+            context: None,
+            compaction_headroom_tokens: None,
+            retain_recent_tokens: None,
+            summary_max_output_tokens: None,
+            budget_sources: BTreeMap::new(),
         }
     }
 }
