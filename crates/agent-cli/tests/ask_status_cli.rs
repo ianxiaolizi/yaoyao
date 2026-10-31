@@ -7,8 +7,13 @@ use agent_cli::{CliOutput, Verdict, run_ask, run_status};
 use agent_kernel::scheduler::Scheduler;
 use agent_loop::DefaultAgentLoop;
 use agent_ports::event_store::EventStore;
+use agent_ports::model_provider::ModelResponse;
+use agent_ports::tool_provider::ToolSideEffect;
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{EventId, EventSeq, RunId, SchemaVersion, SessionId};
+use agent_protocol::model::{ContentBlock, FinishReason, ModelRoute, ModelTier, Usage};
+use agent_protocol::permissions::CapabilitySet;
+use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget};
 use agent_testkit::{
     FakeEventStore, FakeModelProvider, FakeToolGateway, FakeToolProvider, NullContextEngine,
     one_model_router,
@@ -229,4 +234,135 @@ async fn status_json_reports_pending_count() {
         }
         _ => panic!("expected json output"),
     }
+}
+
+/// A run that spent its step budget did not finish, and the command says so:
+/// `AnsweredNo` (exit `1`), with a line a person can act on.
+///
+/// Before this, an exhausted step budget printed `[turn ended: MaxSteps]` and
+/// exited `0` — a silent stop a script could not tell from an answer.
+#[tokio::test]
+async fn a_run_that_spent_its_steps_is_reported_as_not_answered() {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::tool_call(
+        "echo",
+        serde_json::json!({"s": "hi"}),
+    )]));
+    let tools = Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+    let gateway = Arc::new(FakeToolGateway::new(tools));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    // One step: the turn ends at the next boundary with the budget exhausted.
+    let scheduler = Scheduler::new(store.clone(), loop_, 1);
+    let sid = SessionId::from_string("spent-steps");
+
+    let outcome = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+    assert_eq!(outcome.verdict, Verdict::AnsweredNo);
+    let CliOutput::Text(text) = outcome.output else { panic!("expected text output") };
+    assert!(text.contains("incomplete: max_steps"), "the notice names the limit: {text}");
+    assert!(text.contains("step(s)"), "the notice says how far it got: {text}");
+
+    // The terminal says the same in the shape a fold reads, including the spend
+    // beside the step count.
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let end = events
+        .iter()
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
+        .expect("the turn ended");
+    assert_eq!(end.event.payload["stop_reason"], "max_steps");
+    assert_eq!(end.event.payload["spent"]["steps"], 1);
+    assert!(end.event.payload["spent"].get("input_tokens").is_some());
+}
+
+/// A run that spent its whole token budget is a limit stop like any other: the
+/// command exits `1` and the line names the limit, the spend and the one change
+/// that would let the work continue.
+///
+/// The budget here is one token, so the first response — which reports what it
+/// cost — crosses it and the step boundary after it ends the run. What matters
+/// is that the counting is the provider's own number, carried all the way to
+/// the terminal payload and the summary line, rather than a count the CLI has
+/// to guess.
+#[tokio::test]
+async fn a_run_that_spent_its_token_budget_is_reported_as_not_answered() {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![priced_tool_call()]));
+    let tools = Arc::new(FakeToolProvider::new().with_tool("echo", "hello", ToolSideEffect::Pure));
+    let gateway = Arc::new(FakeToolGateway::new(tools));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    let scheduler = Scheduler::new(store.clone(), loop_, 8).with_profile_snapshot(
+        snapshot_with_budget(RunBudget { max_total_tokens: Some(1), ..RunBudget::default() }),
+    );
+    let sid = SessionId::from_string("spent-tokens");
+
+    let outcome = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+    assert_eq!(outcome.verdict, Verdict::AnsweredNo);
+    let CliOutput::Text(text) = outcome.output else { panic!("expected text output") };
+    assert!(
+        text.contains("incomplete: token_budget_exceeded"),
+        "the notice names the limit: {text}"
+    );
+    assert!(
+        text.contains("spent 100 input + 20 output tokens"),
+        "the spend is the provider's: {text}"
+    );
+    assert!(text.contains("raise `budget.max_total_tokens`"), "the notice is actionable: {text}");
+
+    // The same facts in the log, where a fold reads them.
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let end = events
+        .iter()
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
+        .expect("the turn ended");
+    assert_eq!(end.event.payload["stop_reason"], "token_budget_exceeded");
+    assert_eq!(end.event.payload["spent"]["input_tokens"], 100);
+    assert_eq!(end.event.payload["spent"]["output_tokens"], 20);
+    assert_eq!(end.event.payload["spent"]["estimated"], false);
+}
+
+/// A tool-call response that reports its own usage, so the run has a next step
+/// to reach and a number to count.
+fn priced_tool_call() -> ModelResponse {
+    ModelResponse {
+        content_blocks: vec![ContentBlock::tool_use(
+            String::new(),
+            "echo",
+            serde_json::json!({"s": "hi"}),
+        )],
+        usage: Some(Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            total_tokens: Some(120),
+            cache_hit_tokens: Some(0),
+            ..Usage::default()
+        }),
+        finish_reason: FinishReason::new(FinishReason::TOOL_CALLS),
+        provider_metadata: serde_json::Value::Null,
+    }
+}
+
+/// A profile snapshot that carries only the budget this test is about.
+fn snapshot_with_budget(budget: RunBudget) -> ResolvedProfileSnapshot {
+    ResolvedProfileSnapshot {
+        profile_id: "long".to_string(),
+        config_hash: String::new(),
+        plugin_versions: std::collections::BTreeMap::new(),
+        policy_version: "deadbeef".to_string(),
+        decision_backends: Vec::new(),
+        model_route: ModelRoute::new(ModelTier::Main, "fake", "echo"),
+        model_routes: std::collections::BTreeMap::new(),
+        memory_enabled: false,
+        capability_set: CapabilitySet::new(),
+        budget,
+    }
+    .sealed()
 }

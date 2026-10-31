@@ -1472,6 +1472,7 @@ decisions = { laya = true }
             "budget = { max_steps = 0 }",
             "budget = { max_tool_calls = 0 }",
             "budget = { wall_clock_timeout = \"0s\" }",
+            "budget = { max_total_tokens = 0 }",
         ] {
             let mut layers = no_layers();
             layers.user = UserConfig::from_toml_str(&format!("[profiles.p]\n{budget}\n")).unwrap();
@@ -1517,6 +1518,69 @@ decisions = { laya = true }
                     assert!(detail.contains("zero"), "{detail} did not say why");
                 }
                 other => panic!("expected a refusal for {budget}, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_token_budget_raises_the_step_ceiling_and_fills_the_phase_defaults() {
+        // A run with a primary limit is meant to last; the step count becomes a
+        // backstop rather than the plan, and the phases that only make sense
+        // against a primary limit are filled in.
+        let mut layers = no_layers();
+        layers.user =
+            UserConfig::from_toml_str("[profiles.p]\nbudget = { max_total_tokens = 45000000 }\n")
+                .unwrap();
+        layers.profile_override = Some("p".to_string());
+        let budget = resolve(layers).unwrap().budget;
+        assert_eq!(budget.max_total_tokens, Some(45_000_000));
+        assert_eq!(budget.max_steps, 300, "a primary limit raises the step backstop");
+        assert_eq!(budget.finalize_at_percent, Some(85));
+        assert_eq!(budget.stall_steps, Some(8));
+        assert_eq!(budget.cache_hit_weight_percent, Some(10));
+
+        // A profile that names its own step count keeps it.
+        let mut named = no_layers();
+        named.user = UserConfig::from_toml_str(
+            "[profiles.p]\nbudget = { max_total_tokens = 1000, max_steps = 40 }\n",
+        )
+        .unwrap();
+        named.profile_override = Some("p".to_string());
+        assert_eq!(resolve(named).unwrap().budget.max_steps, 40);
+    }
+
+    #[test]
+    fn the_phase_thresholds_are_validated_where_they_are_written() {
+        let refused = |text: &str| {
+            let mut layers = no_layers();
+            layers.user =
+                UserConfig::from_toml_str(&format!("[profiles.p]\nbudget = {{ {text} }}\n"))
+                    .unwrap();
+            layers.profile_override = Some("p".to_string());
+            resolve(layers).unwrap_err()
+        };
+
+        // A phase share is a percentage of a budget, not the budget itself.
+        for (text, needle) in [
+            ("max_total_tokens = 1000, finalize_at_percent = 0", "1..=99"),
+            ("max_total_tokens = 1000, finalize_at_percent = 100", "1..=99"),
+            (
+                "max_total_tokens = 1000, max_input_tokens = 10000, \
+                 reserved_output_tokens = 1000, settle_at_percent = 90, finalize_at_percent = 90",
+                "smaller than `finalize_at_percent`",
+            ),
+            ("max_total_tokens = 1000, stall_steps = 1", "at least 2 steps"),
+            ("cache_hit_weight_percent = 101", "0..=100"),
+            // Finalize needs a primary limit to finalize against. (A
+            // settlement with no window cannot be written through config: an
+            // unstated window is filled with the shipped working set first.)
+            ("finalize_at_percent = 50", "needs `max_total_tokens`"),
+        ] {
+            match refused(text) {
+                ConfigError::InvalidBudget { detail, .. } => {
+                    assert!(detail.contains(needle), "{text}: {detail} did not mention {needle}")
+                }
+                other => panic!("expected a refusal for {text}, got {other}"),
             }
         }
     }
@@ -1632,6 +1696,72 @@ decisions = { laya = true }
         let budget = resolve(layers).unwrap().budget;
         assert_eq!(budget.max_input_tokens, Some(500));
         assert_eq!(budget.compact_at_percent, Some(90));
+    }
+
+    #[test]
+    fn a_working_set_under_ninety_percent_of_the_model_window_is_accepted() {
+        // The model window and the run's working set are different numbers.
+        // 262k in and 32k out on a 1M model is 28% of the physical window: a
+        // deliberate cost choice, not a model limit.
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            r#"
+[profiles.p.model]
+main = "deepseek-flash"
+context_window = 1048576
+
+[profiles.p.budget]
+max_input_tokens = 262144
+reserved_output_tokens = 16384
+max_output_tokens = 32768
+"#,
+        )
+        .unwrap();
+        layers.profile_override = Some("p".to_string());
+        let budget = resolve(layers).unwrap().budget;
+        assert_eq!(budget.max_input_tokens, Some(262_144));
+        assert_eq!(budget.max_output_tokens, Some(32_768));
+    }
+
+    #[test]
+    fn a_working_set_over_ninety_percent_of_the_model_window_is_refused() {
+        // The estimator is allowed to be wrong; it is not allowed to be wrong
+        // past the provider's physical ceiling. 95k + 8k on a 100k model is
+        // 103% of the window even before the estimate's error.
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            r#"
+[profiles.p.model]
+context_window = 100000
+
+[profiles.p.budget]
+max_input_tokens = 95000
+max_output_tokens = 8000
+"#,
+        )
+        .unwrap();
+        layers.profile_override = Some("p".to_string());
+        match resolve(layers).unwrap_err() {
+            ConfigError::InvalidBudget { detail, .. } => {
+                assert!(detail.contains("context_window"), "{detail} did not name the window");
+                assert!(detail.contains("90000"), "{detail} did not name the 90% ceiling");
+            }
+            other => panic!("expected a refusal over the model window, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_profile_that_does_not_state_a_model_window_still_resolves() {
+        // The field is a claim a layer may make, not a requirement: a profile
+        // written before it existed must not be refused for a fact it never
+        // claimed.
+        let mut layers = no_layers();
+        layers.user = UserConfig::from_toml_str(
+            "[profiles.p]\nbudget = { max_input_tokens = 900000, max_output_tokens = 32768 }\n",
+        )
+        .unwrap();
+        layers.profile_override = Some("p".to_string());
+        assert_eq!(resolve(layers).unwrap().budget.max_input_tokens, Some(900_000));
     }
 
     #[test]

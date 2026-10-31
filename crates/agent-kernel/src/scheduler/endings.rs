@@ -27,6 +27,8 @@ pub(crate) fn is_limit(reason: &StopReason) -> bool {
             | StopReason::MaxToolCalls
             | StopReason::WallClockExceeded
             | StopReason::MaxOutputTokens
+            | StopReason::TokenBudgetExceeded
+            | StopReason::Stalled
     )
 }
 
@@ -68,7 +70,10 @@ impl Ending {
             | StopReason::MaxToolCalls
             | StopReason::WallClockExceeded
             | StopReason::MaxOutputTokens
-            | StopReason::ContentFiltered => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
+            | StopReason::ContentFiltered
+            | StopReason::TokenBudgetExceeded
+            | StopReason::Stalled
+            | StopReason::Completed => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
             StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
             StopReason::FatalError => (EventType::TURN_FAILED, EventType::RUN_FAILED),
             StopReason::UserCancelled => (EventType::TURN_CANCELLED, EventType::RUN_CANCELLED),
@@ -95,6 +100,30 @@ impl Ending {
                 if matches!(reason, StopReason::MaxToolCalls | StopReason::WallClockExceeded) =>
             {
                 serde_json::json!({ "stop_reason": reason })
+            }
+            // A budget or stall ending may still carry text the model wrote
+            // before it was stopped, but that text is not an answer to the
+            // whole task. `incomplete` says so in the log beside it, so a
+            // reader does not have to infer it from the stop reason.
+            Ending::Loop {
+                reason: reason @ (StopReason::TokenBudgetExceeded | StopReason::Stalled),
+                final_content,
+            } => {
+                let mut payload = serde_json::json!({ "stop_reason": reason, "incomplete": true });
+                if let Some(content) = final_content {
+                    payload["final_content"] = serde_json::json!(content);
+                }
+                payload
+            }
+            // The operator's completion check ended the turn. Unlike a model
+            // final answer this reason is a claim about the world, so the log
+            // names it even when a final content is absent.
+            Ending::Loop { reason: StopReason::Completed, final_content } => {
+                let mut payload = serde_json::json!({ "stop_reason": reason });
+                if let Some(content) = final_content {
+                    payload["final_content"] = serde_json::json!(content);
+                }
+                payload
             }
             // A response the provider ended before the model finished is not an
             // answer, and it may still have text: the beginning of one. The

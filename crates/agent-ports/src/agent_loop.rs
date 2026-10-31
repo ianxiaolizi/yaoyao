@@ -20,7 +20,7 @@ use agent_protocol::events::EventDraft;
 use agent_protocol::ids::{InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::instructions::RunInstructions;
 use agent_protocol::permissions::SecretRef;
-use agent_protocol::profile::RunBudget;
+use agent_protocol::profile::{RunBudget, Spent};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -290,6 +290,10 @@ pub struct StepOutcome {
     /// because the step budget is the caller's policy, not the loop's.
     pub stop: Option<StopReason>,
     pub final_content: Option<String>,
+    /// What the run had spent when this step ended, cumulative. The caller
+    /// adds the facts only it knows — steps, tool calls, elapsed time — when it
+    /// writes the terminal payload.
+    pub spent: Spent,
 }
 
 /// Why a turn stopped.
@@ -337,6 +341,21 @@ pub enum StopReason {
     /// model chose to stop, so what is left is not an answer and saying it is
     /// one would repeat the 2026-10-30 reading (§7 #132).
     ContentFiltered,
+    /// The run's cumulative `max_total_tokens` was reached. Checked at the step
+    /// boundary; a response already in flight is not aborted, so the overshoot
+    /// is bounded by one request. The text that arrived, if any, is not an
+    /// answer to the whole task — the run stopped because it ran out of budget,
+    /// not because the model was done.
+    TokenBudgetExceeded,
+    /// The run made no measurable progress for twice its `stall_steps`.
+    /// Reported as its own reason so a reader can tell "stuck" from "spent":
+    /// the budget may be barely touched when a loop keeps re-reading the same
+    /// thing.
+    Stalled,
+    /// The operator's completion check said the task was done. Unlike the
+    /// other endings this one is not the model's claim: a command's exit code
+    /// (or an HTTP status) decided it.
+    Completed,
 }
 
 /// Port for how a turn advances. Implementations are assembled at the app layer.

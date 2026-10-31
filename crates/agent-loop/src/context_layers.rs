@@ -449,6 +449,45 @@ impl ContextNotice {
     }
 }
 
+/// The wrap-up reminder a run carries once it is in its finalize phase.
+///
+/// It is not a stop: the turn ends when a limit is actually reached, and a
+/// model that finishes its answer before then still ends with `final_answer`.
+/// The reminder exists because a run stopped at the limit with no notice gives
+/// its reader a beginning of an answer and no statement of what is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BudgetNotice {
+    pub(crate) phase: &'static str,
+    pub(crate) percent: u32,
+    pub(crate) max_total_tokens: Option<u64>,
+    pub(crate) text: String,
+}
+
+impl BudgetNotice {
+    pub(crate) fn new(phase: &'static str, percent: u32, max_total_tokens: Option<u64>) -> Self {
+        let limit = match max_total_tokens {
+            Some(max) => format!("of its {max}-token run budget"),
+            None => "of the time it was given".to_string(),
+        };
+        let text = format!(
+            "Budget notice: this run has used about {percent}% {limit}. Do not open a new line \
+             of work. Finish the step you are on, then answer with what is done, what is not, \
+             and the first concrete action that would continue. If something cannot be \
+             finished, name it plainly instead of leaving it out."
+        );
+        Self { phase, percent, max_total_tokens, text }
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "phase": self.phase,
+            "percent": self.percent,
+            "max_total_tokens": self.max_total_tokens,
+            "text": self.text,
+        })
+    }
+}
+
 /// Build the notice this turn's request deserves, if any.
 ///
 /// No configured window means the derivation had nothing to drop and no

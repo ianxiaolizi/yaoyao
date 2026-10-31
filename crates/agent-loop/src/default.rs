@@ -48,7 +48,7 @@ use agent_protocol::ledger::Ledger;
 use agent_protocol::model::{ToolCall, estimate_message, estimate_text};
 use agent_protocol::permissions::ArtifactRef;
 use agent_protocol::plan::{self, Plan, PlanItemStatus};
-use agent_protocol::profile::RunBudget;
+use agent_protocol::profile::{RunBudget, Spent};
 use agent_protocol::reason::{
     self as reason_record, Basis, Mode, ReasonKind, ReasonNode, ReasonSource, Recorder, Situation,
     SpeechAct, Stance,
@@ -69,6 +69,8 @@ use crate::context_layers::{
     capability_text, context_notice, repair_note, stale_read, state_text, task_text, tool_source,
     truncate, user_text,
 };
+
+mod budget;
 
 /// Longest provider error text persisted in a durable attempt event.
 const MAX_ERROR_CHARS: usize = 500;
@@ -919,6 +921,13 @@ struct LoopTurn {
     /// Tool calls this turn has dispatched. The run's `max_tool_calls` is
     /// counted here, where the call is; the Scheduler cannot see inside a step.
     tool_calls_made: u32,
+    /// The tokens this run has spent, cumulative across its steps.
+    ///
+    /// The loop is what sees each response's usage, so the run's
+    /// `max_total_tokens` is checked here, at the step boundary — before the
+    /// next request is assembled. It rides every `StepOutcome` so the caller
+    /// can write the terminal payload without re-deriving the log.
+    spent: Spent,
     /// Where the facts that must precede a side effect become durable.
     ///
     /// A step's events travel back to the caller and are appended after the
@@ -1394,6 +1403,7 @@ impl AgentLoop for DefaultAgentLoop {
                 budget,
                 deadline,
                 tool_calls_made: 0,
+                spent: Spent::default(),
                 journal: ctx.journal.clone(),
             }),
             events,
@@ -1429,6 +1439,21 @@ impl AgentLoop for DefaultAgentLoop {
                 events,
                 stop: Some(StopReason::WallClockExceeded),
                 final_content: None,
+                spent: turn.spent,
+            });
+        }
+
+        // The same boundary for the token budget. The spend is only known after
+        // a response settles, so the response that crosses the limit is not
+        // aborted; the next step is where the run stops, and the overshoot is
+        // bounded by that one request.
+        if turn.token_budget_spent() {
+            return Ok(StepOutcome {
+                step_id,
+                events,
+                stop: Some(StopReason::TokenBudgetExceeded),
+                final_content: None,
+                spent: turn.spent,
             });
         }
 
@@ -1522,6 +1547,8 @@ impl AgentLoop for DefaultAgentLoop {
                 self.compact(turn, &step_id, candidate, &mut events).await?;
             }
 
+            let budget_notice = budget::place_finalize_reminder(turn, &ctx.turn_id);
+
             let request = ModelRequest {
                 session_id: ctx.session_id.clone(),
                 turn_id: ctx.turn_id.clone(),
@@ -1611,11 +1638,19 @@ impl AgentLoop for DefaultAgentLoop {
                     .iter()
                     .map(|c| c.as_str())
                     .collect::<Vec<_>>(),
+                "spent": serde_json::to_value(turn.spent)?,
+                "budget_phase": turn.budget_phase(),
             });
             // Absent, not null, when no reminder was placed: a request with no
             // notice has exactly the payload it had before notices existed.
             if let Some(notice) = &turn.context_notice {
                 prepared["context_notice"] = notice.to_json();
+            }
+            // The wrap-up reminder, on the same terms as the context notice:
+            // recorded with the request so the sentence the model saw can be
+            // read back without re-deriving the budget.
+            if let Some(notice) = &budget_notice {
+                prepared["budget_notice"] = notice.to_json();
             }
             // Absent, not null, when the caller had no facts: a harness's
             // request keeps exactly the payload it had before layers existed.
@@ -1693,6 +1728,7 @@ impl AgentLoop for DefaultAgentLoop {
                     events,
                     stop: Some(StopReason::FatalError),
                     final_content: None,
+                    spent: turn.spent,
                 });
             }
 
@@ -1753,9 +1789,26 @@ impl AgentLoop for DefaultAgentLoop {
                                 StopReason::FatalError
                             }),
                             final_content: None,
+                            spent: turn.spent,
                         });
                     }
                 };
+
+            // What this response cost, added before anything else this step
+            // does, so every later boundary in the step sees it.
+            budget::record_spend(turn, &response, estimated_request_tokens as u64);
+            events.push(draft(
+                ctx,
+                &step_id,
+                EventType::BUDGET_UPDATED,
+                serde_json::json!({
+                    "spent": serde_json::to_value(turn.spent)?,
+                    "phase": turn.budget_phase(),
+                    "used_percent": turn.budget_used_percent(),
+                    "max_total_tokens": turn.budget.max_total_tokens,
+                }),
+                Actor::Agent,
+            ));
 
             // The assistant turn — its text and any tool proposals — enters the
             // conversation before its tool results. That is the order every
@@ -1812,7 +1865,13 @@ impl AgentLoop for DefaultAgentLoop {
                         serde_json::json!({}),
                         Actor::Agent,
                     ));
-                    return Ok(StepOutcome { step_id, events, stop: None, final_content: None });
+                    return Ok(StepOutcome {
+                        step_id,
+                        events,
+                        stop: None,
+                        final_content: None,
+                        spent: turn.spent,
+                    });
                 }
                 // The gate. A real failure left a question the model has not
                 // answered; an answer now would be the measured behaviour this
@@ -1888,7 +1947,13 @@ impl AgentLoop for DefaultAgentLoop {
                         serde_json::json!({}),
                         Actor::Agent,
                     ));
-                    return Ok(StepOutcome { step_id, events, stop: None, final_content: None });
+                    return Ok(StepOutcome {
+                        step_id,
+                        events,
+                        stop: None,
+                        final_content: None,
+                        spent: turn.spent,
+                    });
                 }
                 // The time gate. This turn's words name a read an earlier turn
                 // made, and nothing has been looked at since the turn began:
@@ -1953,7 +2018,13 @@ impl AgentLoop for DefaultAgentLoop {
                         serde_json::json!({}),
                         Actor::Agent,
                     ));
-                    return Ok(StepOutcome { step_id, events, stop: None, final_content: None });
+                    return Ok(StepOutcome {
+                        step_id,
+                        events,
+                        stop: None,
+                        final_content: None,
+                        spent: turn.spent,
+                    });
                 }
                 // The answer is the end of the derivation: it rests on the
                 // last observation this turn made (if any) and on how the
@@ -2024,6 +2095,7 @@ impl AgentLoop for DefaultAgentLoop {
                     events,
                     stop: Some(read.stop),
                     final_content: Some(answer_text),
+                    spent: turn.spent,
                 });
             }
 
@@ -2064,6 +2136,7 @@ impl AgentLoop for DefaultAgentLoop {
                     events,
                     stop: Some(read.stop),
                     final_content: Some(text),
+                    spent: turn.spent,
                 });
             }
 
@@ -2139,7 +2212,13 @@ impl AgentLoop for DefaultAgentLoop {
                     serde_json::json!({}),
                     Actor::Agent,
                 ));
-                return Ok(StepOutcome { step_id, events, stop: None, final_content: None });
+                return Ok(StepOutcome {
+                    step_id,
+                    events,
+                    stop: None,
+                    final_content: None,
+                    spent: turn.spent,
+                });
             }
 
             // Where, if anywhere, a run limit stopped this batch. The calls
@@ -2799,6 +2878,7 @@ impl AgentLoop for DefaultAgentLoop {
                                 events,
                                 stop: Some(StopReason::NeedsUserInput),
                                 final_content: Some(format!("approval pending: {approval_id}")),
+                                spent: turn.spent,
                             });
                         }
                         // The text the model is given has to be the text the
@@ -2883,6 +2963,7 @@ impl AgentLoop for DefaultAgentLoop {
                     events,
                     stop: Some(reason),
                     final_content: None,
+                    spent: turn.spent,
                 });
             }
 
@@ -2899,7 +2980,7 @@ impl AgentLoop for DefaultAgentLoop {
         // caller's decision: the step budget is the Scheduler's policy, not the
         // loop's, and a loop that stopped itself could not be steered past the
         // step it just finished.
-        Ok(StepOutcome { step_id, events, stop: None, final_content: None })
+        Ok(StepOutcome { step_id, events, stop: None, final_content: None, spent: turn.spent })
     }
 }
 
@@ -3181,6 +3262,11 @@ fn sandbox_word(mode: SandboxMode) -> &'static str {
 mod tests {
     use super::*;
     use crate::context_layers::{MAX_CAPABILITY_GIST_CHARS, MAX_TASK_CHARS, gist};
+
+    /// The tests about what a turn may spend, and what it is told when it nears
+    /// that: token budget, step budget, and the window reminder.
+    mod limits;
+
     use agent_ports::agent_loop::TurnFailureFacts;
     use agent_ports::agent_loop::{TurnCapabilityFacts, TurnStateFacts};
     use agent_ports::decision::{
@@ -3995,7 +4081,7 @@ mod tests {
         // was never asked.
         let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
         assert_eq!(
-            &types[8..12],
+            &types[9..13],
             ["reason/recorded", "tool/started", "plan/updated", "tool/completed"],
             "{types:?}"
         );
@@ -4111,7 +4197,7 @@ mod tests {
 
         let types: Vec<&str> = outcome.events.iter().map(|e| e.event_type.as_str()).collect();
         assert_eq!(
-            &types[8..12],
+            &types[9..13],
             ["reason/recorded", "tool/started", "judgment/updated", "tool/completed"],
             "{types:?}"
         );
@@ -5119,99 +5205,6 @@ mod tests {
         assert!(text.contains("4 older message(s) were omitted"), "{text}");
     }
 
-    /// A window that is configured but not yet full is still worth one line
-    /// when the next large read could exhaust it. The reminder goes after
-    /// settled history, immediately before this turn's input, so it reads as a
-    /// condition of this turn and cannot break the cached prefix.
-    #[tokio::test]
-    async fn a_context_near_the_budget_is_reminded_once_after_history() {
-        let mut ctx = ctx();
-        ctx.instructions = Some(RunInstructions {
-            text: "the run's rules".to_string(),
-            project_file: None,
-            builtin: "test".to_string(),
-        });
-        let history = ModelMessage::user_for_turn(&agent_protocol::ids::TurnId::new(), "history");
-        let context: Arc<dyn ContextEngine> = Arc::new(
-            FakeContextEngine::new(vec![history], EventSeq::new(3)).with_usage(ContextUsage {
-                dropped_messages: 0,
-                estimated_tokens: 480,
-                max_input_tokens: Some(500),
-                reserved_output_tokens: Some(0),
-            }),
-        );
-        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
-        let loop_ = DefaultAgentLoop::new(
-            model.clone(),
-            Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
-            context,
-            one_model_router(),
-        );
-
-        let outcome = run_turn(&loop_, &ctx).await;
-        let payload = prepared_payload(&outcome);
-        assert_eq!(payload["context_notice"]["kind"], "near-limit");
-        assert_eq!(payload["context_notice"]["percent"], 96);
-        assert_eq!(payload["context_notice"]["max_input_tokens"], 500);
-
-        let request = &model.requests()[0];
-        assert_eq!(request.messages[0].role, MessageRole::System);
-        assert_eq!(request.messages[0].text_content(), "the run's rules");
-        assert_eq!(request.messages[1].text_content(), "history");
-        assert_eq!(request.messages[2].role, MessageRole::System);
-        assert_eq!(request.messages[2].message_uid.as_str(), format!("msg/notice/{}", ctx.turn_id));
-        let notice = request.messages[2].text_content();
-        assert!(notice.contains("about 96%"), "{notice}");
-        assert!(notice.contains("20 tokens left"), "{notice}");
-        assert_eq!(request.messages[3], ModelMessage::user_for_turn(&ctx.turn_id, "hi"));
-    }
-
-    #[tokio::test]
-    async fn a_context_below_the_threshold_carries_no_notice() {
-        let context: Arc<dyn ContextEngine> =
-            Arc::new(FakeContextEngine::new(vec![], EventSeq::new(2)).with_usage(ContextUsage {
-                dropped_messages: 0,
-                estimated_tokens: 424,
-                max_input_tokens: Some(500),
-                reserved_output_tokens: Some(0),
-            }));
-        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
-        let loop_ = DefaultAgentLoop::new(
-            model,
-            Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
-            context,
-            one_model_router(),
-        );
-
-        let outcome = run_turn(&loop_, &ctx()).await;
-        let payload = prepared_payload(&outcome);
-        assert!(payload.get("context_notice").is_none(), "84% is below the threshold: {payload}");
-        assert_eq!(payload["message_count"], 1, "history is empty; only this turn's input");
-    }
-
-    #[tokio::test]
-    async fn a_context_without_a_configured_window_carries_no_notice() {
-        let context: Arc<dyn ContextEngine> =
-            Arc::new(FakeContextEngine::new(vec![], EventSeq::new(1)).with_usage(ContextUsage {
-                dropped_messages: 0,
-                estimated_tokens: 1_000_000,
-                max_input_tokens: None,
-                reserved_output_tokens: None,
-            }));
-        let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
-        let loop_ = DefaultAgentLoop::new(
-            model,
-            Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
-            context,
-            one_model_router(),
-        );
-
-        let outcome = run_turn(&loop_, &ctx()).await;
-        let payload = prepared_payload(&outcome);
-        assert!(payload.get("context_notice").is_none(), "{payload}");
-        assert_eq!(payload["message_count"], 1);
-    }
-
     #[tokio::test]
     async fn a_model_that_cannot_call_tools_is_offered_none() {
         // The fake is scripted to answer directly; the point is that the request
@@ -5328,7 +5321,7 @@ mod tests {
         // is about to be committed, and a log read top-down has to learn that
         // the content was cut before it is told the call completed.
         assert_eq!(
-            types[8..13],
+            types[9..14],
             [
                 "reason/recorded",
                 "tool/started",
@@ -5337,7 +5330,7 @@ mod tests {
                 "tool/result.redacted",
             ]
         );
-        assert_eq!(types[13], "tool/completed", "{types:?}");
+        assert_eq!(types[14], "tool/completed", "{types:?}");
 
         let completed = outcome
             .events
@@ -5591,6 +5584,8 @@ mod tests {
             "model/request.prepared",
             "model/attempt.started",
             "model/response.completed",
+            // The spend is recorded beside the response it counted.
+            "budget/updated",
         ];
         if with_tool {
             types.extend(["reason/recorded", "tool/started", "tool/completed", "reason/recorded"]);
@@ -5645,6 +5640,7 @@ mod tests {
                 "model/request.prepared",
                 "model/attempt.started",
                 "model/response.completed",
+                "budget/updated",
                 "reason/recorded",
                 "step/completed",
             ]
@@ -6091,6 +6087,7 @@ mod tests {
                 "model/request.prepared",
                 "model/attempt.started",
                 "model/response.completed",
+                "budget/updated",
                 "reason/recorded",
                 "step/completed",
             ]

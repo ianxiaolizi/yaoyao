@@ -163,6 +163,11 @@ impl EventType {
     /// their place; the summarized messages stay in the log, so the original
     /// is never lost — only moved out of the model's window.
     pub const CONTEXT_COMPACTED: &'static str = "context/compacted";
+    /// What the run has spent, and which phase its remaining budget puts it in
+    /// (`normal`, `finalize`). Written once per step that completed a model
+    /// response, so a reader can see the spend grow without re-summing every
+    /// response in the log.
+    pub const BUDGET_UPDATED: &'static str = "budget/updated";
     pub const TOOL_RESULT_TRUNCATED: &'static str = "tool/result.truncated";
     pub const TOOL_RESULT_REDACTED: &'static str = "tool/result.redacted";
     /// A tool result carried a token the high-entropy layer flagged but did
@@ -279,6 +284,7 @@ impl EventType {
         Self::CONTEXT_COMPACTION_STARTED,
         Self::CONTEXT_COMPACTION_FAILED,
         Self::CONTEXT_COMPACTED,
+        Self::BUDGET_UPDATED,
         Self::TOOL_RESULT_TRUNCATED,
         Self::TOOL_RESULT_REDACTED,
         Self::TOOL_RESULT_HIGH_ENTROPY,

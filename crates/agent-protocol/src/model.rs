@@ -252,6 +252,23 @@ impl ModelMessage {
         }
     }
 
+    /// A reminder that the run's budget is nearly spent, for one turn.
+    ///
+    /// It is placed at the tail of the request, after this turn's own traffic,
+    /// because that is where the model reads last and where a wrap-up
+    /// instruction is least likely to be crowded out. User-role for the same
+    /// reason as [`kernel_note_for_turn`](Self::kernel_note_for_turn): a
+    /// mid-conversation system message is refused by some chat templates. It is
+    /// not history — the projection never folds it — and its uid is the turn's,
+    /// so later steps replace it rather than repeat it.
+    pub fn budget_notice_for_turn(turn_id: &TurnId, text: impl Into<String>) -> Self {
+        Self {
+            message_uid: MessageUid::from_string(format!("msg/budget/{turn_id}")),
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
     /// The state of the world when one turn opens.
     ///
     /// Like the context notice, this is not history: the projection never

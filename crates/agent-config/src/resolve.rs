@@ -499,6 +499,7 @@ fn merge(base: Profile, above: Profile) -> Profile {
             main: above.main.or(base.main),
             fast: above.fast.or(base.fast),
             thinking: above.thinking.or(base.thinking),
+            context_window: above.context_window.or(base.context_window),
         }),
         tools: merge_with(base.tools, above.tools, |base, above| ToolsSpec {
             allow: pick(base.allow, above.allow),
@@ -513,6 +514,13 @@ fn merge(base: Profile, above: Profile) -> Profile {
             max_steps: above.max_steps.or(base.max_steps),
             max_tool_calls: above.max_tool_calls.or(base.max_tool_calls),
             wall_clock_timeout: above.wall_clock_timeout.or(base.wall_clock_timeout),
+            max_total_tokens: above.max_total_tokens.or(base.max_total_tokens),
+            finalize_at_percent: above.finalize_at_percent.or(base.finalize_at_percent),
+            settle_at_percent: above.settle_at_percent.or(base.settle_at_percent),
+            stall_steps: above.stall_steps.or(base.stall_steps),
+            cache_hit_weight_percent: above
+                .cache_hit_weight_percent
+                .or(base.cache_hit_weight_percent),
             max_input_tokens: above.max_input_tokens.or(base.max_input_tokens),
             reserved_output_tokens: above.reserved_output_tokens.or(base.reserved_output_tokens),
             max_output_tokens: above.max_output_tokens.or(base.max_output_tokens),
@@ -700,6 +708,23 @@ const DEFAULT_COMPACT_AT_PERCENT: u32 = 75;
 /// that task with: 4/4, with no single response passing 4.9k output tokens.
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_000;
 
+/// The step ceiling a profile gets when it configured a primary limit but no
+/// step count. The limit is the plan; this is the backstop that stops a loop
+/// whose other limits never fire.
+const DEFAULT_BACKSTOP_STEPS: u32 = 300;
+
+/// When a run with a primary limit is told to finalize.
+const DEFAULT_FINALIZE_AT_PERCENT: u32 = 85;
+
+/// When a run with a window settles its own traffic into state.
+const DEFAULT_SETTLE_AT_PERCENT: u32 = 70;
+
+/// Steps without new evidence before a stall is reported.
+const DEFAULT_STALL_STEPS: u32 = 8;
+
+/// How much a cached input token counts in the displayed billable total.
+const DEFAULT_CACHE_HIT_WEIGHT_PERCENT: u32 = 10;
+
 /// Whether a layer said anything about the window.
 ///
 /// Step and tool-call limits do not count: a profile that only tightens how
@@ -728,6 +753,53 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
     if budget.max_output_tokens.is_none() {
         budget.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
     }
+    // A primary limit (token budget or wall clock) is what makes the step
+    // ceiling a backstop rather than the plan: a run meant to last an hour
+    // must not die at the eighth step because nobody raised it. Only a profile
+    // that configured no `max_steps` of its own gets the raised value.
+    let primary_limit = budget.max_total_tokens.is_some() || budget.wall_clock_ms.is_some();
+    let named_steps = workspace.budget.as_ref().and_then(|spec| spec.max_steps).is_some()
+        || composed.budget.as_ref().and_then(|spec| spec.max_steps).is_some();
+    if primary_limit && !named_steps {
+        budget.max_steps = DEFAULT_BACKSTOP_STEPS;
+    }
+    if primary_limit {
+        if budget.finalize_at_percent.is_none() {
+            budget.finalize_at_percent = Some(DEFAULT_FINALIZE_AT_PERCENT);
+        }
+        if budget.stall_steps.is_none() {
+            budget.stall_steps = Some(DEFAULT_STALL_STEPS);
+        }
+    }
+    if budget.max_input_tokens.is_some() && budget.settle_at_percent.is_none() {
+        budget.settle_at_percent = Some(DEFAULT_SETTLE_AT_PERCENT);
+    }
+    if budget.cache_hit_weight_percent.is_none() {
+        budget.cache_hit_weight_percent = Some(DEFAULT_CACHE_HIT_WEIGHT_PERCENT);
+    }
+    // The model's physical window and the run's working set are different
+    // numbers: `max_input_tokens` is a cost/latency choice, `context_window`
+    // is what the provider will accept. A working set plus its completion cap
+    // that exceeds 90% of the physical window leaves no room for the estimator
+    // being wrong, so it is refused only when a layer actually stated the
+    // window. A profile that does not state one keeps the old behaviour.
+    if let (Some(window), Some(input)) =
+        (composed.model.as_ref().and_then(|model| model.context_window), budget.max_input_tokens)
+    {
+        let output = budget.max_output_tokens.unwrap_or(0);
+        let ceiling = u64::from(window) * 90 / 100;
+        if u64::from(input) + u64::from(output) > ceiling {
+            return Err(ConfigError::InvalidBudget {
+                layer: "budget".to_string(),
+                detail: format!(
+                    "`max_input_tokens` ({input}) + `max_output_tokens` ({output}) exceeds 90% \
+                     of the configured `context_window` ({window}); keep the working set plus \
+                     its completion cap under {ceiling}, or raise `context_window` if the model \
+                     really accepts more"
+                ),
+            });
+        }
+    }
     // The pair is checked once both layers have had their say: one layer may
     // name the window and another the reservation, and each is unremarkable
     // until it meets the other.
@@ -751,6 +823,64 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
             detail: "`compact_at_percent` needs `max_input_tokens`: without a window there is \
                      no budget to take a share of"
                 .to_string(),
+        });
+    }
+    if budget.settle_at_percent.is_some() && budget.max_input_tokens.is_none() {
+        return Err(ConfigError::InvalidBudget {
+            layer: "budget".to_string(),
+            detail: "`settle_at_percent` needs `max_input_tokens`: without a window there is no \
+                     working set to settle"
+                .to_string(),
+        });
+    }
+    if budget.finalize_at_percent.is_some() && !primary_limit {
+        return Err(ConfigError::InvalidBudget {
+            layer: "budget".to_string(),
+            detail: "`finalize_at_percent` needs `max_total_tokens` or `wall_clock_timeout`: \
+                     without a primary limit there is no budget to finalize against"
+                .to_string(),
+        });
+    }
+    for (name, percent) in [
+        ("settle_at_percent", budget.settle_at_percent),
+        ("finalize_at_percent", budget.finalize_at_percent),
+    ] {
+        if let Some(percent) = percent
+            && !(1..=99).contains(&percent)
+        {
+            return Err(ConfigError::InvalidBudget {
+                layer: "budget".to_string(),
+                detail: format!(
+                    "`{name}` is {percent}, which is not a share of the budget; use 1..=99"
+                ),
+            });
+        }
+    }
+    if let (Some(settle), Some(finalize)) = (budget.settle_at_percent, budget.finalize_at_percent)
+        && settle >= finalize
+    {
+        return Err(ConfigError::InvalidBudget {
+            layer: "budget".to_string(),
+            detail: format!(
+                "`settle_at_percent` ({settle}) must be smaller than `finalize_at_percent` \
+                 ({finalize}); settlement happens before finalize"
+            ),
+        });
+    }
+    if let Some(stall) = budget.stall_steps
+        && stall < 2
+    {
+        return Err(ConfigError::InvalidBudget {
+            layer: "budget".to_string(),
+            detail: format!("`stall_steps` is {stall}; a stall needs at least 2 steps"),
+        });
+    }
+    if let Some(weight) = budget.cache_hit_weight_percent
+        && weight > 100
+    {
+        return Err(ConfigError::InvalidBudget {
+            layer: "budget".to_string(),
+            detail: format!("`cache_hit_weight_percent` is {weight}; use 0..=100"),
         });
     }
     Ok(budget)
@@ -800,6 +930,29 @@ fn apply_budget(budget: &mut RunBudget, spec: Option<&BudgetSpec>) -> Result<()>
             });
         }
         budget.wall_clock_ms = Some(ms);
+    }
+    if let Some(total) = spec.max_total_tokens {
+        if total == 0 {
+            return Err(ConfigError::InvalidBudget {
+                layer: "budget".to_string(),
+                detail: "`max_total_tokens` is zero, which ends the run after its first \
+                         response; omit it to leave the token spend unbounded"
+                    .to_string(),
+            });
+        }
+        budget.max_total_tokens = Some(total);
+    }
+    if let Some(percent) = spec.finalize_at_percent {
+        budget.finalize_at_percent = Some(percent);
+    }
+    if let Some(percent) = spec.settle_at_percent {
+        budget.settle_at_percent = Some(percent);
+    }
+    if let Some(steps) = spec.stall_steps {
+        budget.stall_steps = Some(steps);
+    }
+    if let Some(weight) = spec.cache_hit_weight_percent {
+        budget.cache_hit_weight_percent = Some(weight);
     }
     if let Some(max) = spec.max_input_tokens {
         if max == 0 {

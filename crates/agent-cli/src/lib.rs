@@ -15,7 +15,7 @@ use agent_kernel::fork::{Fork, ForkOutcome};
 use agent_kernel::inbox::Inbox;
 use agent_kernel::recovery::RecoveryReport;
 use agent_kernel::resume::{Disposition, Resume, ResumeOutcome};
-use agent_kernel::scheduler::Scheduler;
+use agent_kernel::scheduler::{RunReport, Scheduler};
 use agent_ports::agent_loop::StopReason;
 use agent_ports::artifact_store::{ArtifactStore, ArtifactStoreError};
 use agent_ports::event_store::EventStore;
@@ -319,7 +319,7 @@ pub async fn run_ask(
                 });
                 CliOutput::Json(json_output(&value)?)
             } else if halted(&r.stop_reason) {
-                CliOutput::Text(halted_text(&r.stop_reason, r.final_content.as_deref()))
+                CliOutput::Text(stopped_text(&r))
             } else {
                 match r.final_content {
                     Some(content) => CliOutput::Text(content),
@@ -416,7 +416,7 @@ pub async fn run_resume(
                         // The same reading `ask` gives a halted answer: the
                         // continuation may be the one the provider cut off.
                         lines.push(if halted {
-                            halted_text(&r.stop_reason, r.final_content.as_deref())
+                            stopped_text(&r)
                         } else {
                             match r.final_content {
                                 Some(content) => content,
@@ -439,7 +439,66 @@ pub async fn run_resume(
 /// finished. Those turns ran and did not answer, so the commands report them the
 /// same way: `AnsweredNo` (exit 1), never `Answered`.
 pub(crate) fn halted(reason: &StopReason) -> bool {
-    matches!(reason, StopReason::MaxOutputTokens | StopReason::ContentFiltered)
+    matches!(
+        reason,
+        StopReason::MaxOutputTokens
+            | StopReason::ContentFiltered
+            | StopReason::MaxSteps
+            | StopReason::MaxToolCalls
+            | StopReason::WallClockExceeded
+            | StopReason::TokenBudgetExceeded
+            | StopReason::Stalled
+    )
+}
+
+/// What a turn that stopped on a limit prints.
+///
+/// Two families, because they are two different facts. A provider cutoff
+/// (`max_output_tokens`, `content_filter`) arrived with text the model was
+/// producing; a run limit (steps, calls, wall clock, tokens, stall) is the run
+/// deciding it had spent what it had. Both are not answers, and both print
+/// `incomplete: <reason>` so a script can branch on the line rather than parse
+/// prose. The provider cutoffs keep [`halted_text`]'s wording, which predates
+/// this and is what the §7 rows say.
+pub(crate) fn stopped_text(report: &RunReport) -> String {
+    match report.stop_reason {
+        StopReason::MaxOutputTokens | StopReason::ContentFiltered => {
+            halted_text(&report.stop_reason, report.final_content.as_deref())
+        }
+        _ => limit_text(report),
+    }
+}
+
+/// A run limit's report: what it cost, and the smallest change that would let
+/// the same work continue.
+fn limit_text(report: &RunReport) -> String {
+    let advice = match report.stop_reason {
+        StopReason::MaxSteps => "raise `budget.max_steps` and continue",
+        StopReason::MaxToolCalls => "raise `budget.max_tool_calls` and continue",
+        StopReason::WallClockExceeded => "raise `budget.wall_clock_timeout` and continue",
+        StopReason::TokenBudgetExceeded => "raise `budget.max_total_tokens` and continue",
+        StopReason::Stalled => {
+            "the run kept repeating itself; narrow the task or change what it is given"
+        }
+        _ => "run again",
+    };
+    let reason = serde_json::to_value(report.stop_reason.clone())
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{:?}", report.stop_reason).to_lowercase());
+    let notice = format!(
+        "incomplete: {reason}; ran {} step(s) and {} tool call(s), spent {} input + {} output \
+         tokens in {}s. Not finished — {advice}",
+        report.steps,
+        report.tool_calls,
+        report.spent.input_tokens,
+        report.spent.output_tokens,
+        report.elapsed_ms / 1000,
+    );
+    match report.final_content.as_deref() {
+        Some(text) if !text.trim().is_empty() => format!("{text}\n\n[{notice}]"),
+        _ => format!("[{notice}]"),
+    }
 }
 
 /// What a halted answer prints: the text that arrived, and the fact that it is

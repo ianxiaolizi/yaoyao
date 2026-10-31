@@ -225,6 +225,13 @@ pub struct ModelSpec {
     pub main: Option<String>,
     pub fast: Option<String>,
     pub thinking: Option<String>,
+    /// The provider's context window for this profile's main model, when a
+    /// layer states it. Used only to sanity-check the budget: the window a
+    /// request may carry is `budget.max_input_tokens`, and the model's physical
+    /// ceiling is not the same number. Absent means "not stated", not "zero" —
+    /// old configurations keep parsing and are not refused for a fact they
+    /// never claimed.
+    pub context_window: Option<u32>,
 }
 
 /// What a profile's tools may do.
@@ -285,6 +292,22 @@ pub struct BudgetSpec {
     pub max_tool_calls: Option<u32>,
     /// A duration such as `"30m"`, `"90s"`, or `"2h"`.
     pub wall_clock_timeout: Option<String>,
+    /// The most raw `input_tokens + output_tokens` this run may spend. Omit
+    /// for no cumulative token limit.
+    pub max_total_tokens: Option<u64>,
+    /// The share of the wall clock or token budget at which the loop enters
+    /// finalize. Omit for the shipped default (85) when a primary limit is
+    /// configured.
+    pub finalize_at_percent: Option<u32>,
+    /// The share of the usable input window at which the turn's traffic is
+    /// settled into a state message. Omit for the shipped default (70) when a
+    /// window is configured.
+    pub settle_at_percent: Option<u32>,
+    /// Steps without new evidence before a stall is reported. Omit for 8.
+    pub stall_steps: Option<u32>,
+    /// How much a cache-hit input token counts in the displayed billable total.
+    /// Omit for 10. The enforced limit remains the raw total.
+    pub cache_hit_weight_percent: Option<u32>,
     /// The most estimated input tokens one request may carry. Omit to send the
     /// settled history whole.
     pub max_input_tokens: Option<u32>,

@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use agent_ports::agent_loop::{
-    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, StopReason, TurnCapabilityFacts,
-    TurnContext, TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
+    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, TurnCapabilityFacts, TurnContext,
+    TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
 };
 use agent_ports::control::{ControlError, ControlHandler, ControlOutcome, ControlRequest};
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
@@ -21,7 +21,7 @@ use agent_ports::instructions::{InstructionError, InstructionSource};
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{EventSeq, InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::inbox::{InboxItem, InboxKind};
-use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget};
+use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget, Spent};
 use chrono::{DateTime, Utc};
 
 use crate::approval::{ApprovalError, ApprovalService};
@@ -35,10 +35,13 @@ mod draft;
 mod endings;
 mod journal;
 mod rebuilt;
+mod report;
 
 pub(crate) use draft::draft;
 use endings::{Ending, Gate};
 use journal::{SessionJournal, close_failed_turn};
+use report::Finished;
+pub use report::RunReport;
 
 /// Drives runs: claims input, enforces a single active run, and settles turns.
 pub struct Scheduler {
@@ -69,15 +72,6 @@ pub struct Scheduler {
     /// no capability layer rather than describing a boundary that does not
     /// exist.
     capability: Option<TurnCapabilityFacts>,
-}
-
-/// What one driven turn produced.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RunReport {
-    pub run_id: RunId,
-    pub turn_id: TurnId,
-    pub stop_reason: StopReason,
-    pub final_content: Option<String>,
 }
 
 /// Errors from Scheduler operations.
@@ -548,6 +542,10 @@ impl Scheduler {
 
         let mut steps = 0u32;
         let mut last_step: Option<StepId> = None;
+        // What the last completed step reported spending. A step that refused
+        // to open at the boundary never ran, so it leaves this as the previous
+        // step left it.
+        let mut spent = Spent::default();
         // What this turn has already taken out of the queue, whether it went to
         // a step or was discarded as unreadable. Being consumed by the turn is a
         // fact only the turn can know, so it is tracked across steps even though
@@ -594,6 +592,7 @@ impl Scheduler {
                     return Err(SchedulerError::Loop(error));
                 }
             };
+            spent = outcome.spent;
             pending.extend(outcome.events);
             last_step = Some(outcome.step_id);
             steps += 1;
@@ -609,27 +608,14 @@ impl Scheduler {
 
         let (stop_reason, final_content, turn_terminal, run_terminal, mut turn_payload) =
             ending.settle();
-        // What a limit stop spent. A turn that stops on a limit has to say
-        // how far it got, or a reader cannot tell a limit hit at once from one
-        // hit after a long run. Only limit endings carry it: every other
-        // terminal payload keeps the shape it had, so nothing that reads those
-        // sees a new field. `stop_reason` is not repeated here — the terminal
-        // payload beside this already says it.
-        if endings::is_limit(&stop_reason) {
-            // Counted from the log's own step markers rather than the loop
-            // counter: a step that refused to open — a spent wall clock at the
-            // boundary — returned without one, and it must not be counted as a
-            // step the turn took. The journal counts what it actually wrote,
-            // which is the same number whether the batch was written once or a
-            // boundary at a time.
-            let steps = journal.steps();
-            let tool_calls = journal.calls();
-            turn_payload["budget"] = serde_json::json!({
-                "steps": steps,
-                "tool_calls": tool_calls,
-                "elapsed_ms": run_started.elapsed().as_millis() as u64,
-            });
-        }
+        let finished = Finished::now(
+            spent,
+            journal.steps(),
+            journal.calls(),
+            run_started,
+            self.budget.cache_hit_weight_percent.unwrap_or(10),
+        );
+        finished.decorate(&mut turn_payload, endings::is_limit(&stop_reason));
         // The item is claimed only now: the claim is the fact "this input has
         // been answered", and a turn that never reached its end has not
         // answered it. Writing the claim at the opening would consume the
@@ -660,7 +646,7 @@ impl Scheduler {
         // durable rather than merely accepted.
         journal.commit(std::mem::take(&mut pending)).await?;
 
-        Ok(RunReport { run_id, turn_id, stop_reason, final_content })
+        Ok(finished.report(run_id, turn_id, stop_reason, final_content))
     }
 
     /// Apply the changes waiting at this boundary, one at a time, in order.
@@ -835,7 +821,7 @@ impl Scheduler {
 mod tests {
     use super::*;
     use agent_loop::DefaultAgentLoop;
-    use agent_ports::agent_loop::{StepOutcome, TurnState};
+    use agent_ports::agent_loop::{StepOutcome, StopReason, TurnState};
     use agent_ports::execution_environment::SandboxMode;
     use agent_ports::instructions::{InstructionError, InstructionSource};
     use agent_ports::model_provider::{
@@ -914,6 +900,9 @@ mod tests {
                 "model/request.prepared",
                 "model/attempt.started",
                 "model/response.completed",
+                // The spend is recorded with the response it came from, so a
+                // reader never has to re-sum the log to know what a run cost.
+                "budget/updated",
                 "reason/recorded",
                 "step/completed",
                 "inbox/claimed",
@@ -1032,6 +1021,7 @@ mod tests {
                 events: vec![],
                 stop: Some(StopReason::NeedsUserInput),
                 final_content: None,
+                spent: Spent::default(),
             })
         }
     }
@@ -1782,7 +1772,9 @@ mod tests {
     async fn a_turn_nobody_steers_gains_no_steering_events() {
         // The invariant the whole change has to preserve: steering is opt-in. A
         // turn with an empty steering queue is the turn this code drove before
-        // there was such a queue, down to the order of the log.
+        // there was such a queue, down to the order of the log — the one
+        // addition is `budget/updated`, which every step writes beside the
+        // response it counted.
         let (scheduler, store, _, sid) = two_step_scheduler();
         scheduler
             .inbox
@@ -1807,6 +1799,7 @@ mod tests {
                 EventType::MODEL_REQUEST_PREPARED,
                 EventType::MODEL_ATTEMPT_STARTED,
                 EventType::MODEL_RESPONSE_COMPLETED,
+                EventType::BUDGET_UPDATED,
                 "reason/recorded",
                 EventType::TOOL_STARTED,
                 EventType::TOOL_COMPLETED,
@@ -1816,6 +1809,7 @@ mod tests {
                 EventType::MODEL_REQUEST_PREPARED,
                 EventType::MODEL_ATTEMPT_STARTED,
                 EventType::MODEL_RESPONSE_COMPLETED,
+                EventType::BUDGET_UPDATED,
                 "reason/recorded",
                 EventType::STEP_COMPLETED,
                 EventType::INBOX_CLAIMED,
@@ -2514,6 +2508,7 @@ mod tests {
                 events: vec![],
                 stop: Some(StopReason::FinalAnswer),
                 final_content: Some(String::from("done")),
+                spent: Spent::default(),
             })
         }
     }

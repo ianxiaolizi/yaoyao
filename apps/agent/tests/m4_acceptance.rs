@@ -410,6 +410,7 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::BUDGET_UPDATED,
         EventType::REASON_RECORDED,
         EventType::TOOL_STARTED,
         EventType::TOOL_COMPLETED,
@@ -419,6 +420,7 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::BUDGET_UPDATED,
         EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
         // The claim lands with the ending: the item is answered when the turn
@@ -655,6 +657,7 @@ async fn a_plan_recorded_by_the_loop_reaches_the_next_request_and_the_log() {
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::BUDGET_UPDATED,
         EventType::REASON_RECORDED,
         EventType::TOOL_STARTED,
         EventType::PLAN_UPDATED,
@@ -665,6 +668,7 @@ async fn a_plan_recorded_by_the_loop_reaches_the_next_request_and_the_log() {
         EventType::MODEL_REQUEST_PREPARED,
         EventType::MODEL_ATTEMPT_STARTED,
         EventType::MODEL_RESPONSE_COMPLETED,
+        EventType::BUDGET_UPDATED,
         EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
         // The claim lands with the ending: the item is answered when the turn

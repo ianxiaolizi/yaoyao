@@ -455,6 +455,20 @@ pub(crate) fn describe_report(
             "was cut off at its output-token limit",
             "Give the delegation a larger `budget.max_output_tokens` if the answer needs more.",
         ),
+        StopReason::TokenBudgetExceeded => limit(
+            "spent its whole token budget",
+            "Give the delegation a larger `budget.max_total_tokens` if the work needs more.",
+        ),
+        StopReason::Stalled => limit(
+            "kept re-reading the same thing and made no progress",
+            "The delegation is going in circles; narrow it or tell it what it is missing.",
+        ),
+        StopReason::Completed => SubagentOutcome::Completed {
+            summary: said.unwrap_or_else(|| {
+                format!("the child's completion check passed without a summary ({child})")
+            }),
+            result: None,
+        },
         StopReason::ContentFiltered => SubagentOutcome::Failed {
             message: "the provider withheld the child's answer (content filter); there is no \
                       answer to read"
@@ -588,7 +602,7 @@ mod tests {
     use agent_ports::tool_provider::ToolSource;
     use agent_protocol::ids::{EventSeq, RunId};
     use agent_protocol::permissions::Capability as Cap;
-    use agent_protocol::profile::RunBudget;
+    use agent_protocol::profile::{RunBudget, Spent};
     use agent_testkit::{
         FakeEventStore, FakeToolGateway, FakeToolProvider, NullContextEngine, one_model_router,
     };
@@ -797,6 +811,10 @@ mod tests {
             turn_id: agent_protocol::ids::TurnId::new(),
             stop_reason: StopReason::FinalAnswer,
             final_content: Some("the answer".to_string()),
+            spent: Spent::default(),
+            steps: 1,
+            tool_calls: 0,
+            elapsed_ms: 0,
         };
 
         let outcome = ended(Ok(Some(report)), &child(), Some(Asked::Cancelled), DEFAULT_CEILING);
@@ -814,6 +832,10 @@ mod tests {
             turn_id: agent_protocol::ids::TurnId::new(),
             stop_reason,
             final_content: None,
+            spent: Spent::default(),
+            steps: 1,
+            tool_calls: 0,
+            elapsed_ms: 0,
         };
 
         assert_eq!(
@@ -847,6 +869,10 @@ mod tests {
             turn_id: agent_protocol::ids::TurnId::new(),
             stop_reason: StopReason::MaxOutputTokens,
             final_content: Some("the beginning".to_string()),
+            spent: Spent::default(),
+            steps: 1,
+            tool_calls: 0,
+            elapsed_ms: 0,
         };
 
         match describe_report(&report, &child()) {

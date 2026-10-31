@@ -247,7 +247,7 @@ pub fn render_ran(report: RunReport, json: bool) -> Result<CliOutcome, String> {
             "final_content": report.final_content,
         }))?)
     } else if halted {
-        CliOutput::Text(super::halted_text(&report.stop_reason, report.final_content.as_deref()))
+        CliOutput::Text(super::stopped_text(&report))
     } else {
         CliOutput::Text(match report.final_content {
             Some(content) => content,

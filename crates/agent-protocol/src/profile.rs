@@ -17,6 +17,50 @@ use crate::model::ModelRoute;
 use crate::permissions::CapabilitySet;
 use serde::{Deserialize, Serialize};
 
+/// What a run has spent so far, as the provider reported it.
+///
+/// Token counts are cumulative for the run. `cache_hit_tokens` is a subset of
+/// `input_tokens`, not an addition to it: DeepSeek reports the prompt split
+/// this way, and an OpenAI-style `prompt_tokens_details.cached_tokens` is
+/// mapped onto the same field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spent {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_hit_tokens: u64,
+    /// Whether any part of the count came from the estimator rather than the
+    /// provider. A provider that reports nothing must not read as zero.
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+impl Spent {
+    /// Add one response's usage to the running total.
+    pub fn add(&mut self, input_tokens: u64, output_tokens: u64, cache_hit_tokens: u64) {
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        self.cache_hit_tokens = self.cache_hit_tokens.saturating_add(cache_hit_tokens);
+    }
+
+    /// The raw total the run's `max_total_tokens` is compared against.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// The same total with cache hits discounted, for display only.
+    ///
+    /// `weight_percent` is how much a cached input token counts: 100 means the
+    /// raw total, 10 means a tenth. The limit stays on the raw total, so this
+    /// number cannot make a run outlive its configured budget.
+    pub fn billable_tokens(&self, weight_percent: u32) -> u64 {
+        let weight = weight_percent.min(100) as u64;
+        let hit = self.cache_hit_tokens.min(self.input_tokens).saturating_mul(weight) / 100;
+        let miss = self.input_tokens.saturating_sub(self.cache_hit_tokens);
+        miss.saturating_add(hit).saturating_add(self.output_tokens)
+    }
+}
+
 /// The step and spend limits a run starts with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunBudget {
@@ -36,6 +80,31 @@ pub struct RunBudget {
     /// on the monotonic clock the turn opened with. A request already in flight
     /// is not aborted, so the overshoot is bounded by one request.
     pub wall_clock_ms: Option<u64>,
+    /// The most raw `input_tokens + output_tokens` this run may spend.
+    /// `None` means unbounded.
+    ///
+    /// Raw, not billed: a cached input token is counted once. `Spent` reports
+    /// `billable_tokens` beside it for a reader who wants the discounted view,
+    /// but the limit stays on the raw count so a cache cannot extend a run past
+    /// the number its operator configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u64>,
+    /// The share of the wall clock or token budget at which the loop enters
+    /// finalize: it is told to stop opening new lines of work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalize_at_percent: Option<u32>,
+    /// The share of the usable input window at which this turn's traffic is
+    /// settled into a `state/1` message instead of being carried whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_at_percent: Option<u32>,
+    /// How many steps without new evidence are tolerated before a stall is
+    /// reported, and twice that before the run ends as `Stalled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_steps: Option<u32>,
+    /// How much a cache-hit input token counts in `Spent::billable_tokens`.
+    /// Display only; the enforced limit is still `max_total_tokens` raw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_weight_percent: Option<u32>,
     /// The most estimated input tokens one request may carry. `None` means the
     /// history is sent whole — the behaviour before this limit existed.
     ///
@@ -109,6 +178,11 @@ impl Default for RunBudget {
             max_steps: 8,
             max_tool_calls: None,
             wall_clock_ms: None,
+            max_total_tokens: None,
+            finalize_at_percent: None,
+            settle_at_percent: None,
+            stall_steps: None,
+            cache_hit_weight_percent: None,
             max_input_tokens: None,
             reserved_output_tokens: None,
             max_output_tokens: None,
