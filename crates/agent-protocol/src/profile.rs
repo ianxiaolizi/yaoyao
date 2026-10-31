@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use crate::digest;
-use crate::model::{BudgetPreset, ModelRoute, ReasoningEffort};
+use crate::model::{BudgetPreset, ModelCapabilities, ModelRoute, ReasoningEffort};
 use crate::permissions::CapabilitySet;
 use serde::{Deserialize, Serialize};
 
@@ -352,6 +352,24 @@ pub struct ResolvedProfileSnapshot {
     /// The capabilities this run is authorized to use.
     pub capability_set: CapabilitySet,
     pub budget: RunBudget,
+    /// What each route's model declared it can do, keyed `provider/model`.
+    ///
+    /// Frozen beside the budget because the budget is derived from it: a reader
+    /// asking "why 262,144?" has to be able to see the window it came from, and
+    /// whether that window was a discovered fact or this build's conservative
+    /// guess. Absent from snapshots written before this field existed, and from
+    /// an assembly that learned nothing — both decode to an empty map rather
+    /// than to a made-up capability.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_capabilities: BTreeMap<String, ModelCapabilities>,
+    /// Where each derived budget number came from (`provider:/models`,
+    /// `preset:balanced`, `derived:0.25W`, ...), keyed by budget field.
+    ///
+    /// The audit half of the same question `model_capabilities` answers: the
+    /// capability says what the model can hold, this says which of the run's
+    /// numbers were read from it, which were chosen, and which were derived.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub budget_sources: BTreeMap<String, String>,
     /// The operator's completion criterion, when the profile names one.
     ///
     /// Absent when there is none, for the reason `model_routes` is absent when
@@ -397,6 +415,8 @@ mod tests {
             memory_enabled: false,
             capability_set: [Capability::new(Capability::FS_READ)].into_iter().collect(),
             budget: RunBudget::default(),
+            model_capabilities: BTreeMap::new(),
+            budget_sources: BTreeMap::new(),
             completion: None,
         }
     }

@@ -104,6 +104,13 @@ pub struct ResolvedProfile {
     /// The physical window a layer claimed for the main model, when it stated
     /// one. Used by assembly to cap the resolved budget; never sent anywhere.
     pub model_context_window: Option<u32>,
+    /// What each route's model declared it can do, keyed `provider/model`.
+    ///
+    /// Empty until assembly has asked the provider: a resolution happens before
+    /// a route exists, and this crate does not know which vendors there are.
+    /// Assembly fills it and [`ResolvedProfile::into_snapshot`] freezes it
+    /// beside the budget derived from it.
+    pub model_capabilities: BTreeMap<String, agent_protocol::model::ModelCapabilities>,
     /// The operator's completion criterion, when the profile names one.
     pub completion: Option<CompletionSpec>,
     pub policy: ResolvedPolicy,
@@ -138,6 +145,13 @@ impl ResolvedProfile {
             model_routes,
             memory_enabled: self.memory_enabled,
             capability_set: self.capability_set,
+            model_capabilities: self.model_capabilities,
+            // One canonical map: the budget carries it because the numbers it
+            // describes live there, and the snapshot states it at the top level
+            // because the design documents it beside the capabilities. Copying
+            // rather than accepting a second value is what keeps the two from
+            // ever disagreeing.
+            budget_sources: self.budget.budget_sources.clone(),
             budget: self.budget,
             completion: self.completion,
         }
@@ -449,6 +463,7 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
         decision_backends,
         budget,
         model_context_window,
+        model_capabilities: BTreeMap::new(),
         completion,
         policy,
         policy_version,

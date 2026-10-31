@@ -295,13 +295,18 @@ fn a_schema_an_in_process_child_cannot_honour_never_forks_one() {
 #[test]
 fn a_long_answer_reaches_the_parent_as_a_locator_that_reads_back_whole() {
     let (data, workspace, home) = dirs();
-    let config = config(&home, DELEGATING);
+    // The parent's working set is stated rather than derived: since budgets come
+    // from the model, an unconfigured run over the echo model holds a 131k
+    // window and an 11 KiB answer is not "long" for it. The property under test
+    // is the gateway's bound, so the run states a working set small enough that
+    // this answer cannot sit inline.
+    let config = config(&home, &format!("{DELEGATING}budget = {{ max_input_tokens = 8000 }}\n"));
     a_parent_with_a_closed_turn(data.path(), workspace.path(), &config, &[]);
 
-    // Past any configured tool-output limit, and past what one step of a
-    // parent's context could hold.
-    // 8 KiB is the floor a run's tool-output limit is clamped to, and this is
-    // past it while still fitting a Windows command line.
+    // Past the configured tool-output limit, and past what one step of a
+    // parent's context could hold. 8 KiB is the floor a run's tool-output limit
+    // is clamped to, and this is past it while still fitting a Windows command
+    // line.
     let objective = "the notes say the sentinel is RHUBARB-7731.\n".repeat(260);
     let request = serde_json::json!({ "provider": "inner", "objective": objective }).to_string();
 

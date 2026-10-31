@@ -363,6 +363,8 @@ fn snapshot_with_budget(budget: RunBudget) -> ResolvedProfileSnapshot {
         memory_enabled: false,
         capability_set: CapabilitySet::new(),
         budget,
+        model_capabilities: std::collections::BTreeMap::new(),
+        budget_sources: std::collections::BTreeMap::new(),
         completion: None,
     }
     .sealed()

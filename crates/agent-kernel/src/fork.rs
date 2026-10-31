@@ -601,6 +601,8 @@ mod tests {
             .into_iter()
             .collect(),
             budget: agent_protocol::profile::RunBudget::default(),
+            model_capabilities: std::collections::BTreeMap::new(),
+            budget_sources: std::collections::BTreeMap::new(),
             completion: None,
         }
         .sealed();

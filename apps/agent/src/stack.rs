@@ -22,11 +22,11 @@
 //! guarded gateway, the context engine, the live bus, the scheduler, recovery,
 //! resume and fork.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_config::{McpTransport, ResolvedProfile};
+use agent_config::{BudgetPolicy, McpTransport, ResolvedProfile, resolve_context_budget};
 use agent_context::ProjectionContextEngine;
 use agent_index_sqlite::{MemoryToolProvider, SqliteMemoryIndex};
 use agent_kernel::approval::ApprovalService;
@@ -48,12 +48,15 @@ use agent_ports::decision::DecisionAdvisor;
 use agent_ports::execution_environment::{ExecutionEnvironment, SandboxMode};
 use agent_ports::memory_index::MemoryIndex;
 use agent_ports::memory_store::MemoryStore;
+use agent_ports::model_provider::{ModelProvider, ResolvedModelCapabilities};
 use agent_ports::model_router::ModelRouter;
 use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_protocol::ids::SessionId;
 use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef, Workspace};
+use agent_protocol::model::{ModelCapabilities, ModelRoute, ModelTier, ReasoningEffort};
+use agent_protocol::profile::ResolvedProfileSnapshot;
 use agent_protocol::redactor::{HighEntropy, Redactor};
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
@@ -149,6 +152,27 @@ pub enum StackError {
     /// detector off, nor start mangling results the reader asked for.
     #[error("redaction mode '{0}' is not one of `off`, `warn` or `redact`")]
     RedactionMode(String),
+    /// The budget this run would derive cannot be honored by the model its
+    /// route names: an explicit number larger than the model declares, or a
+    /// configuration that leaves no room for an answer.
+    #[error("budget for route {route}: {source}")]
+    Budget {
+        route: String,
+        #[source]
+        source: agent_config::ConfigError,
+    },
+    /// The configuration chose a reasoning depth the route's model does not
+    /// declare. Fail closed: a depth the provider never confirmed is a request
+    /// it may reject mid-turn, or silently ignore while the run believes it was
+    /// followed.
+    #[error(
+        "reasoning_effort for route {route}: `{requested}` is not one of the depths the model declares ({supported:?})"
+    )]
+    UnsupportedReasoningEffort {
+        route: String,
+        requested: ReasoningEffort,
+        supported: Vec<ReasoningEffort>,
+    },
 }
 
 /// Which part of the thinking pipeline a run gets.
@@ -232,6 +256,103 @@ fn judgment_arm(enabled: bool) -> Result<JudgmentArm, StackError> {
     }
 }
 
+/// What every route's model declares, discovered once at assembly.
+///
+/// Both maps are keyed `provider/model`. The snapshot takes the first — what a
+/// model can hold is a fact worth reading back — while the budget resolver takes
+/// the second, because it must know whether a window was discovered or guessed
+/// before it can say where its own numbers came from.
+struct DiscoveredCapabilities {
+    by_route: BTreeMap<String, ModelCapabilities>,
+    resolved: BTreeMap<String, ResolvedModelCapabilities>,
+}
+
+/// How a route is named in the audit trail.
+fn route_key(route: &ModelRoute) -> String {
+    format!("{}/{}", route.provider, route.model)
+}
+
+/// Ask the provider what each route's model can do.
+///
+/// A provider that cannot answer — no catalog, an unreachable endpoint, or no
+/// discovery at all — is not a reason to run with no budget: this build's
+/// conservative catalog answers instead, and the recorded source says the
+/// numbers are a guess rather than a fact (CONTRACT §7 #137).
+async fn discover_route_capabilities(
+    provider: &Arc<dyn ModelProvider>,
+    main: &ModelRoute,
+    routes: &BTreeMap<String, ModelRoute>,
+) -> DiscoveredCapabilities {
+    let mut discovered =
+        DiscoveredCapabilities { by_route: BTreeMap::new(), resolved: BTreeMap::new() };
+    for route in std::iter::once(main).chain(routes.values()) {
+        let key = route_key(route);
+        // Two tiers pointed at one model are one question, asked once.
+        if discovered.resolved.contains_key(&key) {
+            continue;
+        }
+        let capabilities = provider
+            .model_capabilities(&route.model)
+            .await
+            .unwrap_or_else(|_| agent_model_openai::capabilities_without_provider(&route.model));
+        discovered.by_route.insert(key.clone(), capabilities.capabilities.clone());
+        discovered.resolved.insert(key, capabilities);
+    }
+    discovered
+}
+
+/// The preset and nothing else: how a route nobody configured a budget for is
+/// derived.
+fn preset_only_policy(preset: agent_protocol::model::BudgetPreset) -> BudgetPolicy {
+    BudgetPolicy { preset, ..BudgetPolicy::balanced() }
+}
+
+/// The reasoning depth this run asks for, and where that choice came from.
+///
+/// A profile's explicit value wins; otherwise the model's declared default;
+/// otherwise `high`. A model that declares no depths at all is sent no field:
+/// a fabricated value is a request the provider never promised to accept.
+fn reasoning_effort_for(
+    chosen: &Option<ReasoningEffort>,
+    capabilities: &ResolvedModelCapabilities,
+    route: &str,
+) -> Result<(Option<ReasoningEffort>, &'static str), StackError> {
+    let declared = &capabilities.capabilities.reasoning_efforts;
+    if let Some(effort) = chosen {
+        if !declared.contains(effort) {
+            return Err(StackError::UnsupportedReasoningEffort {
+                route: route.to_string(),
+                requested: *effort,
+                supported: declared.clone(),
+            });
+        }
+        return Ok((Some(*effort), "explicit"));
+    }
+    if let Some(default) = capabilities.capabilities.default_reasoning_effort
+        && (declared.is_empty() || declared.contains(&default))
+    {
+        return Ok((Some(default), "model_default"));
+    }
+    if declared.is_empty() {
+        return Ok((None, "unsupported"));
+    }
+    Ok((Some(nearest_high(declared)), "default"))
+}
+
+/// `high`, or the deepest declared depth that does not exceed it.
+///
+/// The rule names `high` because that is the depth the shipped model reasons
+/// at; a model that does not offer it is asked for the closest thing it does
+/// offer, never for a depth it never declared.
+fn nearest_high(declared: &[ReasoningEffort]) -> ReasoningEffort {
+    declared
+        .iter()
+        .copied()
+        .filter(|effort| *effort <= ReasoningEffort::High)
+        .max()
+        .unwrap_or_else(|| *declared.iter().min().expect("the caller ruled out an empty list"))
+}
+
 /// The assembled stack: one event store, one tool surface, and the kernel
 /// services built over them.
 ///
@@ -273,6 +394,20 @@ pub struct Runtime {
     /// the drain from needing `Runtime: Sync` — it clones one `Arc`, not the
     /// whole stack.
     pub children: Arc<subagents::Children>,
+}
+
+impl Runtime {
+    /// The configuration this stack froze for its runs.
+    ///
+    /// The same value the scheduler records as `profile/resolved`, readable
+    /// before a run opens. Assembly always sets one — a stack that could not
+    /// state what it would run under never starts — so this is not optional
+    /// here even though the scheduler's field is.
+    pub fn profile_snapshot(&self) -> &ResolvedProfileSnapshot {
+        self.scheduler
+            .profile_snapshot()
+            .expect("an assembled stack always records the configuration it runs under")
+    }
 }
 
 /// The execution backend the selected mode names, or a refusal.
@@ -416,7 +551,7 @@ pub async fn assemble_with_delegation(
         session,
         workspace_root,
         data_dir,
-        resolved,
+        mut resolved,
         model,
         decisions,
         sandbox,
@@ -473,6 +608,69 @@ pub async fn assemble_with_delegation(
         Some(selected) => selected,
         None => providers::select(resolved.model.as_deref())?,
     };
+    // The tiers the configuration named, pointed at the provider this run
+    // selected. Every entry differs from `main` only in its model name: this
+    // build speaks to one provider kind per run, and a route that named another
+    // kind would be a claim nothing here can honor.
+    let routes = providers::route_table(&selected.route, &resolved.model_tiers);
+    // What each route's model says it can hold, asked once, before anything
+    // derives a budget from it (CONTRACT §7 #137). The window a request may
+    // carry, the completion cap, and the input working set are all functions of
+    // these numbers; asking after the tool surface was built would mean the
+    // offload limit and the trimmer running on a policy the model never agreed
+    // to.
+    let discovered =
+        discover_route_capabilities(&selected.provider, &selected.route, &routes).await;
+    let main_route = route_key(&selected.route);
+    let main_capabilities = discovered
+        .resolved
+        .get(&main_route)
+        .expect("the main route is discovered before every other");
+    let budget_policy = BudgetPolicy {
+        preset: resolved.budget.preset,
+        // A smaller window a layer stated wins over the model's own; a larger
+        // one is refused by the resolver rather than trusted.
+        context_window_tokens: resolved.model_context_window,
+        input_working_set_tokens: resolved.budget.max_input_tokens,
+        completion_cap_tokens: resolved.budget.max_output_tokens,
+        compaction_headroom_tokens: resolved.budget.compaction_headroom_tokens,
+        retain_recent_tokens: resolved.budget.retain_recent_tokens,
+        compact_at_percent: resolved.budget.compact_at_percent,
+    };
+    // An explicit value that cannot fit is a refusal to start, not a clamp: the
+    // operator asked for numbers the model cannot honor, and the field that has
+    // to change is theirs to change. The refusal names the route as well as the
+    // field, because "completion_cap_tokens" is only actionable next to which
+    // model it was asked of.
+    let resolution = resolve_context_budget(main_capabilities, &budget_policy)
+        .map_err(|source| StackError::Budget { route: main_route.clone(), source })?;
+    let (reasoning_effort, reasoning_source) =
+        reasoning_effort_for(&resolved.budget.reasoning_effort, main_capabilities, &main_route)?;
+    // A compaction summary may be routed to a faster model, so its cap has to
+    // fit *that* model's window rather than borrow the main one's. The preset
+    // carries over because it is a cost choice about the run; the explicit
+    // numbers do not, because they were chosen for the main model.
+    let summary_cap = routes
+        .get(ModelTier::Fast.as_str())
+        .and_then(|route| discovered.resolved.get(&route_key(route)))
+        .and_then(|caps| {
+            resolve_context_budget(caps, &preset_only_policy(resolved.budget.preset)).ok()
+        })
+        .map(|resolution| resolution.budget.completion_cap_tokens)
+        .unwrap_or(resolution.budget.completion_cap_tokens);
+
+    let context_budget = resolution.budget;
+    let mut budget_sources = resolution.sources;
+    budget_sources.insert("reasoning_effort".to_string(), reasoning_source.to_string());
+    resolved.budget.context = Some(context_budget);
+    // The provider is asked for this cap, not for the build's old completion
+    // default: a cap sized for prose is a cap that ends a reasoning model
+    // mid-thought (CONTRACT §7 #131).
+    resolved.budget.max_output_tokens = Some(context_budget.completion_cap_tokens);
+    resolved.budget.summary_max_output_tokens = Some(summary_cap);
+    resolved.budget.reasoning_effort = reasoning_effort;
+    resolved.budget.budget_sources = budget_sources;
+    resolved.model_capabilities = discovered.by_route;
     // The arms: `gates` (the default) keeps the deterministic refusals without
     // the ledger's tool and advice, `on` adds the ledger for audit and the
     // evaluation's full arm, and `off` is the baseline that predates the
@@ -723,11 +921,6 @@ pub async fn assemble_with_delegation(
 
     // Shadow decisions are assembled here, next to the provider they are built
     // from, and nowhere else decides which model a run talks to.
-    // The tiers the configuration named, pointed at the provider this run
-    // selected. Every entry differs from `main` only in its model name: this
-    // build speaks to one provider kind per run, and a route that named another
-    // kind would be a claim nothing here can honor.
-    let routes = providers::route_table(&selected.route, &resolved.model_tiers);
     let (router, advisor): (Arc<dyn ModelRouter>, Option<Arc<dyn DecisionAdvisor>>) =
         match decisions {
             Decisions::FromConfiguration => {

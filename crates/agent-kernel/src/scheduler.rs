@@ -37,6 +37,7 @@ mod endings;
 mod journal;
 mod rebuilt;
 mod report;
+mod snapshot;
 
 pub(crate) use draft::draft;
 use endings::{Ending, Gate};
@@ -839,6 +840,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::snapshot::snapshot_with_budget;
     use agent_loop::DefaultAgentLoop;
     use agent_ports::agent_loop::{StepOutcome, StopReason, TurnState};
     use agent_ports::execution_environment::SandboxMode;
@@ -1169,27 +1171,6 @@ mod tests {
         let decoded: InboxItemId =
             serde_json::from_value(payload.get("item_id").cloned().unwrap()).unwrap();
         assert_eq!(decoded.as_str(), "abc");
-    }
-
-    fn snapshot_with_budget(budget: agent_protocol::profile::RunBudget) -> ResolvedProfileSnapshot {
-        ResolvedProfileSnapshot {
-            profile_id: "coding".to_string(),
-            config_hash: String::new(),
-            plugin_versions: std::collections::BTreeMap::new(),
-            policy_version: "deadbeef".to_string(),
-            decision_backends: Vec::new(),
-            model_route: agent_protocol::model::ModelRoute::new(
-                agent_protocol::model::ModelTier::Main,
-                "echo",
-                "echo",
-            ),
-            model_routes: std::collections::BTreeMap::new(),
-            memory_enabled: false,
-            capability_set: agent_protocol::permissions::CapabilitySet::new(),
-            budget,
-            completion: None,
-        }
-        .sealed()
     }
 
     /// What a run is, before it is a run.

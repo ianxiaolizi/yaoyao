@@ -918,9 +918,15 @@ impl LoopTurn {
     /// no limit: the step boundary already refuses to start a request past the
     /// deadline, and a round-trip value of 0 is a different instruction in some
     /// adapters.
+    ///
+    /// `reasoning_effort` is the depth assembly resolved — the profile's choice,
+    /// the model's declared default, or `high`. It is a separate control from
+    /// `max_tokens`: effort says how deeply to think, the cap only bounds how
+    /// long the whole completion may run, reasoning included.
     fn model_budget(&self) -> ModelBudget {
         ModelBudget {
             max_tokens: self.budget.max_output_tokens,
+            reasoning_effort: self.budget.reasoning_effort,
             wall_clock_ms: self.deadline.and_then(|deadline| {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 (left.as_millis() > 0).then_some(left.as_millis() as u64)

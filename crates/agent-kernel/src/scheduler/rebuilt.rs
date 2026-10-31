@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn a_rebuilt_scheduler_takes_its_step_limit_from_the_budget_it_was_given() {
         let budget = RunBudget { max_steps: 3, ..RunBudget::default() };
-        let rebuilt = scheduler().rebudgeted(budget);
+        let rebuilt = scheduler().rebudgeted(budget.clone());
 
         assert_eq!(rebuilt.budget, budget);
         assert_eq!(rebuilt.max_steps, 3);
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn rebudgeting_leaves_the_scheduler_it_was_taken_from_alone() {
         let original = scheduler();
-        let before = original.budget;
+        let before = original.budget.clone();
         let _ = original.rebudgeted(RunBudget { max_steps: 1, ..RunBudget::default() });
 
         assert_eq!(original.budget, before);

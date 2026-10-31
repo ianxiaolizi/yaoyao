@@ -80,11 +80,21 @@ impl Scripted {
 struct ScriptedTransport {
     responses: Mutex<Vec<Scripted>>,
     posts: Mutex<Vec<TransportRequest>>,
+    /// What `GET /models` answers, when this endpoint has a catalog. `None` is
+    /// an endpoint that serves chat traffic only: the discovery request fails
+    /// and the provider answers from the bundled catalog or its fallback.
+    models: Option<String>,
 }
 
 impl ScriptedTransport {
     fn new(responses: Vec<Scripted>) -> Self {
-        Self { responses: Mutex::new(responses), posts: Mutex::new(Vec::new()) }
+        Self { responses: Mutex::new(responses), posts: Mutex::new(Vec::new()), models: None }
+    }
+
+    /// The same transport with a `/models` catalog behind it.
+    fn with_models(mut self, body: &str) -> Self {
+        self.models = Some(body.to_string());
+        self
     }
 
     /// Every request body this transport was handed, as text.
@@ -123,6 +133,17 @@ impl Transport for ScriptedTransport {
             }
         };
         Ok(TransportResponse { status: 200, body: Box::pin(futures_util::stream::iter(chunks)) })
+    }
+
+    /// Capability discovery, which is a `GET` and not an attempt: it consumes no
+    /// scripted response, so a test can script exactly the chat traffic it
+    /// expects.
+    async fn get(&self, request: TransportRequest) -> Result<TransportResponse, TransportError> {
+        let Some(body) = self.models.clone() else {
+            return Err(TransportError::Connect("this endpoint serves no catalog".to_string()));
+        };
+        assert!(request.url.ends_with("/models"), "discovery asks for the model list: {}", request.url);
+        Ok(TransportResponse { status: 200, body: Box::pin(futures_util::stream::iter(vec![Ok(body.into_bytes())])) })
     }
 }
 
@@ -220,9 +241,37 @@ async fn harness_with(
     shadow: bool,
     resolved: ResolvedProfile,
 ) -> Harness {
+    harness_with_profile_and_catalog(workspace, responses, shadow, resolved, None).await
+}
+
+/// A harness whose endpoint has a `/models` catalog, discovered through the
+/// real adapter rather than assumed by the test.
+async fn harness_with_catalog(models: &str, responses: Vec<Scripted>) -> Harness {
+    harness_with_profile_and_catalog(
+        Arc::new(tempfile::tempdir().expect("temp workspace")),
+        responses,
+        false,
+        default_profile(),
+        Some(models.to_string()),
+    )
+    .await
+}
+
+/// The one assembly every harness goes through.
+async fn harness_with_profile_and_catalog(
+    workspace: Arc<TempDir>,
+    responses: Vec<Scripted>,
+    shadow: bool,
+    resolved: ResolvedProfile,
+    models: Option<String>,
+) -> Harness {
     let data_dir = tempfile::tempdir().expect("temp data dir");
 
-    let transport = Arc::new(ScriptedTransport::new(responses));
+    let mut transport = ScriptedTransport::new(responses);
+    if let Some(models) = models.as_deref() {
+        transport = transport.with_models(models);
+    }
+    let transport = Arc::new(transport);
     let stack = stack::assemble(stack::Inputs {
         session: SessionId::from_string("m4"),
         workspace_root: workspace.path().to_path_buf(),
@@ -1177,4 +1226,90 @@ async fn a_turn_starts_a_worker_on_the_step_the_plan_says_is_ready() {
     // Release the child, so the test does not leave a process running.
     h.stack.children.drain().await;
     assert_eq!(h.events_of(EventType::SUBAGENT_COMPLETED).await.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The budget assembly derives from the model
+// ---------------------------------------------------------------------------
+
+/// The catalog the scripted endpoint serves for the model this harness names.
+fn deepseek_flash_catalog() -> String {
+    serde_json::json!({
+        "data": [{
+            "id": "scripted-model",
+            "context_window": 1_048_576,
+            "max_output_tokens": 393_216,
+            "reasoning_efforts": ["low", "high", "max"],
+            "default_reasoning_effort": "high",
+        }]
+    })
+    .to_string()
+}
+
+/// The budget a run executes under is derived from what its model declares, and
+/// the snapshot records both the numbers and where each one came from. Without
+/// this, a 1M-token model runs on the 8k cap the build used to hard-code.
+#[tokio::test]
+async fn assembly_freezes_discovered_capabilities_and_budget_sources() {
+    let h = harness_with_catalog(&deepseek_flash_catalog(), Vec::new()).await;
+    let profile = h.stack.profile_snapshot();
+
+    let context = profile.budget.context.expect("a resolved budget");
+    assert_eq!(context.context_window_tokens, 1_048_576);
+    assert_eq!(context.completion_cap_tokens, 262_144);
+    assert_eq!(context.input_working_set_tokens, 262_144);
+    assert_eq!(context.compaction_trigger_tokens, 209_715);
+
+    // The cap the provider will be asked for is the derived one, not the
+    // build's old completion default.
+    assert_eq!(profile.budget.max_output_tokens, Some(262_144));
+
+    assert_eq!(
+        profile.budget_sources.get("context_window_tokens").map(String::as_str),
+        Some("provider:/models")
+    );
+    assert_eq!(
+        profile.budget_sources.get("input_working_set_tokens").map(String::as_str),
+        Some("preset:balanced")
+    );
+
+    // The capability itself is frozen beside the budget, keyed by route, so a
+    // reader can answer "what did the model say it could hold?" without asking
+    // the endpoint again.
+    let caps = profile
+        .model_capabilities
+        .get("scripted-endpoint/scripted-model")
+        .expect("the main route's capabilities");
+    assert_eq!(caps.context_window_tokens, 1_048_576);
+    assert_eq!(caps.max_output_tokens, 393_216);
+
+    // The model declared its default depth, so the run records that rather
+    // than a made-up one.
+    assert_eq!(
+        profile.budget.reasoning_effort,
+        Some(agent_protocol::model::ReasoningEffort::High)
+    );
+}
+
+/// An endpoint that serves no catalog still assembles: the budget is derived
+/// from the conservative fallback, and the snapshot says it was a guess.
+#[tokio::test]
+async fn a_route_whose_capabilities_cannot_be_discovered_records_the_fallback() {
+    let h = harness(Vec::new(), false).await;
+    let profile = h.stack.profile_snapshot();
+
+    let context = profile.budget.context.expect("a resolved budget");
+    assert_eq!(context.context_window_tokens, 131_072);
+    assert_eq!(context.completion_cap_tokens, 32_768);
+    assert_eq!(
+        profile.budget_sources.get("context_window_tokens").map(String::as_str),
+        Some("fallback")
+    );
+    assert_eq!(
+        profile
+            .model_capabilities
+            .get("scripted-endpoint/scripted-model")
+            .map(|caps| caps.context_window_tokens),
+        Some(131_072)
+    );
 }
