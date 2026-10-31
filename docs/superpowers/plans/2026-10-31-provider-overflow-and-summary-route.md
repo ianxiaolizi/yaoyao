@@ -45,7 +45,7 @@
 - Consumes: existing `ModelProviderError`, `OpenAiCompatProvider::run_attempt`, and the scripted transport in `tests/contract.rs`.
 - Produces: `ModelProviderError::ContextOverflow { status: u16, body: String }` and `ModelProviderError::is_context_overflow() -> bool`.
 
-- [ ] **Step 1: Write the failing provider-classification tests**
+- [x] **Step 1: Write the failing provider-classification tests**
 
 Add tests asserting:
 
@@ -89,7 +89,7 @@ async fn the_adapter_does_not_repeat_a_context_overflow() {
 }
 ```
 
-- [ ] **Step 2: Run the failing tests**
+- [x] **Step 2: Run the failing tests**
 
 Run:
 
@@ -102,7 +102,7 @@ cargo test -p agent-model-openai the_adapter_does_not_repeat_a_context_overflow
 
 Expected: compile failure because `ContextOverflow` and `is_context_overflow` do not exist.
 
-- [ ] **Step 3: Add the provider-neutral error variant**
+- [x] **Step 3: Add the provider-neutral error variant**
 
 In `agent-ports`, add:
 
@@ -121,7 +121,7 @@ pub fn is_context_overflow(&self) -> bool {
 
 Treat `ContextOverflow` as non-retryable in `agent-model-openai::provider::is_retryable`.
 
-- [ ] **Step 4: Classify responses in the OpenAI-compatible adapter**
+- [x] **Step 4: Classify responses in the OpenAI-compatible adapter**
 
 When `run_attempt` sees a non-200 response, classify before constructing the ordinary HTTP error:
 
@@ -150,7 +150,7 @@ fn context_overflow(status: u16, body: &str) -> bool {
 
 Classify the raw bounded response body, then store the existing `describe_error_body` value in the typed error so the accepted `code` field is not discarded before classification. Do not parse vendor fields outside `agent-model-openai`.
 
-- [ ] **Step 5: Run the focused provider tests**
+- [x] **Step 5: Run the focused provider tests**
 
 Run:
 
@@ -160,7 +160,7 @@ cargo test -p agent-model-openai --test contract context
 
 Expected: PASS, including the four new tests and all existing retry/timeout tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/agent-ports/src/model_provider.rs crates/agent-model-openai/src/provider.rs crates/agent-model-openai/tests/contract.rs
@@ -181,7 +181,7 @@ git commit -m "feat: classify provider context overflow"
 - Consumes: `ResolvedContextBudget`, `resolve_context_budget`, `preset_only_policy`, `reasoning_effort_for`, route capabilities discovered during assembly, and `ModelRouter::route(TaskClass::SUMMARIZE)`.
 - Produces: `SummaryRouteBudget { context, reasoning_effort, supported_reasoning_efforts }`, `RunBudget.summary: Option<SummaryRouteBudget>`, and `agent_protocol::compaction::fit_leading_groups(messages, available_tokens) -> Vec<ModelMessage>`.
 
-- [ ] **Step 1: Write the failing protocol and fitted-prefix tests**
+- [x] **Step 1: Write the failing protocol and fitted-prefix tests**
 
 In `profile.rs`, assert old snapshots still deserialize and the new shape round-trips:
 
@@ -216,7 +216,7 @@ fn fitting_leading_groups_never_splits_a_tool_call_from_its_result() {
 
 The first test must use messages sized so the call/result group fits but `new` does not. Write exact text lengths or helper constructors in the test so the boundary is deterministic.
 
-- [ ] **Step 2: Run the failing protocol tests**
+- [x] **Step 2: Run the failing protocol tests**
 
 Run:
 
@@ -227,7 +227,7 @@ cargo test -p agent-protocol fitting_leading_groups
 
 Expected: FAIL because `SummaryRouteBudget`, `RunBudget.summary`, and `fit_leading_groups` do not exist.
 
-- [ ] **Step 3: Add the summary budget type and fitted-prefix helper**
+- [x] **Step 3: Add the summary budget type and fitted-prefix helper**
 
 Add to `profile.rs`:
 
@@ -245,7 +245,7 @@ Add `pub summary: Option<SummaryRouteBudget>` to `RunBudget` with `serde(default
 
 Implement `fit_leading_groups` in `compaction.rs` by walking `groups(messages)` from oldest to newest, skipping orphan groups, and including a group only when its whole cost still fits `available_tokens`. Return an empty vector when the first eligible group does not fit.
 
-- [ ] **Step 4: Write the failing assembly and summary-route tests**
+- [x] **Step 4: Write the failing assembly and summary-route tests**
 
 In `apps/agent/src/stack.rs`, add a pure helper test with:
 
@@ -271,7 +271,7 @@ Use a router that maps `TaskClass::SUMMARIZE` to a fast route and a model script
 - its `budget.reasoning_effort` is a value declared by the fast model, never the main model's unsupported depth;
 - all selected candidate messages are an oldest leading prefix of complete groups.
 
-- [ ] **Step 5: Resolve the complete summary budget during assembly**
+- [x] **Step 5: Resolve the complete summary budget during assembly**
 
 In `apps/agent/src/stack.rs`, replace the cap-only branch with:
 
@@ -308,7 +308,7 @@ resolved.budget.summary_max_output_tokens = Some(summary_resolution.budget.compl
 
 Add audit keys for `summary.context_window_tokens`, `summary.input_working_set_tokens`, `summary.completion_cap_tokens`, and `summary.reasoning_effort`. When no fast route is configured, derive the summary budget from the main capabilities and reuse the main effort.
 
-- [ ] **Step 6: Make compaction consume the summary route budget**
+- [x] **Step 6: Make compaction consume the summary route budget**
 
 In `DefaultAgentLoop::compact`, after selecting the summarize route:
 
@@ -331,7 +331,7 @@ candidate.retained_tokens = candidate.retained_tokens
 
 Set the summary request's `budget.max_tokens` to the selected profile's `completion_cap_tokens` and `budget.reasoning_effort` to its route-specific effort. Record `"route_fallback": "input_working_set"` when the fast route had no fitting prefix and the main route was used.
 
-- [ ] **Step 7: Run the focused budget and loop tests**
+- [x] **Step 7: Run the focused budget and loop tests**
 
 Run:
 
@@ -344,7 +344,7 @@ cargo test -p agent-loop summary_route
 
 Expected: PASS. Inspect the recorded fast summary request and confirm its message estimate is within the fast input working set.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/agent-protocol/src/profile.rs crates/agent-protocol/src/compaction.rs apps/agent/src/stack.rs crates/agent-loop/src/default.rs crates/agent-loop/src/default/tests/summary_route.rs
@@ -363,7 +363,7 @@ git commit -m "fix: budget summary route independently"
 - Consumes: `ModelProviderError::ContextOverflow`, `ResolvedContextBudget`, `budget::estimated_request_tokens`, `settlement::settle`, `agent_protocol::compaction::groups`, and the current `LoopTurn` history bounds.
 - Produces: `context_recovery::safe_target(...)`, `context_recovery::compress_for_overflow(...) -> bool`, and a one-shot retry branch in `DefaultAgentLoop::step`.
 
-- [ ] **Step 1: Write the failing integration tests**
+- [x] **Step 1: Write the failing integration tests**
 
 Create a static context engine in the test that returns a long settled history and a medium-sized current user input. Add these tests:
 
@@ -402,7 +402,7 @@ async fn a_generic_http_400_does_not_enter_context_recovery()
 
 Script one `Http { status: 400, .. }`. Assert one request and a normal fatal result.
 
-- [ ] **Step 2: Run the failing integration tests**
+- [x] **Step 2: Run the failing integration tests**
 
 Run:
 
@@ -412,7 +412,7 @@ cargo test -p agent-loop --test context_overflow_recovery
 
 Expected: FAIL because the typed error branch and recovery module do not exist.
 
-- [ ] **Step 3: Implement the safe target and deterministic compression**
+- [x] **Step 3: Implement the safe target and deterministic compression**
 
 In `context_recovery.rs`, add:
 
@@ -448,7 +448,7 @@ Overflow recovery: N older messages were omitted because the provider rejected t
 
 Return `false` when no removable group exists or the protected request still exceeds `target`; in that case do not mutate `turn.messages`.
 
-- [ ] **Step 4: Wire the one-shot retry into the step**
+- [x] **Step 4: Wire the one-shot retry into the step**
 
 In `DefaultAgentLoop::step`, on a `ContextOverflow` error from the first `model.stream` attempt:
 
@@ -468,7 +468,7 @@ In `DefaultAgentLoop::step`, on a `ContextOverflow` error from the first `model.
 
 Do not call `output_recovery` until the context retry has succeeded. Keep token accounting unchanged: only settled responses add spend.
 
-- [ ] **Step 5: Run the focused recovery tests**
+- [x] **Step 5: Run the focused recovery tests**
 
 Run:
 
@@ -479,7 +479,7 @@ cargo test -p agent-loop halted_response
 
 Expected: PASS. The recovery suite must show exactly one retry and one `overflow-trim` event.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/agent-loop/src/default/context_recovery.rs crates/agent-loop/src/default.rs crates/agent-loop/src/default/settlement.rs crates/agent-loop/tests/context_overflow_recovery.rs
@@ -498,11 +498,11 @@ git commit -m "feat: recover once from provider context overflow"
 - Consumes: all previous tasks.
 - Produces: assembled-product proof that a real OpenAI-compatible `413`/context-length rejection compresses and retries, plus durable documentation of the fast summary budget and overflow path.
 
-- [ ] **Step 1: Make the assembled scripted transport status-aware**
+- [x] **Step 1: Make the assembled scripted transport status-aware**
 
 Extend `ScriptedTransport` so each reply carries `{ status, body }` while existing `answer_body(...)` call sites continue to construct `200` replies. Keep `GET /models` returning the scripted catalog without consuming the chat reply queue.
 
-- [ ] **Step 2: Add the assembled overflow acceptance test**
+- [x] **Step 2: Add the assembled overflow acceptance test**
 
 Add:
 
@@ -526,7 +526,7 @@ Assert:
 - exactly one `context/compacted` event has `strategy == "overflow-trim"`;
 - the retry prepared event has `context_recovery == "max_safe_compression"`.
 
-- [ ] **Step 3: Add the assembled summary-route snapshot test**
+- [x] **Step 3: Add the assembled summary-route snapshot test**
 
 With a profile naming `model = { main = "big", fast = "small" }` and a catalog where `small` declares a 131,072 window, 8,192 output cap, and only `low` effort, assert `profile/resolved` records:
 
@@ -548,7 +548,7 @@ With a profile naming `model = { main = "big", fast = "small" }` and a catalog w
 
 Also assert `budget_sources["summary.input_working_set_tokens"] == "preset:balanced"` and that the main route still records its own independent values.
 
-- [ ] **Step 4: Update durable documentation**
+- [x] **Step 4: Update durable documentation**
 
 Add CONTRACT §7 rows recording:
 
@@ -558,7 +558,7 @@ Add CONTRACT §7 rows recording:
 
 Update `PROJECT.md` to state that a provider context rejection causes one maximum-safe deterministic compression followed by one retry, and that fast summaries use the fast route's own input window and effort.
 
-- [ ] **Step 5: Run assembled acceptance and boundary checks**
+- [x] **Step 5: Run assembled acceptance and boundary checks**
 
 Run:
 
@@ -570,7 +570,7 @@ cargo test -p agent-testkit architecture_boundaries
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the full repository gate**
+- [x] **Step 6: Run the full repository gate**
 
 Run:
 
@@ -580,7 +580,7 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1
 
 Expected: `fmt`, `clippy`, and `cargo test --workspace` all pass; the script ends with `gate: all requested steps passed`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add apps/agent/tests/model_budget_acceptance.rs CONTRACT.md PROJECT.md
