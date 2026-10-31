@@ -144,6 +144,8 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 
 模型档位写在 profile 的 `[model]` 里：`main` 是本次运行的模型，`fast` / `thinking` 留给摘要与审查；`--model` 只覆盖 `main`，不会动另两档。今天**只有上下文压缩**按 `summarize` 真的走到 `fast`，`review` 还没有生产者，所以配了 `thinking` 也只会被记录、不会被用到。档位只换模型名，不换 provider——一个进程仍然只说一种 provider kind。没配任何档位时行为与以前完全一致，`profile/resolved` 也不多一个字段（`CONTRACT.md` §7 #118）。
 
+上下文预算不再写死。路由确定后，爻爻先 `GET /models` 问模型自己声明能装多少，再按预设（`[budget] preset`：`frugal`/`balanced`/`deep`/`max`，默认 `balanced` = 窗口的 1/4）派生这一轮冻结的 `ResolvedContextBudget`：物理窗口、输入工作集、补全上限（**含 reasoning tokens**）、补全上界、压缩预留、压缩触发点、最近保留量。派生是纯整数运算，每个字段的来源（`provider:/models`、`preset:balanced`、`derived:0.25W`、`config`、`fallback`）随 `profile/resolved` 一起落盘，`context inspect` 读的就是这份记录。端点答不出时用保守的 131,072 窗口并标 `fallback`，不再回到 8,000。旧配置里的 `max_input_tokens`/`max_output_tokens` 仍可用；`reserved_output_tokens` 接受但忽略（记一条 note）。模型只产出思路、`finish_reason = length` 时，本次运行会带更大额度（已在物理上限时改降推理深度）重问一次；第二次仍是纯思考才以 `max_output_tokens` 结束，并说明是思考烧完了额度。传输层同理：连接 30 秒、首事件 60 秒、流内空闲 300 秒，没有总时长上限——持续出字的流不会被砍（`CONTRACT.md` §7 #151–#155）。
+
 记忆检索是**词面**的：`entries` 表存事件正文，`entries_fts`（FTS5，`tokenize='trigram'`，external content）负责查找。查询三个字符以上走 trigram 短语匹配，两字（中文常用词，例如「记账」）退回子串扫描——trigram 没有更短的 token，硬走索引会静默零命中。命中按 `score` 排序：`-bm25`（词在事件里有多密、事件有多短）+ 按日志末尾归一的时间项 + 事件种类权重（人说的话 0.3 / 助手的话 0.1 / 工具输出 0），同分取新。`score` 只在一次结果内可比，不是概率；`memory search --json` 会给出它。索引版本 `memory-index/0.2.0`，旧库搜索会得到版本错误，`memory reindex` 重建即可。`CONTRACT.md` §7 #119。
 
 ```bash
