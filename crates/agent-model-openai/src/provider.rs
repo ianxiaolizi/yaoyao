@@ -165,7 +165,8 @@ impl OpenAiCompatProvider {
                 url: self.config.models_url(),
                 bearer_token: key,
                 body: Vec::new(),
-                timeout_ms: self.config.timeout_ms,
+                timeout_ms: self.config.first_event_timeout_ms,
+                connect_timeout_ms: self.config.connect_timeout_ms,
             })
             .await
             .ok()?;
@@ -190,16 +191,25 @@ impl OpenAiCompatProvider {
         body: &[u8],
         requested_model: &str,
     ) -> Result<ModelResponse, ModelProviderError> {
-        let response = self
-            .transport
-            .post(TransportRequest {
+        // The endpoint gets one first-event window to answer at all. Note the
+        // request still carries no total deadline: a stream that has started
+        // talking is governed by the idle window below, chunk by chunk.
+        let first_event = Duration::from_millis(self.config.first_event_timeout_ms);
+        let response = tokio::time::timeout(
+            first_event,
+            self.transport.post(TransportRequest {
                 url: self.config.chat_completions_url(),
                 bearer_token: key.to_string(),
                 body: body.to_vec(),
-                timeout_ms: self.config.timeout_ms,
-            })
-            .await
-            .map_err(|e| map_transport_error(e, self.config.timeout_ms))?;
+                timeout_ms: self.config.first_event_timeout_ms,
+                connect_timeout_ms: self.config.connect_timeout_ms,
+            }),
+        )
+        .await
+        .map_err(|_| ModelProviderError::Timeout {
+            after_ms: self.config.first_event_timeout_ms,
+        })?
+        .map_err(|e| map_transport_error(e, self.config.first_event_timeout_ms))?;
 
         if response.status != 200 {
             let detail = read_bounded(response.body).await;
@@ -214,8 +224,16 @@ impl OpenAiCompatProvider {
         let mut accumulator = StreamAccumulator::new();
         let mut interrupted: Option<TransportError> = None;
         let mut settled = false;
+        let idle = Duration::from_millis(self.config.stream_idle_timeout_ms);
 
-        'chunks: while let Some(chunk) = stream_body.next().await {
+        'chunks: loop {
+            // Each iteration starts a fresh window, so any chunk — including one
+            // that carries no event — resets the patience. What is measured is
+            // silence, not duration.
+            let chunk = tokio::time::timeout(idle, stream_body.next()).await.map_err(|_| {
+                ModelProviderError::Timeout { after_ms: self.config.stream_idle_timeout_ms }
+            })?;
+            let Some(chunk) = chunk else { break };
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -236,7 +254,7 @@ impl OpenAiCompatProvider {
                 // The endpoint stopped answering on our own timeout: keep its
                 // identity rather than degrading into a generic interruption.
                 TransportError::Timeout => {
-                    ModelProviderError::Timeout { after_ms: self.config.timeout_ms }
+                    ModelProviderError::Timeout { after_ms: self.config.stream_idle_timeout_ms }
                 }
                 // A connection that dropped or failed mid-stream. The
                 // interruption keeps the transport's own text — the one clue to

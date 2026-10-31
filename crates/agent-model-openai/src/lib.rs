@@ -26,8 +26,9 @@ pub use catalog::{
     capabilities_without_provider, fallback_capabilities, parse_model_capabilities,
 };
 pub use config::{
-    ConfigError, DEFAULT_PROVIDER_ID, DEFAULT_RETRIES, DEFAULT_TIMEOUT_MS, ENV_API_KEY,
-    ENV_BASE_URL, ENV_MODEL_NAME, OpenAiCompatConfig,
+    ConfigError, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_FIRST_EVENT_TIMEOUT_MS, DEFAULT_PROVIDER_ID,
+    DEFAULT_RETRIES, DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, ENV_API_KEY, ENV_BASE_URL,
+    ENV_MODEL_NAME, OpenAiCompatConfig,
 };
 pub use provider::OpenAiCompatProvider;
 pub use sse::{SseDecoder, SseFrame};

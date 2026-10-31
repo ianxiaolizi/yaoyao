@@ -13,9 +13,23 @@ pub const ENV_MODEL_NAME: &str = "AGENT_MODEL_NAME";
 /// Environment variable holding the API key.
 pub const ENV_API_KEY: &str = "AGENT_MODEL_API_KEY";
 
-/// Default per-attempt wall clock. It covers the whole attempt, streaming
-/// included, so it is deliberately generous.
-pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// How long establishing a connection may take. A connection that cannot be
+/// made in this window is not going to be made by waiting longer.
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 30_000;
+/// How long the endpoint may take to answer at all — response headers first,
+/// then anything at all — before the attempt is considered dead.
+pub const DEFAULT_FIRST_EVENT_TIMEOUT_MS: u64 = 60_000;
+/// How long a stream that has already started may stay silent before it is
+/// considered dead. Every chunk restarts the window, so a reasoning model that
+/// thinks for minutes but keeps the connection warm is not killed; a stream
+/// that stops talking is.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+/// The old single per-attempt wall clock.
+///
+/// There is no whole-request deadline any more: a long answer is not a hung
+/// endpoint, and the first-event and idle watchdogs are what separate the two.
+/// Kept, equal to the first-event default, for callers that still name it.
+pub const DEFAULT_TIMEOUT_MS: u64 = DEFAULT_FIRST_EVENT_TIMEOUT_MS;
 /// Default provider id, used in attempt events and doctor output.
 pub const DEFAULT_PROVIDER_ID: &str = "openai-compat";
 /// Default number of *extra* attempts after a transient failure. Two means a
@@ -35,8 +49,14 @@ pub struct OpenAiCompatConfig {
     pub model: String,
     /// Where to find the credential — never the credential itself.
     pub api_key: SecretRef,
-    /// Per-attempt wall clock in milliseconds.
-    pub timeout_ms: u64,
+    /// How long establishing a connection may take, in milliseconds.
+    pub connect_timeout_ms: u64,
+    /// How long the endpoint may take to return response headers, in
+    /// milliseconds.
+    pub first_event_timeout_ms: u64,
+    /// How long a started stream may stay silent between chunks, in
+    /// milliseconds.
+    pub stream_idle_timeout_ms: u64,
     /// Extra attempts allowed after a transient failure, on top of the first.
     ///
     /// Only failures that could plausibly answer differently are retried — a
@@ -56,7 +76,9 @@ impl OpenAiCompatConfig {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             api_key: SecretRef { source: "env".to_string(), name: ENV_API_KEY.to_string() },
-            timeout_ms: DEFAULT_TIMEOUT_MS,
+            connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            first_event_timeout_ms: DEFAULT_FIRST_EVENT_TIMEOUT_MS,
+            stream_idle_timeout_ms: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
             retries: DEFAULT_RETRIES,
             default_max_tokens: None,
         }
@@ -84,9 +106,32 @@ impl OpenAiCompatConfig {
         self
     }
 
-    /// Override the per-attempt wall clock.
+    /// Override the legacy single timeout: both the first-event limit and the
+    /// stream idle limit become `timeout_ms`.
+    ///
+    /// Kept so a caller that configured "the timeout" keeps the patience it
+    /// asked for. New code should name the limit it means.
     pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
-        self.timeout_ms = timeout_ms;
+        self.first_event_timeout_ms = timeout_ms;
+        self.stream_idle_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Override how long response headers may take.
+    pub fn with_first_event_timeout_ms(mut self, first_event_timeout_ms: u64) -> Self {
+        self.first_event_timeout_ms = first_event_timeout_ms;
+        self
+    }
+
+    /// Override how long a started stream may stay silent between chunks.
+    pub fn with_stream_idle_timeout_ms(mut self, stream_idle_timeout_ms: u64) -> Self {
+        self.stream_idle_timeout_ms = stream_idle_timeout_ms;
+        self
+    }
+
+    /// Override how long establishing a connection may take.
+    pub fn with_connect_timeout_ms(mut self, connect_timeout_ms: u64) -> Self {
+        self.connect_timeout_ms = connect_timeout_ms;
         self
     }
 

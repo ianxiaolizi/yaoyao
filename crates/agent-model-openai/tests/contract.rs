@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use futures_util::StreamExt;
+
 use agent_model_openai::{
     ChatRequest, OpenAiCompatConfig, OpenAiCompatProvider, SseDecoder, StreamAccumulator,
     Transport, TransportError, TransportRequest, TransportResponse, WireChunk, WireError,
@@ -298,6 +300,78 @@ fn died_silently(cause: &str) -> Vec<Result<Vec<u8>, TransportError>> {
 fn spoke_then_died(cause: &str) -> Vec<Result<Vec<u8>, TransportError>> {
     let body = sse(&[r#"data: {"choices":[{"delta":{"content":"half"},"finish_reason":null}]}"#]);
     vec![Ok(body), Err(TransportError::Io(cause.to_string()))]
+}
+
+/// A transport whose body arrives on a clock.
+///
+/// A real stream is paced by the endpoint, not by the number of chunks; this
+/// double reproduces that with one sleep before each chunk, so a test can tell
+/// "slow but alive" from "stopped talking". It can also stall before returning
+/// headers and hang forever after its scripted chunks, the two ways an endpoint
+/// can be late.
+struct TimedTransport {
+    chunks: Vec<Result<Vec<u8>, TransportError>>,
+    interval_ms: u64,
+    post_delay_ms: u64,
+    hang_after_script: bool,
+}
+
+impl TimedTransport {
+    /// Chunks with `interval_ms` between them, then a clean end of stream.
+    fn pacing(interval_ms: u64, chunks: Vec<Result<Vec<u8>, TransportError>>) -> Self {
+        Self { chunks, interval_ms, post_delay_ms: 0, hang_after_script: false }
+    }
+
+    /// One chunk, then silence: the connection stays open and says nothing.
+    fn silent_after(interval_ms: u64, chunks: Vec<Result<Vec<u8>, TransportError>>) -> Self {
+        Self { chunks, interval_ms, post_delay_ms: 0, hang_after_script: true }
+    }
+
+    /// Headers arrive only after `delay_ms`, with no body ever scripted.
+    fn slow_post(delay_ms: u64) -> Self {
+        Self { chunks: Vec::new(), interval_ms: 0, post_delay_ms: delay_ms, hang_after_script: true }
+    }
+}
+
+#[async_trait::async_trait]
+impl Transport for TimedTransport {
+    async fn post(&self, request: TransportRequest) -> Result<TransportResponse, TransportError> {
+        if self.post_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.post_delay_ms)).await;
+        }
+        let _ = request;
+        let interval_ms = self.interval_ms;
+        let pacing = futures_util::stream::iter(self.chunks.clone()).then(move |chunk| async move {
+            if interval_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+            }
+            chunk
+        });
+        let body: agent_model_openai::ChunkStream = if self.hang_after_script {
+            Box::pin(pacing.chain(futures_util::stream::pending()))
+        } else {
+            Box::pin(pacing)
+        };
+        Ok(TransportResponse { status: 200, body })
+    }
+}
+
+/// A provider over a [`TimedTransport`], with explicit first-event and idle
+/// limits so a test does not have to wait out a production timeout.
+fn provider_with_timeouts(
+    first_event_ms: u64,
+    stream_idle_ms: u64,
+    transport: TimedTransport,
+) -> (OpenAiCompatProvider, Arc<TimedTransport>) {
+    let transport = Arc::new(transport);
+    let provider = OpenAiCompatProvider::new(
+        config()
+            .with_first_event_timeout_ms(first_event_ms)
+            .with_stream_idle_timeout_ms(stream_idle_ms),
+        Arc::new(FixedSecret::new(TEST_KEY)),
+        Arc::clone(&transport) as Arc<dyn Transport>,
+    );
+    (provider, transport)
 }
 
 /// A provider over an [`AttemptsTransport`], with an explicit retry budget.
@@ -997,7 +1071,13 @@ async fn provider_posts_to_the_configured_endpoint_with_a_bearer_token() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url, "https://api.example.com/chat/completions");
     assert_eq!(requests[0].bearer_token, TEST_KEY);
+    // The streaming attempt carries no total deadline; it names the first-event
+    // window it is under and the connect timeout the transport enforces.
     assert_eq!(requests[0].timeout_ms, 5_000);
+    assert_eq!(
+        requests[0].connect_timeout_ms,
+        agent_model_openai::DEFAULT_CONNECT_TIMEOUT_MS
+    );
     let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(sent["messages"][0]["content"], "hi");
 }
@@ -1140,6 +1220,49 @@ async fn provider_keeps_a_mid_stream_failure_distinct_from_a_clean_end() {
 }
 
 #[tokio::test]
+async fn a_continually_streaming_response_is_not_killed_by_the_old_total_timeout() {
+    // Eight events 40 ms apart take 320 ms in all — longer than the idle limit
+    // the provider enforces. A stream that keeps talking must survive however
+    // long it takes; only a silence is a failure.
+    let mut chunks: Vec<Result<Vec<u8>, TransportError>> = (0..7)
+        .map(|_| {
+            Ok(sse(&[r#"data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}"#]))
+        })
+        .collect();
+    chunks.push(Ok(sse(&[
+        r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+    ])));
+    let (provider, _) = provider_with_timeouts(400, 300, TimedTransport::pacing(40, chunks));
+
+    let response = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap();
+    assert_eq!(response.finish_reason, FinishReason::new(FinishReason::STOP));
+}
+
+#[tokio::test]
+async fn a_stream_with_no_event_after_the_idle_limit_times_out() {
+    // The first chunk arrives and then the endpoint stops talking without
+    // closing. The idle limit — not a whole-request deadline — is what catches
+    // it.
+    let first = sse(&[r#"data: {"choices":[{"delta":{"content":"half"},"finish_reason":null}]}"#]);
+    let (provider, _) =
+        provider_with_timeouts(400, 100, TimedTransport::silent_after(0, vec![Ok(first)]));
+
+    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    assert!(matches!(error, ModelProviderError::Timeout { after_ms: 100 }), "{error:?}");
+}
+
+#[tokio::test]
+async fn the_first_event_limit_applies_before_headers_are_returned() {
+    // An endpoint that accepts the connection and then says nothing at all is
+    // caught by the first-event limit, before any body exists.
+    let (provider, _) = provider_with_timeouts(50, 5_000, TimedTransport::slow_post(400));
+
+    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    assert!(matches!(error, ModelProviderError::Timeout { after_ms: 50 }), "{error:?}");
+}
+
+#[tokio::test]
 async fn a_sink_that_stops_accepting_is_a_cancellation_not_an_outage() {
     // The endpoint is reachable and answering; the *consumer* ended the attempt.
     // Reporting that as `Unavailable` would call a stopped listener an
@@ -1179,6 +1302,7 @@ fn a_transport_request_debug_redacts_the_credential() {
         bearer_token: TEST_KEY.to_string(),
         body: b"{}".to_vec(),
         timeout_ms: 1_000,
+        connect_timeout_ms: 500,
     };
     let debug = format!("{request:?}");
     assert!(!debug.contains(TEST_KEY), "a transport request must be safe to log: {debug}");
@@ -1214,7 +1338,19 @@ fn the_endpoint_url_tolerates_a_trailing_slash() {
 fn the_default_config_names_the_credential_instead_of_holding_it() {
     let config = OpenAiCompatConfig::new("https://api.example.com", "m");
     assert_eq!(config.provider_id, agent_model_openai::DEFAULT_PROVIDER_ID);
-    assert_eq!(config.timeout_ms, agent_model_openai::DEFAULT_TIMEOUT_MS);
+    assert_eq!(
+        config.connect_timeout_ms,
+        agent_model_openai::DEFAULT_CONNECT_TIMEOUT_MS
+    );
+    assert_eq!(
+        config.first_event_timeout_ms,
+        agent_model_openai::DEFAULT_FIRST_EVENT_TIMEOUT_MS
+    );
+    assert_eq!(
+        config.stream_idle_timeout_ms,
+        agent_model_openai::DEFAULT_STREAM_IDLE_TIMEOUT_MS
+    );
+    assert_eq!(agent_model_openai::DEFAULT_TIMEOUT_MS, 60_000, "the deprecated alias");
     assert_eq!(config.retries, agent_model_openai::DEFAULT_RETRIES);
     assert_eq!(config.api_key.source, "env");
     assert_eq!(config.api_key.name, agent_model_openai::ENV_API_KEY);
