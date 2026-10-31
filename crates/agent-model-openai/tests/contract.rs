@@ -1102,6 +1102,41 @@ async fn provider_reports_a_vendors_error_message_on_a_non_200() {
 }
 
 #[tokio::test]
+async fn a_413_is_a_context_overflow() {
+    let (provider, _) = provider_over(FakeTransport::status(413, "payload too large"));
+    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    assert!(error.is_context_overflow(), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_context_length_400_is_a_context_overflow() {
+    let body = r#"{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}"#;
+    let (provider, _) = provider_over(FakeTransport::status(400, body));
+    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    assert!(error.is_context_overflow(), "{error:?}");
+}
+
+#[tokio::test]
+async fn an_unrelated_400_remains_an_http_error() {
+    let (provider, _) = provider_over(FakeTransport::status(400, "bad tool schema"));
+    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    assert!(matches!(error, ModelProviderError::Http { status: 400, .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn the_adapter_does_not_repeat_a_context_overflow() {
+    let attempts = AttemptsTransport::new(vec![
+        Outcome::Response(413, vec![Ok(b"context too long".to_vec())]),
+        AttemptsTransport::answered("must not be used"),
+    ]);
+    let (provider, transport) = provider_with_retries(attempts, 3);
+    let error =
+        provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    assert!(error.is_context_overflow(), "{error:?}");
+    assert_eq!(transport.calls(), 1);
+}
+
+#[tokio::test]
 async fn provider_never_settles_a_clean_end_without_an_end_signal() {
     // The connection closed cleanly with neither `[DONE]` nor a `finish_reason`:
     // there is no way to tell a finished answer from a truncated one, so it is

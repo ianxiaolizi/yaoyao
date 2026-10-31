@@ -77,6 +77,12 @@ pub enum ModelProviderError {
     Timeout { after_ms: u64 },
     #[error("model endpoint returned HTTP {status}: {body}")]
     Http { status: u16, body: String },
+    /// The endpoint rejected the request for its context length. This is a
+    /// typed failure rather than a bare 400/413 so the loop can recover by
+    /// compressing the request once — repeating the same body would only be
+    /// rejected again.
+    #[error("model context overflow (HTTP {status}): {body}")]
+    ContextOverflow { status: u16, body: String },
     /// The response did not match the protocol (unparseable body, missing
     /// fields, unknown shape).
     #[error("model protocol error: {0}")]
@@ -109,6 +115,7 @@ impl ModelProviderError {
             Self::Unavailable(_) => "unavailable",
             Self::Timeout { .. } => "timeout",
             Self::Http { .. } => "http",
+            Self::ContextOverflow { .. } => "context_overflow",
             Self::Protocol(_) => "protocol",
             Self::StreamInterrupted { .. } => "stream_interrupted",
             Self::Cancelled => "cancelled",
@@ -118,5 +125,13 @@ impl ModelProviderError {
     /// Whether this error ended the attempt by cancellation rather than failure.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
+    }
+
+    /// Whether the endpoint rejected the request for its context length.
+    ///
+    /// Only this typed error may enter the loop's one-shot overflow recovery;
+    /// a generic HTTP failure must keep its ordinary fatal path.
+    pub fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::ContextOverflow { .. })
     }
 }

@@ -211,10 +211,14 @@ impl OpenAiCompatProvider {
 
         if response.status != 200 {
             let detail = read_bounded(response.body).await;
-            return Err(ModelProviderError::Http {
-                status: response.status,
-                body: wire::describe_error_body(&detail),
-            });
+            let status = response.status;
+            let body = wire::describe_error_body(&detail);
+            // Classify against the raw body: a vendor's `code` field is part of
+            // the rejection signal and `describe_error_body` may drop it.
+            if is_context_overflow(status, &detail) {
+                return Err(ModelProviderError::ContextOverflow { status, body });
+            }
+            return Err(ModelProviderError::Http { status, body });
         }
 
         let mut stream_body = response.body;
@@ -300,6 +304,34 @@ impl OpenAiCompatProvider {
     }
 }
 
+/// Whether a non-200 rejection means the request was too large for the model's
+/// context window.
+///
+/// Beyond the unambiguous `413`, vendors report the same condition as a 400
+/// with one of several messages. The signal list is deliberately literal: a
+/// generic 400 ("bad tool schema", an auth failure) must keep its ordinary
+/// HTTP path rather than trigger a pointless compression.
+fn is_context_overflow(status: u16, body: &str) -> bool {
+    if status == 413 {
+        return true;
+    }
+    if status != 400 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "context window",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "request too large",
+    ]
+    .iter()
+    .any(|signal| body.contains(signal))
+}
+
 /// Whether asking again could plausibly get a different answer.
 ///
 /// Three kinds of failure are permanent for this attempt. One is about the
@@ -321,7 +353,10 @@ fn is_retryable(error: &ModelProviderError) -> bool {
         // the sink there is nothing to retract, so a second attempt would show
         // the consumer the same beginning twice.
         ModelProviderError::StreamInterrupted { received_deltas, .. } => *received_deltas == 0,
+        // Repeating the identical oversized body would be rejected the same
+        // way; only the loop's compression can make the retry smaller.
         ModelProviderError::Timeout { .. }
+        | ModelProviderError::ContextOverflow { .. }
         | ModelProviderError::Protocol(_)
         | ModelProviderError::Cancelled => false,
     }
