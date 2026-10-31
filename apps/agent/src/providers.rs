@@ -20,8 +20,8 @@ use agent_ports::model_provider::{
     MessageRole, ModelCapability, ModelProvider, ModelProviderError, ModelRequest, ModelResponse,
     ModelStreamEvent, ModelStreamSink, ResolvedModelCapabilities,
 };
-use agent_protocol::model::ModelCapabilitySource;
 use agent_ports::model_router::{ModelRoute, ModelTier, TaskClass};
+use agent_protocol::model::ModelCapabilitySource;
 use agent_store_secret::EnvSecretProvider;
 
 /// Environment variable selecting the provider: `echo` (default) or `openai`.

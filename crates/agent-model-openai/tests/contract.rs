@@ -19,8 +19,8 @@ use agent_ports::model_provider::{
     ModelStreamEvent, ModelStreamSink, ModelTier, ReasoningEffort, ResponseFormat, ToolManifest,
     Usage,
 };
-use agent_protocol::model::{ModelCapabilitySource, ModelCapabilities};
 use agent_protocol::ids::{SessionId, StepId, TurnId};
+use agent_protocol::model::{ModelCapabilities, ModelCapabilitySource};
 use agent_protocol::tool::{ToolDefinition, ToolSideEffect, ToolSource};
 use agent_testkit::{FixedSecret, MissingSecret, RecordingSink};
 
@@ -329,7 +329,12 @@ impl TimedTransport {
 
     /// Headers arrive only after `delay_ms`, with no body ever scripted.
     fn slow_post(delay_ms: u64) -> Self {
-        Self { chunks: Vec::new(), interval_ms: 0, post_delay_ms: delay_ms, hang_after_script: true }
+        Self {
+            chunks: Vec::new(),
+            interval_ms: 0,
+            post_delay_ms: delay_ms,
+            hang_after_script: true,
+        }
     }
 }
 
@@ -341,12 +346,13 @@ impl Transport for TimedTransport {
         }
         let _ = request;
         let interval_ms = self.interval_ms;
-        let pacing = futures_util::stream::iter(self.chunks.clone()).then(move |chunk| async move {
-            if interval_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
-            }
-            chunk
-        });
+        let pacing =
+            futures_util::stream::iter(self.chunks.clone()).then(move |chunk| async move {
+                if interval_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                }
+                chunk
+            });
         let body: agent_model_openai::ChunkStream = if self.hang_after_script {
             Box::pin(pacing.chain(futures_util::stream::pending()))
         } else {
@@ -474,9 +480,8 @@ async fn an_unknown_model_with_an_unusable_answer_is_a_labelled_fallback() {
 
 #[tokio::test]
 async fn a_discovered_capability_set_is_asked_for_once() {
-    let (provider, transport) = catalog_provider(
-        r#"{"data":[{"id":"m","context_window":1000,"max_output_tokens":100}]}"#,
-    );
+    let (provider, transport) =
+        catalog_provider(r#"{"data":[{"id":"m","context_window":1000,"max_output_tokens":100}]}"#);
     let first: ModelCapabilities = provider.model_capabilities("m").await.unwrap().capabilities;
     let second = provider.model_capabilities("m").await.unwrap().capabilities;
     assert_eq!(first, second);
@@ -1074,10 +1079,7 @@ async fn provider_posts_to_the_configured_endpoint_with_a_bearer_token() {
     // The streaming attempt carries no total deadline; it names the first-event
     // window it is under and the connect timeout the transport enforces.
     assert_eq!(requests[0].timeout_ms, 5_000);
-    assert_eq!(
-        requests[0].connect_timeout_ms,
-        agent_model_openai::DEFAULT_CONNECT_TIMEOUT_MS
-    );
+    assert_eq!(requests[0].connect_timeout_ms, agent_model_openai::DEFAULT_CONNECT_TIMEOUT_MS);
     let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(sent["messages"][0]["content"], "hi");
 }
@@ -1235,7 +1237,8 @@ async fn a_continually_streaming_response_is_not_killed_by_the_old_total_timeout
     ])));
     let (provider, _) = provider_with_timeouts(400, 300, TimedTransport::pacing(40, chunks));
 
-    let response = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap();
+    let response =
+        provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap();
     assert_eq!(response.finish_reason, FinishReason::new(FinishReason::STOP));
 }
 
@@ -1248,7 +1251,8 @@ async fn a_stream_with_no_event_after_the_idle_limit_times_out() {
     let (provider, _) =
         provider_with_timeouts(400, 100, TimedTransport::silent_after(0, vec![Ok(first)]));
 
-    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    let error =
+        provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
     assert!(matches!(error, ModelProviderError::Timeout { after_ms: 100 }), "{error:?}");
 }
 
@@ -1258,7 +1262,8 @@ async fn the_first_event_limit_applies_before_headers_are_returned() {
     // caught by the first-event limit, before any body exists.
     let (provider, _) = provider_with_timeouts(50, 5_000, TimedTransport::slow_post(400));
 
-    let error = provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
+    let error =
+        provider.stream(&request(vec![user("hi")]), &RecordingSink::new()).await.unwrap_err();
     assert!(matches!(error, ModelProviderError::Timeout { after_ms: 50 }), "{error:?}");
 }
 
@@ -1338,18 +1343,9 @@ fn the_endpoint_url_tolerates_a_trailing_slash() {
 fn the_default_config_names_the_credential_instead_of_holding_it() {
     let config = OpenAiCompatConfig::new("https://api.example.com", "m");
     assert_eq!(config.provider_id, agent_model_openai::DEFAULT_PROVIDER_ID);
-    assert_eq!(
-        config.connect_timeout_ms,
-        agent_model_openai::DEFAULT_CONNECT_TIMEOUT_MS
-    );
-    assert_eq!(
-        config.first_event_timeout_ms,
-        agent_model_openai::DEFAULT_FIRST_EVENT_TIMEOUT_MS
-    );
-    assert_eq!(
-        config.stream_idle_timeout_ms,
-        agent_model_openai::DEFAULT_STREAM_IDLE_TIMEOUT_MS
-    );
+    assert_eq!(config.connect_timeout_ms, agent_model_openai::DEFAULT_CONNECT_TIMEOUT_MS);
+    assert_eq!(config.first_event_timeout_ms, agent_model_openai::DEFAULT_FIRST_EVENT_TIMEOUT_MS);
+    assert_eq!(config.stream_idle_timeout_ms, agent_model_openai::DEFAULT_STREAM_IDLE_TIMEOUT_MS);
     assert_eq!(agent_model_openai::DEFAULT_TIMEOUT_MS, 60_000, "the deprecated alias");
     assert_eq!(config.retries, agent_model_openai::DEFAULT_RETRIES);
     assert_eq!(config.api_key.source, "env");

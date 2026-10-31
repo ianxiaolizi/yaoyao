@@ -54,8 +54,8 @@ use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_protocol::ids::SessionId;
-use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef, Workspace};
 use agent_protocol::model::{ModelCapabilities, ModelRoute, ModelTier, ReasoningEffort};
+use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef, Workspace};
 use agent_protocol::profile::ResolvedProfileSnapshot;
 use agent_protocol::redactor::{HighEntropy, Redactor};
 use agent_store_artifact::FsArtifactStore;
@@ -669,6 +669,11 @@ pub async fn assemble_with_delegation(
     resolved.budget.max_output_tokens = Some(context_budget.completion_cap_tokens);
     resolved.budget.summary_max_output_tokens = Some(summary_cap);
     resolved.budget.reasoning_effort = reasoning_effort;
+    // What the model declared it accepts, frozen beside the depth chosen from
+    // it: output recovery may step down, and a lower depth the model never
+    // offered would be a fabricated request rather than a cheaper one.
+    resolved.budget.supported_reasoning_efforts =
+        main_capabilities.capabilities.reasoning_efforts.clone();
     resolved.budget.budget_sources = budget_sources;
     resolved.model_capabilities = discovered.by_route;
     // The arms: `gates` (the default) keeps the deterministic refusals without

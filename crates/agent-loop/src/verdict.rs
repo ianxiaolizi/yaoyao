@@ -59,12 +59,25 @@ pub(crate) struct Facts {
     pub criterion_observed: bool,
     /// The turn switched posture to repair after a real failure.
     pub repair_after_failure: bool,
+    /// The response that ended the turn spent the whole completion cap on
+    /// reasoning and produced no content, even after the one recovery.
+    ///
+    /// Such a stop is still `MaxOutputTokens`, not an answer. What changes is
+    /// the claim: it says where the budget went, because a reader told only
+    /// "truncated" would go looking for a longer answer when the next lever is
+    /// a larger cap or a shallower depth.
+    pub reasoning_exhausted: bool,
 }
 
 impl Facts {
     /// A halt with nothing else to weigh: the provider ended the response, so
     /// no posture, criterion or repair history can make it an answer.
-    pub(crate) fn halted(halt: Halt, output_limit: Option<u32>, undispatched_calls: u32) -> Self {
+    pub(crate) fn halted(
+        halt: Halt,
+        output_limit: Option<u32>,
+        undispatched_calls: u32,
+        reasoning_exhausted: bool,
+    ) -> Self {
         Self {
             halt: Some(halt),
             output_limit,
@@ -72,6 +85,7 @@ impl Facts {
             unmet_action: false,
             criterion_observed: false,
             repair_after_failure: false,
+            reasoning_exhausted,
         }
     }
 }
@@ -105,11 +119,20 @@ pub(crate) fn answer(text: &str, facts: &Facts) -> Verdict {
                     Some(limit) => format!(" at {limit} completion tokens"),
                     None => String::new(),
                 };
-                Verdict {
-                    claim: format!(
+                let claim = if facts.reasoning_exhausted {
+                    format!(
+                        "reasoning budget exhausted: the provider stopped the response{limit} \
+                         after the model spent the whole cap thinking, and the one recovery \
+                         produced no content either{kept}: {summary}"
+                    )
+                } else {
+                    format!(
                         "truncated: the provider stopped the response{limit} before the turn \
                          finished{kept}: {summary}"
-                    ),
+                    )
+                };
+                Verdict {
+                    claim,
                     rule: "verdict/output-truncated",
                     stop: StopReason::MaxOutputTokens,
                 }
@@ -156,6 +179,7 @@ mod tests {
             unmet_action: false,
             criterion_observed: false,
             repair_after_failure: false,
+            reasoning_exhausted: false,
         }
     }
 
@@ -180,6 +204,21 @@ mod tests {
         assert_eq!(verdict.stop, StopReason::MaxOutputTokens);
         assert!(verdict.claim.contains("2000 completion tokens"), "{}", verdict.claim);
         assert!(verdict.claim.contains("half a sent"), "{}", verdict.claim);
+    }
+
+    #[test]
+    fn a_reasoning_exhausted_truncation_says_where_the_budget_went() {
+        let facts = Facts {
+            halt: Some(Halt::OutputLimit),
+            output_limit: Some(393_216),
+            reasoning_exhausted: true,
+            ..facts()
+        };
+        let verdict = answer("", &facts);
+        assert_eq!(verdict.rule, "verdict/output-truncated");
+        assert_eq!(verdict.stop, StopReason::MaxOutputTokens);
+        assert!(verdict.claim.starts_with("reasoning budget exhausted"), "{}", verdict.claim);
+        assert!(!verdict.claim.starts_with("truncated"), "{}", verdict.claim);
     }
 
     #[test]

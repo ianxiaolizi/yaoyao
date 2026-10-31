@@ -150,6 +150,16 @@ pub struct RunBudget {
     /// How deeply the model should think. `None` means the model's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The depths the route's model declared it accepts, in the order it
+    /// declared them.
+    ///
+    /// Kept with the run because output recovery may have to step one level
+    /// down from `reasoning_effort` when even the largest completion cap is
+    /// spent thinking: a depth the model never offered must not be sent.
+    /// Empty means the model declared none (or the route was never asked), and
+    /// recovery has no lower depth to try.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_reasoning_efforts: Vec<ReasoningEffort>,
     /// The concrete budget derived from the model capabilities.
     ///
     /// Frozen when the route is known; every consumer reads these numbers
@@ -218,6 +228,7 @@ impl Default for RunBudget {
             compact_at_percent: None,
             preset: BudgetPreset::Balanced,
             reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
             context: None,
             compaction_headroom_tokens: None,
             retain_recent_tokens: None,

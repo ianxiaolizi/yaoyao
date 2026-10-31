@@ -3,7 +3,9 @@
 use agent_protocol::profile::ResolvedProfileSnapshot;
 
 /// A profile snapshot that carries only the budget a scheduler test is about.
-pub(crate) fn snapshot_with_budget(budget: agent_protocol::profile::RunBudget) -> ResolvedProfileSnapshot {
+pub(crate) fn snapshot_with_budget(
+    budget: agent_protocol::profile::RunBudget,
+) -> ResolvedProfileSnapshot {
     ResolvedProfileSnapshot {
         profile_id: "coding".to_string(),
         config_hash: String::new(),

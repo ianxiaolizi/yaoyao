@@ -206,9 +206,7 @@ impl OpenAiCompatProvider {
             }),
         )
         .await
-        .map_err(|_| ModelProviderError::Timeout {
-            after_ms: self.config.first_event_timeout_ms,
-        })?
+        .map_err(|_| ModelProviderError::Timeout { after_ms: self.config.first_event_timeout_ms })?
         .map_err(|e| map_transport_error(e, self.config.first_event_timeout_ms))?;
 
         if response.status != 200 {

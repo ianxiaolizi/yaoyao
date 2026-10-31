@@ -8,7 +8,7 @@
 //! zero as a budget.
 
 use agent_protocol::model::{
-    ModelCapabilitySource, ModelCapabilities, ReasoningEffort, ResolvedModelCapabilities,
+    ModelCapabilities, ModelCapabilitySource, ReasoningEffort, ResolvedModelCapabilities,
 };
 use serde::Deserialize;
 
@@ -93,9 +93,10 @@ impl WireModelsResponse {
 /// ceiling. The caller then moves to the bundled catalog rather than to zero.
 pub fn parse_model_capabilities(body: &str, model: &str) -> Option<ModelCapabilities> {
     let response: WireModelsResponse = serde_json::from_str(body).ok()?;
-    let entry = response.entries().into_iter().find(|entry| {
-        entry.id.as_deref().is_some_and(|id| id == model)
-    })?;
+    let entry = response
+        .entries()
+        .into_iter()
+        .find(|entry| entry.id.as_deref().is_some_and(|id| id == model))?;
     let context_window_tokens = entry.context_window.or(entry.max_context_window)?;
     let max_output_tokens = entry.max_output_tokens?;
     if context_window_tokens == 0 || max_output_tokens == 0 {
@@ -113,10 +114,7 @@ pub fn parse_model_capabilities(body: &str, model: &str) -> Option<ModelCapabili
         // window is the tighter truth.
         max_output_tokens: max_output_tokens.min(context_window_tokens),
         reasoning_efforts,
-        default_reasoning_effort: entry
-            .default_reasoning_effort
-            .as_deref()
-            .and_then(parse_effort),
+        default_reasoning_effort: entry.default_reasoning_effort.as_deref().and_then(parse_effort),
     })
 }
 
@@ -151,10 +149,7 @@ mod tests {
     fn an_envelope_and_a_bare_list_parse_the_same() {
         let envelope = r#"{"data":[{"id":"m","context_window":1000,"max_output_tokens":100}]}"#;
         let bare = r#"[{"id":"m","context_window":1000,"max_output_tokens":100}]"#;
-        assert_eq!(
-            parse_model_capabilities(envelope, "m"),
-            parse_model_capabilities(bare, "m")
-        );
+        assert_eq!(parse_model_capabilities(envelope, "m"), parse_model_capabilities(bare, "m"));
     }
 
     #[test]

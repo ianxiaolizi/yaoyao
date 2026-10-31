@@ -142,8 +142,15 @@ impl Transport for ScriptedTransport {
         let Some(body) = self.models.clone() else {
             return Err(TransportError::Connect("this endpoint serves no catalog".to_string()));
         };
-        assert!(request.url.ends_with("/models"), "discovery asks for the model list: {}", request.url);
-        Ok(TransportResponse { status: 200, body: Box::pin(futures_util::stream::iter(vec![Ok(body.into_bytes())])) })
+        assert!(
+            request.url.ends_with("/models"),
+            "discovery asks for the model list: {}",
+            request.url
+        );
+        Ok(TransportResponse {
+            status: 200,
+            body: Box::pin(futures_util::stream::iter(vec![Ok(body.into_bytes())])),
+        })
     }
 }
 
@@ -1285,10 +1292,7 @@ async fn assembly_freezes_discovered_capabilities_and_budget_sources() {
 
     // The model declared its default depth, so the run records that rather
     // than a made-up one.
-    assert_eq!(
-        profile.budget.reasoning_effort,
-        Some(agent_protocol::model::ReasoningEffort::High)
-    );
+    assert_eq!(profile.budget.reasoning_effort, Some(agent_protocol::model::ReasoningEffort::High));
 }
 
 /// An endpoint that serves no catalog still assembles: the budget is derived

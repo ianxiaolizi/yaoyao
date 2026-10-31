@@ -101,10 +101,11 @@ pub fn resolve_context_budget(
     // one is a claim the model cannot honor, so it is refused rather than
     // trusted.
     let (window, window_source) = match policy.context_window_tokens {
-        Some(window) if window == 0 => {
+        Some(0) => {
             return Err(invalid_budget(
                 "context_window_tokens",
-                "`context_window_tokens` is zero; omit it to use the model's own window".to_string(),
+                "`context_window_tokens` is zero; omit it to use the model's own window"
+                    .to_string(),
             ));
         }
         Some(window) if window > physical => {
@@ -258,12 +259,8 @@ pub fn resolve_context_budget(
     };
 
     // R: how much recent history compaction keeps whole.
-    let auto_retained = ratio(
-        window.saturating_sub(completion),
-        RETAIN_WINDOW_PERCENT,
-        100,
-    )
-    .min(input / 2);
+    let auto_retained =
+        ratio(window.saturating_sub(completion), RETAIN_WINDOW_PERCENT, 100).min(input / 2);
     let (retained, retained_source) = match policy.retain_recent_tokens {
         Some(retained) => {
             if retained >= trigger {
@@ -313,10 +310,7 @@ fn ratio(value: u32, numerator: u64, denominator: u64) -> u32 {
 }
 
 fn invalid_budget(field: &str, detail: String) -> ConfigError {
-    ConfigError::InvalidBudget {
-        layer: format!("budget.{field}"),
-        detail,
-    }
+    ConfigError::InvalidBudget { layer: format!("budget.{field}"), detail }
 }
 
 #[cfg(test)]
@@ -375,7 +369,8 @@ mod tests {
     #[test]
     fn an_explicit_cap_larger_than_the_model_allows_is_refused() {
         let caps = deepseek_flash_caps();
-        let policy = BudgetPolicy { completion_cap_tokens: Some(400_000), ..BudgetPolicy::balanced() };
+        let policy =
+            BudgetPolicy { completion_cap_tokens: Some(400_000), ..BudgetPolicy::balanced() };
         let error = resolve_context_budget(&caps, &policy).unwrap_err().to_string();
         assert!(error.contains("completion_cap_tokens"));
     }

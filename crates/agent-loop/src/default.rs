@@ -42,7 +42,7 @@ use agent_ports::tool_provider::{ToolInvocation, ToolResult, ToolStatus};
 use agent_protocol::digest;
 use agent_protocol::events::{Actor, EventDraft, EventType, LiveEvent};
 use agent_protocol::failures::Failures;
-use agent_protocol::ids::{AttemptId, EventId, EventSeq, SchemaVersion, SessionId, StepId};
+use agent_protocol::ids::{AttemptId, EventSeq, SessionId, StepId};
 use agent_protocol::judgment::{self, Judgment, JudgmentStage};
 use agent_protocol::ledger::Ledger;
 use agent_protocol::model::{ToolCall, estimate_message};
@@ -50,8 +50,8 @@ use agent_protocol::permissions::ArtifactRef;
 use agent_protocol::plan::{self, Plan, PlanItemStatus};
 use agent_protocol::profile::{RunBudget, Spent};
 use agent_protocol::reason::{
-    self as reason_record, Basis, Mode, ReasonKind, ReasonNode, ReasonSource, Recorder, Situation,
-    SpeechAct, Stance,
+    self as reason_record, Basis, Mode, ReasonKind, ReasonSource, Recorder, Situation, SpeechAct,
+    Stance,
 };
 use agent_protocol::redactor::Redactor;
 use agent_protocol::state::{self, WorkState};
@@ -70,11 +70,14 @@ use crate::context_layers::{
     capability_text, context_notice, identity_text, repair_note, stale_read, state_text, task_text,
     tool_source, truncate, user_text,
 };
+use event_drafts::{draft, draft_turn, reason_event};
 use loop_call::{LoopCallAnswer, answer_loop_call};
 
 mod budget;
 mod completion;
+mod event_drafts;
 mod loop_call;
+mod output_recovery;
 mod settle;
 mod settlement;
 mod stall;
@@ -1669,7 +1672,7 @@ impl AgentLoop for DefaultAgentLoop {
             let estimated_tool_tokens = budget::estimated_tool_tokens(&request.tool_manifest);
             let estimated_request_tokens = estimated_messages_tokens + estimated_tool_tokens;
 
-            let attempt_id = AttemptId::new();
+            let mut attempt_id = AttemptId::new();
             let mut prepared = serde_json::json!({
                 "attempt_id": attempt_id,
                 "context_revision": request.context_revision,
@@ -1765,7 +1768,9 @@ impl AgentLoop for DefaultAgentLoop {
                 ctx,
                 &step_id,
                 EventType::MODEL_REQUEST_PREPARED,
-                prepared,
+                // Kept so an output recovery can record the retry as its own
+                // prepared request with the same derivation, one field added.
+                prepared.clone(),
                 Actor::Agent,
             ));
 
@@ -1815,9 +1820,46 @@ impl AgentLoop for DefaultAgentLoop {
 
             let sink = self.sink(ctx);
             let redactor = &self.redactor;
+            // Whether the step ended on a response that spent the whole cap
+            // thinking. The verdict says so once, instead of calling a request
+            // that produced no content a truncated answer.
+            let reasoning_exhausted;
             let (response, response_event_id) =
                 match self.model.stream(&request, sink.as_ref()).await {
-                    Ok(response) => {
+                    Ok(first) => {
+                        // A reasoning model can spend the whole completion on
+                        // tokens that never become content (2026-10-31: 8,000
+                        // of 8,000 output tokens reasoning, `finish_reason:
+                        // length`, no text). The cap, not the model, ended the
+                        // answer, so the step re-asks once with more room — or,
+                        // at the model's own ceiling, less depth. `output_recovery`
+                        // owns that ask, including why it happens at most once.
+                        let response = match self
+                            .recover_output(
+                                ctx,
+                                &step_id,
+                                turn,
+                                &request,
+                                &prepared,
+                                &mut attempt_id,
+                                first,
+                                estimated_request_tokens,
+                                &mut events,
+                            )
+                            .await?
+                        {
+                            output_recovery::RecoveryOutcome::Settled(response) => response,
+                            output_recovery::RecoveryOutcome::Failed(stop) => {
+                                return Ok(StepOutcome {
+                                    step_id,
+                                    events,
+                                    stop: Some(stop),
+                                    final_content: None,
+                                    spent: turn.spent,
+                                });
+                            }
+                        };
+                        reasoning_exhausted = output_recovery::is_reasoning_only(&response);
                         // The durable copy is scrubbed: a proposal's arguments are
                         // the model's, and a secret copied into them must not sit in
                         // a long-lived log (§7 row 4). `response` keeps its raw
@@ -2161,6 +2203,7 @@ impl AgentLoop for DefaultAgentLoop {
                         criterion_observed: turn.criterion_observed,
                         repair_after_failure: turn.stance_switched
                             && turn.mode.stance == Stance::Repair,
+                        reasoning_exhausted,
                     },
                 );
                 let verdict = turn.reason.node(
@@ -2198,7 +2241,12 @@ impl AgentLoop for DefaultAgentLoop {
                 let calls = tool_calls.len() as u32;
                 let read = verdict::answer(
                     &text,
-                    &verdict::Facts::halted(halt, turn.budget.max_output_tokens, calls),
+                    &verdict::Facts::halted(
+                        halt,
+                        turn.budget.max_output_tokens,
+                        calls,
+                        reasoning_exhausted,
+                    ),
                 );
                 let verdict = turn.reason.node(
                     ReasonKind::Verdict,
@@ -3241,70 +3289,6 @@ fn gate_text(failure: &PendingFailure, hint: String) -> String {
     )
 }
 
-fn draft(
-    ctx: &TurnContext,
-    step_id: &StepId,
-    event_type: &str,
-    payload: serde_json::Value,
-    actor: Actor,
-) -> EventDraft {
-    draft_scoped(ctx, Some(step_id), event_type, payload, actor)
-}
-
-/// A turn-level event: it belongs to the turn and to no step.
-///
-/// Which step was running is a fact worth recording for a step's own events and
-/// a lie for a turn's, so the route decision — taken before any step exists —
-/// carries no `step_id` rather than borrowing the first one's.
-fn draft_turn(
-    ctx: &TurnContext,
-    event_type: &str,
-    payload: serde_json::Value,
-    actor: Actor,
-) -> EventDraft {
-    draft_scoped(ctx, None, event_type, payload, actor)
-}
-
-fn draft_scoped(
-    ctx: &TurnContext,
-    step_id: Option<&StepId>,
-    event_type: &str,
-    payload: serde_json::Value,
-    actor: Actor,
-) -> EventDraft {
-    EventDraft {
-        event_id: EventId::new(),
-        event_type: EventType::new(event_type),
-        schema_version: SchemaVersion::current(),
-        session_id: ctx.session_id.clone(),
-        run_id: Some(ctx.run_id.clone()),
-        turn_id: Some(ctx.turn_id.clone()),
-        step_id: step_id.cloned(),
-        actor,
-        created_at: Utc::now(),
-        causation_id: None,
-        correlation_id: None,
-        payload,
-        metadata: serde_json::json!({}),
-        ignorable: false,
-    }
-}
-
-/// One node of the turn's reasoning chain.
-///
-/// Turn-level nodes carry no `step_id`; a step's nodes carry the step they were
-/// decided in. The actor is the agent in both cases: the node was written by
-/// this loop, whatever the source it records.
-fn reason_event(ctx: &TurnContext, step_id: Option<&StepId>, node: &ReasonNode) -> EventDraft {
-    draft_scoped(
-        ctx,
-        step_id,
-        EventType::REASON_RECORDED,
-        serde_json::json!({ "node": node }),
-        Actor::Agent,
-    )
-}
-
 /// The tool arguments as one bounded line for a node's claim.
 ///
 /// The arguments are the redacted ones: the chain is durable, and a secret the
@@ -3348,6 +3332,7 @@ fn sandbox_word(mode: SandboxMode) -> &'static str {
 mod tests {
     use super::*;
     use crate::context_layers::{MAX_CAPABILITY_GIST_CHARS, MAX_TASK_CHARS, gist};
+    use agent_protocol::reason::ReasonNode;
 
     /// The tests about what a turn may spend, and what it is told when it nears
     /// that: token budget, step budget, and the window reminder.
