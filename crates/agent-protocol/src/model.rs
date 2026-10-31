@@ -659,6 +659,146 @@ pub struct ModelBudget {
     pub max_tokens: Option<u32>,
     pub max_cost_usd: Option<f64>,
     pub wall_clock_ms: Option<u64>,
+    /// How deeply the model should think before answering.
+    ///
+    /// Two independent controls, not one: effort says how deep the reasoning
+    /// should go, `max_tokens` only bounds how long the whole completion may
+    /// be. A provider that does not declare reasoning support gets no field at
+    /// all rather than a fabricated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// How deeply a reasoning model should think before it answers.
+///
+/// Ordered from shallow to deep so a recovery path can step one level down
+/// (`max -> high -> low`) when the output cap itself is the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The wire string, matching the serde representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What one model can do, as the provider or the bundled catalog declares it.
+///
+/// A provider-neutral shape: an adapter resolves its vendor payload into this
+/// and the resolver derives budgets from it, so the kernel never reads a
+/// vendor's field names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    /// The physical context window, in tokens.
+    pub context_window_tokens: u32,
+    /// The most completion tokens one request may ask for.
+    pub max_output_tokens: u32,
+    /// The reasoning depths the model accepts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+    /// The depth to use when the profile does not choose one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Model capabilities together with where they came from.
+///
+/// The source is part of the value because a fallback that reads like provider
+/// fact is indistinguishable from a real answer in a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModelCapabilities {
+    pub capabilities: ModelCapabilities,
+    pub source: ModelCapabilitySource,
+}
+
+/// Where a model's capabilities were learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapabilitySource {
+    /// Asked the endpoint (`GET /models`) and parsed its answer.
+    Provider,
+    /// The build's own catalog of known models.
+    Bundled,
+    /// Neither answered; a conservative guess that must not be read as fact.
+    Fallback,
+}
+
+impl ModelCapabilitySource {
+    /// The stable label recorded in audit payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Bundled => "bundled",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// How much of the model's window a run chooses to spend on input.
+///
+/// A cost and latency policy, not a capability: the window says what fits, the
+/// preset says what is worth paying for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetPreset {
+    /// An eighth of the window.
+    Frugal,
+    /// A quarter of the window — the default.
+    #[default]
+    Balanced,
+    /// Half the window.
+    Deep,
+    /// Three quarters of the window.
+    Max,
+}
+
+impl BudgetPreset {
+    /// The preset's share of the context window, in eighths.
+    ///
+    /// Integer arithmetic on purpose: the same preset must derive the same
+    /// numbers on every platform, and a float would make `0.25 * W` depend on
+    /// rounding.
+    pub fn window_eighths(self) -> u32 {
+        match self {
+            Self::Frugal => 1,
+            Self::Balanced => 2,
+            Self::Deep => 4,
+            Self::Max => 6,
+        }
+    }
+
+    /// The share as a percentage of the window, for display and audit.
+    pub fn percent(self) -> u32 {
+        self.window_eighths() * 100 / 8
+    }
+
+    /// The stable label recorded in audit payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frugal => "frugal",
+            Self::Balanced => "balanced",
+            Self::Deep => "deep",
+            Self::Max => "max",
+        }
+    }
 }
 
 /// Token accounting. Inner fields are optional because providers may report a
@@ -1020,6 +1160,33 @@ mod tests {
         let reworded = ToolManifest::from_definitions(&[reworded]);
         assert_eq!(base.entries[0].schema_hash, reworded.entries[0].schema_hash);
         assert_ne!(base.entries[0].registration_version, reworded.entries[0].registration_version);
+    }
+
+    #[test]
+    fn model_capabilities_round_trip_through_json() {
+        let caps = ModelCapabilities {
+            context_window_tokens: 1_048_576,
+            max_output_tokens: 393_216,
+            reasoning_efforts: vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ],
+            default_reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let encoded = serde_json::to_string(&caps).unwrap();
+        assert_eq!(serde_json::from_str::<ModelCapabilities>(&encoded).unwrap(), caps);
+    }
+
+    #[test]
+    fn a_model_budget_carries_reasoning_effort_without_changing_max_tokens() {
+        let budget = ModelBudget {
+            max_tokens: Some(262_144),
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..ModelBudget::default()
+        };
+        assert_eq!(budget.max_tokens, Some(262_144));
+        assert_eq!(budget.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]

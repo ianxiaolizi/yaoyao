@@ -191,6 +191,29 @@ impl Default for RunBudget {
     }
 }
 
+/// The context budget one run derived from its model's capabilities.
+///
+/// Concrete numbers, computed once after the route is known and frozen for the
+/// run: `max_input_tokens - reserved_output_tokens` and a percentage threshold
+/// made every consumer re-derive the same policy differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResolvedContextBudget {
+    /// The model's physical window, in tokens.
+    pub context_window_tokens: u32,
+    /// The most estimated input tokens one request may carry.
+    pub input_working_set_tokens: u32,
+    /// The completion cap sent to the provider; it includes reasoning tokens.
+    pub completion_cap_tokens: u32,
+    /// The most the completion cap may grow to during output recovery.
+    pub completion_cap_ceiling_tokens: u32,
+    /// Room kept free for compaction handover text.
+    pub compaction_headroom_tokens: u32,
+    /// The full-request estimate at which compaction is triggered.
+    pub compaction_trigger_tokens: u32,
+    /// How many recent tokens compaction keeps whole.
+    pub retain_recent_tokens: u32,
+}
+
 /// The operator's criterion for "this task is finished".
 ///
 /// A run whose profile names one does not have to wait for the model to
