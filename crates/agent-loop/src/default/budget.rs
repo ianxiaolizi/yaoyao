@@ -7,7 +7,7 @@
 //! the caller, whose step boundary ends the run (`default.rs`'s module doc).
 
 use agent_protocol::ids::TurnId;
-use agent_protocol::model::estimate_block;
+use agent_protocol::model::{estimate_block, estimate_message, estimate_text};
 
 use crate::context_layers::BudgetNotice;
 
@@ -51,6 +51,45 @@ impl LoopTurn {
         let threshold = self.budget.finalize_at_percent.unwrap_or(85);
         if self.budget_used_percent() >= threshold { "finalize" } else { "normal" }
     }
+}
+
+/// What this request will cost the window, on the same estimator the context
+/// engine uses.
+///
+/// It covers the whole request rather than the settled derivation: the stable
+/// head, every layer, this turn's input, any in-flight tool traffic, and the
+/// tool definitions sent beside the messages. That is the number settlement is
+/// triggered on — the settled history alone was measured at 240 tokens while
+/// the real request carried 69,575 (2026-10-31).
+pub(super) fn estimated_request_tokens(
+    messages: &[ModelMessage],
+    manifest: &ToolManifest,
+) -> usize {
+    let messages: usize = messages.iter().map(estimate_message).sum();
+    messages + estimated_tool_tokens(manifest)
+}
+
+/// What the tool definitions beside a request cost, on the same estimator.
+///
+/// The wire shape, not the manifest entry: `registration_version`, `source`,
+/// and `schema_hash` never reach the provider, and counting them inflated this
+/// estimate by roughly 12% (2026-10-19).
+pub(super) fn estimated_tool_tokens(manifest: &ToolManifest) -> usize {
+    manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let wire = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": entry.tool_id,
+                    "description": entry.description.trim(),
+                    "parameters": entry.input_schema,
+                },
+            });
+            estimate_text(&wire.to_string())
+        })
+        .sum()
 }
 
 /// What a response with no reported usage plausibly cost in output tokens.

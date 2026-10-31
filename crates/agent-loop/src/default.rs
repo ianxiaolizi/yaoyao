@@ -45,7 +45,7 @@ use agent_protocol::failures::Failures;
 use agent_protocol::ids::{AttemptId, EventId, EventSeq, SchemaVersion, SessionId, StepId};
 use agent_protocol::judgment::{self, Judgment, JudgmentStage};
 use agent_protocol::ledger::Ledger;
-use agent_protocol::model::{ToolCall, estimate_message, estimate_text};
+use agent_protocol::model::{ToolCall, estimate_message};
 use agent_protocol::permissions::ArtifactRef;
 use agent_protocol::plan::{self, Plan, PlanItemStatus};
 use agent_protocol::profile::{RunBudget, Spent};
@@ -71,6 +71,7 @@ use crate::context_layers::{
 };
 
 mod budget;
+mod settle;
 
 /// Longest provider error text persisted in a durable attempt event.
 const MAX_ERROR_CHARS: usize = 500;
@@ -109,15 +110,6 @@ const COMPACTION_PROMPT: &str = "You maintain the running handover summary of a 
 /// the handover it was supposed to preserve was lost. A final user turn is what
 /// makes the request an instruction rather than a continuation.
 const COMPACTION_INSTRUCTION: &str = "Write the handover summary of the conversation above now. The tool calls and their results are already recorded in the ledger, and the user's own messages are kept verbatim in a separate record, so do not repeat either. Keep the goal and current state, decisions, the user's requirements and constraints verbatim, what failed in a sentence, and what remains. Do not continue the conversation and do not call tools. Reply with the summary text only.";
-
-/// How far this turn's own traffic may grow before the loop compacts it once.
-///
-/// The engine only ever sees settled history, so a turn that outgrows the
-/// window through its own tool results has no protection from it. Twice the
-/// usable budget is the point where the next request is already larger than
-/// the configured window and the trimmer (which also only sees the settled
-/// derivation) cannot help.
-const IN_FLIGHT_CEILING_MULTIPLIER: usize = 2;
 
 /// How many mid-turn compactions one turn may attempt.
 ///
@@ -201,59 +193,6 @@ impl FailuresRef {
             "elided": self.elided,
         })
     }
-}
-
-/// This turn's own step traffic, proposed for one of its mid-turn compactions.
-///
-/// The range starts after this turn's input and covers every assistant/tool
-/// message since; user text (the input, any steering note) is never proposed
-/// and stays verbatim. `None` means the turn is under the ceiling, there is
-/// nothing older than the newest group to summarize, or no window is
-/// configured — in which case the turn keeps the behavior it had before
-/// in-flight compaction existed.
-fn in_flight_candidate(turn: &LoopTurn) -> Option<CompactionCandidate> {
-    let max_input = turn.context_usage.max_input_tokens?;
-    let budget =
-        max_input.saturating_sub(turn.context_usage.reserved_output_tokens.unwrap_or(0)) as usize;
-    if budget == 0 {
-        return None;
-    }
-    let input_uid = format!("msg/user/{}", turn.ctx.turn_id);
-    let input =
-        turn.messages.iter().position(|message| message.message_uid.as_str() == input_uid)?;
-    let traffic = &turn.messages[input + 1..];
-    let traffic_tokens: usize = traffic.iter().map(estimate_message).sum();
-    if traffic_tokens < budget.saturating_mul(IN_FLIGHT_CEILING_MULTIPLIER) {
-        return None;
-    }
-
-    let groups = agent_protocol::compaction::groups(traffic);
-    let keep_target =
-        budget.saturating_mul(agent_protocol::compaction::COMPACTION_KEEP_PERCENT as usize) / 100;
-    let (keep_from, retained) =
-        agent_protocol::compaction::keep_from(traffic, &groups, 0, keep_target)?;
-
-    let candidate: Vec<ModelMessage> = groups[..keep_from]
-        .iter()
-        .filter(|group| {
-            group.keep
-                && !traffic[group.start..=group.end]
-                    .iter()
-                    .any(|message| message.role == MessageRole::User)
-        })
-        .flat_map(|group| traffic[group.start..=group.end].iter().cloned())
-        .collect();
-    if candidate.is_empty() {
-        return None;
-    }
-    Some(CompactionCandidate {
-        estimated_tokens: candidate.iter().map(estimate_message).sum(),
-        messages: candidate,
-        retained_tokens: retained,
-        budget_tokens: budget,
-        observed_input_tokens: None,
-        scope: CompactionScope::InFlight,
-    })
 }
 
 /// The default turn-advancement strategy.
@@ -1263,7 +1202,15 @@ impl AgentLoop for DefaultAgentLoop {
         // volatile like the layers above, so it goes with them, immediately
         // before this turn's input. It is not history — the projection never
         // folds it — and the prepared request records it.
-        let context_notice = context_notice(&context_usage);
+        //
+        // The share it reports is measured over the whole request this step
+        // will send — layers, this turn's input, and the tool definitions
+        // beside them — because the settled derivation alone once read 240
+        // tokens while the real request carried 69,575 (2026-10-31).
+        let turn_input = ModelMessage::user_for_turn(&ctx.turn_id, user_text(&ctx.user_input));
+        let request_tokens =
+            budget::estimated_request_tokens(&messages, &manifest) + estimate_message(&turn_input);
+        let context_notice = context_notice(&context_usage, request_tokens);
         if let Some(notice) = &context_notice {
             messages.push(ModelMessage::context_notice_for_turn(&ctx.turn_id, notice.text.clone()));
         }
@@ -1272,7 +1219,7 @@ impl AgentLoop for DefaultAgentLoop {
         // of the `inbox/appended` event it is holding — but this turn's
         // `turn/started` does not exist yet, so the loop is the one that places
         // it.
-        messages.push(ModelMessage::user_for_turn(&ctx.turn_id, user_text(&ctx.user_input)));
+        messages.push(turn_input);
 
         let capabilities = required_capabilities(&manifest);
 
@@ -1527,20 +1474,26 @@ impl AgentLoop for DefaultAgentLoop {
             }
 
             // The turn's own traffic has no other protection: the engine
-            // compacts settled history only, and the trimmer does too. Once a
-            // turn has carried more than the ceiling in its own steps, compact
+            // compacts settled history only, and the trimmer does too. Once
+            // this step's request — the whole thing, tool definitions
+            // included — would spend the settle share of the window, compact
             // it — at most `MAX_IN_FLIGHT_COMPACTIONS` times, and a later
             // attempt only once the newest group has changed. The first
-            // attempt cannot summarize the group that crossed the ceiling; it
+            // attempt cannot summarize the group that crossed the share; it
             // is the newest one and is always kept. The second attempt, after
             // the model has acted on it, is what turns that group into a
             // summary. A failed attempt counts: retrying the same messages
             // every step would spend a summary request per step without
             // changing anything.
+            //
+            // Measured before compaction so that a turn that is already
+            // compacting does not also fire on the smaller request it just
+            // produced.
+            let estimated_before = budget::estimated_request_tokens(&turn.messages, &turn.manifest);
             let newest = turn.messages.last().map(|message| message.message_uid.to_string());
             if turn.in_flight_compactions < MAX_IN_FLIGHT_COMPACTIONS
                 && newest.as_deref() != turn.in_flight_newest.as_deref()
-                && let Some(candidate) = in_flight_candidate(turn)
+                && let Some(candidate) = settle::in_flight_candidate(turn, estimated_before)
             {
                 turn.in_flight_compactions += 1;
                 turn.in_flight_newest = newest;
@@ -1583,33 +1536,13 @@ impl AgentLoop for DefaultAgentLoop {
             let messages_hash = digest::json(&serde_json::Value::Array(message_refs.clone()));
 
             // What this request costs, on the same estimate the context engine
-            // uses. `estimated_context_tokens` above describes only the
-            // settled derivation; these cover the whole request: the stable
-            // head, every layer, this turn's input, any in-flight tool traffic,
-            // and the tool definitions sent beside the messages. The provider's
-            // own count is recorded with the response, so the two can be
-            // compared without re-deriving anything.
+            // uses. `estimated_context_tokens` above describes only the settled
+            // derivation; this covers the whole request. The provider's own
+            // count is recorded with the response, so the two can be compared
+            // without re-deriving anything.
             let estimated_messages_tokens: usize =
                 request.messages.iter().map(estimate_message).sum();
-            // The wire shape, not the manifest entry: `registration_version`,
-            // `source`, and `schema_hash` never reach the provider, and counting
-            // them inflated this estimate by roughly 12% (2026-10-19).
-            let estimated_tool_tokens: usize = request
-                .tool_manifest
-                .entries
-                .iter()
-                .map(|entry| {
-                    let wire = serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": entry.tool_id,
-                            "description": entry.description.trim(),
-                            "parameters": entry.input_schema,
-                        },
-                    });
-                    estimate_text(&wire.to_string())
-                })
-                .sum();
+            let estimated_tool_tokens = budget::estimated_tool_tokens(&request.tool_manifest);
             let estimated_request_tokens = estimated_messages_tokens + estimated_tool_tokens;
 
             let attempt_id = AttemptId::new();
@@ -5176,7 +5109,11 @@ mod tests {
             FakeContextEngine::new(vec![history], EventSeq::new(7)).with_usage(ContextUsage {
                 dropped_messages: 4,
                 estimated_tokens: 120,
-                max_input_tokens: Some(500),
+                // Wide enough that the request itself stays under the
+                // near-limit share: this test is about trimming, and the
+                // built-in tool definitions alone are a few hundred tokens
+                // that a 500-token window would report as near-limit too.
+                max_input_tokens: Some(2_000),
                 reserved_output_tokens: Some(100),
             }),
         );
@@ -5193,7 +5130,7 @@ mod tests {
         assert_eq!(payload["context_message_count"], 1);
         assert_eq!(payload["dropped_message_count"], 4);
         assert_eq!(payload["estimated_context_tokens"], 120);
-        assert_eq!(payload["max_input_tokens"], 500);
+        assert_eq!(payload["max_input_tokens"], 2_000);
         assert_eq!(payload["reserved_output_tokens"], 100);
         assert_eq!(
             payload["message_count"], 3,
@@ -6111,9 +6048,13 @@ mod tests {
     /// in place: the input stays, older steps become one summary.
     #[tokio::test]
     async fn in_flight_traffic_is_compacted_once_mid_turn() {
-        // Two 6,000-character tool results are about 1,560 estimated tokens
-        // each against a 500-token window: the ceiling is 1,000, so the
-        // second result crosses it and the first is proposed.
+        // Two 6,000-character tool results are about 1,500 estimated tokens
+        // each against a 3,000-token window: settlement is triggered at 70% of
+        // it (2,100), which the second result crosses, and the first is
+        // proposed. The window is stated above the ~1,300 tokens the builtin
+        // tool definitions already add to every request, so this test is about
+        // the turn's traffic rather than about the manifest: a smaller window
+        // would also put a near-limit notice in front of the input.
         let big = "x".repeat(6_000);
         let tools =
             Arc::new(
@@ -6126,7 +6067,7 @@ mod tests {
             ContextUsage {
                 dropped_messages: 0,
                 estimated_tokens: 0,
-                max_input_tokens: Some(500),
+                max_input_tokens: Some(3_000),
                 reserved_output_tokens: Some(0),
             },
         ));
@@ -6220,12 +6161,14 @@ mod tests {
             ContextUsage {
                 dropped_messages: 0,
                 estimated_tokens: 0,
-                max_input_tokens: Some(500),
+                max_input_tokens: Some(3_000),
                 reserved_output_tokens: Some(0),
             },
         ));
-        // Four tool steps, each adding a result far past the 500-token
-        // window. The queue interleaves the two summary requests: step 3
+        // Four tool steps, each adding a result far past the 70% settle share
+        // of the 3,000-token window (as in the single-attempt test above, the
+        // window is stated above the tool definitions' own cost). The queue
+        // interleaves the two summary requests: step 3
         // compacts the first result, step 4 the second, and step 5 has
         // eligible older groups but no attempt left.
         let model = Arc::new(FakeModelProvider::new(vec![

@@ -187,6 +187,49 @@ async fn the_budget_reminder_is_one_tail_message_that_turns_final() {
     );
 }
 
+/// A context whose derivation reports `settled` tokens against a `window` of
+/// input budget, with `history` as its one settled message when it is stated.
+fn notice_context(
+    history: Option<&'static str>,
+    settled: usize,
+    window: u32,
+) -> Arc<dyn ContextEngine> {
+    let history: Vec<ModelMessage> = history
+        .map(|text| ModelMessage::user_for_turn(&agent_protocol::ids::TurnId::new(), text))
+        .into_iter()
+        .collect();
+    Arc::new(FakeContextEngine::new(history, EventSeq::new(3)).with_usage(ContextUsage {
+        dropped_messages: 0,
+        estimated_tokens: settled,
+        max_input_tokens: Some(window),
+        reserved_output_tokens: Some(0),
+    }))
+}
+
+/// What the loop reports for `turn`'s first request when no window is near.
+///
+/// The notice's percentage is measured over the whole request now — tool
+/// definitions included — so a test places its window as a share of this
+/// number instead of re-deriving the manifest's cost. A window of a million
+/// tokens cannot reach the threshold, and what the prepared record says is
+/// exactly the estimate the next run's `begin_turn` will make.
+async fn first_request_tokens(
+    turn: &TurnContext,
+    history: Option<&'static str>,
+    settled: usize,
+) -> usize {
+    let loop_ = DefaultAgentLoop::new(
+        Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")])),
+        Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
+        notice_context(history, settled, 1_000_000),
+        one_model_router(),
+    );
+    let outcome = run_turn(&loop_, turn).await;
+    let payload = prepared_payload(&outcome);
+    assert!(payload.get("context_notice").is_none(), "a million-token window is not near");
+    usize::try_from(payload["estimated_request_tokens"].as_u64().unwrap_or(0)).unwrap_or(0)
+}
+
 /// A window that is configured but not yet full is still worth one line
 /// when the next large read could exhaust it. The reminder goes after
 /// settled history, immediately before this turn's input, so it reads as a
@@ -199,20 +242,13 @@ async fn a_context_near_the_budget_is_reminded_once_after_history() {
         project_file: None,
         builtin: "test".to_string(),
     });
-    let history = ModelMessage::user_for_turn(&agent_protocol::ids::TurnId::new(), "history");
-    let context: Arc<dyn ContextEngine> = Arc::new(
-        FakeContextEngine::new(vec![history], EventSeq::new(3)).with_usage(ContextUsage {
-            dropped_messages: 0,
-            estimated_tokens: 480,
-            max_input_tokens: Some(500),
-            reserved_output_tokens: Some(0),
-        }),
-    );
+    let tokens = first_request_tokens(&ctx, Some("history"), 480).await;
+    let window = u32::try_from(tokens * 100 / 96).expect("a window fits a `u32`");
     let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
     let loop_ = DefaultAgentLoop::new(
         model.clone(),
         Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
-        context,
+        notice_context(Some("history"), 480, window),
         one_model_router(),
     );
 
@@ -220,7 +256,7 @@ async fn a_context_near_the_budget_is_reminded_once_after_history() {
     let payload = prepared_payload(&outcome);
     assert_eq!(payload["context_notice"]["kind"], "near-limit");
     assert_eq!(payload["context_notice"]["percent"], 96);
-    assert_eq!(payload["context_notice"]["max_input_tokens"], 500);
+    assert_eq!(payload["context_notice"]["max_input_tokens"], window);
 
     let request = &model.requests()[0];
     assert_eq!(request.messages[0].role, MessageRole::System);
@@ -229,32 +265,29 @@ async fn a_context_near_the_budget_is_reminded_once_after_history() {
     assert_eq!(request.messages[2].role, MessageRole::System);
     assert_eq!(request.messages[2].message_uid.as_str(), format!("msg/notice/{}", ctx.turn_id));
     let notice = request.messages[2].text_content();
-    assert!(notice.contains("about 96%"), "{notice}");
-    assert!(notice.contains("20 tokens left"), "{notice}");
+    let left = u64::from(window) - u64::try_from(tokens).expect("tokens fit a `u64`");
+    assert!(notice.contains("this request is using about 96%"), "{notice}");
+    assert!(notice.contains(&format!("{left} tokens left")), "{notice}");
     assert_eq!(request.messages[3], ModelMessage::user_for_turn(&ctx.turn_id, "hi"));
 }
 
 #[tokio::test]
 async fn a_context_below_the_threshold_carries_no_notice() {
-    let context: Arc<dyn ContextEngine> =
-        Arc::new(FakeContextEngine::new(vec![], EventSeq::new(2)).with_usage(ContextUsage {
-            dropped_messages: 0,
-            estimated_tokens: 424,
-            max_input_tokens: Some(500),
-            reserved_output_tokens: Some(0),
-        }));
+    let ctx = ctx();
+    let tokens = first_request_tokens(&ctx, None, 424).await;
+    let window = u32::try_from(tokens * 100 / 84).expect("a window fits a `u32`");
     let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
     let loop_ = DefaultAgentLoop::new(
         model,
         Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
-        context,
+        notice_context(None, 424, window),
         one_model_router(),
     );
 
-    let outcome = run_turn(&loop_, &ctx()).await;
+    let outcome = run_turn(&loop_, &ctx).await;
     let payload = prepared_payload(&outcome);
     assert!(payload.get("context_notice").is_none(), "84% is below the threshold: {payload}");
-    assert_eq!(payload["message_count"], 1, "history is empty; only this turn's input");
+    assert_eq!(payload["message_count"], 1, "{payload}");
 }
 
 #[tokio::test]

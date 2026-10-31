@@ -408,7 +408,12 @@ async fn a_windowed_history_sends_the_kept_suffix_plus_this_turns_input() {
     assert_eq!(prepared.event.payload["max_input_tokens"], 18);
     assert_eq!(prepared.event.payload["reserved_output_tokens"], 0);
     assert_eq!(prepared.event.payload["context_notice"]["kind"], "trimmed+near-limit");
-    assert_eq!(prepared.event.payload["context_notice"]["percent"], 94);
+    // The percentage is measured over the whole request — tool definitions
+    // included — since 2026-10-31, and this fixture's 18-token window could
+    // never hold them. That it accompanies the trim is what this test pins;
+    // the exact share is placed under test where the window is real.
+    let percent = prepared.event.payload["context_notice"]["percent"].as_u64().unwrap_or(0);
+    assert!(percent >= 85, "{percent}");
 }
 
 #[tokio::test]

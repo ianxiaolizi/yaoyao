@@ -513,17 +513,25 @@ impl BudgetNotice {
 /// before notices existed. The percentage is measured against the budget
 /// history may use, not the whole window the answer also draws from.
 ///
-/// It is an estimate of the settled context only: this turn's own tool results
-/// accumulate after `begin_turn`, and the loop does not trim mid-turn
-/// (`CONTRACT.md` §7 #29). "About" is deliberate.
-pub(crate) fn context_notice(usage: &ContextUsage) -> Option<ContextNotice> {
+/// It is an estimate of the request this turn is about to send:
+/// `request_tokens` covers the assembled messages and the tool definitions,
+/// while `usage` supplies the window and what the engine dropped. A trimmed
+/// derivation is still worth saying even when the request is small, so the
+/// percentage is the larger of the two measurements — a context engine that
+/// reports a fuller derivation than the request estimate must not be
+/// understated. This turn's own tool results accumulate after `begin_turn`,
+/// and the loop does not trim mid-turn (`CONTRACT.md` §7 #29) — the in-flight
+/// settlement in `default::settle` is what bounds those. "About" is
+/// deliberate.
+pub(crate) fn context_notice(usage: &ContextUsage, request_tokens: usize) -> Option<ContextNotice> {
     let max_input_tokens = usage.max_input_tokens?;
     let budget =
         max_input_tokens.saturating_sub(usage.reserved_output_tokens.unwrap_or(0)) as usize;
     if budget == 0 {
         return None;
     }
-    let percent = usage.estimated_tokens.saturating_mul(100) / budget;
+    let used = request_tokens.max(usage.estimated_tokens);
+    let percent = used.saturating_mul(100) / budget;
     let percent = u32::try_from(percent).unwrap_or(u32::MAX);
     let trimmed = usage.dropped_messages > 0;
     let near = u64::from(percent) >= CONTEXT_NOTICE_PERCENT;
@@ -534,7 +542,7 @@ pub(crate) fn context_notice(usage: &ContextUsage) -> Option<ContextNotice> {
         (true, true) => ContextNoticeKind::TrimmedNearLimit,
     };
     let dropped = usage.dropped_messages;
-    let left = budget.saturating_sub(usage.estimated_tokens);
+    let left = budget.saturating_sub(used);
     let text = match kind {
         ContextNoticeKind::Trimmed => format!(
             "Context notice: {dropped} older message(s) were omitted to fit the configured \
@@ -542,21 +550,21 @@ pub(crate) fn context_notice(usage: &ContextUsage) -> Option<ContextNotice> {
              assuming the omitted content is unchanged."
         ),
         ContextNoticeKind::NearLimit => format!(
-            "Context notice: the settled context is using about {percent}% of the \
-             {budget}-token input budget ({left} tokens left). Keep the next steps focused and \
-             prefer targeted reads over broad dumps."
+            "Context notice: this request is using about {percent}% of the {budget}-token \
+             input budget ({left} tokens left). Keep the next steps focused and prefer \
+             targeted reads over broad dumps."
         ),
         ContextNoticeKind::TrimmedNearLimit => format!(
             "Context notice: {dropped} older message(s) were omitted to fit the configured \
-             input budget, and the settled context is using about {percent}% of the \
-             {budget}-token input budget ({left} tokens left). Re-read a file or search if an \
-             earlier fact matters; keep the next steps focused."
+             input budget, and this request is using about {percent}% of the {budget}-token \
+             input budget ({left} tokens left). Re-read a file or search if an earlier fact \
+             matters; keep the next steps focused."
         ),
     };
     Some(ContextNotice {
         kind,
         dropped_messages: dropped,
-        estimated_tokens: usage.estimated_tokens,
+        estimated_tokens: used,
         max_input_tokens,
         percent,
         text,
