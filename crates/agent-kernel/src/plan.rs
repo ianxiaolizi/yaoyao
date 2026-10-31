@@ -7,7 +7,7 @@
 //! history.
 
 use agent_protocol::events::{EventType, StoredEvent};
-use agent_protocol::plan::{Plan, StepWorker, WorkState};
+use agent_protocol::plan::{Plan, StepWorker, WorkerState};
 
 /// The plan the session currently carries, if any.
 ///
@@ -56,7 +56,7 @@ pub fn workers(events: &[StoredEvent]) -> Vec<StepWorker> {
                 workers.push(StepWorker {
                     step: step.to_string(),
                     child: child.to_string(),
-                    state: WorkState::Running,
+                    state: WorkerState::Running,
                 });
             }
             continue;
@@ -64,14 +64,14 @@ pub fn workers(events: &[StoredEvent]) -> Vec<StepWorker> {
         let Some(worker) = workers
             .iter_mut()
             .rev()
-            .find(|worker| worker.child == child && worker.state == WorkState::Running)
+            .find(|worker| worker.child == child && worker.state == WorkerState::Running)
         else {
             continue;
         };
         worker.state = match event_type {
-            EventType::SUBAGENT_COMPLETED => WorkState::Completed,
-            EventType::SUBAGENT_FAILED => WorkState::Failed,
-            EventType::SUBAGENT_CANCELLED => WorkState::Cancelled,
+            EventType::SUBAGENT_COMPLETED => WorkerState::Completed,
+            EventType::SUBAGENT_FAILED => WorkerState::Failed,
+            EventType::SUBAGENT_CANCELLED => WorkerState::Cancelled,
             // A settlement this fold does not know is not guessed at: the
             // worker stays running, which is the safe reading — a step whose
             // ending is unknown is not ready to start again.
@@ -175,21 +175,21 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].step, "build");
         assert_eq!(found[0].child, "child-1");
-        assert_eq!(found[0].state, WorkState::Running);
-        assert_eq!(found[1].state, WorkState::Running);
+        assert_eq!(found[0].state, WorkerState::Running);
+        assert_eq!(found[1].state, WorkerState::Running);
 
         let events = [events, vec![settled(3, "child-1", EventType::SUBAGENT_COMPLETED)]].concat();
         let found = workers(&events);
-        assert_eq!(found[0].state, WorkState::Completed, "the settlement follows the child");
-        assert_eq!(found[1].state, WorkState::Running, "the other child is untouched");
+        assert_eq!(found[0].state, WorkerState::Completed, "the settlement follows the child");
+        assert_eq!(found[1].state, WorkerState::Running, "the other child is untouched");
     }
 
     #[test]
     fn a_settlement_under_each_family_names_the_state_it_means() {
         for (event_type, state) in [
-            (EventType::SUBAGENT_COMPLETED, WorkState::Completed),
-            (EventType::SUBAGENT_FAILED, WorkState::Failed),
-            (EventType::SUBAGENT_CANCELLED, WorkState::Cancelled),
+            (EventType::SUBAGENT_COMPLETED, WorkerState::Completed),
+            (EventType::SUBAGENT_FAILED, WorkerState::Failed),
+            (EventType::SUBAGENT_CANCELLED, WorkerState::Cancelled),
         ] {
             let events =
                 vec![spawned(1, "child-1", Some("build")), settled(2, "child-1", event_type)];

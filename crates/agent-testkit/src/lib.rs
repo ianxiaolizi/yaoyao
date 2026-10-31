@@ -2,6 +2,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod messages;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 

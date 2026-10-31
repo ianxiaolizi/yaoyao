@@ -30,6 +30,7 @@ use crate::judgment;
 use crate::lifecycle;
 use crate::plan;
 use crate::session_lifecycle;
+use crate::state;
 
 mod draft;
 mod endings;
@@ -438,6 +439,11 @@ impl Scheduler {
         // The judgment record, on the same terms: the Scheduler keeps the
         // ledger, and "none recorded yet" is a fact worth placing.
         let judgment = judgment::current(&history)?.unwrap_or_default();
+        // The work state the model last recorded, read the same way: the
+        // Scheduler keeps it, so `Some` even when nothing was written, and the
+        // loop says "none recorded yet" rather than opening a turn that seems
+        // to have forgotten.
+        let work = state::current(&history)?.unwrap_or_default();
         // A resume continuation opens on a turn that already closed: the held
         // call ran and may have failed there. The loop has no memory of that
         // turn, so the failure is read back from the log and handed to it.
@@ -485,6 +491,7 @@ impl Scheduler {
             capability: self.capability.clone(),
             plan: Some(plan),
             workers,
+            work: Some(work),
             judgment: Some(judgment),
             pending_failure,
         };
@@ -834,6 +841,7 @@ mod tests {
     use agent_protocol::inbox::InboxKind;
     use agent_protocol::instructions::RunInstructions;
     use agent_protocol::model::{ContentBlock, ModelMessage};
+    use agent_testkit::messages::{is_loop_tail, last_said, shown_text};
     use agent_testkit::{
         FakeEventStore, FakeModelProvider, FakeToolGateway, FakeToolProvider, NullContextEngine,
         one_model_router,
@@ -1263,33 +1271,6 @@ mod tests {
         (scheduler, store, model, SessionId::from_string("steer-session"))
     }
 
-    /// The words the model was shown, message by message, in order.
-    ///
-    /// System messages are skipped: they are the frame around the conversation
-    /// (instructions, the per-turn state and task layers, the context notice),
-    /// while these tests are about what the user and the tools said.
-    ///
-    /// Text and tool outcomes are what carry words; a tool proposal carries none
-    /// and so contributes nothing. The result reads as "what was said to the
-    /// model, and when".
-    fn shown_text(messages: &[ModelMessage]) -> Vec<String> {
-        messages
-            .iter()
-            .filter(|m| m.role != agent_protocol::model::MessageRole::System)
-            .map(|m| {
-                m.content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.clone()),
-                        ContentBlock::ToolResult { content, .. } => Some(content.clone()),
-                        ContentBlock::ToolUse { .. } => None,
-                    })
-                    .collect::<String>()
-            })
-            .filter(|t| !t.is_empty())
-            .collect()
-    }
-
     /// The one `turn/steered` event in the log, and where it sits in the chain.
     async fn steer_event(store: &FakeEventStore, sid: &SessionId) -> (StoredEvent, usize) {
         let events = store.read_stream(sid, EventSeq::ZERO, usize::MAX).await.unwrap();
@@ -1326,7 +1307,7 @@ mod tests {
         // instead of producing a lookalike.
         let expected =
             ModelMessage::user_for_steering(&turn_id, &steer_item.item_id, "also check the tests");
-        assert_eq!(requests[0].messages.last(), Some(&expected));
+        assert_eq!(last_said(&requests[0].messages), Some(&expected));
 
         // The log places it at the turn boundary, before any step ran — so there
         // is no step to name as the one it came after.
@@ -1409,7 +1390,10 @@ mod tests {
             requests[0]
                 .messages
                 .iter()
-                .filter(|m| m.role != agent_protocol::model::MessageRole::System)
+                .filter(|m| {
+                    m.role != agent_protocol::model::MessageRole::System
+                        && !is_loop_tail(m.message_uid.as_str())
+                })
                 .count(),
             1,
             "{:?}",
@@ -1559,7 +1543,7 @@ mod tests {
         );
         let item_id = model.landed.lock().unwrap().clone().expect("the note landed");
         let expected = ModelMessage::user_for_steering(&report.turn_id, &item_id, "and the tests");
-        assert_eq!(requests[1].messages.last(), Some(&expected));
+        assert_eq!(last_said(&requests[1].messages), Some(&expected));
         assert_eq!(
             requests[2].messages.iter().filter(|m| **m == expected).count(),
             1,

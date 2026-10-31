@@ -269,6 +269,22 @@ impl ModelMessage {
         }
     }
 
+    /// Where the run stands, placed at the tail of every request.
+    ///
+    /// Objective facts (steps, budget, the last failure) and the model's own
+    /// `state/1` account, so a step that has lost its history reads its purpose
+    /// at the point where it acts. User-role for the same reason as the budget
+    /// notice: some chat templates accept a system message only at the start.
+    /// Not history — the projection never folds it — and its uid is the turn's,
+    /// so each step replaces the previous block rather than piling them up.
+    pub fn work_state_for_turn(turn_id: &TurnId, text: impl Into<String>) -> Self {
+        Self {
+            message_uid: MessageUid::from_string(format!("msg/work-state/{turn_id}")),
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
     /// The state of the world when one turn opens.
     ///
     /// Like the context notice, this is not history: the projection never

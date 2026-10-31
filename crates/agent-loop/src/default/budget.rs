@@ -113,6 +113,10 @@ pub(super) fn record_spend(
     response: &ModelResponse,
     estimated_request_tokens: u64,
 ) {
+    // The provider's own count, kept for the settlement trigger's backstop: an
+    // estimate can be too kind, and this cannot be wrong about what the window
+    // really held.
+    turn.observed_input_tokens = response.usage.as_ref().and_then(|usage| usage.input_tokens);
     match &response.usage {
         Some(usage) if usage.input_tokens.is_some() && usage.output_tokens.is_some() => {
             turn.spent.add(

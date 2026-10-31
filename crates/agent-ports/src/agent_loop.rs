@@ -126,6 +126,14 @@ pub struct TurnContext {
     /// one the model has to decide about. Empty is the ordinary case, and it
     /// renders exactly like a turn that never had a worker.
     pub workers: Vec<agent_protocol::plan::StepWorker>,
+    /// The run's work state as of this turn's opening: what the model last
+    /// said it was doing, in `state/1` (`agent_protocol::state`).
+    ///
+    /// Same convention as `plan`: `None` means the caller keeps no record and
+    /// the loop places no work-state section; `Some(WorkState::default())` is a
+    /// caller that keeps one and has nothing recorded yet. The loop refreshes
+    /// it inside the turn when the model writes a new one.
+    pub work: Option<agent_protocol::state::WorkState>,
     /// The session's judgment record as of this turn's opening.
     ///
     /// Same convention as `plan`: `None` means the caller keeps no record and

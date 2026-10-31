@@ -15,7 +15,7 @@ use super::*;
 /// The same default the configuration layer fills in; stated here so a caller
 /// that builds a budget by hand (a test, a harness) gets the same shape as a
 /// configuration that omitted the field.
-const DEFAULT_SETTLE_AT_PERCENT: u32 = 70;
+pub(super) const DEFAULT_SETTLE_PERCENT: u32 = 70;
 
 /// This turn's own step traffic, proposed for one of its mid-turn compactions.
 ///
@@ -44,7 +44,7 @@ pub(super) fn in_flight_candidate(
     if budget == 0 {
         return None;
     }
-    let percent = turn.budget.settle_at_percent.unwrap_or(DEFAULT_SETTLE_AT_PERCENT) as usize;
+    let percent = turn.budget.settle_at_percent.unwrap_or(DEFAULT_SETTLE_PERCENT) as usize;
     let threshold = budget.saturating_mul(percent) / 100;
     if estimated_request_tokens < threshold {
         return None;

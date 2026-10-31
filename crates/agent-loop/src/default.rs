@@ -54,6 +54,7 @@ use agent_protocol::reason::{
     SpeechAct, Stance,
 };
 use agent_protocol::redactor::Redactor;
+use agent_protocol::state::{self, WorkState};
 use agent_protocol::tool::{
     APPROVAL_PENDING_OUTCOME, GATE_REFUSED_OUTCOME, GATEWAY_REFUSED_OUTCOME, ToolSideEffect,
 };
@@ -69,9 +70,13 @@ use crate::context_layers::{
     capability_text, context_notice, repair_note, stale_read, state_text, task_text, tool_source,
     truncate, user_text,
 };
+use loop_call::{LoopCallAnswer, answer_loop_call};
 
 mod budget;
+mod loop_call;
 mod settle;
+mod settlement;
+mod work_state;
 
 /// Longest provider error text persisted in a durable attempt event.
 const MAX_ERROR_CHARS: usize = 500;
@@ -349,6 +354,7 @@ impl DefaultAgentLoop {
         turn: &mut LoopTurn,
         step_id: &StepId,
         candidate: CompactionCandidate,
+        fallback: &'static str,
         events: &mut Vec<EventDraft>,
     ) -> Result<(), AgentLoopError> {
         let ctx = turn.ctx.clone();
@@ -608,6 +614,11 @@ impl DefaultAgentLoop {
         }
 
         let mut payload = serde_json::json!({
+            // Who wrote this text, and what was tried first: a summary is
+            // either the turn-start strategy or the settlement's fallback, and
+            // a reader can tell the two apart without reconstructing the turn.
+            "strategy": "summary",
+            "fallback": fallback,
             "attempt_id": attempt_id,
             "summary_message_uid": format!("msg/summary/{attempt_id}"),
             "summary": summary,
@@ -780,6 +791,10 @@ struct LoopTurn {
     /// acted since the group that was too large — so the group it could not
     /// summarize on the first pass is summarized only after it has been used.
     in_flight_newest: Option<String>,
+    /// The provider's own input count for the last request, when it reported
+    /// one. Settlement falls back to it when the estimate is too kind: it is
+    /// the only measure that cannot be wrong about what the window held.
+    observed_input_tokens: Option<u64>,
     /// The judgment record this turn is building on, as of the turn's opening.
     /// Every accepted `judgment.update` replaces it with the merged record, so
     /// the task layer the next step reads is the one the log now holds.
@@ -805,6 +820,9 @@ struct LoopTurn {
     /// `plan.update` lands. Kept here so a later rewrite (a stance switch) does
     /// not fall back to the plan the turn opened with.
     plan_view: Option<Plan>,
+    /// The work state this turn shows at the tail of every request: opened from
+    /// the caller's fold, replaced when `state.update` lands.
+    work: Option<WorkState>,
     /// The latest observation node, so the answer can cite what it rests on.
     reason_last_observation: Option<String>,
     /// Whether the kernel's reading named a checkable criterion, so a completed
@@ -933,7 +951,11 @@ fn refresh_task_layer(turn: &mut LoopTurn, ledger: bool) {
     let text = task_text(
         &turn.ctx.user_input,
         facts,
-        TaskLedger { plan: turn.plan_view.as_ref(), workers: &turn.ctx.workers },
+        TaskLedger {
+            plan: turn.plan_view.as_ref(),
+            workers: &turn.ctx.workers,
+            work: turn.work.as_ref(),
+        },
         turn.judgment.as_ref(),
         turn.stale.as_ref(),
         ledger.then_some(&advice),
@@ -1010,7 +1032,9 @@ impl AgentLoop for DefaultAgentLoop {
             // choice, and a manifest that lists it is one more entry to read.
             let mut definitions = self.gateway.model_definitions();
             definitions.retain(|definition| {
-                definition.name != plan::TOOL_NAME && definition.name != judgment::TOOL_NAME
+                definition.name != plan::TOOL_NAME
+                    && definition.name != state::TOOL_NAME
+                    && definition.name != judgment::TOOL_NAME
             });
             // Recorded beside the manifest because the manifest itself keeps
             // only what reaches the wire; rehydration needs the declared side
@@ -1046,6 +1070,10 @@ impl AgentLoop for DefaultAgentLoop {
                 .map(|definition| definition.name.clone())
                 .collect();
             definitions.push(plan::tool_definition());
+            // The work state is the second loop-owned ledger, on the same
+            // terms: the loop answers it, so a provider's definition of the
+            // name would only describe a tool that can never run.
+            definitions.push(state::tool_definition());
             // The judgment tool is offered on the same terms as the plan: the
             // loop answers it itself, so a provider that claimed the name would
             // only describe a tool that can never run.
@@ -1186,7 +1214,11 @@ impl AgentLoop for DefaultAgentLoop {
                 task: task_text(
                     &ctx.user_input,
                     facts,
-                    TaskLedger { plan: ctx.plan.as_ref(), workers: &ctx.workers },
+                    TaskLedger {
+                        plan: ctx.plan.as_ref(),
+                        workers: &ctx.workers,
+                        work: ctx.work.as_ref(),
+                    },
                     if self.judgment_ledger { ctx.judgment.as_ref() } else { None },
                     stale.as_ref(),
                     if self.judgment_ledger { Some(&advice) } else { None },
@@ -1317,6 +1349,7 @@ impl AgentLoop for DefaultAgentLoop {
                 repeat_refused: false,
                 in_flight_compactions: 0,
                 in_flight_newest: None,
+                observed_input_tokens: None,
                 judgment: ctx.judgment.clone(),
                 mode: selection.mode,
                 reason: recorder,
@@ -1324,6 +1357,7 @@ impl AgentLoop for DefaultAgentLoop {
                 stance_note: None,
                 stance_switched: false,
                 plan_view: ctx.plan.clone(),
+                work: ctx.work.clone(),
                 reason_last_observation: None,
                 criterion_expects_check,
                 criterion_observed: false,
@@ -1470,7 +1504,7 @@ impl AgentLoop for DefaultAgentLoop {
             // taken, not read: one turn summarizes settled history at most
             // once.
             if let Some(candidate) = turn.compaction.take() {
-                self.compact(turn, &step_id, candidate, &mut events).await?;
+                self.compact(turn, &step_id, candidate, "none", &mut events).await?
             }
 
             // The turn's own traffic has no other protection: the engine
@@ -1493,13 +1527,27 @@ impl AgentLoop for DefaultAgentLoop {
             let newest = turn.messages.last().map(|message| message.message_uid.to_string());
             if turn.in_flight_compactions < MAX_IN_FLIGHT_COMPACTIONS
                 && newest.as_deref() != turn.in_flight_newest.as_deref()
-                && let Some(candidate) = settle::in_flight_candidate(turn, estimated_before)
+                && let Some(trigger) = settlement::trigger(turn, estimated_before)
             {
-                turn.in_flight_compactions += 1;
-                turn.in_flight_newest = newest;
-                self.compact(turn, &step_id, candidate, &mut events).await?;
+                // The state settles first — no provider, no invented text. A
+                // turn with no state to write from keeps the summarizer. An
+                // attempt counts only when one of them did something: a step
+                // that merely crossed the share has nothing to spend yet.
+                if settlement::settle(turn, &step_id, trigger, &mut events)? {
+                    turn.in_flight_compactions += 1;
+                    turn.in_flight_newest = newest;
+                } else if let Some(candidate) = settle::in_flight_candidate(turn, estimated_before)
+                {
+                    turn.in_flight_compactions += 1;
+                    turn.in_flight_newest = newest;
+                    self.compact(turn, &step_id, candidate, "settlement", &mut events).await?;
+                }
             }
 
+            // Where the run stands, after this turn's traffic and before the
+            // reminder about stopping (see `work_state` for why both sit at
+            // the tail and are replaced rather than repeated).
+            let work_block = work_state::place_work_state(turn);
             let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id);
 
             let request = ModelRequest {
@@ -1584,6 +1632,21 @@ impl AgentLoop for DefaultAgentLoop {
             // read back without re-deriving the budget.
             if let Some(notice) = &budget_notice {
                 prepared["budget_notice"] = notice.to_json();
+            }
+            // The state block, on the same terms: what the model read at the
+            // tail, with the verdict on whether it had written an account of
+            // its own. Absent when this turn keeps no work-state ledger.
+            if let Some(block) = &work_block {
+                prepared["work_state"] = serde_json::json!({
+                    "message_uid": format!("msg/work-state/{}", ctx.turn_id),
+                    "hash": digest::json(&serde_json::Value::String(block.clone())),
+                    "subjective": if turn.work.as_ref().is_some_and(|work| !work.is_empty()) {
+                        "present"
+                    } else {
+                        "none"
+                    },
+                    "text": block,
+                });
             }
             // Absent, not null, when the caller had no facts: a harness's
             // request keeps exactly the payload it had before layers existed.
@@ -2204,6 +2267,7 @@ impl AgentLoop for DefaultAgentLoop {
                 // everything else is the gateway's — including a name no
                 // provider offered, which the gateway refuses.
                 let loop_owned = call.tool_name == plan::TOOL_NAME
+                    || call.tool_name == state::TOOL_NAME
                     || (self.judgment_ledger && call.tool_name == judgment::TOOL_NAME);
                 let mut payload = serde_json::json!({
                     "tool_name": call.tool_name,
@@ -2278,41 +2342,33 @@ impl AgentLoop for DefaultAgentLoop {
                             format!("plan not recorded: {error}"),
                         ),
                     };
-                    let result_event = draft(
+                    answer_loop_call(
+                        turn,
                         ctx,
                         &step_id,
-                        event_type,
-                        serde_json::json!({
-                            "tool_name": call.tool_name,
-                            "provider_tool_call_id": call.tool_call_id,
-                            "status": status,
-                            "content": &content,
-                        }),
-                        Actor::Tool,
-                    );
-                    let result_event_id = result_event.event_id.as_str().to_string();
-                    events.push(result_event);
-                    // The loop's own tool is still a call the model made, so
-                    // its answer is an observation in the chain like any other:
-                    // a ledger write with no recorded result would be an action
-                    // a reader could not follow to its outcome.
-                    let observation = turn.reason.node(
-                        ReasonKind::Observation,
                         step_index,
-                        format!("{} {}: {}", call.tool_name, status_word(status), content),
-                        vec![Basis::node(action_id.clone()), Basis::event(result_event_id)],
-                        "observation/result",
-                        ReasonSource::World,
+                        LoopCallAnswer { call, action_id: &action_id, status, event_type, content },
+                        &mut events,
                     );
-                    turn.reason_last_observation = Some(observation.id.clone());
-                    events.push(reason_event(ctx, Some(&step_id), &observation));
-                    turn.messages.push(ModelMessage::tool_for_call(
+                    continue;
+                }
+
+                // `state.update` is the loop's third own tool, and with the
+                // plan it is the pair a long run leans on: the plan says what
+                // was intended, this says where the work actually stands. A
+                // refused state records no event — the model gets the reason
+                // and may try again.
+                if call.tool_name == state::TOOL_NAME {
+                    work_state::answer_update(
+                        turn,
+                        ctx,
                         &step_id,
-                        call.tool_call_id.clone(),
-                        call.tool_name.clone(),
-                        content,
-                        status != ToolStatus::Completed,
-                    ));
+                        step_index,
+                        call,
+                        &action_id,
+                        redactor,
+                        &mut events,
+                    )?;
                     continue;
                 }
 
@@ -3200,6 +3256,9 @@ mod tests {
     /// that: token budget, step budget, and the window reminder.
     mod limits;
 
+    /// The work state: `state.update`, the tail block, carry-over, settlement.
+    mod state;
+
     use agent_ports::agent_loop::TurnFailureFacts;
     use agent_ports::agent_loop::{TurnCapabilityFacts, TurnStateFacts};
     use agent_ports::decision::{
@@ -3317,6 +3376,7 @@ mod tests {
             capability: None,
             plan: None,
             workers: Vec::new(),
+            work: None,
             judgment: None,
             pending_failure: None,
         }
@@ -3942,9 +4002,10 @@ mod tests {
         let outcome = run_turn(&loop_, &ctx()).await;
         let payload = prepared_payload(&outcome);
 
-        // The gateway's two tools plus `plan.update` and `judgment.update`,
-        // which the loop owns and offers whenever it offers anything.
-        assert_eq!(payload["tool_count"], 4);
+        // The gateway's two tools plus `plan.update`, `state.update` and
+        // `judgment.update`, which the loop owns and offers whenever it offers
+        // anything.
+        assert_eq!(payload["tool_count"], 5);
         let required = payload["required_capabilities"].as_array().unwrap();
         assert!(
             required.iter().any(|c| c == ModelCapability::TOOL_CALL),
@@ -3972,7 +4033,7 @@ mod tests {
         let ids: Vec<&str> = entries.iter().filter_map(|e| e["tool_id"].as_str()).collect();
         assert_eq!(
             ids,
-            ["echo", "judgment.update", "plan.update", "shout"],
+            ["echo", "judgment.update", "plan.update", "shout", "state.update"],
             "the loop's own tool is offered with the rest, sorted by tool id as they reach the wire"
         );
         assert_eq!(frozen.payload["entries_hash"], digest::json(&frozen.payload["entries"]));
@@ -5111,9 +5172,10 @@ mod tests {
                 estimated_tokens: 120,
                 // Wide enough that the request itself stays under the
                 // near-limit share: this test is about trimming, and the
-                // built-in tool definitions alone are a few hundred tokens
-                // that a 500-token window would report as near-limit too.
-                max_input_tokens: Some(2_000),
+                // built-in tool definitions alone (plan, state, judgment) are
+                // over a thousand tokens that a small window would report as
+                // near-limit too.
+                max_input_tokens: Some(4_000),
                 reserved_output_tokens: Some(100),
             }),
         );
@@ -5130,7 +5192,7 @@ mod tests {
         assert_eq!(payload["context_message_count"], 1);
         assert_eq!(payload["dropped_message_count"], 4);
         assert_eq!(payload["estimated_context_tokens"], 120);
-        assert_eq!(payload["max_input_tokens"], 2_000);
+        assert_eq!(payload["max_input_tokens"], 4_000);
         assert_eq!(payload["reserved_output_tokens"], 100);
         assert_eq!(
             payload["message_count"], 3,
@@ -6986,10 +7048,10 @@ mod tests {
             text.contains("- network for sandboxed commands: not bounded by this backend"),
             "{text}"
         );
-        // The gateway's two tools plus the loop's own `judgment.update` and
-        // `plan.update`.
+        // The gateway's two tools plus the loop's own `judgment.update`,
+        // `plan.update` and `state.update`.
         assert!(
-            text.contains("4 tools are available; full arguments are in the tool definitions:"),
+            text.contains("5 tools are available; full arguments are in the tool definitions:"),
             "{text}"
         );
         // Sorted by tool id, and each entry is the description's first

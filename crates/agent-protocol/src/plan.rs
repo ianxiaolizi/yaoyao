@@ -382,7 +382,7 @@ impl Plan {
     pub fn render_with(&self, workers: &[StepWorker]) -> String {
         let running: Vec<&str> = workers
             .iter()
-            .filter(|worker| worker.state == WorkState::Running)
+            .filter(|worker| worker.state == WorkerState::Running)
             .map(|worker| worker.step.as_str())
             .collect();
         let mut text = self.render_plan(&running);
@@ -491,14 +491,14 @@ impl Plan {
 /// worker to the fact that ended it without a translation table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkState {
+pub enum WorkerState {
     Running,
     Completed,
     Failed,
     Cancelled,
 }
 
-impl WorkState {
+impl WorkerState {
     /// The wire word, matching the serde representation.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -522,7 +522,7 @@ pub struct StepWorker {
     pub step: String,
     /// The child's session id, which is what `subagent.wait` takes.
     pub child: String,
-    pub state: WorkState,
+    pub state: WorkerState,
 }
 
 impl StepWorker {
@@ -533,23 +533,23 @@ impl StepWorker {
     /// the model writes statuses.
     pub fn line(&self) -> String {
         match self.state {
-            WorkState::Running => format!(
+            WorkerState::Running => format!(
                 "- step {}: subagent {} is running; collect it with subagent.wait \
                  (child_session_id: \"{}\").",
                 self.step, self.child, self.child
             ),
-            WorkState::Completed => format!(
+            WorkerState::Completed => format!(
                 "- step {}: subagent {} completed; mark the step done in plan.update once its \
                  work is finished.",
                 self.step, self.child
             ),
-            WorkState::Failed => {
+            WorkerState::Failed => {
                 format!(
                     "- step {}: subagent {} failed; the step is not done.",
                     self.step, self.child
                 )
             }
-            WorkState::Cancelled => {
+            WorkerState::Cancelled => {
                 format!(
                     "- step {}: subagent {} was cancelled; the step is not done.",
                     self.step, self.child
@@ -1085,7 +1085,7 @@ mod tests {
         let running = vec![StepWorker {
             step: String::from("fix"),
             child: String::from("child-1"),
-            state: WorkState::Running,
+            state: WorkerState::Running,
         }];
 
         let text = plan.render_with(&running);
@@ -1114,14 +1114,14 @@ mod tests {
             vec![StepWorker { step: String::from("fix"), child: String::from("child-1"), state }]
         };
 
-        let completed = plan.render_with(&ended(WorkState::Completed));
+        let completed = plan.render_with(&ended(WorkerState::Completed));
         assert!(
             completed.contains("subagent child-1 completed; mark the step done"),
             "{completed}"
         );
-        let failed = plan.render_with(&ended(WorkState::Failed));
+        let failed = plan.render_with(&ended(WorkerState::Failed));
         assert!(failed.contains("subagent child-1 failed; the step is not done"), "{failed}");
-        let cancelled = plan.render_with(&ended(WorkState::Cancelled));
+        let cancelled = plan.render_with(&ended(WorkerState::Cancelled));
         assert!(cancelled.contains("subagent child-1 was cancelled"), "{cancelled}");
         // An ended worker is not a running one: the plain readiness line is
         // back, because nothing is holding the step any more.
@@ -1133,7 +1133,7 @@ mod tests {
         let workers = vec![StepWorker {
             step: String::from("fix"),
             child: String::from("child-1"),
-            state: WorkState::Running,
+            state: WorkerState::Running,
         }];
         let text = workers_text(&workers);
         assert!(

@@ -132,6 +132,11 @@ impl EventType {
     /// `plan.update` tool — one event per accepted call, carrying the plan it
     /// recorded. It never reaches a provider; the next turn reads it back.
     pub const PLAN_UPDATED: &'static str = "plan/updated";
+    /// The run's work state, replaced in full. Written by the loop's own
+    /// `state.update` tool — one event per accepted call, carrying the state it
+    /// recorded (`schema` names the shape, `state/1` today). It never reaches a
+    /// provider; the next request and the next turn read it back.
+    pub const STATE_UPDATED: &'static str = "state/updated";
     /// The session's judgment record, replaced in full by the merged snapshot.
     /// Written by the loop's own `judgment.update` tool — one event per accepted
     /// stage, carrying the whole record after the merge. Like the plan it never
@@ -278,6 +283,7 @@ impl EventType {
         Self::TOOL_OUTCOME_UNKNOWN,
         Self::TOOL_NOT_STARTED,
         Self::PLAN_UPDATED,
+        Self::STATE_UPDATED,
         Self::JUDGMENT_UPDATED,
         Self::JUDGMENT_REQUIRED,
         Self::REASON_RECORDED,

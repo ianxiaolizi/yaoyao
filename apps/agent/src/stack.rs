@@ -565,6 +565,8 @@ pub async fn assemble_with_delegation(
     // but it is on the wire: a plugin that claimed the name would be offering a
     // tool the loop intercepts before any provider sees it.
     reserved.insert(agent_protocol::plan::TOOL_NAME.to_string());
+    // The work state is the loop's second own tool, on the same terms.
+    reserved.insert(agent_protocol::state::TOOL_NAME.to_string());
     // The configured backends, held to the workspace boundary the same way a
     // plugin's working directory is: a relative `cwd` resolves against the
     // workspace root, not the process, and one that lands outside is refused. A

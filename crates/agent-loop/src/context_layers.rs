@@ -180,6 +180,13 @@ pub(crate) fn repair_note(failure: Option<&PendingFailure>, because: &str) -> St
 pub(crate) struct TaskLedger<'a> {
     pub(crate) plan: Option<&'a Plan>,
     pub(crate) workers: &'a [StepWorker],
+    /// What the model last said about where the work stands, if it ever did.
+    ///
+    /// It is summarized rather than rendered in full: the block at the tail of
+    /// the request carries the whole state, and repeating it here would spend
+    /// the layer on what the model already reads two messages later. What the
+    /// start of a turn needs is that the previous turn's purpose survives.
+    pub(crate) work: Option<&'a agent_protocol::state::WorkState>,
 }
 
 pub(crate) fn task_text(
@@ -227,6 +234,20 @@ pub(crate) fn task_text(
         // No ledger, but children are running: the worker block says what a
         // step name means and how to collect it, so it is placed on its own.
         text.push_str(&agent_protocol::plan::workers_text(ledger.workers));
+    }
+    if let Some(work) = ledger.work {
+        if let Some(summary) = work.summary() {
+            text.push('\n');
+            text.push_str(&summary);
+        }
+        // Advice, not a gate: the model decides when its own account has
+        // changed. A turn that never writes one still has the objective half
+        // of the block at the tail of every request.
+        text.push_str(
+            "\nKeep the work state current with `state.update` before changing direction, \
+             before the final answer, and when a budget notice asks you to settle. Record what \
+             failed and the evidence for what is done.",
+        );
     }
     if let Some(judgment) = judgment {
         text.push('\n');
@@ -612,7 +633,7 @@ mod tests {
         let text = task_text(
             &serde_json::json!({ "text": "do the work" }),
             &facts(),
-            TaskLedger { plan: Some(&plan), workers: &[] },
+            TaskLedger { plan: Some(&plan), workers: &[], work: None },
             None,
             None,
             None,
@@ -635,13 +656,13 @@ mod tests {
         let workers = vec![StepWorker {
             step: String::from("fix"),
             child: String::from("child-1"),
-            state: agent_protocol::plan::WorkState::Running,
+            state: agent_protocol::plan::WorkerState::Running,
         }];
 
         let text = task_text(
             &serde_json::json!({ "text": "do the work" }),
             &facts(),
-            TaskLedger { plan: Some(&plan), workers: &workers },
+            TaskLedger { plan: Some(&plan), workers: &workers, work: None },
             None,
             None,
             None,

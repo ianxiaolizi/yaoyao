@@ -94,7 +94,7 @@ use agent_ports::tool_provider::{
 use agent_protocol::events::EventType;
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::permissions::{Capability, PolicyDecision};
-use agent_protocol::plan::{PlanItemStatus, WorkState};
+use agent_protocol::plan::{PlanItemStatus, WorkerState};
 use agent_subagent_stdio::StdioSubagentProvider;
 use serde::Deserialize;
 use serde_json::json;
@@ -969,7 +969,7 @@ impl SubagentToolProvider {
         };
         if let Some(worker) = agent_kernel::plan::workers(&events)
             .into_iter()
-            .find(|worker| worker.step == step && worker.state == WorkState::Running)
+            .find(|worker| worker.step == step && worker.state == WorkerState::Running)
         {
             return Err(refused(
                 TOOL_NAME,

@@ -150,13 +150,21 @@ impl Harness {
     }
 }
 
-/// A request's messages minus the per-turn layers, which are not history.
+/// A request's messages minus the per-turn layers and tail blocks, which are
+/// not history.
+///
+/// The state and task layers open a request for its turn; the work-state block
+/// closes it. All three are placed by the loop for each request and are not
+/// folded into history (CONTRACT #42), so the rebuilt transcript must not
+/// contain them.
 fn settled(messages: Vec<ModelMessage>) -> Vec<ModelMessage> {
     messages
         .into_iter()
         .filter(|message| {
             let uid = message.message_uid.as_str();
-            !uid.starts_with("msg/state/") && !uid.starts_with("msg/task/")
+            !uid.starts_with("msg/state/")
+                && !uid.starts_with("msg/task/")
+                && !uid.starts_with("msg/work-state/")
         })
         .collect()
 }
@@ -381,11 +389,15 @@ async fn a_windowed_history_sends_the_kept_suffix_plus_this_turns_input() {
     assert_eq!(notice.message_uid.as_str(), format!("msg/notice/{}", report.turn_id));
     assert_eq!(notice.role, MessageRole::System);
     assert!(notice.text_content().contains("1 older message(s) were omitted"), "{notice:?}");
+    // The input follows the notice, and the loop's work-state block closes
+    // the request: where the work stands is the last thing a step reads.
     assert_eq!(
-        &request.messages[kept.len() + 3..],
+        &request.messages[kept.len() + 3..kept.len() + 4],
         [ModelMessage::user_for_turn(&report.turn_id, "second")].as_slice(),
-        "this turn's input closes the request"
+        "this turn's input stays verbatim after the layers"
     );
+    let tail = request.messages.last().expect("a tail");
+    assert_eq!(tail.message_uid.as_str(), format!("msg/work-state/{}", report.turn_id));
 
     // The record of the derivation carries the same numbers the engine used,
     // so a reader does not have to re-derive the log to know what was dropped.
@@ -399,8 +411,8 @@ async fn a_windowed_history_sends_the_kept_suffix_plus_this_turns_input() {
         })
         .expect("model/request.prepared");
     assert_eq!(
-        prepared.event.payload["message_count"], 7,
-        "the sent count includes the two per-turn layers, the notice and the input"
+        prepared.event.payload["message_count"], 8,
+        "the sent count includes the two per-turn layers, the notice, the input and the          work-state tail"
     );
     assert_eq!(prepared.event.payload["context_message_count"], 3);
     assert_eq!(prepared.event.payload["dropped_message_count"], 1);
@@ -875,7 +887,14 @@ async fn steering_reaches_the_loop_and_survives_a_rebuild() {
         ModelMessage::user_for_steering(&report.turn_id, &note.item_id, "and check the tests");
     let requests = h.model.requests();
     assert_eq!(requests.len(), 2, "one request per step");
-    assert_eq!(requests[0].messages.last(), Some(&expected));
+    // The note is the last thing the user said; the loop's own tail block
+    // follows it and is not a message anyone steered with.
+    let last_user = requests[0]
+        .messages
+        .iter()
+        .rev()
+        .find(|m| !m.message_uid.as_str().starts_with("msg/work-state/"));
+    assert_eq!(last_user, Some(&expected));
 
     // And a fresh process, reading only the log, hands the model the same
     // conversation.

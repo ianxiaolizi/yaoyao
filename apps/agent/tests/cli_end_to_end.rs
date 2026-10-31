@@ -1966,7 +1966,14 @@ fn context_inspect_after_a_turn_reports_the_last_request() {
     assert_eq!(refs[1]["message_uid"], capability_uid, "the capability layer's place is recorded");
     assert_eq!(refs[2]["message_uid"], last["context_layers"]["state"]["message_uid"], "{doc}");
     assert_eq!(refs[3]["message_uid"], last["context_layers"]["task"]["message_uid"], "{doc}");
-    assert!(refs[refs.len() - 1]["message_uid"].as_str().expect("a uid").starts_with("msg/user/"));
+    // The user's input, then the loop's work-state block at the tail: the
+    // last thing the model reads is where the work stands, not history.
+    let n = refs.len();
+    assert!(refs[n - 2]["message_uid"].as_str().expect("a uid").starts_with("msg/user/"), "{doc}");
+    assert!(
+        refs[n - 1]["message_uid"].as_str().expect("a uid").starts_with("msg/work-state/"),
+        "{doc}"
+    );
     for recorded in refs {
         assert_eq!(
             recorded["hash"].as_str().expect("a digest").len(),

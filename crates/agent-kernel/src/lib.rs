@@ -25,6 +25,7 @@ pub mod schedule;
 pub mod scheduler;
 pub mod session_archive;
 pub mod session_lifecycle;
+pub mod state;
 pub mod subagent;
 pub mod tool_schema;
 pub mod tools;

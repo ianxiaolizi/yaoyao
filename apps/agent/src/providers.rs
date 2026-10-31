@@ -36,11 +36,16 @@ impl ModelProvider for EchoModelProvider {
         request: &ModelRequest,
         sink: &dyn ModelStreamSink,
     ) -> Result<ModelResponse, ModelProviderError> {
+        // The user's words, not the harness's: the loop places its own tail
+        // messages (the work state, the budget reminder) with the user role so
+        // that every provider accepts them, but they are not what the user
+        // said — a placeholder model that echoed them would answer its own
+        // ledger.
         let text = request
             .messages
             .iter()
             .rev()
-            .find(|m| m.role == MessageRole::User)
+            .find(|m| m.role == MessageRole::User && !is_harness_tail(m.message_uid.as_str()))
             .map(|m| m.text_content())
             .unwrap_or_default();
 
@@ -63,6 +68,11 @@ impl ModelProvider for EchoModelProvider {
     fn provider_id(&self) -> String {
         "echo".to_string()
     }
+}
+
+/// Whether a user-role message is the loop's own tail rather than the user's.
+fn is_harness_tail(uid: &str) -> bool {
+    uid.starts_with("msg/work-state/") || uid.starts_with("msg/budget/")
 }
 
 /// Why the provider could not be assembled.

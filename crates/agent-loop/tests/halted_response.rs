@@ -35,6 +35,7 @@ fn ctx() -> TurnContext {
         capability: None,
         plan: None,
         workers: Vec::new(),
+        work: None,
         judgment: None,
         pending_failure: None,
     }
