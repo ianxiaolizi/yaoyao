@@ -170,6 +170,10 @@ async fn the_budget_reminder_is_one_tail_message_that_turns_final() {
     let finalize_request = &requests[2];
     let final_text = finalize_request.messages.last().unwrap().text_content();
     assert!(final_text.contains("Do not open a new line of work"), "{final_text}");
+    assert!(
+        final_text.contains("`state.update` with `blocked`"),
+        "unfinished work has a field to go in: {final_text}"
+    );
 
     let prepared: Vec<_> = outcome
         .events

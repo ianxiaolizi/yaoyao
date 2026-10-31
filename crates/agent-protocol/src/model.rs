@@ -269,6 +269,20 @@ impl ModelMessage {
         }
     }
 
+    /// A reminder that the last steps produced no new evidence, for one turn.
+    ///
+    /// The sibling of [`Self::budget_notice_for_turn`], placed the same way and
+    /// for the same reasons: last in the request, user-role, replaced rather
+    /// than repeated, and never folded into history. What differs is what it
+    /// answers — not "you are running out" but "you are going in circles".
+    pub fn stall_notice_for_turn(turn_id: &TurnId, text: impl Into<String>) -> Self {
+        Self {
+            message_uid: MessageUid::from_string(format!("msg/stall/{turn_id}")),
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
     /// Where the run stands, placed at the tail of every request.
     ///
     /// Objective facts (steps, budget, the last failure) and the model's own

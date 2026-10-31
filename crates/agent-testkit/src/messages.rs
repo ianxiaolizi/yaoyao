@@ -10,7 +10,9 @@ use agent_protocol::model::{ContentBlock, MessageRole, ModelMessage};
 /// Whether a message is the loop's own per-request tail — the work state, the
 /// budget reminder — rather than anything the user or the model said.
 pub fn is_loop_tail(uid: &str) -> bool {
-    uid.starts_with("msg/work-state/") || uid.starts_with("msg/budget/")
+    uid.starts_with("msg/work-state/")
+        || uid.starts_with("msg/budget/")
+        || uid.starts_with("msg/stall/")
 }
 
 /// The last thing said, past the loop's own tails.

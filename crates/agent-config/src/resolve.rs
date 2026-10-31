@@ -26,11 +26,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use agent_protocol::digest;
 use agent_protocol::model::{ModelRoute, ModelTier};
 use agent_protocol::permissions::{Capability, CapabilitySet, PolicyDecision};
-use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget};
+use agent_protocol::profile::{CompletionKind, CompletionSpec, ResolvedProfileSnapshot, RunBudget};
 
 use crate::layers::{
-    BudgetSpec, Disposition, LayaSpec, ManagedPolicy, McpServer, PluginsSpec, PolicySpec, Profile,
-    SubagentSpec, ToolsSpec, UserConfig, WorkspaceConfig, parse_duration_ms,
+    BudgetSpec, CompletionKindSpec, CompletionSpecConfig, Disposition, LayaSpec, ManagedPolicy,
+    McpServer, PluginsSpec, PolicySpec, Profile, SubagentSpec, ToolsSpec, UserConfig,
+    WorkspaceConfig, parse_duration_ms,
 };
 use crate::{ConfigError, Result};
 
@@ -100,6 +101,8 @@ pub struct ResolvedProfile {
     /// files back.
     pub decision_backends: Vec<String>,
     pub budget: RunBudget,
+    /// The operator's completion criterion, when the profile names one.
+    pub completion: Option<CompletionSpec>,
     pub policy: ResolvedPolicy,
     /// Digest of the resolved policy; see `ResolvedProfileSnapshot::policy_version`.
     pub policy_version: String,
@@ -133,6 +136,7 @@ impl ResolvedProfile {
             memory_enabled: self.memory_enabled,
             capability_set: self.capability_set,
             budget: self.budget,
+            completion: self.completion,
         }
         .sealed()
     }
@@ -403,6 +407,11 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
     note_unstarted_plugins(&plugin_versions, &mut notes);
     let laya = laya_backend(&layers, &composed, &profile_id, &mut notes)?;
     let decision_backends = laya.iter().map(ResolvedLaya::label).collect();
+    // Resolved before the struct takes ownership of the pieces it was asked
+    // about — the criterion is a claim about the run's policy, so it is checked
+    // against the policy this run would actually enforce.
+    let completion =
+        completion(composed.completion.as_ref(), &capability_set, &composed, &profile_id)?;
 
     Ok(ResolvedProfile {
         profile_id,
@@ -419,6 +428,7 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
         laya,
         decision_backends,
         budget: budget(&layers.workspace, &composed)?,
+        completion,
         policy,
         policy_version,
         notes,
@@ -526,6 +536,10 @@ fn merge(base: Profile, above: Profile) -> Profile {
             max_output_tokens: above.max_output_tokens.or(base.max_output_tokens),
             compact_at_percent: above.compact_at_percent.or(base.compact_at_percent),
         }),
+        // One object rather than a set of knobs: a child that names any part of
+        // the criterion states the whole criterion, so the closer layer's
+        // section wins outright.
+        completion: above.completion.or(base.completion),
         plugins: merge_with(base.plugins, above.plugins, |base, above| PluginsSpec {
             enable: union(base.enable, above.enable),
             disable: union(base.disable, above.disable),
@@ -885,6 +899,137 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
     }
     Ok(budget)
 }
+
+/// Steps between completion checks when the section names none.
+const DEFAULT_COMPLETION_INTERVAL_STEPS: u32 = 5;
+
+/// What one completion check may spend when the section names no timeout.
+const DEFAULT_COMPLETION_TIMEOUT_MS: u64 = 120_000;
+
+/// The longest interval a criterion may ask for.
+///
+/// A check every hundred steps is already a backstop rather than a signal;
+/// beyond that the setting is more likely a mistyped `max_steps` than an
+/// interval someone meant.
+const MAX_COMPLETION_INTERVAL_STEPS: u32 = 100;
+
+/// The completion criterion, resolved and validated against the profile.
+///
+/// The check runs through the same gateway a model-made call does, so a
+/// criterion whose capability the profile does not grant is a check that can
+/// never pass. That is refused here, where the operator can see it, rather
+/// than recorded as a failed check on every step of the run.
+fn completion(
+    spec: Option<&CompletionSpecConfig>,
+    capability_set: &CapabilitySet,
+    composed: &Profile,
+    profile_id: &str,
+) -> Result<Option<CompletionSpec>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let refuse = |detail: String| {
+        Err(ConfigError::InvalidCompletion { profile: profile_id.to_string(), detail })
+    };
+    let Some(kind) = spec.kind else {
+        return refuse(String::from(
+            "`kind` is required; write `kind = \"command\"` or `kind = \"http\"`",
+        ));
+    };
+    let interval_steps = spec.interval_steps.unwrap_or(DEFAULT_COMPLETION_INTERVAL_STEPS);
+    if !(1..=MAX_COMPLETION_INTERVAL_STEPS).contains(&interval_steps) {
+        return refuse(format!(
+            "`interval_steps` is {interval_steps}; use 1..={MAX_COMPLETION_INTERVAL_STEPS}"
+        ));
+    }
+    let timeout_ms = spec.timeout_ms.unwrap_or(DEFAULT_COMPLETION_TIMEOUT_MS);
+    let (command, url) = match kind {
+        CompletionKindSpec::Command => {
+            let command = spec.command.as_deref().map(str::trim).unwrap_or_default();
+            if command.is_empty() {
+                return refuse(String::from("`kind = \"command\"` needs a non-empty `command`"));
+            }
+            if spec.url.is_some() {
+                return refuse(String::from(
+                    "`url` belongs to `kind = \"http\"`, not a command check",
+                ));
+            }
+            // The same two questions the gateway will ask per call, asked here
+            // once so the run does not start with a check that cannot pass.
+            if composed.policy.as_ref().and_then(|policy| policy.shell) != Some(Disposition::Allow)
+            {
+                return refuse(String::from(
+                    "a command check runs a process, so the profile must say `[policy] shell = \
+                     \"allow\"`; an ask would hold the check on an approval nobody can answer",
+                ));
+            }
+            if !capability_set.contains(&Capability::new(Capability::PROCESS_SPAWN)) {
+                return refuse(String::from(
+                    "a command check runs a process, but `process.spawn` is not among this \
+                     run's capabilities",
+                ));
+            }
+            if !(1..=MAX_CHECK_TIMEOUT_MS).contains(&timeout_ms) {
+                return refuse(format!(
+                    "`timeout_ms` is {timeout_ms}; use 1..={MAX_CHECK_TIMEOUT_MS}"
+                ));
+            }
+            (Some(command.to_string()), None)
+        }
+        CompletionKindSpec::Http => {
+            let url = spec.url.as_deref().map(str::trim).unwrap_or_default();
+            if url.is_empty() {
+                return refuse(String::from("`kind = \"http\"` needs a non-empty `url`"));
+            }
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return refuse(format!(
+                    "`url` is {url:?}; a completion check may only fetch http or https"
+                ));
+            }
+            if spec.command.is_some() {
+                return refuse(String::from(
+                    "`command` belongs to `kind = \"command\"`, not an http check",
+                ));
+            }
+            if composed.policy.as_ref().and_then(|policy| policy.network)
+                != Some(Disposition::Allow)
+            {
+                return refuse(String::from(
+                    "an http check reaches the network, so the profile must say `[policy] \
+                     network = \"allow\"`",
+                ));
+            }
+            if !capability_set.contains(&Capability::new(Capability::NETWORK_REQUEST)) {
+                return refuse(String::from(
+                    "an http check reaches the network, but `network.request` is not among this \
+                     run's capabilities",
+                ));
+            }
+            if !(1..=MAX_HTTP_CHECK_TIMEOUT_MS).contains(&timeout_ms) {
+                return refuse(format!(
+                    "`timeout_ms` is {timeout_ms}; an http check may spend 1..={MAX_HTTP_CHECK_TIMEOUT_MS}"
+                ));
+            }
+            (None, Some(url.to_string()))
+        }
+    };
+    Ok(Some(CompletionSpec {
+        kind: match kind {
+            CompletionKindSpec::Command => CompletionKind::Command,
+            CompletionKindSpec::Http => CompletionKind::Http,
+        },
+        command,
+        url,
+        interval_steps,
+        timeout_ms,
+    }))
+}
+
+/// The longest a command check may run, matching `shell.run`'s own ceiling.
+const MAX_CHECK_TIMEOUT_MS: u64 = 600_000;
+
+/// The longest an http check may run, matching `web.request`'s own ceiling.
+const MAX_HTTP_CHECK_TIMEOUT_MS: u64 = 120_000;
 
 /// A limit of zero is refused wherever it is written.
 ///

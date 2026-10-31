@@ -530,7 +530,10 @@ impl BudgetNotice {
             text.push_str(
                 " Do not open a new line of work. Finish the step you are on, then answer with \
                  what is done, what is not, and the first concrete action that would continue. \
-                 If something cannot be finished, name it plainly instead of leaving it out.",
+                 Work you cannot finish belongs in the work state rather than quietly in the \
+                 answer: call `state.update` with `blocked` saying what cannot be done and what \
+                 would unblock it, and name it in the answer too. Leaving `blocked` empty while \
+                 something is unfinished is a false report.",
             );
         } else {
             text.push_str(" Phase: normal.");
@@ -705,6 +708,7 @@ mod tests {
             resumed: None,
             max_steps: 4,
             budget: Default::default(),
+            completion: None,
         }
     }
 }

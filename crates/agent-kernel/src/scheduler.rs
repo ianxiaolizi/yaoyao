@@ -54,6 +54,10 @@ pub struct Scheduler {
     /// limit (a harness supplies it directly); this carries the limits the
     /// loop enforces inside a step and the ones recorded in a budget stop.
     budget: RunBudget,
+    /// The profile's completion criterion, when it named one. The loop runs it
+    /// at step boundaries; the scheduler only carries it from the resolved
+    /// profile into every turn it opens.
+    completion: Option<agent_protocol::profile::CompletionSpec>,
     /// The configuration this session's runs execute under, when the app layer
     /// resolved one. `None` is a real state — a harness or a tool that has no
     /// configuration to speak of — and it means the run records no snapshot
@@ -124,6 +128,7 @@ impl Scheduler {
             loop_,
             max_steps,
             budget: RunBudget::default(),
+            completion: None,
             profile: None,
             controls: Vec::new(),
             instructions: None,
@@ -203,6 +208,7 @@ impl Scheduler {
         // The profile's budget is what the run executes under; the step limit
         // stays the one `new` was given, which is how a harness states it.
         self.budget = snapshot.budget;
+        self.completion = snapshot.completion.clone();
         self.profile = Some(snapshot);
         self
     }
@@ -476,6 +482,7 @@ impl Scheduler {
             resumed: decision,
             max_steps: self.max_steps,
             budget: self.budget,
+            completion: self.completion.clone(),
         };
         // The turn's journal: the same log every other write goes to, committed
         // and flushed at the points where a fact has to outlive the process.
@@ -1175,6 +1182,7 @@ mod tests {
             memory_enabled: false,
             capability_set: agent_protocol::permissions::CapabilitySet::new(),
             budget,
+            completion: None,
         }
         .sealed()
     }

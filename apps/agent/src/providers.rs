@@ -72,7 +72,9 @@ impl ModelProvider for EchoModelProvider {
 
 /// Whether a user-role message is the loop's own tail rather than the user's.
 fn is_harness_tail(uid: &str) -> bool {
-    uid.starts_with("msg/work-state/") || uid.starts_with("msg/budget/")
+    uid.starts_with("msg/work-state/")
+        || uid.starts_with("msg/budget/")
+        || uid.starts_with("msg/stall/")
 }
 
 /// Why the provider could not be assembled.

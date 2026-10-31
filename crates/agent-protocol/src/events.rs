@@ -173,6 +173,14 @@ impl EventType {
     /// response, so a reader can see the spend grow without re-summing every
     /// response in the log.
     pub const BUDGET_UPDATED: &'static str = "budget/updated";
+    /// One run of the profile's completion criterion, at a step boundary.
+    ///
+    /// Written whether or not the check passed, because "the world says it is
+    /// done" and "the last check still said no" are both facts a reader of a
+    /// `Completed` turn needs. A check that could not run at all (the gateway
+    /// refused it, the tool failed to start) is recorded the same way with
+    /// `status: "error"`: it is not completion, and the turn continues.
+    pub const COMPLETION_CHECKED: &'static str = "completion/checked";
     pub const TOOL_RESULT_TRUNCATED: &'static str = "tool/result.truncated";
     pub const TOOL_RESULT_REDACTED: &'static str = "tool/result.redacted";
     /// A tool result carried a token the high-entropy layer flagged but did
@@ -291,6 +299,7 @@ impl EventType {
         Self::CONTEXT_COMPACTION_FAILED,
         Self::CONTEXT_COMPACTED,
         Self::BUDGET_UPDATED,
+        Self::COMPLETION_CHECKED,
         Self::TOOL_RESULT_TRUNCATED,
         Self::TOOL_RESULT_REDACTED,
         Self::TOOL_RESULT_HIGH_ENTROPY,

@@ -601,6 +601,7 @@ mod tests {
             .into_iter()
             .collect(),
             budget: agent_protocol::profile::RunBudget::default(),
+            completion: None,
         }
         .sealed();
 

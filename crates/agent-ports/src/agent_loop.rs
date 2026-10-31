@@ -195,6 +195,12 @@ pub struct TurnStateFacts {
     /// provider's `max_tokens`. A harness with no configuration passes the
     /// default, which leaves every one of them unbounded.
     pub budget: RunBudget,
+    /// The profile's completion criterion, when it named one.
+    ///
+    /// The loop runs it at step boundaries and ends the turn as `Completed`
+    /// the first time it passes. `None` is the ordinary case: a run without a
+    /// criterion ends when the model answers, and nothing else decides.
+    pub completion: Option<agent_protocol::profile::CompletionSpec>,
 }
 
 /// What opened a turn.

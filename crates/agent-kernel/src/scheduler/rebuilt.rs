@@ -53,6 +53,7 @@ impl Scheduler {
             loop_,
             max_steps: budget.max_steps,
             budget,
+            completion: self.completion.clone(),
             profile: self.profile.clone(),
             controls: self.controls.clone(),
             instructions: self.instructions.clone(),

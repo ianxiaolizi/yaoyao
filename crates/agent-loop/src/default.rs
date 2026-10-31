@@ -73,9 +73,11 @@ use crate::context_layers::{
 use loop_call::{LoopCallAnswer, answer_loop_call};
 
 mod budget;
+mod completion;
 mod loop_call;
 mod settle;
 mod settlement;
+mod stall;
 mod work_state;
 
 /// Longest provider error text persisted in a durable attempt event.
@@ -823,6 +825,15 @@ struct LoopTurn {
     /// The work state this turn shows at the tail of every request: opened from
     /// the caller's fold, replaced when `state.update` lands.
     work: Option<WorkState>,
+    /// What this turn has learned, step by step: the digests of every distinct
+    /// (call, answer) pair and the streak that has produced none. `stall` says
+    /// why a turn that keeps answering itself is stopped rather than left to
+    /// spend its step budget.
+    progress: stall::Progress,
+    /// The profile's completion criterion, when it named one. `completion`
+    /// says why a run whose task is already done is ended rather than left to
+    /// finish its step budget.
+    completion: Option<agent_protocol::profile::CompletionSpec>,
     /// The latest observation node, so the answer can cite what it rests on.
     reason_last_observation: Option<String>,
     /// Whether the kernel's reading named a checkable criterion, so a completed
@@ -1242,6 +1253,7 @@ impl AgentLoop for DefaultAgentLoop {
         // measured from the moment the turn opens; a harness with no facts has
         // the default budget, where only the step count is set.
         let budget = ctx.state.as_ref().map(|facts| facts.budget).unwrap_or_default();
+        let completion = ctx.state.as_ref().and_then(|facts| facts.completion.clone());
         let deadline = budget
             .wall_clock_ms
             .map(|millis| std::time::Instant::now() + std::time::Duration::from_millis(millis));
@@ -1376,6 +1388,8 @@ impl AgentLoop for DefaultAgentLoop {
                 stance_switched: false,
                 plan_view: ctx.plan.clone(),
                 work: ctx.work.clone(),
+                progress: stall::Progress::default(),
+                completion,
                 reason_last_observation: None,
                 criterion_expects_check,
                 criterion_observed: false,
@@ -1454,6 +1468,40 @@ impl AgentLoop for DefaultAgentLoop {
                 final_content: None,
                 spent: turn.spent,
             });
+        }
+
+        // And the boundary for a run that is going in circles: twice the
+        // reminder threshold of steps without new evidence ends it as
+        // `Stalled`, whatever budget is left. The check is here rather than
+        // after a response because the model was told to change course one
+        // step ago; a further request would spend budget on the same loop.
+        if turn.stall_reached() {
+            return Ok(StepOutcome {
+                step_id,
+                events,
+                stop: Some(StopReason::Stalled),
+                final_content: None,
+                spent: turn.spent,
+            });
+        }
+
+        // And the boundary the operator's criterion is asked at. It happens
+        // before the request rather than after a response because the world
+        // may already be done: a request sent past that point is spend on a
+        // run that has finished, and the work the model would have done next
+        // is work nobody needs. A check that does not pass costs one call and
+        // the turn carries on unchanged.
+        if let Some(outcome) = completion::check_at_boundary(
+            self.gateway.as_ref(),
+            &self.redactor,
+            ctx,
+            turn,
+            &step_id,
+            &mut events,
+        )
+        .await?
+        {
+            return Ok(outcome);
         }
 
         // Steering goes in before anything else this step does: it was injected
@@ -1566,6 +1614,10 @@ impl AgentLoop for DefaultAgentLoop {
             // reminder about stopping (see `work_state` for why both sit at
             // the tail and are replaced rather than repeated).
             let work_block = work_state::place_work_state(turn);
+            // Ahead of the budget reminder: "you are going in circles" is the
+            // more specific problem when both apply, and the budget line is the
+            // last thing the request says either way.
+            let stall_notice = stall::place_stall_notice(turn, &ctx.turn_id);
             let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id);
 
             let request = ModelRequest {
@@ -1650,6 +1702,15 @@ impl AgentLoop for DefaultAgentLoop {
             // read back without re-deriving the budget.
             if let Some(notice) = &budget_notice {
                 prepared["budget_notice"] = notice.to_json();
+            }
+            // And the stall reminder, for the same reason: the sentence the
+            // model read, and the streak it was measured from, in one record.
+            if let Some(text) = &stall_notice {
+                prepared["stall_notice"] = serde_json::json!({
+                    "unchanged_steps": turn.progress_unchanged_steps(),
+                    "stall_steps": turn.stall_steps(),
+                    "text": text,
+                });
             }
             // The state block, on the same terms: what the model read at the
             // tail, with the verdict on whether it had written an account of
@@ -1824,6 +1885,11 @@ impl AgentLoop for DefaultAgentLoop {
                 Actor::Agent,
             ));
 
+            // Where this step's own messages begin. Everything pushed from here
+            // on is what the step learned, and what `record_evidence` reads
+            // when the step ends: the assistant turn, then its tool results.
+            turn.mark_evidence_start();
+
             // The assistant turn — its text and any tool proposals — enters the
             // conversation before its tool results. That is the order every
             // provider expects when the history is replayed.
@@ -1872,6 +1938,7 @@ impl AgentLoop for DefaultAgentLoop {
                             .messages
                             .push(ModelMessage::kernel_note_for_turn(&ctx.turn_id, text)),
                     }
+                    turn.record_evidence();
                     events.push(draft(
                         ctx,
                         &step_id,
@@ -1954,6 +2021,7 @@ impl AgentLoop for DefaultAgentLoop {
                             .messages
                             .push(ModelMessage::kernel_note_for_turn(&ctx.turn_id, text)),
                     }
+                    turn.record_evidence();
                     events.push(draft(
                         ctx,
                         &step_id,
@@ -2025,6 +2093,7 @@ impl AgentLoop for DefaultAgentLoop {
                             .messages
                             .push(ModelMessage::kernel_note_for_turn(&ctx.turn_id, text)),
                     }
+                    turn.record_evidence();
                     events.push(draft(
                         ctx,
                         &step_id,
@@ -2219,6 +2288,7 @@ impl AgentLoop for DefaultAgentLoop {
                     })
                     .collect();
                 hold_step(ctx, &step_id, turn, &mut events, &tool_calls, &contents);
+                turn.record_held_step();
                 events.push(draft(
                     ctx,
                     &step_id,
@@ -2983,6 +3053,9 @@ impl AgentLoop for DefaultAgentLoop {
             ));
         }
 
+        // Whether this step learned anything, before the turn is handed back.
+        turn.record_evidence();
+
         // The step is done and the turn could continue. Whether it does is the
         // caller's decision: the step budget is the Scheduler's policy, not the
         // loop's, and a loop that stopped itself could not be steered past the
@@ -3283,6 +3356,12 @@ mod tests {
     /// The turn's frame: the capability layer, the secret names, and the order
     /// they hold relative to the instructions and the turn's own layers.
     mod frame;
+
+    /// Steps that produced no new evidence: the reminder, and the stop.
+    mod stall;
+
+    /// The operator's criterion, asked at a step boundary.
+    mod completion;
 
     use agent_ports::agent_loop::TurnFailureFacts;
     use agent_ports::agent_loop::{TurnCapabilityFacts, TurnStateFacts};
@@ -6912,6 +6991,7 @@ mod tests {
             resumed: None,
             max_steps: 16,
             budget: RunBudget::default(),
+            completion: None,
         }
     }
 

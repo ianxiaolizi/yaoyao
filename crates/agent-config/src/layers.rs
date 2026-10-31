@@ -176,9 +176,40 @@ pub struct Profile {
     pub tools: Option<ToolsSpec>,
     pub policy: Option<PolicySpec>,
     pub budget: Option<BudgetSpec>,
+    /// How this run decides the task is finished, when the operator can say.
+    pub completion: Option<CompletionSpecConfig>,
     pub plugins: Option<PluginsSpec>,
     /// Which decision backends this scenario runs with.
     pub decisions: Option<ProfileDecisions>,
+}
+
+/// The operator's completion criterion, as configuration spells it.
+///
+/// It is resolved against the profile's own policy: a `command` criterion needs
+/// `[policy] shell = "allow"`, and an `http` one needs `[policy] network =
+/// "allow"`, because a criterion the gateway would refuse is a check that can
+/// never pass — a configuration error rather than a runtime surprise.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionSpecConfig {
+    /// `"command"` or `"http"`.
+    pub kind: Option<CompletionKindSpec>,
+    /// The command for `kind = "command"`; exit status 0 means done.
+    pub command: Option<String>,
+    /// The endpoint for `kind = "http"`; a 2xx answer means done.
+    pub url: Option<String>,
+    /// Steps between checks. Omit for 5.
+    pub interval_steps: Option<u32>,
+    /// What one check may spend, in milliseconds. Omit for 120,000.
+    pub timeout_ms: Option<u64>,
+}
+
+/// How a completion criterion is checked, as configuration spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKindSpec {
+    Command,
+    Http,
 }
 
 /// The decision backends a scenario turns on or off.

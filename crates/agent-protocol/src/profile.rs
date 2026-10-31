@@ -191,6 +191,53 @@ impl Default for RunBudget {
     }
 }
 
+/// The operator's criterion for "this task is finished".
+///
+/// A run whose profile names one does not have to wait for the model to
+/// announce completion: the loop runs the check at a step boundary every
+/// `interval_steps` steps and ends the turn as `Completed` the first time it
+/// passes. The check is configuration, never model input — the model cannot
+/// choose the command or the URL — and both kinds go through the same gateway
+/// a model-made call does, so policy, approvals, redaction, and the tool's own
+/// timeout all apply.
+///
+/// Only the exit status (or the HTTP status class) is read. A criterion that
+/// needs more than that — a particular field of a JSON answer — is a claim
+/// about content the operator can put in the command itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionSpec {
+    pub kind: CompletionKind,
+    /// The command for `kind = "command"`. Exit status 0 passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The endpoint for `kind = "http"`. A 2xx answer passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Steps between checks. `1` checks before every request.
+    pub interval_steps: u32,
+    /// What one check may spend, in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// How a completion criterion is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKind {
+    /// Run a command; a zero exit status is completion.
+    Command,
+    /// Fetch a URL; a 2xx answer is completion.
+    Http,
+}
+
+impl CompletionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Http => "http",
+        }
+    }
+}
+
 /// The configuration one run executes under, frozen.
 ///
 /// Recorded once per run as `profile/resolved`, and copied into a fork's
@@ -246,6 +293,13 @@ pub struct ResolvedProfileSnapshot {
     /// The capabilities this run is authorized to use.
     pub capability_set: CapabilitySet,
     pub budget: RunBudget,
+    /// The operator's completion criterion, when the profile names one.
+    ///
+    /// Absent when there is none, for the reason `model_routes` is absent when
+    /// empty: a run without a criterion must hash and compare exactly like the
+    /// runs that came before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<CompletionSpec>,
 }
 
 impl ResolvedProfileSnapshot {
@@ -284,6 +338,7 @@ mod tests {
             memory_enabled: false,
             capability_set: [Capability::new(Capability::FS_READ)].into_iter().collect(),
             budget: RunBudget::default(),
+            completion: None,
         }
     }
 

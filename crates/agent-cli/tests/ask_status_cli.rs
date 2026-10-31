@@ -363,6 +363,7 @@ fn snapshot_with_budget(budget: RunBudget) -> ResolvedProfileSnapshot {
         memory_enabled: false,
         capability_set: CapabilitySet::new(),
         budget,
+        completion: None,
     }
     .sealed()
 }

@@ -98,6 +98,15 @@ pub enum ConfigError {
     #[error("{layer} sets a limit that cannot be run: {detail}")]
     InvalidBudget { layer: String, detail: String },
 
+    /// A completion criterion that could never run, or could never pass.
+    ///
+    /// Refused at resolution rather than checked at the first step boundary:
+    /// most of these are policy questions the operator can answer from the
+    /// message, and a run whose every check is refused is a run that was told
+    /// it had a criterion and never had one.
+    #[error("profile '{profile}' has an invalid completion criterion: {detail}")]
+    InvalidCompletion { profile: String, detail: String },
+
     #[error(
         "profile '{profile}' enables the Laya sidecar, but no layer defines it; add \
          [decisions.laya] to the user configuration"
@@ -127,6 +136,7 @@ mod tests {
     use super::*;
     use agent_protocol::model::{ModelRoute, ModelTier};
     use agent_protocol::permissions::{Capability, PolicyDecision};
+    use agent_protocol::profile::CompletionKind;
     use std::collections::BTreeMap;
 
     /// The layers a test is about, with everything else empty.
@@ -1497,6 +1507,100 @@ decisions = { laya = true }
         assert_eq!(resolved.max_steps, 1);
         assert_eq!(resolved.max_tool_calls, Some(1));
         assert_eq!(resolved.wall_clock_ms, Some(1_000));
+    }
+
+    fn completion_config(capabilities: &[&str], profile: &str) -> Layers {
+        let mut layers = no_layers();
+        let names: Vec<String> = capabilities.iter().map(|name| format!("\"{name}\"")).collect();
+        layers.user = UserConfig::from_toml_str(&format!(
+            "capabilities = [{}]\n[profiles.p]\n{profile}\n",
+            names.join(", ")
+        ))
+        .unwrap();
+        layers.profile_override = Some("p".to_string());
+        layers
+    }
+
+    #[test]
+    fn a_command_criterion_resolves_with_its_defaults() {
+        let resolved = resolve(completion_config(
+            &["process.spawn"],
+            "[profiles.p.policy]\nshell = \"allow\"\n\
+             [profiles.p.completion]\nkind = \"command\"\ncommand = \"python check.py\"\n",
+        ))
+        .unwrap();
+
+        let completion = resolved.completion.expect("the criterion is resolved");
+        assert_eq!(completion.kind, CompletionKind::Command);
+        assert_eq!(completion.command.as_deref(), Some("python check.py"));
+        assert_eq!(completion.url, None);
+        assert_eq!(completion.interval_steps, 5, "the shipped interval");
+        assert_eq!(completion.timeout_ms, 120_000, "the shipped timeout");
+    }
+
+    #[test]
+    fn an_http_criterion_resolves_against_a_network_that_may_reach_it() {
+        let resolved = resolve(completion_config(
+            &["network.request"],
+            "[profiles.p.policy]\nnetwork = \"allow\"\n\
+             [profiles.p.completion]\nkind = \"http\"\nurl = \"https://example.test/status\"\n\
+             interval_steps = 3\ntimeout_ms = 5000\n",
+        ))
+        .unwrap();
+
+        let completion = resolved.completion.expect("the criterion is resolved");
+        assert_eq!(completion.kind, CompletionKind::Http);
+        assert_eq!(completion.url.as_deref(), Some("https://example.test/status"));
+        assert_eq!(completion.command, None);
+        assert_eq!(completion.interval_steps, 3);
+        assert_eq!(completion.timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn a_criterion_that_could_never_run_is_refused_where_it_is_written() {
+        // Each of these is a check that could never pass — or never run — and
+        // saying so at resolution is what keeps the run from recording a
+        // refused check on every step instead.
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "[profiles.p.policy]\nshell = \"allow\"\n[profiles.p.completion]\ncommand = \"x\"\n",
+                "kind",
+                "no kind",
+            ),
+            (
+                "[profiles.p.completion]\nkind = \"command\"\ncommand = \"x\"\n",
+                "shell",
+                "a command check with the default shell disposition",
+            ),
+            (
+                "[profiles.p.policy]\nshell = \"allow\"\n[profiles.p.completion]\nkind = \"command\"\ncommand = \"x\"\n",
+                "process.spawn",
+                "a command check without the capability",
+            ),
+            (
+                "[profiles.p.completion]\nkind = \"http\"\nurl = \"file:///etc/passwd\"\n",
+                "http or https",
+                "a scheme a check may not fetch",
+            ),
+            (
+                "[profiles.p.completion]\nkind = \"http\"\nurl = \"https://x.test/\"\ninterval_steps = 0\n",
+                "interval_steps",
+                "an interval of zero",
+            ),
+        ];
+        for (profile, expected, what) in cases {
+            let layers = completion_config(&[], profile);
+            match resolve(layers).unwrap_err() {
+                ConfigError::InvalidCompletion { profile, detail } => {
+                    assert_eq!(profile, "p");
+                    assert!(
+                        detail.contains(expected),
+                        "{what}: {detail} did not mention `{expected}`"
+                    );
+                }
+                other => panic!("expected a refusal for {what}, got {other}"),
+            }
+        }
     }
 
     #[test]
