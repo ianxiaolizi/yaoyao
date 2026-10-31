@@ -98,27 +98,39 @@ pub(super) fn record_spend(
     }
 }
 
-/// Place the wrap-up reminder this request carries, if the run has reached the
-/// finalize phase, and return it for the prepared-request record.
+/// Place this step's budget reminder at the tail of the request, and return it
+/// for the prepared-request record.
 ///
-/// It goes last, after any compaction and after this turn's own traffic: it is
-/// a wrap-up instruction, and an instruction buried above a large tool result
-/// reads as history. The uid is the turn's, so replacing it each step keeps one
-/// reminder in the request rather than a growing pile of them.
-pub(super) fn place_finalize_reminder(
-    turn: &mut LoopTurn,
-    turn_id: &TurnId,
-) -> Option<BudgetNotice> {
-    let phase = turn.budget_phase();
-    if phase != "finalize" {
+/// Every request carries one while the run has a limit to report: the numbers
+/// are what let the model decide where to spend what is left. A turn with no
+/// token budget and no wall clock has nothing to report, and gets none — the
+/// request is then exactly what it was before reminders existed.
+///
+/// It goes last, after any compaction and after this turn's own traffic: a
+/// wrap-up instruction buried above a large tool result reads as history. The
+/// uid is the turn's, so replacing it each step keeps one reminder in the
+/// request rather than a growing pile of them, and the stable prefix the
+/// provider's cache hits stays untouched.
+pub(super) fn place_budget_notice(turn: &mut LoopTurn, turn_id: &TurnId) -> Option<BudgetNotice> {
+    if turn.budget.max_total_tokens.is_none() && turn.budget.wall_clock_ms.is_none() {
         return None;
     }
-    let notice = BudgetNotice::new(phase, turn.budget_used_percent(), turn.budget.max_total_tokens);
+    let notice = BudgetNotice::new(
+        turn.budget_phase(),
+        turn.budget_used_percent(),
+        turn.spent.total_tokens(),
+        turn.budget.max_total_tokens,
+        turn.deadline.map(|deadline| {
+            deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64
+        }),
+    );
     let uid = format!("msg/budget/{turn_id}");
     let message = ModelMessage::budget_notice_for_turn(turn_id, notice.text.clone());
-    match turn.messages.iter_mut().find(|message| message.message_uid.as_str() == uid) {
-        Some(existing) => *existing = message,
-        None => turn.messages.push(message),
-    }
+    // Replaced and re-appended rather than overwritten in place: the reminder
+    // from the previous step sat above the traffic that step produced, and a
+    // stale position would bury it in exactly the tool results it should be
+    // read after.
+    turn.messages.retain(|message| message.message_uid.as_str() != uid);
+    turn.messages.push(message);
     Some(notice)
 }

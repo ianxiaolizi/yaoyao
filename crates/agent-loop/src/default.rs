@@ -1547,7 +1547,7 @@ impl AgentLoop for DefaultAgentLoop {
                 self.compact(turn, &step_id, candidate, &mut events).await?;
             }
 
-            let budget_notice = budget::place_finalize_reminder(turn, &ctx.turn_id);
+            let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id);
 
             let request = ModelRequest {
                 session_id: ctx.session_id.clone(),

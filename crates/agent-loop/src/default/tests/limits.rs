@@ -119,11 +119,11 @@ async fn unreported_usage_is_estimated_and_flagged() {
     assert!(spent["input_tokens"].as_u64().unwrap() > 0, "{spent}");
 }
 
-/// At the finalize threshold the next request carries one wrap-up reminder
-/// at its tail, and the run still ends only when the budget is actually
-/// spent.
+/// Every request carries one budget reminder at its tail: the numbers always,
+/// the wrap-up advice from the finalize threshold on. The run still ends only
+/// when the budget is actually spent.
 #[tokio::test]
-async fn the_finalize_reminder_is_placed_once_at_the_tail() {
+async fn the_budget_reminder_is_one_tail_message_that_turns_final() {
     let model = Arc::new(FakeModelProvider::new(vec![
         priced_call(450, 0, 0),
         priced_call(450, 0, 0),
@@ -148,21 +148,28 @@ async fn the_finalize_reminder_is_placed_once_at_the_tail() {
     let requests = model.requests();
     assert_eq!(requests.len(), 3);
     let uid = format!("msg/budget/{}", turn.turn_id);
-    assert!(
-        !requests[1].messages.iter().any(|m| m.message_uid.as_str() == uid),
-        "45% is not the finalize phase"
-    );
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            request.messages.iter().filter(|m| m.message_uid.as_str() == uid).count(),
+            1,
+            "request {index} carries one reminder, not a pile"
+        );
+        assert_eq!(
+            request.messages.last().unwrap().message_uid.as_str(),
+            uid,
+            "the reminder is the last thing the model reads"
+        );
+    }
+    let normal = requests[1]
+        .messages
+        .last()
+        .map(|m| m.text_content())
+        .expect("the second request carries a reminder");
+    assert!(normal.contains("spent 450 of its 1000-token budget"), "{normal}");
+    assert!(normal.contains("Phase: normal"), "45% is not the finalize phase: {normal}");
     let finalize_request = &requests[2];
-    assert_eq!(
-        finalize_request.messages.iter().filter(|m| m.message_uid.as_str() == uid).count(),
-        1,
-        "one reminder, not a pile"
-    );
-    assert_eq!(
-        finalize_request.messages.last().unwrap().message_uid.as_str(),
-        uid,
-        "the reminder is the last thing the model reads"
-    );
+    let final_text = finalize_request.messages.last().unwrap().text_content();
+    assert!(final_text.contains("Do not open a new line of work"), "{final_text}");
 
     let prepared: Vec<_> = outcome
         .events
@@ -171,7 +178,13 @@ async fn the_finalize_reminder_is_placed_once_at_the_tail() {
         .collect();
     assert_eq!(prepared[2].payload["budget_phase"], "finalize");
     assert_eq!(prepared[2].payload["budget_notice"]["percent"], 90);
-    assert!(prepared[1].payload.get("budget_notice").is_none());
+    // The request before it was not finalizing, and the log says so beside the
+    // reminder it did carry: what the model saw is readable per request.
+    assert_eq!(prepared[1].payload["budget_phase"], "normal");
+    assert_eq!(prepared[1].payload["budget_notice"]["percent"], 45);
+    assert!(
+        prepared[1].payload["budget_notice"]["text"].as_str().unwrap().contains("Phase: normal")
+    );
 }
 
 /// A window that is configured but not yet full is still worth one line

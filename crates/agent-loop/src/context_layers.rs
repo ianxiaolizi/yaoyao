@@ -449,12 +449,14 @@ impl ContextNotice {
     }
 }
 
-/// The wrap-up reminder a run carries once it is in its finalize phase.
+/// The reminder a run carries about what it has spent, once per step.
 ///
-/// It is not a stop: the turn ends when a limit is actually reached, and a
-/// model that finishes its answer before then still ends with `final_answer`.
-/// The reminder exists because a run stopped at the limit with no notice gives
-/// its reader a beginning of an answer and no statement of what is missing.
+/// The numbers are always there: a run that is never told how much budget is
+/// left spends it on whatever the model happens to be doing, which is how the
+/// 2026-10-31 run came to ignore three fetched coding problems until the step
+/// limit killed it. The wrap-up advice is only there in the finalize phase,
+/// and it is advice, not a stop: a model that finishes its answer before the
+/// limit still ends with `final_answer`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BudgetNotice {
     pub(crate) phase: &'static str,
@@ -464,17 +466,33 @@ pub(crate) struct BudgetNotice {
 }
 
 impl BudgetNotice {
-    pub(crate) fn new(phase: &'static str, percent: u32, max_total_tokens: Option<u64>) -> Self {
-        let limit = match max_total_tokens {
-            Some(max) => format!("of its {max}-token run budget"),
-            None => "of the time it was given".to_string(),
+    /// What one step's reminder says, from the numbers that step already has.
+    pub(crate) fn new(
+        phase: &'static str,
+        percent: u32,
+        spent_tokens: u64,
+        max_total_tokens: Option<u64>,
+        wall_clock_left_ms: Option<u64>,
+    ) -> Self {
+        let mut text = match max_total_tokens {
+            Some(max) => format!(
+                "Budget notice: this run has spent {spent_tokens} of its {max}-token budget \
+                 ({percent}%)."
+            ),
+            None => format!("Budget notice: this run has used about {percent}% of its wall clock."),
         };
-        let text = format!(
-            "Budget notice: this run has used about {percent}% {limit}. Do not open a new line \
-             of work. Finish the step you are on, then answer with what is done, what is not, \
-             and the first concrete action that would continue. If something cannot be \
-             finished, name it plainly instead of leaving it out."
-        );
+        if let Some(left) = wall_clock_left_ms {
+            text.push_str(&format!(" Wall clock: about {}s left.", left / 1000));
+        }
+        if phase == "finalize" {
+            text.push_str(
+                " Do not open a new line of work. Finish the step you are on, then answer with \
+                 what is done, what is not, and the first concrete action that would continue. \
+                 If something cannot be finished, name it plainly instead of leaving it out.",
+            );
+        } else {
+            text.push_str(" Phase: normal.");
+        }
         Self { phase, percent, max_total_tokens, text }
     }
 
