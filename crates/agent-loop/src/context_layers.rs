@@ -13,6 +13,7 @@ use agent_ports::agent_loop::{TurnCapabilityFacts, TurnEnding, TurnInputKind, Tu
 use agent_ports::context_engine::ContextUsage;
 use agent_ports::execution_environment::SandboxMode;
 use agent_ports::model_provider::{ContentBlock, ModelMessage, ToolManifest};
+use agent_ports::model_router::ModelRoute;
 use agent_protocol::judgment::Judgment;
 use agent_protocol::plan::{Plan, StepWorker};
 use agent_protocol::tool::ToolSource;
@@ -109,6 +110,26 @@ impl ContextLayers {
             },
         })
     }
+}
+
+/// Which model this turn's requests reach, in the words the route used.
+///
+/// The harness knows the name and the model does not: left to itself it answers
+/// "who are you?" from training data, which is a different model than the one
+/// running. `None` when the route names no model — a harness with no vendor —
+/// because inventing an identity is worse than saying nothing.
+pub(crate) fn identity_text(route: &ModelRoute) -> Option<String> {
+    let model = route.model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let provider = route.provider.trim();
+    let via = if provider.is_empty() { String::new() } else { format!(" (provider `{provider}`)") };
+    Some(format!(
+        "Model identity: this turn's requests are answered by `{model}`{via}. If a report, a form \
+         or a debrief asks which model produced the work, that is the name to give — it is the \
+         route this harness chose, not something to infer from training data."
+    ))
 }
 
 /// The state layer's text: the facts around this turn that a transcript does

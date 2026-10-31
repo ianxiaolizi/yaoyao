@@ -311,6 +311,19 @@ impl ModelMessage {
         }
     }
 
+    /// Which model is answering this turn, as the route named it.
+    ///
+    /// Not history, for the same reason as the task layer, and turn-scoped
+    /// rather than run-scoped because the route is chosen per turn: a tier a
+    /// later turn escalates to is a different answer to "who is answering".
+    pub fn identity_for_turn(turn_id: &TurnId, text: impl Into<String>) -> Self {
+        Self {
+            message_uid: MessageUid::from_string(format!("msg/identity/{turn_id}")),
+            role: MessageRole::System,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
     /// What this run can do: its execution boundary and its tool index.
     ///
     /// Run-scoped, not turn-scoped: the boundary is fixed for the run, and the

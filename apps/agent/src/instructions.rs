@@ -34,7 +34,7 @@ pub const MAX_PROJECT_FILE_BYTES: u64 = 64 * 1024;
 /// Names the preamble below. Recorded with every run, so a later change to the
 /// wording is visible in the log as a different prompt rather than as the same
 /// one that mysteriously behaves differently.
-pub const BUILTIN: &str = "yaoyao/instructions/1";
+pub const BUILTIN: &str = "yaoyao/instructions/2";
 
 /// Instructions resolved from one workspace root.
 pub struct WorkspaceInstructions {
@@ -132,6 +132,12 @@ fn builtin_preamble(root: &Path) -> String {
          - Inspect before you assert. A tool result is the only evidence you \
          have about the workspace; when you have not looked, say so instead of \
          guessing.\n\
+         - Name a Python script you write into the workspace something other \
+         than a standard-library module (`inspect.py`, `json.py`, `types.py`, \
+         `random.py`). The interpreter puts the script's directory at the front \
+         of its search path, so such a file shadows the module of that name and \
+         the traceback ends at your own script instead of naming the real \
+         problem.\n\
          - Keep changes to what the task needs and match the surrounding code, \
          its naming and its comment style.\n\
          - When a tool call comes back refused, or the run stops for a human \
@@ -160,6 +166,18 @@ mod tests {
         assert_eq!(instructions.builtin, BUILTIN);
         assert!(instructions.text.contains(&dir.path().display().to_string()));
         assert!(instructions.text.contains("Workspace root:"));
+    }
+
+    /// A script named after a stdlib module is the mistake the environment's
+    /// `PYTHONSAFEPATH` covers for `python file.py`; the preamble says the rule
+    /// as a habit, so it also holds for an interpreter started another way.
+    #[test]
+    fn the_preamble_warns_against_naming_a_script_after_a_stdlib_module() {
+        let dir = workspace();
+        let instructions = resolve_instructions(dir.path()).unwrap();
+        assert!(instructions.text.contains("standard-library module"), "{}", instructions.text);
+        assert!(instructions.text.contains("`inspect.py`"), "{}", instructions.text);
+        assert!(instructions.text.contains("shadows the module"), "{}", instructions.text);
     }
 
     #[test]

@@ -112,6 +112,7 @@ fn workspace_members_match_spec() {
         "crates/agent-tools-fs",
         "crates/agent-tools-git",
         "crates/agent-tools-mcp",
+        "crates/agent-tools-web",
         "crates/agent-subagent-stdio",
         "crates/agent-sandbox-win",
         "crates/agent-model-openai",
@@ -162,6 +163,11 @@ fn dependency_direction_matches_spec() {
         // holds the MCP SDK — the only crate that names it — and the crates
         // above it hold only the `ToolProvider` it implements.
         ("crates/agent-tools-mcp", &["agent-protocol", "agent-ports"]),
+        // The HTTP adapter: the same shape again, and the reason it is a
+        // separate crate rather than a fourth family in the fs tools is that
+        // its guard and its transport are its own. It sees the protocol and the
+        // tool seam, and knows nothing about the loop that dispatches it.
+        ("crates/agent-tools-web", &["agent-protocol", "agent-ports"]),
         // Like the MCP adapter: something outside this process, reached through
         // a port. It knows one wire and one process API and nothing above
         // either — in particular not the kernel that decides what a delegation
@@ -220,6 +226,7 @@ fn dependency_direction_matches_spec() {
                 "agent-tools-fs",
                 "agent-tools-git",
                 "agent-tools-mcp",
+                "agent-tools-web",
                 "agent-subagent-stdio",
                 "agent-sandbox-win",
                 "agent-model-openai",
@@ -288,6 +295,10 @@ const DEV_MATRIX: &[(&str, &[&str])] = &[
     // and the in-memory one lives in the testkit rather than in a second
     // hand-rolled double here.
     ("crates/agent-tools-mcp", &["agent-testkit"]),
+    // Its tests drive a real listener on loopback, so what is under test is the
+    // tool against an HTTP server rather than against a fake of one; nothing
+    // from this workspace is needed to start it.
+    ("crates/agent-tools-web", &[]),
     ("crates/agent-subagent-stdio", &[]),
     // The backend's own tests touch the filesystem ACLs and the device DACL;
     // no other crate in the workspace is needed to drive it.

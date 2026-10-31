@@ -19,6 +19,7 @@ agent-store-artifact = { path = "../../crates/agent-store-artifact" }
 agent-tools-fs = { path = "../../crates/agent-tools-fs" }
 agent-tools-git = { path = "../../crates/agent-tools-git" }
 agent-tools-mcp = { path = "../../crates/agent-tools-mcp" }
+agent-tools-web = { path = "../../crates/agent-tools-web" }
 agent-subagent-stdio = { path = "../../crates/agent-subagent-stdio" }
 agent-sandbox-win = { path = "../../crates/agent-sandbox-win" }
 agent-model-openai = { path = "../../crates/agent-model-openai" }

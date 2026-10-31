@@ -60,6 +60,7 @@ use agent_store_jsonl::JsonlEventStore;
 use agent_store_secret::EnvSecretProvider;
 use agent_tools_fs::{FsToolProvider, LocalExecutionEnvironment, SandboxedFileEnvironment};
 use agent_tools_git::GitToolProvider;
+use agent_tools_web::WebToolProvider;
 
 use crate::config;
 use crate::decisions;
@@ -527,10 +528,19 @@ pub async fn assemble_with_delegation(
         Arc::new(SqliteMemoryIndex::open(store.clone(), data_dir.clone()));
     let memory_tools: Arc<dyn ToolProvider> =
         Arc::new(MemoryToolProvider::new(memory_index, session.clone()));
+    // One page per call. The provider is built here rather than inside the fs
+    // family because its address guard is its own: it refuses loopback and
+    // private ranges before a request leaves the process, and that rule has
+    // nothing to do with where files may be written. A run whose backend does
+    // not advertise `network.request` — a read-only run — is not refused here:
+    // the gateway drops the tool from the surface it offers, which is the same
+    // answer every other built-in gets.
+    let web_tools: Arc<dyn ToolProvider> = Arc::new(WebToolProvider::new());
     // The built-in families are listed once. `reserved` is read off this list
     // and the composite is assembled from it, so a family cannot be added to
     // one and forgotten in the other.
-    let mut builtin_families: Vec<Arc<dyn ToolProvider>> = vec![fs_tools, git_tools, memory_tools];
+    let mut builtin_families: Vec<Arc<dyn ToolProvider>> =
+        vec![fs_tools, git_tools, memory_tools, web_tools];
     // Long-term memory is off unless the user configuration turned it on, and
     // when it is off no provider is built at all: a tool that is not on the
     // surface cannot be called by name, which is stronger than one that refuses.

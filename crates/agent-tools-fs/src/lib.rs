@@ -11,6 +11,7 @@
 
 mod env;
 mod provider;
+mod python_env;
 mod worker;
 
 pub use env::{

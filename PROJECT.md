@@ -74,6 +74,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-tools-fs` | `FsToolProvider`（`fs.list`/`fs.glob`/`fs.grep`/`fs.read`/`fs.write`/`fs.edit`/`shell.run`）+ `LocalExecutionEnvironment`（含 `list_dir`，符号链接只报告不跟随） |
 | `agent-tools-git` | git 工具（编码证据链）：`git.status`/`git.diff` 由进程内 libgit2 读取仓库，不 spawn `git`（AppContainer 下 git 拿不到工作目录，`CONTRACT.md` §7 #59） |
 | `agent-tools-mcp` | MCP 工具适配器（能力闸门下的注册） |
+| `agent-tools-web` | `web.request`：一次 HTTP 调用，只去公网地址（每跳重定向重新校验、DNS 钉住已校验地址）、body 截在 1 MB、per-call 超时上限 120 s（`CONTRACT.md` §7 #144） |
 | `agent-subagent-stdio` | 外部 CLI subagent 适配器（stdio 后端） |
 | `agent-sandbox-win` | Windows AppContainer 执行后端：profile/SID、ACL 授予、`STARTUPINFOEX` + Job Object 启动；唯一允许 `unsafe` 的 crate（`CONTRACT.md` §7 #38） |
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |

@@ -40,6 +40,8 @@ use agent_ports::process_launcher::{
 };
 use agent_protocol::permissions::Capability;
 
+use crate::python_env::add_python_environment;
+
 /// Most output kept from one command, per stream.
 ///
 /// Past this the excess is dropped and `truncated` is set. Draining continues
@@ -725,8 +727,13 @@ impl ExecutionEnvironment for LocalExecutionEnvironment {
         let cwd = process_cwd(cwd);
 
         // The child gets the allowlisted environment, never the parent's whole
-        // one: the parent holds the model key (`process_env` says why).
-        let env = child_environment(&(self.parent_environment)());
+        // one: the parent holds the model key (`process_env` says why). The
+        // Python defaults are added here rather than in the allowlist because
+        // they are a statement about this tool's children, not about every
+        // child the agent ever starts (an MCP server runs Python of its own
+        // and is configured by its operator).
+        let mut env = child_environment(&(self.parent_environment)());
+        add_python_environment(&mut env);
         let mut args = spec.args.clone();
         if matches!(self.shell, Shell::PowerShell(_))
             && let Some(index) = args.iter().position(|arg| arg == "-Command")
@@ -1714,6 +1721,28 @@ mod tests {
                 .any(|(_, value)| value.to_string_lossy().contains("sk-live-secret")),
             "the model key reached a child process"
         );
+    }
+
+    /// A Python child started through `shell.run` gets the three settings that
+    /// keep a workspace script from shadowing the stdlib, its output readable,
+    /// and `__pycache__` out of the workspace. They reach the process the
+    /// launcher spawns, which is the only environment it ever runs with.
+    #[test]
+    fn a_command_carries_the_python_defaults() {
+        let (environment, recorded, _dir) = with_fake(Behaviour::Exit(0), Vec::new());
+
+        environment.run_command(&quick("true")).unwrap();
+
+        let recorded = recorded.lock().unwrap();
+        let request = recorded.requests.first().expect("the command was started");
+        for (name, value) in crate::python_env::PYTHON_ENVIRONMENT {
+            let seen = request
+                .env
+                .iter()
+                .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.to_string_lossy().into_owned());
+            assert_eq!(seen.as_deref(), Some(*value), "{name} did not reach the child");
+        }
     }
 
     #[test]

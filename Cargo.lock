@@ -28,6 +28,7 @@ dependencies = [
  "agent-tools-fs",
  "agent-tools-git",
  "agent-tools-mcp",
+ "agent-tools-web",
  "agent-web",
  "async-trait",
  "chrono",
@@ -349,6 +350,20 @@ dependencies = [
  "base64 0.23.1",
  "http",
  "rmcp",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "agent-tools-web"
+version = "0.1.0"
+dependencies = [
+ "agent-ports",
+ "agent-protocol",
+ "async-trait",
+ "futures-util",
+ "reqwest 0.12.28",
  "serde_json",
  "thiserror",
  "tokio",

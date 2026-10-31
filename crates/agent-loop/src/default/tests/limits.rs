@@ -262,13 +262,17 @@ async fn a_context_near_the_budget_is_reminded_once_after_history() {
     assert_eq!(request.messages[0].role, MessageRole::System);
     assert_eq!(request.messages[0].text_content(), "the run's rules");
     assert_eq!(request.messages[1].text_content(), "history");
-    assert_eq!(request.messages[2].role, MessageRole::System);
-    assert_eq!(request.messages[2].message_uid.as_str(), format!("msg/notice/{}", ctx.turn_id));
-    let notice = request.messages[2].text_content();
+    // The identity layer sits with the frame, before the notice: "who answers"
+    // is a standing fact about the turn and "how full this is" is measured over
+    // it.
+    assert_eq!(request.messages[2].message_uid.as_str(), format!("msg/identity/{}", ctx.turn_id));
+    assert_eq!(request.messages[3].role, MessageRole::System);
+    assert_eq!(request.messages[3].message_uid.as_str(), format!("msg/notice/{}", ctx.turn_id));
+    let notice = request.messages[3].text_content();
     let left = u64::from(window) - u64::try_from(tokens).expect("tokens fit a `u64`");
     assert!(notice.contains("this request is using about 96%"), "{notice}");
     assert!(notice.contains(&format!("{left} tokens left")), "{notice}");
-    assert_eq!(request.messages[3], ModelMessage::user_for_turn(&ctx.turn_id, "hi"));
+    assert_eq!(request.messages[4], ModelMessage::user_for_turn(&ctx.turn_id, "hi"));
 }
 
 #[tokio::test]
@@ -287,7 +291,8 @@ async fn a_context_below_the_threshold_carries_no_notice() {
     let outcome = run_turn(&loop_, &ctx).await;
     let payload = prepared_payload(&outcome);
     assert!(payload.get("context_notice").is_none(), "84% is below the threshold: {payload}");
-    assert_eq!(payload["message_count"], 1, "{payload}");
+    // The identity layer and this turn's input, and nothing else.
+    assert_eq!(payload["message_count"], 2, "{payload}");
 }
 
 #[tokio::test]
@@ -310,5 +315,5 @@ async fn a_context_without_a_configured_window_carries_no_notice() {
     let outcome = run_turn(&loop_, &ctx()).await;
     let payload = prepared_payload(&outcome);
     assert!(payload.get("context_notice").is_none(), "{payload}");
-    assert_eq!(payload["message_count"], 1);
+    assert_eq!(payload["message_count"], 2, "the identity layer and the input");
 }

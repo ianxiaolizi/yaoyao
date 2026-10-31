@@ -28,6 +28,15 @@ use agent_protocol::permissions::Capability;
 /// timeout the model is told about is the timeout that actually applies.
 pub const SHELL_TIMEOUT_MS: u64 = 30_000;
 
+/// The longest deadline a `shell.run` call may state for itself.
+///
+/// A font scan or a full test suite genuinely takes longer than half a minute,
+/// and the alternative a model reached for was splitting the work into commands
+/// that raced the same default (2026-10-31: a scan was killed at the default
+/// and the run read it as the tool being broken). Ten minutes is a ceiling, not
+/// a promise: a call that states nothing gets the default.
+pub const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
+
 /// How deep a recursive walk descends below the path it was given.
 ///
 /// A workspace can contain a directory tree with no bottom (a generated
@@ -205,7 +214,12 @@ impl ToolProvider for FsToolProvider {
                     "required": ["command"],
                     "properties": {
                         "command": { "type": "string" },
-                        "cwd": { "type": "string" }
+                        "cwd": { "type": "string" },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_SHELL_TIMEOUT_MS
+                        }
                     }
                 }),
             },
@@ -480,7 +494,17 @@ impl ToolProvider for FsToolProvider {
                 let command = Self::required_str(invocation, "shell.run", "command")?;
                 let cwd =
                     invocation.arguments.get("cwd").and_then(|v| v.as_str()).map(String::from);
-                let spec = shell_spec(self.env.as_ref(), command.to_string(), cwd);
+                // A deadline the call states for itself: a scan that needs two
+                // minutes says so, and a value past the ceiling is clamped
+                // rather than refused, because "as long as the tool allows" is
+                // what a larger number means.
+                let timeout = match invocation.arguments.get("timeout_ms") {
+                    None => None,
+                    Some(value) => Some(value.as_u64().ok_or_else(|| {
+                        failed("shell.run", "'timeout_ms' must be a whole number of milliseconds")
+                    })?),
+                };
+                let spec = shell_spec(self.env.as_ref(), command.to_string(), cwd, timeout);
                 match self.env.run_command(&spec) {
                     Ok(out) => {
                         // The exit code leads a failed result so the model does
@@ -857,7 +881,9 @@ fn shell_run_description(language: Option<&str>, shell_program: &str) -> String 
                   — write `.\\name`. A non-zero exit code comes back as a failed tool result \
                   whose first line is `exit code N`, followed by the command's output; the exit \
                   code is already reported, so there is no need to echo it. `cwd` defaults to \
-                  the workspace root.";
+                  the workspace root. The command is killed after 30000 ms unless the call \
+                  states `timeout_ms` (at most 600000): a scan or a suite that needs longer \
+                  says so instead of being split into commands that race the same default.";
     // The host convention on Windows is `cmd`, and its syntax is close enough to
     // POSIX to invite commands that exit 0 while doing something else: `;` is
     // passed through inside the argument (so `ledger report; echo done` reaches
@@ -895,17 +921,24 @@ fn shell_run_description(language: Option<&str>, shell_program: &str) -> String 
 /// shell can run inside a confinement is the backend's fact, and a second
 /// hardcoded copy would keep saying `cmd /C` on a backend where `cmd.exe`
 /// cannot start a child process.
-fn shell_spec(env: &dyn ExecutionEnvironment, command: String, cwd: Option<String>) -> CommandSpec {
+fn shell_spec(
+    env: &dyn ExecutionEnvironment,
+    command: String,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+) -> CommandSpec {
     let invocation = env.shell_invocation(&command);
 
     // The deadline travels with the spec. Leaving it `None` here is how the
     // declared 30s once became decorative: the definition promised a limit that
-    // nothing downstream was told about.
+    // nothing downstream was told about. A call that stated its own deadline
+    // replaces the default, clamped to the ceiling the schema advertises.
+    let timeout_ms = timeout_ms.map_or(SHELL_TIMEOUT_MS, |ms| ms.clamp(1, MAX_SHELL_TIMEOUT_MS));
     CommandSpec {
         program: invocation.program,
         args: invocation.args,
         cwd,
-        timeout_ms: Some(SHELL_TIMEOUT_MS),
+        timeout_ms: Some(timeout_ms),
     }
 }
 
@@ -1068,11 +1101,36 @@ mod tests {
     fn the_declared_shell_timeout_is_the_one_the_command_is_given() {
         let dir = tempfile::tempdir().unwrap();
         let env = LocalExecutionEnvironment::new(dir.path().to_path_buf());
-        let spec = shell_spec(&env, "echo hi".to_string(), None);
+        let spec = shell_spec(&env, "echo hi".to_string(), None, None);
         // A definition that promises a deadline nothing downstream receives is
         // worse than no deadline: it is a limit the model is told about and the
         // environment has never heard of.
         assert_eq!(spec.timeout_ms, Some(SHELL_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn a_call_states_its_own_deadline_and_the_ceiling_is_the_schema_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = LocalExecutionEnvironment::new(dir.path().to_path_buf());
+        let two_minutes = shell_spec(&env, "scan".to_string(), None, Some(120_000));
+        assert_eq!(two_minutes.timeout_ms, Some(120_000), "the stated deadline is the one applied");
+        let beyond = shell_spec(&env, "scan".to_string(), None, Some(u64::MAX));
+        assert_eq!(
+            beyond.timeout_ms,
+            Some(MAX_SHELL_TIMEOUT_MS),
+            "a number past the ceiling means 'as long as allowed', not a refusal"
+        );
+        let declared = provider(&dir)
+            .definitions()
+            .into_iter()
+            .find(|definition| definition.name == "shell.run")
+            .expect("shell.run is defined");
+        assert_eq!(
+            declared.input_schema["properties"]["timeout_ms"]["maximum"].as_u64(),
+            Some(MAX_SHELL_TIMEOUT_MS),
+            "the schema states the same ceiling the code enforces"
+        );
+        assert!(declared.description.contains("600000"), "{}", declared.description);
     }
 
     #[test]

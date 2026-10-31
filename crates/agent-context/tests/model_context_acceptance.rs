@@ -153,10 +153,10 @@ impl Harness {
 /// A request's messages minus the per-turn layers and tail blocks, which are
 /// not history.
 ///
-/// The state and task layers open a request for its turn; the work-state block
-/// closes it. All three are placed by the loop for each request and are not
-/// folded into history (CONTRACT #42), so the rebuilt transcript must not
-/// contain them.
+/// The state, task and identity layers open a request for its turn; the
+/// work-state block closes it. All of them are placed by the loop for each
+/// request and are not folded into history (CONTRACT #42), so the rebuilt
+/// transcript must not contain them.
 fn settled(messages: Vec<ModelMessage>) -> Vec<ModelMessage> {
     messages
         .into_iter()
@@ -164,6 +164,7 @@ fn settled(messages: Vec<ModelMessage>) -> Vec<ModelMessage> {
             let uid = message.message_uid.as_str();
             !uid.starts_with("msg/state/")
                 && !uid.starts_with("msg/task/")
+                && !uid.starts_with("msg/identity/")
                 && !uid.starts_with("msg/work-state/")
         })
         .collect()
@@ -385,14 +386,16 @@ async fn a_windowed_history_sends_the_kept_suffix_plus_this_turns_input() {
     assert_eq!(state.message_uid.as_str(), format!("msg/state/{}", report.turn_id));
     let task = &request.messages[kept.len() + 1];
     assert_eq!(task.message_uid.as_str(), format!("msg/task/{}", report.turn_id));
-    let notice = &request.messages[kept.len() + 2];
+    let identity = &request.messages[kept.len() + 2];
+    assert_eq!(identity.message_uid.as_str(), format!("msg/identity/{}", report.turn_id));
+    let notice = &request.messages[kept.len() + 3];
     assert_eq!(notice.message_uid.as_str(), format!("msg/notice/{}", report.turn_id));
     assert_eq!(notice.role, MessageRole::System);
     assert!(notice.text_content().contains("1 older message(s) were omitted"), "{notice:?}");
     // The input follows the notice, and the loop's work-state block closes
     // the request: where the work stands is the last thing a step reads.
     assert_eq!(
-        &request.messages[kept.len() + 3..kept.len() + 4],
+        &request.messages[kept.len() + 4..kept.len() + 5],
         [ModelMessage::user_for_turn(&report.turn_id, "second")].as_slice(),
         "this turn's input stays verbatim after the layers"
     );
@@ -411,8 +414,9 @@ async fn a_windowed_history_sends_the_kept_suffix_plus_this_turns_input() {
         })
         .expect("model/request.prepared");
     assert_eq!(
-        prepared.event.payload["message_count"], 8,
-        "the sent count includes the two per-turn layers, the notice, the input and the          work-state tail"
+        prepared.event.payload["message_count"], 9,
+        "the sent count includes the three per-turn layers, the notice, the input and the \
+         work-state tail"
     );
     assert_eq!(prepared.event.payload["context_message_count"], 3);
     assert_eq!(prepared.event.payload["dropped_message_count"], 1);

@@ -16,6 +16,7 @@ members = [
     "crates/agent-tools-fs",
     "crates/agent-tools-git",
     "crates/agent-tools-mcp",
+    "crates/agent-tools-web",
     "crates/agent-subagent-stdio",
     "crates/agent-sandbox-win",
     "crates/agent-model-openai",
