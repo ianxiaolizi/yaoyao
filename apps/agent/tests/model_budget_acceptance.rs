@@ -35,25 +35,31 @@ use agent_testkit::FixedSecret;
 use chrono::Utc;
 use tempfile::TempDir;
 
-/// A transport that replays scripted SSE bodies and records what it sent.
+/// A transport that replays scripted replies and records what it sent.
 ///
 /// Chat traffic consumes the script; `GET /models` answers from the catalog
 /// without consuming anything, so a test scripts exactly the attempts it
-/// expects.
+/// expects. Each reply carries its own status, so a scripted endpoint can
+/// reject a request the way a real one does.
 struct ScriptedTransport {
-    responses: Mutex<Vec<String>>,
+    responses: Mutex<Vec<(u16, String)>>,
     posts: Mutex<Vec<String>>,
     models: String,
 }
 
 impl ScriptedTransport {
-    fn new(responses: Vec<String>, models: String) -> Self {
+    fn new(responses: Vec<(u16, String)>, models: String) -> Self {
         Self { responses: Mutex::new(responses), posts: Mutex::new(Vec::new()), models }
     }
 
     fn bodies(&self) -> Vec<String> {
         self.posts.lock().map(|posts| posts.clone()).unwrap_or_default()
     }
+}
+
+/// A 200 reply carrying `body`.
+fn ok(body: String) -> (u16, String) {
+    (200, body)
 }
 
 #[async_trait::async_trait]
@@ -67,11 +73,11 @@ impl Transport for ScriptedTransport {
             .lock()
             .ok()
             .and_then(|mut queue| if queue.is_empty() { None } else { Some(queue.remove(0)) });
-        let Some(body) = next else {
+        let Some((status, body)) = next else {
             return Err(TransportError::Connect("no scripted response left".to_string()));
         };
         Ok(TransportResponse {
-            status: 200,
+            status,
             body: Box::pin(futures_util::stream::iter(vec![Ok(body.into_bytes())])),
         })
     }
@@ -153,10 +159,18 @@ struct Harness {
     _data_dir: TempDir,
 }
 
-async fn assemble(responses: Vec<String>) -> Harness {
+async fn assemble(responses: Vec<(u16, String)>) -> Harness {
+    assemble_with(responses, resolved_profile(), deepseek_flash_catalog()).await
+}
+
+async fn assemble_with(
+    responses: Vec<(u16, String)>,
+    resolved: ResolvedProfile,
+    models: String,
+) -> Harness {
     let workspace = tempfile::tempdir().expect("temp workspace");
     let data_dir = tempfile::tempdir().expect("temp data dir");
-    let transport = Arc::new(ScriptedTransport::new(responses, deepseek_flash_catalog()));
+    let transport = Arc::new(ScriptedTransport::new(responses, models));
     let config = OpenAiCompatConfig::new("https://scripted.example.com", "scripted-model")
         .with_provider_id("scripted-endpoint")
         .with_timeout_ms(5_000);
@@ -169,7 +183,7 @@ async fn assemble(responses: Vec<String>) -> Harness {
         session: SessionId::from_string("budget"),
         workspace_root: workspace.path().to_path_buf(),
         data_dir: data_dir.path().to_path_buf(),
-        resolved: resolved_profile(),
+        resolved,
         model: Some(SelectedProvider { provider, route: route() }),
         decisions: Decisions::Unobserved,
         sandbox: SandboxMode::LocalProcess,
@@ -257,7 +271,7 @@ async fn a_one_million_window_model_gets_a_model_derived_budget() {
 /// retry's answer, and the empty first response is never reported as one.
 #[tokio::test]
 async fn reasoning_only_length_is_retried_and_not_reported_as_an_answer() {
-    let h = assemble(vec![reasoning_only_body(8_000), answer_body("finished")]).await;
+    let h = assemble(vec![ok(reasoning_only_body(8_000)), ok(answer_body("finished"))]).await;
     let outcome = h.ask("finish the task").await;
 
     assert_eq!(outcome.stop_reason, StopReason::FinalAnswer);
@@ -283,4 +297,156 @@ async fn reasoning_only_length_is_retried_and_not_reported_as_an_answer() {
         .collect();
     assert_eq!(prepared.len(), 2, "one prepared record per attempt");
     assert_eq!(prepared[1].event.payload["output_recovery"], "reasoning_only");
+}
+
+// ---------------------------------------------------------------------------
+// The assembled stack under a provider context-length rejection
+// ---------------------------------------------------------------------------
+
+/// The same profile, with an input working set small enough that a second
+/// turn's request is the thing the provider rejects.
+fn small_working_set_profile() -> ResolvedProfile {
+    let mut resolved = resolved_profile();
+    resolved.budget.max_input_tokens = Some(100_000);
+    resolved
+}
+
+/// A turn whose first entry is an answer the next turn's history carries.
+fn long_answer_body(marker: &str) -> String {
+    answer_body(&format!("{marker} {}", "filler detail ".repeat(1_200)))
+}
+
+/// The assembled product, not a unit harness: a provider rejects the second
+/// turn's request for its context length, and the stack compresses and retries
+/// once. The turn still answers, and the wire shows what changed.
+#[tokio::test]
+async fn context_overflow_is_compressed_and_retried_once_by_the_assembled_stack() {
+    let marker = "FIRST-TURN-ANSWER-MARKER";
+    let h = assemble_with(
+        vec![
+            ok(long_answer_body(marker)),
+            (413, "payload too large".to_string()),
+            ok(answer_body("recovered")),
+        ],
+        small_working_set_profile(),
+        deepseek_flash_catalog(),
+    )
+    .await;
+
+    let first = h.ask("first turn: write at length").await;
+    assert_eq!(first.stop_reason, StopReason::FinalAnswer);
+    let second = h.ask("second turn: what changed?").await;
+    assert_eq!(second.stop_reason, StopReason::FinalAnswer);
+    assert_eq!(second.final_content.as_deref(), Some("recovered"));
+
+    // One request per turn, plus the one retry the rejection bought.
+    let bodies = h.transport.bodies();
+    assert_eq!(bodies.len(), 3, "two turns and exactly one recovery");
+    assert!(bodies[1].contains(marker), "the rejected request carried the history");
+    assert!(
+        bodies[2].contains("second turn: what changed?"),
+        "the retry still carries the input it was asked to answer"
+    );
+    assert!(
+        !bodies[2].contains(marker),
+        "the retry no longer carries the history the trim removed"
+    );
+
+    // The log records the removal and the retry that followed it.
+    let events = h.log().await;
+    let compacted: Vec<_> = events
+        .iter()
+        .filter(|event| event.event.event_type.as_str() == EventType::CONTEXT_COMPACTED)
+        .collect();
+    assert_eq!(compacted.len(), 1);
+    assert_eq!(compacted[0].event.payload["strategy"], "overflow-trim");
+
+    let prepared: Vec<_> = events
+        .iter()
+        .filter(|event| event.event.event_type.as_str() == EventType::MODEL_REQUEST_PREPARED)
+        .collect();
+    assert_eq!(prepared.len(), 3, "one prepared record per attempt");
+    assert_eq!(prepared[2].event.payload["context_recovery"], "max_safe_compression");
+    assert_eq!(prepared[2].event.payload["original_error_kind"], "context_overflow");
+}
+
+// ---------------------------------------------------------------------------
+// The summary route's own budget, as assembly derives it
+// ---------------------------------------------------------------------------
+
+/// A catalog with a fast model that declares a much smaller window, a small
+/// output cap, and one reasoning depth.
+fn two_model_catalog() -> String {
+    serde_json::json!({
+        "data": [
+            {
+                "id": "scripted-model",
+                "context_window": 1_048_576,
+                "max_output_tokens": 393_216,
+                "reasoning_efforts": ["low", "high", "max"],
+                "default_reasoning_effort": "high",
+            },
+            {
+                "id": "small",
+                "context_window": 131_072,
+                "max_output_tokens": 8_192,
+                "reasoning_efforts": ["low"],
+                "default_reasoning_effort": "low",
+            },
+        ]
+    })
+    .to_string()
+}
+
+/// A profile that routes summaries to `small`.
+fn summary_route_profile() -> ResolvedProfile {
+    let layers = Layers {
+        user: agent_config::UserConfig::from_toml_str(
+            "[profiles.coding]\nmodel = { main = \"big\", fast = \"small\" }\n",
+        )
+        .expect("a profile that names two tiers"),
+        profile_override: Some("coding".to_string()),
+        ..Layers::default()
+    };
+    agent_config::resolve(layers).expect("the profile resolves")
+}
+
+/// The fast model's budget is derived from what *it* declared: its window, its
+/// output cap, and a depth it actually offers. The main route keeps its own.
+#[tokio::test]
+async fn assembled_summary_route_budget_is_derived_from_the_fast_model() {
+    let h = assemble_with(Vec::new(), summary_route_profile(), two_model_catalog()).await;
+    let profile = h.stack.profile_snapshot();
+
+    let summary = profile.budget.summary.as_ref().expect("the fast route gets its own budget");
+    assert_eq!(summary.context.context_window_tokens, 131_072);
+    assert_eq!(summary.context.input_working_set_tokens, 32_768);
+    assert_eq!(summary.context.completion_cap_tokens, 8_192);
+    assert_eq!(
+        profile.budget.summary_max_output_tokens,
+        Some(8_192),
+        "a summary asks the fast model for its own cap"
+    );
+
+    // The depth is the fast model's declared default, and the set is what it
+    // said it accepts — never the main route's.
+    assert_eq!(summary.reasoning_effort, Some(agent_protocol::model::ReasoningEffort::Low));
+    assert_eq!(
+        summary.supported_reasoning_efforts,
+        vec![agent_protocol::model::ReasoningEffort::Low]
+    );
+
+    // The numbers say where they came from, and the main route is untouched: its
+    // window and working set are still the million-token model's.
+    assert_eq!(
+        profile.budget_sources.get("summary.input_working_set_tokens").map(String::as_str),
+        Some("preset:balanced")
+    );
+    let main = profile.budget.context.expect("the main route's budget");
+    assert_eq!(main.context_window_tokens, 1_048_576);
+    assert_eq!(main.input_working_set_tokens, 262_144);
+    assert_eq!(
+        profile.budget_sources.get("context_window_tokens").map(String::as_str),
+        Some("provider:/models")
+    );
 }

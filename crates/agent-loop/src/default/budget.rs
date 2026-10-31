@@ -177,3 +177,19 @@ pub(super) fn place_budget_notice(turn: &mut LoopTurn, turn_id: &TurnId) -> Opti
     turn.messages.push(message);
     Some(notice)
 }
+
+/// The context budget and reasoning depth a summary request must use.
+///
+/// A summary routed to the fast tier answers under that route's frozen budget:
+/// its window, its completion cap, and a depth it actually declared — never
+/// the main route's. Any other route (including the main one a run without a
+/// fast tier falls back to) uses the turn's own budget.
+pub(super) fn summary_route_profile(
+    turn: &LoopTurn,
+    route: &ModelRoute,
+) -> (Option<ResolvedContextBudget>, Option<agent_protocol::model::ReasoningEffort>) {
+    match (route.tier, turn.budget.summary.as_ref()) {
+        (ModelTier::Fast, Some(summary)) => (Some(summary.context), summary.reasoning_effort),
+        _ => (turn.budget.context, turn.budget.reasoning_effort),
+    }
+}

@@ -13,6 +13,8 @@
 
 use std::collections::HashSet;
 
+use agent_ports::model_provider::ModelProviderError;
+
 use super::*;
 
 /// The estimate a compressed request must come in under.
@@ -187,6 +189,157 @@ pub(super) fn compress_for_overflow(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// The pieces one model attempt mutates when the provider refuses it.
+pub(super) struct Attempt<'a> {
+    pub step_id: &'a StepId,
+    pub request: &'a mut ModelRequest,
+    pub prepared: &'a mut serde_json::Value,
+    pub estimated_request_tokens: &'a mut usize,
+    pub attempt_id: &'a mut AttemptId,
+}
+
+/// What the first attempt produced.
+pub(super) enum First {
+    /// A response; the ordinary path continues from it.
+    Response(ModelResponse),
+    /// The step is over, and this is its outcome.
+    Stopped(StepOutcome),
+}
+
+/// Send the request once — and, if the provider rejects it for its context
+/// length, compress and send it once more.
+///
+/// Every attempt that fails reaches a terminal event before this returns, and a
+/// second rejection is never retried: there is nothing left to remove, so a
+/// third attempt would send the same rejected request.
+pub(super) async fn first_attempt(
+    model: &dyn ModelProvider,
+    sink: &dyn ModelStreamSink,
+    turn: &mut LoopTurn,
+    attempt: Attempt<'_>,
+    events: &mut Vec<EventDraft>,
+) -> Result<First, AgentLoopError> {
+    match model.stream(attempt.request, sink).await {
+        Ok(response) => Ok(First::Response(response)),
+        Err(error) if error.is_context_overflow() => {
+            events.push(attempt_event(&turn.ctx, attempt.step_id, attempt.attempt_id, &error));
+            let Some(context) = turn.budget.context else {
+                return Ok(stopped(turn, attempt.step_id, events, StopReason::FatalError));
+            };
+            if !compress_for_overflow(turn, safe_target(&context), attempt.step_id, events)? {
+                return Ok(stopped(turn, attempt.step_id, events, StopReason::FatalError));
+            }
+            // The compressed transcript is what the retry sends. It is a new
+            // attempt: its own id, its own prepared record, exactly one send.
+            attempt.request.messages = turn.messages.clone();
+            *attempt.attempt_id = AttemptId::new();
+            let (refs, hash) = message_references(&attempt.request.messages)?;
+            let messages_tokens: usize =
+                attempt.request.messages.iter().map(estimate_message).sum();
+            let tool_tokens = budget::estimated_tool_tokens(&attempt.request.tool_manifest);
+            let request_tokens = messages_tokens + tool_tokens;
+            let mut retry = attempt.prepared.clone();
+            retry["attempt_id"] = serde_json::json!(&*attempt.attempt_id);
+            retry["message_count"] = serde_json::json!(attempt.request.messages.len());
+            retry["context_message_count"] = serde_json::json!(turn.context_message_count);
+            retry["estimated_messages_tokens"] = serde_json::json!(messages_tokens);
+            retry["estimated_tool_tokens"] = serde_json::json!(tool_tokens);
+            retry["estimated_request_tokens"] = serde_json::json!(request_tokens);
+            retry["messages"] = serde_json::Value::Array(refs);
+            retry["messages_hash"] = serde_json::json!(hash);
+            retry["context_recovery"] = serde_json::json!("max_safe_compression");
+            retry["original_error_kind"] = serde_json::json!("context_overflow");
+            *attempt.prepared = retry.clone();
+            *attempt.estimated_request_tokens = request_tokens;
+            events.push(draft(
+                &turn.ctx,
+                attempt.step_id,
+                EventType::MODEL_REQUEST_PREPARED,
+                retry,
+                Actor::Agent,
+            ));
+            events.push(draft(
+                &turn.ctx,
+                attempt.step_id,
+                EventType::MODEL_ATTEMPT_STARTED,
+                serde_json::json!({
+                    "attempt_id": &*attempt.attempt_id,
+                    "provider": model.provider_id(),
+                    "route": serde_json::to_value(&attempt.request.model_route)?,
+                }),
+                Actor::Agent,
+            ));
+            match model.stream(attempt.request, sink).await {
+                Ok(response) => Ok(First::Response(response)),
+                Err(second) => {
+                    let stop = if second.is_cancelled() {
+                        StopReason::UserCancelled
+                    } else {
+                        StopReason::FatalError
+                    };
+                    events.push(attempt_event(
+                        &turn.ctx,
+                        attempt.step_id,
+                        attempt.attempt_id,
+                        &second,
+                    ));
+                    Ok(stopped(turn, attempt.step_id, events, stop))
+                }
+            }
+        }
+        Err(error) => {
+            let stop = if error.is_cancelled() {
+                StopReason::UserCancelled
+            } else {
+                StopReason::FatalError
+            };
+            events.push(attempt_event(&turn.ctx, attempt.step_id, attempt.attempt_id, &error));
+            Ok(stopped(turn, attempt.step_id, events, stop))
+        }
+    }
+}
+
+/// The durable fact that one attempt did not settle.
+fn attempt_event(
+    ctx: &TurnContext,
+    step_id: &StepId,
+    attempt_id: &AttemptId,
+    error: &ModelProviderError,
+) -> EventDraft {
+    draft(
+        ctx,
+        step_id,
+        if error.is_cancelled() {
+            EventType::MODEL_ATTEMPT_CANCELLED
+        } else {
+            EventType::MODEL_ATTEMPT_FAILED
+        },
+        serde_json::json!({
+            "attempt_id": attempt_id,
+            "error_kind": error.kind(),
+            "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
+        }),
+        Actor::Agent,
+    )
+}
+
+/// End the step with `stop`, carrying what the attempt recorded.
+fn stopped(
+    turn: &LoopTurn,
+    step_id: &StepId,
+    events: &mut Vec<EventDraft>,
+    stop: StopReason,
+) -> First {
+    events.push(step_failed(&turn.ctx, step_id));
+    First::Stopped(StepOutcome {
+        step_id: step_id.clone(),
+        events: std::mem::take(events),
+        stop: Some(stop),
+        final_content: None,
+        spent: turn.spent,
+    })
 }
 
 fn request_fits(turn: &LoopTurn, target: usize) -> bool {

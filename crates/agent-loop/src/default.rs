@@ -73,6 +73,10 @@ use crate::context_layers::{
 };
 use event_drafts::{draft, draft_turn, reason_event};
 use loop_call::{LoopCallAnswer, answer_loop_call};
+use wording::{
+    ending_word, gate_text, listing_hint, reviewed_from, sandbox_word, status_word,
+    summarize_arguments,
+};
 mod budget;
 mod completion;
 mod context_recovery;
@@ -80,9 +84,12 @@ mod event_drafts;
 mod loop_call;
 mod output_recovery;
 use output_recovery::RecoveryOutcome;
+mod request_record;
+use request_record::message_references;
 mod settle;
 mod settlement;
 mod stall;
+mod wording;
 mod work_state;
 /// Longest provider error text persisted in a durable attempt event.
 const MAX_ERROR_CHARS: usize = 500;
@@ -432,7 +439,8 @@ impl DefaultAgentLoop {
         // request it cannot accept. The frozen summary budget is the number
         // that request must fit; everything else uses the turn's own budget.
         let mut request_route = route.clone();
-        let (mut profile_context, mut profile_effort) = summary_route_profile(turn, &request_route);
+        let (mut profile_context, mut profile_effort) =
+            budget::summary_route_profile(turn, &request_route);
         let mut route_fallback: Option<&'static str> = None;
         let original_candidate_tokens = candidate.estimated_tokens;
         if !candidate.messages.is_empty() {
@@ -449,7 +457,8 @@ impl DefaultAgentLoop {
                 && request_route.tier == ModelTier::Fast
             {
                 request_route = turn.route.clone();
-                (profile_context, profile_effort) = summary_route_profile(turn, &request_route);
+                (profile_context, profile_effort) =
+                    budget::summary_route_profile(turn, &request_route);
                 fitted = profile_context.map(fit);
                 if fitted.as_ref().is_some_and(|selected| !selected.is_empty()) {
                     route_fallback = Some("input_working_set");
@@ -1027,22 +1036,6 @@ impl LoopTurn {
             }),
             ..ModelBudget::default()
         }
-    }
-}
-
-/// The context budget and reasoning depth a summary request must use.
-///
-/// A summary routed to the fast tier answers under that route's frozen budget:
-/// its window, its completion cap, and a depth it actually declared — never
-/// the main route's. Any other route (including the main one a run without a
-/// fast tier falls back to) uses the turn's own budget.
-fn summary_route_profile(
-    turn: &LoopTurn,
-    route: &ModelRoute,
-) -> (Option<ResolvedContextBudget>, Option<agent_protocol::model::ReasoningEffort>) {
-    match (route.tier, turn.budget.summary.as_ref()) {
-        (ModelTier::Fast, Some(summary)) => (Some(summary.context), summary.reasoning_effort),
-        _ => (turn.budget.context, turn.budget.reasoning_effort),
     }
 }
 
@@ -1919,167 +1912,27 @@ impl AgentLoop for DefaultAgentLoop {
             let sink = self.sink(ctx);
             let redactor = &self.redactor;
             // The first try. A typed context overflow is the one failure the
-            // loop can repair itself: the request was too large, and no repeat
-            // of the same bytes can help. Everything else keeps its ordinary
+            // loop can repair itself; `context_recovery` owns that repair and
+            // returns either the response the step continues from or the
+            // outcome that ends it. Every other failure keeps its ordinary
             // fatal path.
-            let first = match self.model.stream(&request, sink.as_ref()).await {
-                Ok(first) => first,
-                Err(error) if error.is_context_overflow() => {
-                    events.push(draft(
-                        ctx,
-                        &step_id,
-                        EventType::MODEL_ATTEMPT_FAILED,
-                        serde_json::json!({
-                            "attempt_id": attempt_id,
-                            "error_kind": error.kind(),
-                            "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
-                        }),
-                        Actor::Agent,
-                    ));
-                    let recovered = match turn.budget.context {
-                        Some(context) => {
-                            let target = context_recovery::safe_target(&context);
-                            if context_recovery::compress_for_overflow(
-                                turn,
-                                target,
-                                &step_id,
-                                &mut events,
-                            )? {
-                                // The compressed transcript is what the retry
-                                // sends. It is a new attempt: its own id, its
-                                // own prepared record, exactly one send.
-                                request.messages = turn.messages.clone();
-                                attempt_id = AttemptId::new();
-                                let (refs, hash) = message_references(&request.messages)?;
-                                let messages_tokens: usize =
-                                    request.messages.iter().map(estimate_message).sum();
-                                let tool_tokens =
-                                    budget::estimated_tool_tokens(&request.tool_manifest);
-                                let request_tokens = messages_tokens + tool_tokens;
-                                let mut retry_prepared = prepared.clone();
-                                retry_prepared["attempt_id"] = serde_json::json!(attempt_id);
-                                retry_prepared["message_count"] =
-                                    serde_json::json!(request.messages.len());
-                                retry_prepared["context_message_count"] =
-                                    serde_json::json!(turn.context_message_count);
-                                retry_prepared["estimated_messages_tokens"] =
-                                    serde_json::json!(messages_tokens);
-                                retry_prepared["estimated_tool_tokens"] =
-                                    serde_json::json!(tool_tokens);
-                                retry_prepared["estimated_request_tokens"] =
-                                    serde_json::json!(request_tokens);
-                                retry_prepared["messages"] = serde_json::Value::Array(refs);
-                                retry_prepared["messages_hash"] = serde_json::json!(hash);
-                                retry_prepared["context_recovery"] =
-                                    serde_json::json!("max_safe_compression");
-                                retry_prepared["original_error_kind"] =
-                                    serde_json::json!("context_overflow");
-                                prepared = retry_prepared.clone();
-                                estimated_request_tokens = request_tokens;
-                                events.push(draft(
-                                    ctx,
-                                    &step_id,
-                                    EventType::MODEL_REQUEST_PREPARED,
-                                    retry_prepared,
-                                    Actor::Agent,
-                                ));
-                                events.push(draft(
-                                    ctx,
-                                    &step_id,
-                                    EventType::MODEL_ATTEMPT_STARTED,
-                                    serde_json::json!({
-                                        "attempt_id": attempt_id,
-                                        "provider": self.model.provider_id(),
-                                        "route": serde_json::to_value(&request.model_route)?,
-                                    }),
-                                    Actor::Agent,
-                                ));
-                                Some(self.model.stream(&request, sink.as_ref()).await)
-                            } else {
-                                None
-                            }
-                        }
-                        None => None,
-                    };
-                    match recovered {
-                        Some(Ok(response)) => response,
-                        // A second rejection after a maximum safe compression
-                        // ends the step: there is nothing left to remove, so a
-                        // third attempt would send the same rejected request.
-                        Some(Err(second)) => {
-                            let cancelled = second.is_cancelled();
-                            events.push(draft(
-                                ctx,
-                                &step_id,
-                                if cancelled {
-                                    EventType::MODEL_ATTEMPT_CANCELLED
-                                } else {
-                                    EventType::MODEL_ATTEMPT_FAILED
-                                },
-                                serde_json::json!({
-                                    "attempt_id": attempt_id,
-                                    "error_kind": second.kind(),
-                                    "message": truncate(&second.to_string(), MAX_ERROR_CHARS),
-                                }),
-                                Actor::Agent,
-                            ));
-                            events.push(step_failed(ctx, &step_id));
-                            return Ok(StepOutcome {
-                                step_id,
-                                events,
-                                stop: Some(if cancelled {
-                                    StopReason::UserCancelled
-                                } else {
-                                    StopReason::FatalError
-                                }),
-                                final_content: None,
-                                spent: turn.spent,
-                            });
-                        }
-                        None => {
-                            events.push(step_failed(ctx, &step_id));
-                            return Ok(StepOutcome {
-                                step_id,
-                                events,
-                                stop: Some(StopReason::FatalError),
-                                final_content: None,
-                                spent: turn.spent,
-                            });
-                        }
-                    }
-                }
-                Err(error) => {
-                    // The attempt's deltas stayed live-only; no partial response
-                    // is written, and the failure is a first-class fact.
-                    let cancelled = error.is_cancelled();
-                    events.push(draft(
-                        ctx,
-                        &step_id,
-                        if cancelled {
-                            EventType::MODEL_ATTEMPT_CANCELLED
-                        } else {
-                            EventType::MODEL_ATTEMPT_FAILED
-                        },
-                        serde_json::json!({
-                            "attempt_id": attempt_id,
-                            "error_kind": error.kind(),
-                            "message": truncate(&error.to_string(), MAX_ERROR_CHARS),
-                        }),
-                        Actor::Agent,
-                    ));
-                    events.push(step_failed(ctx, &step_id));
-                    return Ok(StepOutcome {
-                        step_id,
-                        events,
-                        stop: Some(if cancelled {
-                            StopReason::UserCancelled
-                        } else {
-                            StopReason::FatalError
-                        }),
-                        final_content: None,
-                        spent: turn.spent,
-                    });
-                }
+            let first = match context_recovery::first_attempt(
+                self.model.as_ref(),
+                sink.as_ref(),
+                turn,
+                context_recovery::Attempt {
+                    step_id: &step_id,
+                    request: &mut request,
+                    prepared: &mut prepared,
+                    estimated_request_tokens: &mut estimated_request_tokens,
+                    attempt_id: &mut attempt_id,
+                },
+                &mut events,
+            )
+            .await?
+            {
+                context_recovery::First::Response(response) => response,
+                context_recovery::First::Stopped(outcome) => return Ok(outcome),
             };
 
             // Whether the step ended on a response that spent the whole cap
@@ -3361,28 +3214,6 @@ fn redacted_proposal(response: &ModelResponse, redactor: &Redactor) -> ModelResp
     durable
 }
 
-/// The ordered messages a request carries, as checkable references.
-///
-/// Their content is durable elsewhere already — run instructions, this turn's
-/// layers, the input item, the folded history, every tool result — and
-/// repeating it on each step would make the log grow with the whole context on
-/// every step. The per-message hash is what makes a reference checkable, and
-/// the aggregate hash covers the order.
-fn message_references(
-    messages: &[ModelMessage],
-) -> Result<(Vec<serde_json::Value>, String), AgentLoopError> {
-    let mut refs = Vec::with_capacity(messages.len());
-    for message in messages {
-        refs.push(serde_json::json!({
-            "message_uid": message.message_uid.as_str(),
-            "role": message.role.as_str(),
-            "hash": digest::json(&serde_json::to_value(message)?),
-        }));
-    }
-    let hash = digest::json(&serde_json::Value::Array(refs.clone()));
-    Ok((refs, hash))
-}
-
 /// A result's offloaded artifacts as locators a reader can follow, rather than
 /// as content the model has to hold.
 fn artifact_refs(result: &ToolResult) -> Vec<serde_json::Value> {
@@ -3501,79 +3332,6 @@ fn hold_step(
             content.clone(),
             true,
         ));
-    }
-}
-
-/// The call to suggest when the kernel asks the model to look. Naming the
-/// run's own listing tool, when it has one, is advice that can be followed;
-/// "list the directory" assumes the model maps that to a call by itself.
-fn listing_hint(manifest: &ToolManifest) -> String {
-    if manifest.entries.iter().any(|entry| entry.tool_id == "fs.list") {
-        String::from("for example fs.list on the directory")
-    } else {
-        String::from("list the directory")
-    }
-}
-
-/// The `reviewed` line the loop fills in for a reconcile that left it out:
-/// the failed call, cut to the field's own bound rather than to 160 plus an
-/// ellipsis that would fail it.
-fn reviewed_from(failure: &PendingFailure) -> String {
-    format!("{}: {}", failure.tool, failure.detail)
-        .chars()
-        .take(Judgment::MAX_RECONCILE_CHARS)
-        .collect()
-}
-
-/// What the model is told when it tries to answer past a real failure.
-///
-/// Written the way the failure feedback is written: it names the call, the
-/// one thing to do about it, and the fields that do it — not "think again".
-fn gate_text(failure: &PendingFailure, hint: String) -> String {
-    format!(
-        "Kernel check: `{}` failed ({}). Make the retry now with a tool call — {hint}, or \
-         read a corrected path. Only if no retry is possible, record a reconcile with \
-         judgment.update, `stop` true, and why.",
-        failure.tool, failure.detail
-    )
-}
-
-/// The tool arguments as one bounded line for a node's claim.
-///
-/// The arguments are the redacted ones: the chain is durable, and a secret the
-/// model copied into a call must not sit in it.
-fn summarize_arguments(arguments: &serde_json::Value) -> String {
-    let text = serde_json::to_string(arguments).unwrap_or_default();
-    truncate(&text, 100)
-}
-
-/// The word a tool status is shown with in an observation.
-fn status_word(status: ToolStatus) -> &'static str {
-    match status {
-        ToolStatus::Completed => "completed",
-        ToolStatus::Failed => "failed",
-        ToolStatus::Cancelled => "cancelled",
-    }
-}
-
-/// The word a turn ending is shown with in a situation.
-fn ending_word(ending: TurnEnding) -> String {
-    String::from(match ending {
-        TurnEnding::Completed => "completed",
-        TurnEnding::Failed => "failed",
-        TurnEnding::Cancelled => "cancelled",
-        TurnEnding::Interrupted => "interrupted",
-        TurnEnding::Yielded => "yielded",
-    })
-}
-
-/// The word a sandbox mode is shown with in a situation.
-fn sandbox_word(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::ReadOnly => "read-only",
-        SandboxMode::LocalProcess => "local",
-        SandboxMode::WorkspaceSandbox => "app-container",
-        SandboxMode::Container => "container",
     }
 }
 
