@@ -6,7 +6,7 @@
 
 use agent_protocol::model::{
     ContentBlock, ManifestEntry, MessageRole, ModelMessage, ModelRequest, ModelStreamEvent,
-    ResponseFormat, ToolManifest, Usage,
+    ReasoningEffort, ResponseFormat, ToolManifest, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -22,6 +22,11 @@ pub struct ChatRequest {
     pub stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// How deeply the model should reason. Sent only when the run's budget
+    /// names a depth; a provider that has not declared support gets no field
+    /// rather than a fabricated value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<WireResponseFormat>,
     /// Omitted entirely when no tool is on offer. Sending an empty array is not
@@ -320,6 +325,7 @@ pub fn chat_request(
         stream: true,
         stream_options: StreamOptions { include_usage: true },
         max_tokens: request.budget.max_tokens.or(config.default_max_tokens),
+        reasoning_effort: request.budget.reasoning_effort,
         response_format: request.response_format.as_ref().and_then(to_wire_response_format),
         tools: to_wire_tools(&request.tool_manifest)?,
     })

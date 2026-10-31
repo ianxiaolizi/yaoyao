@@ -18,8 +18,9 @@ use agent_decision::TableModelRouter;
 use agent_model_openai::{ENV_API_KEY, OpenAiCompatConfig, OpenAiCompatProvider, ReqwestTransport};
 use agent_ports::model_provider::{
     MessageRole, ModelCapability, ModelProvider, ModelProviderError, ModelRequest, ModelResponse,
-    ModelStreamEvent, ModelStreamSink,
+    ModelStreamEvent, ModelStreamSink, ResolvedModelCapabilities,
 };
+use agent_protocol::model::ModelCapabilitySource;
 use agent_ports::model_router::{ModelRoute, ModelTier, TaskClass};
 use agent_store_secret::EnvSecretProvider;
 
@@ -63,6 +64,20 @@ impl ModelProvider for EchoModelProvider {
 
     fn capabilities(&self) -> Vec<ModelCapability> {
         vec![ModelCapability::new(ModelCapability::STREAMING)]
+    }
+
+    /// A placeholder model has no endpoint to ask, so it answers with the
+    /// conservative fallback and says so. It must not borrow the numbers of a
+    /// real model: a budget derived from them would be a claim about echo's
+    /// window that nothing backs.
+    async fn model_capabilities(
+        &self,
+        _model: &str,
+    ) -> Result<ResolvedModelCapabilities, ModelProviderError> {
+        Ok(ResolvedModelCapabilities {
+            capabilities: agent_model_openai::fallback_capabilities(),
+            source: ModelCapabilitySource::Fallback,
+        })
     }
 
     fn provider_id(&self) -> String {

@@ -112,6 +112,11 @@ impl OpenAiCompatConfig {
     pub fn chat_completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
+
+    /// The capability-discovery URL.
+    pub fn models_url(&self) -> String {
+        format!("{}/models", self.base_url.trim_end_matches('/'))
+    }
 }
 
 /// Errors loading configuration from the environment.

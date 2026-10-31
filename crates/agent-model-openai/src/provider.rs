@@ -1,15 +1,18 @@
 //! The OpenAI-compatible `ModelProvider` adapter.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_ports::model_provider::{
     ContentBlock, ModelCapability, ModelProvider, ModelProviderError, ModelRequest, ModelResponse,
-    ModelStreamSink,
+    ModelStreamSink, ResolvedModelCapabilities,
 };
 use agent_ports::secret_provider::SecretProvider;
+use agent_protocol::model::{ModelCapabilities, ModelCapabilitySource};
 use futures_util::StreamExt;
 
+use crate::catalog::{self, parse_model_capabilities};
 use crate::config::OpenAiCompatConfig;
 use crate::sse::{SseDecoder, SseFrame};
 use crate::stream::StreamAccumulator;
@@ -33,6 +36,9 @@ pub struct OpenAiCompatProvider {
     config: OpenAiCompatConfig,
     secrets: Arc<dyn SecretProvider>,
     transport: Arc<dyn Transport>,
+    /// Capabilities the endpoint already told us, so assembly asking about the
+    /// same model on several routes pays for one `GET /models`.
+    discovered: Mutex<HashMap<String, ModelCapabilities>>,
 }
 
 impl OpenAiCompatProvider {
@@ -42,7 +48,7 @@ impl OpenAiCompatProvider {
         secrets: Arc<dyn SecretProvider>,
         transport: Arc<dyn Transport>,
     ) -> Self {
-        Self { config, secrets, transport }
+        Self { config, secrets, transport, discovered: Mutex::new(HashMap::new()) }
     }
 
     /// The configuration this adapter was built with.
@@ -112,9 +118,64 @@ impl ModelProvider for OpenAiCompatProvider {
     fn provider_id(&self) -> String {
         self.config.provider_id.clone()
     }
+
+    async fn model_capabilities(
+        &self,
+        model: &str,
+    ) -> Result<ResolvedModelCapabilities, ModelProviderError> {
+        if let Some(capabilities) =
+            self.discovered.lock().ok().and_then(|cache| cache.get(model).cloned())
+        {
+            return Ok(ResolvedModelCapabilities {
+                capabilities,
+                source: ModelCapabilitySource::Provider,
+            });
+        }
+
+        match self.discover_capabilities(model).await {
+            Some(capabilities) => {
+                if let Ok(mut cache) = self.discovered.lock() {
+                    cache.insert(model.to_string(), capabilities.clone());
+                }
+                Ok(ResolvedModelCapabilities {
+                    capabilities,
+                    source: ModelCapabilitySource::Provider,
+                })
+            }
+            // An endpoint that is unreachable, refuses the request, or answers
+            // without a usable entry is not a reason to run with no budget. It
+            // is a reason to say the numbers are a guess.
+            None => Ok(catalog::capabilities_without_provider(model)),
+        }
+    }
 }
 
 impl OpenAiCompatProvider {
+    /// Ask `GET /models` what `model` can do.
+    ///
+    /// Every failure mode collapses to `None`: an unreachable endpoint, a
+    /// non-200, an unreadable body, or an entry that names no window. The
+    /// caller turns that into an explicit bundled-or-fallback answer, so a
+    /// malformed catalog can never become a silent zero-token budget.
+    async fn discover_capabilities(&self, model: &str) -> Option<ModelCapabilities> {
+        let key = self.secrets.resolve(self.config.api_key()).ok()?;
+        let response = self
+            .transport
+            .get(TransportRequest {
+                url: self.config.models_url(),
+                bearer_token: key,
+                body: Vec::new(),
+                timeout_ms: self.config.timeout_ms,
+            })
+            .await
+            .ok()?;
+        if response.status != 200 {
+            return None;
+        }
+        let body = read_bounded(response.body).await;
+        parse_model_capabilities(&body, model)
+    }
+
     /// One attempt: post the prepared request and stream it to a settled
     /// response or a failure.
     ///

@@ -11,7 +11,7 @@
 pub use agent_protocol::model::{
     ContentBlock, FinishReason, ManifestEntry, MessageRole, ModelBudget, ModelCapability,
     ModelMessage, ModelRequest, ModelResponse, ModelRoute, ModelStreamEvent, ModelTier,
-    ResponseFormat, ToolCall, ToolManifest, Usage,
+    ReasoningEffort, ResolvedModelCapabilities, ResponseFormat, ToolCall, ToolManifest, Usage,
 };
 
 /// Receives live deltas while an attempt is in flight.
@@ -47,6 +47,21 @@ pub trait ModelProvider: Send + Sync {
     /// or degrade explicitly when a required capability is missing — never let
     /// the provider reshape the request silently.
     fn capabilities(&self) -> Vec<ModelCapability>;
+
+    /// What one model on this provider can do.
+    ///
+    /// The answer carries its own source, so a conservative guess is never
+    /// mistaken for a discovered fact. The default refuses: a provider that
+    /// cannot discover capabilities must be asked through the assembly's own
+    /// fallback rather than silently inheriting a made-up window.
+    async fn model_capabilities(
+        &self,
+        _model: &str,
+    ) -> Result<ResolvedModelCapabilities, ModelProviderError> {
+        Err(ModelProviderError::Protocol(
+            "model capabilities are not supported by this provider".to_string(),
+        ))
+    }
 
     /// A short stable id, used in attempt events and doctor output.
     fn provider_id(&self) -> String;

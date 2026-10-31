@@ -54,9 +54,17 @@ pub enum TransportError {
 }
 
 /// Performs one HTTP POST and hands back the body as a stream.
+///
+/// `get` exists for capability discovery (`GET /models`), which is a different
+/// request than an attempt and must not be retried or streamed like one.
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     async fn post(&self, request: TransportRequest) -> Result<TransportResponse, TransportError>;
+
+    /// Perform a GET. A transport that only carries chat traffic refuses.
+    async fn get(&self, _request: TransportRequest) -> Result<TransportResponse, TransportError> {
+        Err(TransportError::Connect("GET is not supported by this transport".to_string()))
+    }
 }
 
 /// The real transport.
@@ -91,6 +99,28 @@ impl Transport for ReqwestTransport {
             .bearer_auth(&request.bearer_token)
             .timeout(Duration::from_millis(request.timeout_ms))
             .body(request.body)
+            .send()
+            .await
+            .map_err(connect_error)?;
+
+        let status = response.status().as_u16();
+        let body = response.bytes_stream().map(|chunk| match chunk {
+            Ok(bytes) => Ok(bytes.to_vec()),
+            Err(e) => Err(connect_error(e)),
+        });
+        Ok(TransportResponse { status, body: Box::pin(body) })
+    }
+
+    async fn get(&self, request: TransportRequest) -> Result<TransportResponse, TransportError> {
+        // Discovery is bounded by the caller's timeout and is never streamed:
+        // a `/models` answer is small, and an endpoint that streams one is not
+        // an endpoint this adapter can learn anything from.
+        let response = self
+            .client
+            .get(&request.url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .bearer_auth(&request.bearer_token)
+            .timeout(Duration::from_millis(request.timeout_ms))
             .send()
             .await
             .map_err(connect_error)?;

@@ -14,8 +14,10 @@ use agent_model_openai::{
 use agent_ports::model_provider::{
     ContentBlock, FinishReason, MessageRole, ModelBudget, ModelCapability, ModelMessage,
     ModelProvider, ModelProviderError, ModelRequest, ModelRoute, ModelStreamError,
-    ModelStreamEvent, ModelStreamSink, ModelTier, ResponseFormat, ToolManifest, Usage,
+    ModelStreamEvent, ModelStreamSink, ModelTier, ReasoningEffort, ResponseFormat, ToolManifest,
+    Usage,
 };
+use agent_protocol::model::{ModelCapabilitySource, ModelCapabilities};
 use agent_protocol::ids::{SessionId, StepId, TurnId};
 use agent_protocol::tool::{ToolDefinition, ToolSideEffect, ToolSource};
 use agent_testkit::{FixedSecret, MissingSecret, RecordingSink};
@@ -28,14 +30,35 @@ use agent_testkit::{FixedSecret, MissingSecret, RecordingSink};
 struct FakeTransport {
     status: u16,
     chunks: Vec<Result<Vec<u8>, TransportError>>,
+    /// What `GET /models` answers, when a test asks for capabilities.
+    get_chunks: Vec<Result<Vec<u8>, TransportError>>,
     /// When set, the POST itself fails and no response body ever exists.
     post_error: Option<TransportError>,
     seen: Mutex<Vec<TransportRequest>>,
+    gets: Mutex<usize>,
 }
 
 impl FakeTransport {
     fn new(status: u16, chunks: Vec<Result<Vec<u8>, TransportError>>) -> Self {
-        Self { status, chunks, post_error: None, seen: Mutex::new(Vec::new()) }
+        Self {
+            status,
+            chunks,
+            get_chunks: Vec::new(),
+            post_error: None,
+            seen: Mutex::new(Vec::new()),
+            gets: Mutex::new(0),
+        }
+    }
+
+    /// A transport whose `GET /models` answers with `body`.
+    fn models(body: &str) -> Self {
+        let mut transport = Self::body("");
+        transport.get_chunks = vec![Ok(body.as_bytes().to_vec())];
+        transport
+    }
+
+    fn get_count(&self) -> usize {
+        self.gets.lock().map(|count| *count).unwrap_or_default()
     }
 
     /// A 200 response whose whole body is already in hand.
@@ -68,8 +91,10 @@ impl FakeTransport {
         Self {
             status: 0,
             chunks: Vec::new(),
+            get_chunks: Vec::new(),
             post_error: Some(error),
             seen: Mutex::new(Vec::new()),
+            gets: Mutex::new(0),
         }
     }
 
@@ -88,6 +113,20 @@ impl Transport for FakeTransport {
             return Err(error);
         }
         let chunks = self.chunks.clone();
+        Ok(TransportResponse {
+            status: self.status,
+            body: Box::pin(futures_util::stream::iter(chunks)),
+        })
+    }
+
+    async fn get(&self, request: TransportRequest) -> Result<TransportResponse, TransportError> {
+        if let Ok(mut gets) = self.gets.lock() {
+            *gets += 1;
+        }
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(request);
+        }
+        let chunks = self.get_chunks.clone();
         Ok(TransportResponse {
             status: self.status,
             body: Box::pin(futures_util::stream::iter(chunks)),
@@ -186,6 +225,17 @@ fn provider_over(transport: FakeTransport) -> (OpenAiCompatProvider, Arc<FakeTra
         Arc::clone(&transport) as Arc<dyn Transport>,
     );
     (provider, transport)
+}
+
+/// A provider whose `GET /models` answers with `models_body`.
+fn catalog_provider(models_body: &str) -> (OpenAiCompatProvider, Arc<FakeTransport>) {
+    provider_over(FakeTransport::models(models_body))
+}
+
+fn request_with_budget(budget: ModelBudget) -> ModelRequest {
+    let mut request = request(vec![user("hi")]);
+    request.budget = budget;
+    request
 }
 
 fn request(messages: Vec<ModelMessage>) -> ModelRequest {
@@ -292,6 +342,75 @@ fn a_route_overrides_the_configured_model_and_a_budget_overrides_max_tokens() {
     let body = chat_request(&config(), &request).unwrap();
     assert_eq!(body.model, "routed-model");
     assert_eq!(body.max_tokens, Some(64));
+}
+
+#[test]
+fn chat_request_sends_reasoning_effort_but_not_the_reservation_as_max_tokens() {
+    let request = request_with_budget(ModelBudget {
+        max_tokens: Some(262_144),
+        reasoning_effort: Some(ReasoningEffort::Max),
+        ..ModelBudget::default()
+    });
+    let wire = chat_request(&config(), &request).unwrap();
+    assert_eq!(wire.max_tokens, Some(262_144));
+    assert_eq!(wire.reasoning_effort, Some(ReasoningEffort::Max));
+    assert_eq!(serde_json::to_value(&wire).unwrap()["reasoning_effort"], "max");
+
+    // Nothing names an effort: the field is absent, not a fabricated default.
+    let bare = request_with_budget(ModelBudget::default());
+    let json = serde_json::to_value(chat_request(&config(), &bare).unwrap()).unwrap();
+    assert!(json.get("reasoning_effort").is_none(), "{json}");
+}
+
+#[tokio::test]
+async fn models_endpoint_maps_deepseek_capabilities() {
+    let (provider, _) = catalog_provider(
+        r#"{"data":[{"id":"deepseek-flash","context_window":1048576,"max_output_tokens":393216,"reasoning_efforts":["low","high","max"],"default_reasoning_effort":"high"}]}"#,
+    );
+    let resolved = provider.model_capabilities("deepseek-flash").await.unwrap();
+    assert_eq!(resolved.capabilities.context_window_tokens, 1_048_576);
+    assert_eq!(resolved.capabilities.max_output_tokens, 393_216);
+    assert_eq!(
+        resolved.capabilities.reasoning_efforts,
+        vec![ReasoningEffort::Low, ReasoningEffort::High, ReasoningEffort::Max]
+    );
+    assert_eq!(resolved.capabilities.default_reasoning_effort, Some(ReasoningEffort::High));
+    assert_eq!(resolved.source, ModelCapabilitySource::Provider);
+}
+
+#[tokio::test]
+async fn an_unusable_models_response_uses_the_bundled_catalog() {
+    let (provider, _) = catalog_provider("not json");
+    let resolved = provider.model_capabilities("deepseek-flash").await.unwrap();
+    assert_eq!(resolved.capabilities.context_window_tokens, 1_048_576);
+    assert_eq!(resolved.source, ModelCapabilitySource::Bundled);
+}
+
+#[tokio::test]
+async fn an_unknown_model_with_an_unusable_answer_is_a_labelled_fallback() {
+    let (provider, _) = catalog_provider(r#"{"data":[{"id":"other","context_window":1}]}"#);
+    let resolved = provider.model_capabilities("unknown-model").await.unwrap();
+    assert_eq!(
+        resolved.capabilities,
+        agent_model_openai::fallback_capabilities(),
+        "no usable answer must not be read as a zero window"
+    );
+    assert_eq!(resolved.source, ModelCapabilitySource::Fallback);
+}
+
+#[tokio::test]
+async fn a_discovered_capability_set_is_asked_for_once() {
+    let (provider, transport) = catalog_provider(
+        r#"{"data":[{"id":"m","context_window":1000,"max_output_tokens":100}]}"#,
+    );
+    let first: ModelCapabilities = provider.model_capabilities("m").await.unwrap().capabilities;
+    let second = provider.model_capabilities("m").await.unwrap().capabilities;
+    assert_eq!(first, second);
+    assert_eq!(transport.get_count(), 1, "the second answer came from the cache");
+    // The discovery really did go to the models endpoint.
+    let seen = transport.requests();
+    assert_eq!(seen[0].url, "https://api.example.com/models");
+    assert_eq!(seen[0].bearer_token, TEST_KEY);
 }
 
 #[test]

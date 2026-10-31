@@ -13,6 +13,7 @@
 
 #![deny(unsafe_code)]
 
+mod catalog;
 mod config;
 mod provider;
 mod sse;
@@ -20,6 +21,10 @@ mod stream;
 mod transport;
 mod wire;
 
+pub use catalog::{
+    FALLBACK_CONTEXT_WINDOW_TOKENS, FALLBACK_MAX_OUTPUT_TOKENS, bundled_capabilities,
+    capabilities_without_provider, fallback_capabilities, parse_model_capabilities,
+};
 pub use config::{
     ConfigError, DEFAULT_PROVIDER_ID, DEFAULT_RETRIES, DEFAULT_TIMEOUT_MS, ENV_API_KEY,
     ENV_BASE_URL, ENV_MODEL_NAME, OpenAiCompatConfig,
