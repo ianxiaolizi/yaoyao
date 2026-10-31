@@ -199,7 +199,7 @@ impl WorkState {
             )));
         }
         bounded("goal", &self.goal, Self::MAX_GOAL_CHARS)?;
-        if self.next.is_empty() {
+        if self.next.is_empty() && self.blocked.is_none() {
             return Err(StateError::Invalid(String::from(
                 "next is empty; name the next concrete action, or set blocked",
             )));
@@ -453,7 +453,14 @@ pub fn tool_definition() -> ToolDefinition {
         input_schema: serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["goal", "next"],
+            "required": ["goal"],
+            // A fully blocked task has no honest next action. One of the two
+            // fields is required, and `validate` checks that `next` is not
+            // merely an empty string when it is the one supplied.
+            "anyOf": [
+                { "required": ["next"] },
+                { "required": ["blocked"] },
+            ],
             "properties": {
                 "schema": {
                     "type": "string",
@@ -636,6 +643,20 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_state_needs_no_next_action() {
+        let state = WorkState::from_arguments(&serde_json::json!({
+            "goal": "submit every answer",
+            "blocked": "the editor server is not running, and no local replacement exists",
+        }))
+        .expect("a fully blocked task has no honest next action to invent");
+
+        assert_eq!(state.next, "");
+        let rendered = state.render();
+        assert!(rendered.contains("Blocked:"), "{rendered}");
+        assert!(!rendered.contains("Next:"), "{rendered}");
+    }
+
+    #[test]
     fn an_unknown_field_is_refused_rather_than_dropped() {
         let error = WorkState::from_arguments(&serde_json::json!({
             "goal": "g",
@@ -719,7 +740,14 @@ mod tests {
         assert_eq!(definition.source, ToolSource::Builtin);
         assert_eq!(definition.side_effect, ToolSideEffect::Pure);
         assert!(definition.description.contains("evidence"), "{}", definition.description);
-        assert_eq!(definition.input_schema["required"], serde_json::json!(["goal", "next"]));
+        assert_eq!(definition.input_schema["required"], serde_json::json!(["goal"]));
+        assert_eq!(
+            definition.input_schema["anyOf"],
+            serde_json::json!([
+                { "required": ["next"] },
+                { "required": ["blocked"] },
+            ])
+        );
         assert_eq!(
             definition.input_schema["properties"]["done"]["items"]["required"],
             serde_json::json!(["what", "evidence"])

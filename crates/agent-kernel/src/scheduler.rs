@@ -630,6 +630,11 @@ impl Scheduler {
             self.budget.cache_hit_weight_percent.unwrap_or(10),
         );
         finished.decorate(&mut turn_payload, endings::is_limit(&stop_reason));
+        // The run's terminal event carries the same spend. `turn/completed` and
+        // `run/completed` are both terminal records readers can join to, and a
+        // run-level audit must not have to walk back to find what it cost.
+        let mut run_payload = serde_json::json!({ "stop_reason": &stop_reason });
+        finished.decorate(&mut run_payload, false);
         // The item is claimed only now: the claim is the fact "this input has
         // been answered", and a turn that never reached its end has not
         // answered it. Writing the claim at the opening would consume the
@@ -649,7 +654,7 @@ impl Scheduler {
         pending.push(draft(
             session_id,
             run_terminal,
-            serde_json::json!({}),
+            run_payload,
             Actor::Scheduler,
             Some(&run_id),
             None,
@@ -1674,6 +1679,16 @@ mod tests {
         assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(2));
         assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(2));
         assert!(completed.event.payload["budget"]["elapsed_ms"].is_u64());
+        // The run's terminal event is the one an operator reads when asking
+        // what a finished run cost. It must carry the same spend as the turn.
+        let run_completed = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::RUN_COMPLETED)
+            .expect("the run completed");
+        assert_eq!(run_completed.event.payload["stop_reason"], serde_json::json!("max_steps"));
+        assert_eq!(run_completed.event.payload["spent"]["steps"], serde_json::json!(2));
+        assert_eq!(run_completed.event.payload["spent"]["tool_calls"], serde_json::json!(2));
+        assert!(run_completed.event.payload["spent"]["input_tokens"].is_u64());
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
     }
 

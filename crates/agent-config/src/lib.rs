@@ -1654,6 +1654,18 @@ decisions = { laya = true }
     }
 
     #[test]
+    fn a_step_ceiling_alone_still_gets_the_shipped_stall_default() {
+        let mut layers = no_layers();
+        layers.user =
+            UserConfig::from_toml_str("[profiles.p]\nbudget = { max_steps = 100 }\n").unwrap();
+        layers.profile_override = Some("p".to_string());
+
+        let budget = resolve(layers).unwrap().budget;
+
+        assert_eq!(budget.stall_steps, Some(8), "the configured default is not conditional");
+    }
+
+    #[test]
     fn the_phase_thresholds_are_validated_where_they_are_written() {
         let refused = |text: &str| {
             let mut layers = no_layers();

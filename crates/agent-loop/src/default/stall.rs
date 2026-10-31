@@ -25,10 +25,10 @@ use agent_protocol::model::{ContentBlock, ModelMessage};
 
 use super::*;
 
-/// Steps without new evidence before the reminder, when the run configures
-/// none. Six is long enough that an ordinary investigation (read, grep, read
-/// again) never sees it, and short enough that a loop of repeated calls is
-/// caught well before a 300-step budget is spent.
+/// Steps without new evidence before the reminder when a hand-built harness
+/// supplies no budget. Configuration-managed runs get the shipped default of
+/// 8 from `agent-config`; this lower fallback protects callers that bypass
+/// configuration entirely.
 pub(super) const DEFAULT_STALL_STEPS: u32 = 6;
 
 /// The evidence a turn has collected, and the streak that has brought none.

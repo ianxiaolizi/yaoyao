@@ -301,66 +301,81 @@ impl ToolProvider for WebToolProvider {
             });
         }
         let request = self.request(invocation)?;
-        let mut url = request.url.clone();
-        let mut method = request.method.clone();
-        let mut body = request.body.clone();
+        let timeout = request.timeout;
+        // The deadline belongs to the call, not to each redirect hop. The
+        // request-level timeout below also covers DNS, every redirect, and the
+        // body stream, so a chain cannot multiply the operator's limit.
+        let outcome = tokio::time::timeout(timeout, async {
+            let mut url = request.url.clone();
+            let mut method = request.method.clone();
+            let mut body = request.body.clone();
 
-        let mut redirects = 0;
-        loop {
-            let target = guard::parse(&url).map_err(refused)?;
-            let addresses = guard::resolve(&target, self.addresses).await.map_err(refused)?;
-            let response = self
-                .hop(
-                    &request,
-                    &method,
-                    &target.url,
-                    &target.host,
-                    &addresses,
-                    target.port,
-                    body.as_deref(),
-                )
-                .await?;
+            let mut redirects = 0;
+            loop {
+                let target = guard::parse(&url).map_err(refused)?;
+                let addresses = guard::resolve(&target, self.addresses).await.map_err(refused)?;
+                let response = self
+                    .hop(
+                        &request,
+                        &method,
+                        &target.url,
+                        &target.host,
+                        &addresses,
+                        target.port,
+                        body.as_deref(),
+                    )
+                    .await?;
 
-            let status = response.status();
-            if status.is_redirection()
-                && let Some(location) = response.headers().get(LOCATION)
-            {
-                redirects += 1;
-                if redirects > MAX_REDIRECTS {
-                    return Err(ToolProviderError::failed(
-                        WEB_TOOL_NAME,
-                        format!("more than {MAX_REDIRECTS} redirects"),
-                    ));
-                }
-                let location = location.to_str().map_err(|_| {
-                    ToolProviderError::classified(
-                        ToolErrorKind::Protocol,
-                        WEB_TOOL_NAME,
-                        "the redirect location is not readable text".to_string(),
-                    )
-                })?;
-                let next = target.url.join(location).map_err(|error| {
-                    ToolProviderError::classified(
-                        ToolErrorKind::Protocol,
-                        WEB_TOOL_NAME,
-                        format!("the redirect location is not a URL: {error}"),
-                    )
-                })?;
-                // The method follows the redirect the way browsers do: 303 asks
-                // for a GET, and so do 301/302 (the historically universal
-                // reading); 307/308 keep the method and the body.
-                if status == reqwest::StatusCode::SEE_OTHER
-                    || status == reqwest::StatusCode::MOVED_PERMANENTLY
-                    || status == reqwest::StatusCode::FOUND
+                let status = response.status();
+                if status.is_redirection()
+                    && let Some(location) = response.headers().get(LOCATION)
                 {
-                    method = "GET".to_string();
-                    body = None;
+                    redirects += 1;
+                    if redirects > MAX_REDIRECTS {
+                        return Err(ToolProviderError::failed(
+                            WEB_TOOL_NAME,
+                            format!("more than {MAX_REDIRECTS} redirects"),
+                        ));
+                    }
+                    let location = location.to_str().map_err(|_| {
+                        ToolProviderError::classified(
+                            ToolErrorKind::Protocol,
+                            WEB_TOOL_NAME,
+                            "the redirect location is not readable text".to_string(),
+                        )
+                    })?;
+                    let next = target.url.join(location).map_err(|error| {
+                        ToolProviderError::classified(
+                            ToolErrorKind::Protocol,
+                            WEB_TOOL_NAME,
+                            format!("the redirect location is not a URL: {error}"),
+                        )
+                    })?;
+                    // The method follows the redirect the way browsers do: 303
+                    // asks for a GET, and so do 301/302 (the historically
+                    // universal reading); 307/308 keep the method and the body.
+                    if status == reqwest::StatusCode::SEE_OTHER
+                        || status == reqwest::StatusCode::MOVED_PERMANENTLY
+                        || status == reqwest::StatusCode::FOUND
+                    {
+                        method = "GET".to_string();
+                        body = None;
+                    }
+                    url = next.to_string();
+                    continue;
                 }
-                url = next.to_string();
-                continue;
-            }
 
-            return self.render(&url, status, response).await;
+                return self.render(&url, status, response).await;
+            }
+        })
+        .await;
+        match outcome {
+            Ok(result) => result,
+            Err(_) => Err(ToolProviderError::classified(
+                ToolErrorKind::Timeout,
+                WEB_TOOL_NAME,
+                format!("no answer within {} ms", timeout.as_millis()),
+            )),
         }
     }
 }

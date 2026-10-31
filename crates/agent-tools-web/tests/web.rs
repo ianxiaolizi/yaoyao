@@ -80,6 +80,14 @@ async fn serve() -> SocketAddr {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         answer("200 OK", &[], "late")
                     }
+                    "/slow-redirect-one" => {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        answer("302 Found", &[("location", "/slow-redirect-two")], "")
+                    }
+                    "/slow-redirect-two" => {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        answer("200 OK", &[], "late but finished")
+                    }
                     "/missing" => {
                         answer("404 Not Found", &[("content-type", "text/plain")], "no such page")
                     }
@@ -277,6 +285,28 @@ async fn the_call_states_its_own_deadline() {
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "the deadline ended the call, not the server"
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_chain_shares_one_deadline() {
+    let address = serve().await;
+    let provider = local();
+    let started = Instant::now();
+    let error = provider
+        .invoke(&call(serde_json::json!({
+            "url": format!("http://{address}/slow-redirect-one"),
+            "timeout_ms": 180,
+        })))
+        .await
+        .expect_err("the whole redirect chain is slower than one call deadline");
+    assert!(
+        matches!(error, ToolProviderError::Classified { kind: ToolErrorKind::Timeout, .. }),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the deadline belongs to the whole call, not one hop"
     );
 }
 

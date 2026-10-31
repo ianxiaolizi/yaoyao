@@ -777,13 +777,14 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
     if primary_limit && !named_steps {
         budget.max_steps = DEFAULT_BACKSTOP_STEPS;
     }
-    if primary_limit {
-        if budget.finalize_at_percent.is_none() {
-            budget.finalize_at_percent = Some(DEFAULT_FINALIZE_AT_PERCENT);
-        }
-        if budget.stall_steps.is_none() {
-            budget.stall_steps = Some(DEFAULT_STALL_STEPS);
-        }
+    if primary_limit && budget.finalize_at_percent.is_none() {
+        budget.finalize_at_percent = Some(DEFAULT_FINALIZE_AT_PERCENT);
+    }
+    // Stall protection is not tied to a primary limit. A step-ceiling-only
+    // profile can still loop through its whole allowance, and the documented
+    // configured default is 8 regardless of which limit is primary.
+    if budget.stall_steps.is_none() {
+        budget.stall_steps = Some(DEFAULT_STALL_STEPS);
     }
     if budget.max_input_tokens.is_some() && budget.settle_at_percent.is_none() {
         budget.settle_at_percent = Some(DEFAULT_SETTLE_AT_PERCENT);

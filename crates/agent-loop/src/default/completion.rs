@@ -99,9 +99,9 @@ impl LoopTurn {
 
     /// Whether this step boundary is one the criterion is asked at.
     ///
-    /// `step_index` is this step's ordinal, so with an interval of three the
-    /// first check runs before the fourth request: after three steps of work,
-    /// at the boundary. An interval of one checks before every request.
+    /// `step_index` is this step's ordinal. With an interval of three the
+    /// checks run at boundaries 3 and 6 — before the third and sixth requests.
+    /// An interval of one checks before every request.
     pub(super) fn completion_due(&self) -> bool {
         let Some(spec) = self.completion_spec() else {
             return false;
@@ -173,7 +173,7 @@ pub(super) async fn check_at_boundary(
     let finding = run(gateway, &ctx.session_id, &spec, call_id).await;
     let mut payload = serde_json::json!({
         "kind": spec.kind.as_str(),
-        "target": target(&spec),
+        "target": target(&spec, redactor),
         "status": finding.status(),
         "steps": step_index,
     });
@@ -194,11 +194,16 @@ pub(super) async fn check_at_boundary(
 }
 
 /// What the criterion checked, for the event payload: the command or the URL.
-pub(super) fn target(spec: &CompletionSpec) -> String {
-    match spec.kind {
+///
+/// The operator may put a credential in a header, a query string, or a shell
+/// command. The event is durable, so it gets the same redaction pass as a
+/// failing check's detail text.
+pub(super) fn target(spec: &CompletionSpec, redactor: &Redactor) -> String {
+    let raw = match spec.kind {
         CompletionKind::Command => spec.command.clone().unwrap_or_default(),
         CompletionKind::Http => spec.url.clone().unwrap_or_default(),
-    }
+    };
+    redactor.redact(&raw).0
 }
 
 #[cfg(test)]
@@ -242,6 +247,18 @@ mod tests {
 
     #[test]
     fn the_target_is_the_criterion_itself() {
-        assert_eq!(target(&command_spec()), "python check.py");
+        assert_eq!(target(&command_spec(), &Redactor::new()), "python check.py");
+    }
+
+    #[test]
+    fn the_target_is_redacted_before_it_reaches_the_event() {
+        let mut spec = command_spec();
+        spec.command =
+            Some("curl -H 'Authorization: Bearer sk-aaaaaaaaaaaaaaaaaaaaaaaa' check".into());
+
+        let target = target(&spec, &Redactor::new());
+
+        assert!(!target.contains("sk-"), "a credential reached the event target: {target}");
+        assert!(target.contains("curl"), "redaction must not erase the action: {target}");
     }
 }
