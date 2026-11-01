@@ -388,6 +388,61 @@ fn the_selected_sandbox_is_reported_and_an_unavailable_one_stops_the_run() {
         ran_with(data.path(), workspace.path(), &[("AGENT_SANDBOX", "sandbox")], &["run", "hello"]);
     assert_eq!(unknown.code, Some(2), "{}", unknown.err);
     assert!(unknown.err.contains("unknown execution sandbox"), "{}", unknown.err);
+
+    // `AGENT_SANDBOX_NETWORK=allow` is the one value this build cannot honour:
+    // an origin allowlist bounds the requests this process makes, not the
+    // traffic of a command it starts (CONTRACT §7 #179). Read for every mode,
+    // so `local` refuses it too — and the doctor, which used not to look at the
+    // policy outside the sandboxed modes, now fails on it rather than passing a
+    // machine whose next command would not start.
+    let allow = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_SANDBOX_NETWORK", "allow")],
+        &["run", "hello"],
+    );
+    assert_eq!(allow.code, Some(2), "{}", allow.err);
+    assert!(allow.err.contains("web.request"), "the refusal names the way out: {}", allow.err);
+    let allow_doctor =
+        ran_with(data.path(), workspace.path(), &[("AGENT_SANDBOX_NETWORK", "allow")], &["doctor"]);
+    assert_eq!(allow_doctor.code, Some(1), "{}", allow_doctor.out);
+    assert!(allow_doctor.out.contains("web.request"), "{}", allow_doctor.out);
+}
+
+/// The local backend is the trusted-workspace one, and the doctor says so.
+///
+/// A run that starts a process or writes a path at `L2` or above is refused
+/// there rather than run as the user, and the refusal names the backend that
+/// can run it (CONTRACT §7 #179). `shell.run` is `L3`, so on the default
+/// backend no command runs at all — a reader who is told "confined to the
+/// workspace" and nothing else would think one could.
+#[test]
+fn doctor_reports_high_risk_requires_app_container() {
+    let (data, workspace) = dirs();
+
+    let local = ran(data.path(), workspace.path(), &["doctor"]);
+    assert_eq!(local.code, Some(0), "{}", local.err);
+    assert!(local.out.contains("mode=local"), "{}", local.out);
+    assert!(
+        local.out.contains("AGENT_SANDBOX=app-container"),
+        "the doctor names the backend that can run high-risk work: {}",
+        local.out
+    );
+    assert!(local.out.contains("shell.run"), "and the tool it means: {}", local.out);
+
+    // The run agrees: the same call is refused before it starts, and the
+    // sentence says which backend would take it. Exit `2` rather than `1`:
+    // nothing ran, which is the "did not run" verdict — the same one a backend
+    // this build does not ship gets.
+    let args = serde_json::json!({ "command": "echo hi" }).to_string();
+    let refused = ran(data.path(), workspace.path(), &["tool", "shell.run", &args]);
+    assert_eq!(refused.code, Some(2), "{} {}", refused.out, refused.err);
+    assert!(refused.err.contains("app-container"), "{}", refused.err);
+    assert!(
+        refused.err.contains("local backend cannot isolate"),
+        "the refusal says which backend it was: {}",
+        refused.err
+    );
 }
 
 /// `sandbox` is how the one-time machine setup is run and checked. The command

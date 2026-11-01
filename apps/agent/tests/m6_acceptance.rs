@@ -45,6 +45,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+#[path = "support/claimed_isolation.rs"]
+mod claimed_isolation;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -296,23 +299,31 @@ struct Harness {
 impl Harness {
     async fn new(data: &Path, script: Vec<String>) -> Self {
         let transport = Arc::new(ScriptedTransport::new(script));
-        let stack = stack::assemble(stack::Inputs {
-            session: SessionId::from_string(SESSION),
-            // One directory for both, as this suite has always had it: these
-            // tests turn on the plugin surface, not on where the boundary sits
-            // relative to the log.
-            workspace_root: data.to_path_buf(),
-            data_dir: data.to_path_buf(),
-            resolved: default_profile(),
-            model: Some(SelectedProvider {
-                provider: scripted_provider(transport.clone()),
-                route: route(),
-            }),
-            decisions: Decisions::FromConfiguration,
-            sandbox: SandboxMode::LocalProcess,
-            network_allowed: false,
-            judgment: true,
-        })
+        let stack = stack::assemble_over(
+            stack::Inputs {
+                session: SessionId::from_string(SESSION),
+                // One directory for both, as this suite has always had it: these
+                // tests turn on the plugin surface, not on where the boundary sits
+                // relative to the log.
+                workspace_root: data.to_path_buf(),
+                data_dir: data.to_path_buf(),
+                resolved: default_profile(),
+                model: Some(SelectedProvider {
+                    provider: scripted_provider(transport.clone()),
+                    route: route(),
+                }),
+                decisions: Decisions::FromConfiguration,
+                // Supplied below rather than built from this: the case is about
+                // policy over a plugin tool and a built-in one, and the
+                // built-in it names is `shell.run`, which the isolation floor
+                // refuses on `local` before any policy is asked.
+                sandbox: SandboxMode::WorkspaceSandbox,
+                network_allowed: false,
+                judgment: true,
+            },
+            agent::subagents::Delegation::Background,
+            claimed_isolation::isolating(data),
+        )
         .await
         .expect("the assembly the binary runs");
 
@@ -636,25 +647,34 @@ fn shape(trail: &[Value]) -> Vec<(String, Vec<String>)> {
 fn a_plugin_tool_and_a_built_in_tool_are_judged_by_the_same_policy() {
     let server = fixture_bin("agent-tools-mcp", "fake-mcp-server");
 
-    // Two tools from two doors — `shell.run` is built in, `mcp__fake__echo`
+    // Two tools from two doors — `web.request` is built in, `mcp__fake__echo`
     // arrived through the plugin registry — declaring the same capability,
     // which is what makes them the same question to the policy engine.
+    //
+    // `network.request` rather than `process.spawn`, because since stage B's
+    // isolation floor a built-in that starts a process is refused on the
+    // default (`local`) backend before any policy is consulted (CONTRACT §7
+    // #179). What this case pins is that the *policy* treats the two doors
+    // alike, so it uses a capability a local run can still ask about; the
+    // floor's own cases are in `crates/agent-kernel/src/permission.rs`.
     let config = |disposition: &str| {
         format!(
-            "capabilities = [\"process.spawn\"]\n\
+            "capabilities = [\"network.request\"]\n\
              plugins = [\"mcp.fake\"]\n\n\
              [mcp.servers.fake]\n\
              command = '{command}'\n\
-             requires = [\"process.spawn\"]\n\n\
+             requires = [\"network.request\"]\n\n\
              [profiles.p]\n\
-             tools = {{ allow = [\"process.spawn\"] }}\n\
-             policy = {{ shell = \"{disposition}\" }}\n\
+             tools = {{ allow = [\"network.request\"] }}\n\
+             policy = {{ network = \"{disposition}\" }}\n\
              plugins = {{ enable = [\"mcp.fake\"] }}\n",
             command = server.display(),
         )
     };
-    let calls: [(&str, &str); 2] =
-        [("shell.run", r#"{"command":"echo hi"}"#), ("mcp__fake__echo", r#"{"text":"hi"}"#)];
+    let calls: [(&str, &str); 2] = [
+        ("web.request", r#"{"url":"https://docs.rs/index.html"}"#),
+        ("mcp__fake__echo", r#"{"text":"hi"}"#),
+    ];
 
     // --- Asked: neither runs until a person says so, and both say so the same
     // way. ---
@@ -673,7 +693,7 @@ fn a_plugin_tool_and_a_built_in_tool_are_judged_by_the_same_policy() {
     }
 
     let asked_events = events(asked_data.path(), "default");
-    let shell = trail(&asked_events, "shell.run");
+    let shell = trail(&asked_events, "web.request");
     let mcp = trail(&asked_events, "mcp__fake__echo");
     assert_eq!(
         shape(&shell),
@@ -682,7 +702,7 @@ fn a_plugin_tool_and_a_built_in_tool_are_judged_by_the_same_policy() {
     );
     assert_eq!(shell.len(), 1, "asking is one event per call: {shell:#?}");
     assert_eq!(
-        shell[0]["payload"]["capability"], "process.spawn",
+        shell[0]["payload"]["capability"], "network.request",
         "the question is about the capability, not about which door the tool came through"
     );
     assert_eq!(shell[0]["payload"]["capability"], mcp[0]["payload"]["capability"]);
@@ -704,12 +724,15 @@ fn a_plugin_tool_and_a_built_in_tool_are_judged_by_the_same_policy() {
         // layers here and a reader cannot fix a layer the message will not name.
         // This one came from the profile's own rule.
         let expected = format!(
-            "policy denied tool '{tool}': capability process.spawn is denied by a policy rule"
+            "policy denied tool '{tool}': capability network.request is denied by a policy rule"
         );
         assert!(r.err.contains(&expected), "{tool}: {}", r.err);
     }
     let denied_events = events(denied_data.path(), "default");
-    assert!(trail(&denied_events, "shell.run").is_empty(), "a denied call was recorded as a call");
+    assert!(
+        trail(&denied_events, "web.request").is_empty(),
+        "a denied call was recorded as a call"
+    );
     assert!(trail(&denied_events, "mcp__fake__echo").is_empty());
 }
 

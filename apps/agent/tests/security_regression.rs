@@ -39,6 +39,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "support/claimed_isolation.rs"]
+mod claimed_isolation;
+
 use agent::providers::SelectedProvider;
 use agent::stack::{self, Decisions};
 use agent_config::{Layers, ResolvedProfile};
@@ -198,28 +201,62 @@ async fn process_in(
     script: Vec<String>,
 ) -> Process {
     let transport = Arc::new(ScriptedTransport::new(script));
-    let stack = stack::assemble(stack::Inputs {
+    let stack = stack::assemble_over(
+        // Supplied below rather than built from the mode: these runs are about
+        // the policy and approval boundary, and the dangerous call they make is
+        // `shell.run`. On the default `local` backend the isolation floor
+        // refuses it before any policy or person is asked (CONTRACT §7 #179),
+        // which is `a_dangerous_call_is_refused_before_anyone_is_asked`'s case.
+        // Here the machine is said to confine the run.
+        inputs(session, workspace, data_dir, transport.clone(), SandboxMode::WorkspaceSandbox),
+        agent::subagents::Delegation::Background,
+        claimed_isolation::isolating(workspace),
+    )
+    .await
+    .expect("the assembly the binary runs");
+
+    Process { stack, transport, session: SessionId::from_string(session) }
+}
+
+/// The same run over the backend the host selects when it selects nothing.
+async fn process_local(workspace: &Path, data_dir: &Path, script: Vec<String>) -> Process {
+    let transport = Arc::new(ScriptedTransport::new(script));
+    let stack = stack::assemble(inputs(
+        SESSION,
+        workspace,
+        data_dir,
+        transport.clone(),
+        SandboxMode::LocalProcess,
+    ))
+    .await
+    .expect("the assembly the binary runs");
+
+    Process { stack, transport, session: SessionId::from_string(SESSION) }
+}
+
+/// The inputs every process above is assembled from.
+fn inputs(
+    session: &str,
+    workspace: &Path,
+    data_dir: &Path,
+    transport: Arc<ScriptedTransport>,
+    sandbox: SandboxMode,
+) -> stack::Inputs {
+    stack::Inputs {
         session: SessionId::from_string(session),
         workspace_root: workspace.to_path_buf(),
         data_dir: data_dir.to_path_buf(),
         resolved: default_profile(),
-        model: Some(SelectedProvider {
-            provider: scripted_provider(transport.clone()),
-            route: route(),
-        }),
+        model: Some(SelectedProvider { provider: scripted_provider(transport), route: route() }),
         decisions: Decisions::FromConfiguration,
-        sandbox: SandboxMode::LocalProcess,
+        sandbox,
         network_allowed: false,
         // These runs are about the policy and approval boundary, and their
         // model scripts are fixed sequences counted in calls. The thinking
         // pipeline would hold the first irreversible call for a branch record
         // the scripts were never written to produce.
         judgment: false,
-    })
-    .await
-    .expect("the assembly the binary runs");
-
-    Process { stack, transport, session: SessionId::from_string(session) }
+    }
 }
 
 impl Process {
@@ -699,6 +736,56 @@ async fn a_dangerous_call_stops_the_turn_for_an_answer() {
     );
     assert!(!workspace.path().join("marker.txt").exists(), "the world is unchanged");
     assert_eq!(process.posts().len(), 1, "the model proposed exactly one call");
+}
+
+// ---------------------------------------------------------------------------
+// 4b. a dangerous call on a backend that cannot confine it ⇒ refused, no ask
+// ---------------------------------------------------------------------------
+
+/// On the default (`local`) backend the same call never becomes a question.
+///
+/// A person's "yes" is an answer about a call, not a boundary around what the
+/// command does; running it as the user and calling that approved would be the
+/// downgrade the isolation floor exists to refuse (CONTRACT §7 #179). The turn
+/// therefore reads a failed call, no approval is raised, and the world is
+/// unchanged.
+#[tokio::test]
+async fn a_dangerous_call_is_refused_before_anyone_is_asked() {
+    let (workspace, data) = dirs();
+    let process = process_local(
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": MARKER_COMMAND }),
+            ),
+            answer_body("cannot run that here"),
+        ],
+    )
+    .await;
+
+    let report = process.ask("run the command").await;
+    assert_eq!(
+        report.stop_reason,
+        StopReason::FinalAnswer,
+        "a refusal is an answer the turn can read, not a stop for input"
+    );
+
+    assert!(
+        process.stack.approvals.pending(&process.session).await.expect("pending").is_empty(),
+        "nothing may be asked: the answer could not make the call safe"
+    );
+    let failures = process.tool_events(EventType::TOOL_FAILED, "shell.run").await;
+    assert_eq!(failures.len(), 1, "the call is recorded as failed");
+    let recorded = serde_json::to_string(&failures[0].event.payload).unwrap_or_default();
+    assert!(recorded.contains("app-container"), "the refusal names the fix: {recorded}");
+    assert!(
+        process.tool_events(EventType::TOOL_COMPLETED, "shell.run").await.is_empty(),
+        "and it is not a completed one"
+    );
+    assert!(!workspace.path().join("marker.txt").exists(), "the world is unchanged");
 }
 
 // ---------------------------------------------------------------------------

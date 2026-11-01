@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use agent_ports::artifact_store::ArtifactStore;
+use agent_ports::execution_environment::SandboxMode;
 use agent_ports::permission_classifier::PermissionClassifier;
 use agent_ports::secret_provider::SecretProvider;
 use agent_ports::tool_gateway::{ToolGateway, ToolGatewayError};
@@ -73,6 +74,15 @@ pub struct GuardedToolProvider {
     /// and the policy's own answer stands. A judge that *is* installed and then
     /// cannot answer is the case that stops for a person (CONTRACT §7 #177).
     classifier: Option<Arc<dyn PermissionClassifier>>,
+    /// The backend this gateway's calls would run under (B5).
+    ///
+    /// The gateway is the only layer holding the action *and* the backend at
+    /// once, and the isolation floor is a question about both. It defaults to
+    /// [`SandboxMode::LocalProcess`] — the documented backend of an unnamed run
+    /// — because a gateway that was not told what confines it must not assume
+    /// something does: the conservative answer refuses a high-risk command, and
+    /// a caller that really is confined says so with [`Self::with_sandbox_mode`].
+    sandbox_mode: SandboxMode,
     /// How many bytes of one result stay inline; larger results are offloaded.
     offload_max_bytes: usize,
     /// The compiled declarations calls are checked against, kept between calls
@@ -98,6 +108,7 @@ impl GuardedToolProvider {
             secrets: None,
             permissions: None,
             classifier: None,
+            sandbox_mode: SandboxMode::LocalProcess,
             offload_max_bytes: OFFLOAD_MAX_BYTES,
             schema: SchemaCheck::new(),
         }
@@ -116,6 +127,18 @@ impl GuardedToolProvider {
     /// Ask an independent classifier about every boundary action (B3).
     pub fn with_permission_classifier(mut self, classifier: Arc<dyn PermissionClassifier>) -> Self {
         self.classifier = Some(classifier);
+        self
+    }
+
+    /// Say what backend these calls would run under (B5).
+    ///
+    /// Assembly reads it from the environment it built
+    /// ([`agent_ports::execution_environment::ExecutionEnvironment::mode`]), so
+    /// the floor and the process the call reaches agree by construction. The
+    /// default is the local process, which is what an unnamed run gets and the
+    /// one mode that cannot confine a high-risk call.
+    pub fn with_sandbox_mode(mut self, mode: SandboxMode) -> Self {
+        self.sandbox_mode = mode;
         self
     }
 
@@ -290,6 +313,29 @@ impl GuardedToolProvider {
         let ctx = self.policy_context(invocation);
         self.check_paths(invocation, &ctx)?;
         let action = self.action_facts(&format!("manual:{}", session_id.as_str()), 0, invocation);
+
+        // The isolation floor holds on the resume path too: a standing answer
+        // about a call is an answer about the call, and it cannot confine it.
+        if let Some(floor) = crate::permission::isolation_floor(&action, self.sandbox_mode) {
+            let reason =
+                floor.reason.clone().unwrap_or_else(|| "the sandbox refused this call".to_string());
+            self.record(session_id, &action, floor.clone(), None).await?;
+            return Err(ToolGatewayError::PolicyDenied {
+                tool: invocation.tool_name.clone(),
+                reason,
+                policy: Box::new(
+                    ToolPolicyRecord::denied(
+                        self.capabilities_for(&invocation.tool_name),
+                        floor
+                            .refusals
+                            .iter()
+                            .map(|(cap, layer)| (cap.clone(), *layer))
+                            .collect::<Vec<_>>(),
+                    )
+                    .about(action.digest.clone()),
+                ),
+            });
+        }
 
         let covers = self
             .approvals
@@ -562,6 +608,13 @@ impl ToolGateway for GuardedToolProvider {
         // an absent classifier means: a grant is an answer, a rule is not.
         let approved = ungranted != PolicyDecision::Allow && decision == PolicyDecision::Allow;
 
+        // The isolation floor (B5), before any estimate and after every grant:
+        // an action that needs a confining backend and does not have one is
+        // refused, and a rule, a person's answer or a classifier's opinion is an
+        // answer to a different question. Lifting it is not expressible here.
+        let isolation = crate::permission::isolation_floor(&action, self.sandbox_mode);
+        let decision = if isolation.is_some() { PolicyDecision::Deny } else { decision };
+
         // The independent judgement of a boundary action, taken before anything
         // is written or run (B3). A policy deny never reaches it: a refusal is
         // final, and an estimate about a call nobody may make is work done to
@@ -599,14 +652,32 @@ impl ToolGateway for GuardedToolProvider {
                 // Asked with no grants, because a grant cannot turn anything
                 // into a `deny`: every layer this can name refuses the same way
                 // it did in the evaluation above, whichever that was.
-                let record = ToolPolicyRecord::denied(
-                    capabilities.clone(),
-                    self.policy.refusals(&capabilities, Some(&ctx), &[]),
-                );
+                // A call the sandbox floor refused names that layer rather than
+                // the policy's — nothing about it was forbidden by a rule, and
+                // the sentence a person reads should say where the fix is.
+                let record = match &isolation {
+                    Some(floor) => ToolPolicyRecord::denied(
+                        capabilities.clone(),
+                        floor
+                            .refusals
+                            .iter()
+                            .map(|(cap, layer)| (cap.clone(), *layer))
+                            .collect::<Vec<_>>(),
+                    ),
+                    None => ToolPolicyRecord::denied(
+                        capabilities.clone(),
+                        self.policy.refusals(&capabilities, Some(&ctx), &[]),
+                    ),
+                };
                 let denied_by_classifier = classifier.as_ref().is_some_and(|trace| {
                     trace.outcome == crate::permission::ClassifierOutcome::Deny
                 });
-                let reason = if denied_by_classifier {
+                let reason = if let Some(floor) = &isolation {
+                    floor
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "the sandbox refused this call".to_string())
+                } else if denied_by_classifier {
                     // The policy allowed this call; the refusal is the
                     // classifier's, and the record says so with its own words.
                     classifier
@@ -627,7 +698,9 @@ impl ToolGateway for GuardedToolProvider {
                 // policy's own answer plus the trace, so the written decision
                 // re-derives to "the classifier refused" rather than to a
                 // policy deny nobody wrote.
-                let baseline = if denied_by_classifier {
+                let baseline = if let Some(floor) = &isolation {
+                    floor.clone()
+                } else if denied_by_classifier {
                     PermissionBaseline::new(policy_answer)
                 } else {
                     PermissionBaseline::from(record.clone())
@@ -767,6 +840,7 @@ mod tests {
     use agent_ports::secret_provider::SecretProviderError;
     use agent_ports::tool_provider::{ToolProviderError, ToolSideEffect, ToolSource, ToolStatus};
     use agent_protocol::ids::ApprovalId;
+    use agent_protocol::permission::RiskLevel;
     use agent_protocol::permissions::SecretRef;
     use agent_protocol::permissions::{ApprovalScope, ArtifactRef, Workspace};
     use agent_protocol::tool::ToolErrorKind;
@@ -936,8 +1010,15 @@ mod tests {
         let store = Arc::new(FakeEventStore::new());
         let approvals = Arc::new(ApprovalService::new(store));
         let artifacts = Arc::new(agent_testkit::InMemoryArtifactStore::default());
+        // These cases are about the gateway's own chain — policy, approval,
+        // execution — and the provider they run is scripted, so the backend
+        // they name is one that would isolate a high-risk call. The isolation
+        // floor has cases of its own below, and each of those names `local`
+        // explicitly; leaving the default here would deny every `shell.run`
+        // case in this file for a reason none of them is asking about.
         let gateway =
-            GuardedToolProvider::new(tools.clone(), policy, approvals.clone(), guard, artifacts);
+            GuardedToolProvider::new(tools.clone(), policy, approvals.clone(), guard, artifacts)
+                .with_sandbox_mode(SandboxMode::WorkspaceSandbox);
         (gateway, approvals, tools)
     }
 
@@ -956,6 +1037,9 @@ mod tests {
             guard,
             Arc::new(agent_testkit::InMemoryArtifactStore::default()),
         )
+        // Same reason as `gateway_over`: the sandbox question is answered by
+        // the cases that name a mode, not by this harness.
+        .with_sandbox_mode(SandboxMode::WorkspaceSandbox)
     }
 
     /// An artifact store that is simply not there, to see what the gateway does
@@ -1262,6 +1346,83 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].approval_id.to_string(), id);
         assert_eq!(pending[0].capability, Capability::new(Capability::PROCESS_SPAWN));
+    }
+
+    /// A scripted surface that declares a risk of its own.
+    ///
+    /// The side-effect class supplies a floor (`Write` is `L1`), and a
+    /// provider's own declaration is how a tool says it is worse than its
+    /// class. This one exists so a case can be about `L2` — the lowest risk the
+    /// isolation floor covers — without inventing a new side-effect class for
+    /// it.
+    struct DeclaredRisk {
+        inner: Arc<ScriptedTools>,
+        risk: RiskLevel,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolProvider for DeclaredRisk {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            self.inner.definitions()
+        }
+
+        fn side_effect(&self, tool_name: &str) -> Option<ToolSideEffect> {
+            self.inner.side_effect(tool_name)
+        }
+
+        fn path_arguments(&self, tool_name: &str) -> Vec<String> {
+            self.inner.path_arguments(tool_name)
+        }
+
+        fn risk(&self, _: &ToolInvocation) -> Option<RiskLevel> {
+            Some(self.risk)
+        }
+
+        async fn invoke(
+            &self,
+            invocation: &ToolInvocation,
+        ) -> Result<ToolResult, ToolProviderError> {
+            self.inner.invoke(invocation).await
+        }
+    }
+
+    #[tokio::test]
+    async fn an_app_container_l2_action_can_ask_but_never_starts_before_approval() {
+        // The other half of the floor: with a backend that isolates, the same
+        // `L2` call is exactly what it always was — a question, then an
+        // execution. What the floor removes is the third possibility, that it
+        // runs anyway on a backend that cannot confine it.
+        let tools = Arc::new(ScriptedTools::echo(vec![def(
+            "fs.write",
+            &[Capability::FS_WRITE],
+            ToolSideEffect::Write,
+        )]));
+        *tools.results.lock().unwrap() =
+            HashMap::from([("fs.write".to_string(), ToolResult::completed("wrote"))]);
+        let policy = PolicyEngine::new()
+            .with_rules([crate::policy::PolicyRule::ask(Capability::new(Capability::FS_WRITE))])
+            .with_sandbox([Capability::new(Capability::FS_WRITE)]);
+        let gateway = gateway_any(
+            ResourceGuard::new(workspace()),
+            Arc::new(DeclaredRisk { inner: tools.clone(), risk: RiskLevel::L2 }),
+            policy,
+        );
+        let gateway = gateway.with_sandbox_mode(SandboxMode::WorkspaceSandbox);
+        let call =
+            ToolInvocation::proposed("fs.write", serde_json::json!({ "path": "notes/a.txt" }));
+
+        let held = gateway.execute(&sid(), &call).await.expect_err("a person is asked first");
+        assert!(
+            matches!(held, ToolGatewayError::ApprovalPending { .. }),
+            "the isolating backend asks rather than refusing: {held:?}"
+        );
+        assert!(tools.calls().is_empty(), "nothing started before the person answered");
+
+        let id = approve_once(&gateway, held).await;
+        let result =
+            gateway.execute_approved(&sid(), &id, &call).await.expect("the answer covers it");
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(tools.calls(), vec!["fs.write"], "and then it runs, once");
     }
 
     /// A classifier that allows whatever it is asked about (B3).

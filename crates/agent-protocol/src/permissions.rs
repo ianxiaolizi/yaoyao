@@ -83,6 +83,16 @@ impl Capability {
     pub const FS_EXTERNAL_PATH: &'static str = "fs.external_path";
     pub const PROCESS_SPAWN: &'static str = "process.spawn";
     pub const NETWORK_REQUEST: &'static str = "network.request";
+    /// A command that reaches the network on its own, outside any egress rule.
+    ///
+    /// Reserved for a later phase and advertised by nothing in this build: a
+    /// process's traffic cannot be held to an origin allowlist, so a backend
+    /// that offered this would offer exactly the reach `network.request` exists
+    /// to bound. Declaring the name now is what makes "no backend advertises a
+    /// raw process network" a statement about a capability rather than about an
+    /// absence — a gap nothing names is a gap the next surface can fill by
+    /// accident.
+    pub const NETWORK_PROCESS: &'static str = "network.process";
     pub const NETWORK_PACKAGE_REGISTRY: &'static str = "network.package_registry";
     pub const GIT_STATUS: &'static str = "git.status";
     pub const GIT_COMMIT: &'static str = "git.commit";

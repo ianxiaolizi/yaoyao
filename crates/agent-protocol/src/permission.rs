@@ -284,6 +284,29 @@ impl ActionFacts {
     pub fn requires_high_risk_isolation(&self) -> bool {
         self.risk >= RiskLevel::L2
     }
+
+    /// Whether this action needs a backend that confines it from the host.
+    ///
+    /// Two things put an action's effects outside what the run can account for:
+    /// it starts a process, whose effects are whatever the program does, or it
+    /// writes a path this build cannot place under a writable root — a write the
+    /// workspace boundary has not vouched for. Either at `L2` or above is an
+    /// action that has to run confined, and a backend that cannot confine it has
+    /// to refuse it rather than run it as the invoking user. Below `L2` neither
+    /// applies: a recoverable write inside the task workspace is what the
+    /// workspace boundary exists for.
+    ///
+    /// This build fills `writable_root` on no target, so every declared path
+    /// counts as one it cannot place. There is no `L2` path action today; a tool
+    /// that adds one meets the conservative answer rather than the permissive
+    /// one, and a later layer that knows the roots can narrow this predicate
+    /// without changing what the answer means.
+    pub fn requires_isolated_execution(&self) -> bool {
+        self.requires_high_risk_isolation()
+            && self.targets.iter().any(|target| {
+                matches!(target, ActionTarget::Command { .. } | ActionTarget::WorkspacePath { .. })
+            })
+    }
 }
 
 /// The bytes the action digest covers, in one place.
@@ -472,6 +495,57 @@ mod tests {
         assert_ne!(raised.digest, facts.digest);
         // Raising an already-risky action is not a second, different action.
         assert_eq!(raised.raised_to(RiskLevel::L2).digest, raised.digest);
+    }
+
+    #[test]
+    fn only_high_risk_commands_and_workspace_writes_need_an_isolating_backend() {
+        // The four cells of the predicate: risk, and whether the action
+        // reaches through a process or a path.
+        let command = |risk| {
+            let mut spec = spec(json!({ "command": "cargo test" }));
+            spec.risk = risk;
+            spec.reversibility = Reversibility::for_risk(risk);
+            spec.targets = vec![ActionTarget::Command {
+                program: "shell".to_string(),
+                args: vec!["cargo test".to_string()],
+                cwd: None,
+            }];
+            ActionFacts::from_spec(spec)
+        };
+        let path = |risk| {
+            let mut spec = spec(json!({ "path": "a.txt" }));
+            spec.risk = risk;
+            spec.reversibility = Reversibility::for_risk(risk);
+            ActionFacts::from_spec(spec)
+        };
+
+        // The shipped write is `L1` inside the workspace: the boundary that
+        // bounds it is the workspace boundary, not a sandbox.
+        assert!(!path(RiskLevel::L1).requires_isolated_execution());
+        assert!(path(RiskLevel::L2).requires_isolated_execution());
+        assert!(command(RiskLevel::L2).requires_isolated_execution());
+        assert!(command(RiskLevel::L3).requires_isolated_execution());
+
+        // A network read is `L2` and is *not* this predicate's business: what
+        // bounds it is the origin allowlist (B6), not a process sandbox.
+        let mut network = spec(json!({ "url": "https://docs.rs/index.html" }));
+        network.risk = RiskLevel::L2;
+        network.reversibility = Reversibility::Compensatable;
+        network.targets = vec![ActionTarget::Network {
+            scheme: "https".to_string(),
+            host: "docs.rs".to_string(),
+            port: 443,
+            method: "GET".to_string(),
+        }];
+        assert!(!ActionFacts::from_spec(network).requires_isolated_execution());
+
+        // And neither is a target this build cannot describe at all: that is a
+        // surface question for the policy, not an isolation one.
+        let mut other = spec(json!({}));
+        other.risk = RiskLevel::L3;
+        other.reversibility = Reversibility::Irreversible;
+        other.targets = vec![ActionTarget::Other { tool: "mystery.tool".to_string() }];
+        assert!(!ActionFacts::from_spec(other).requires_isolated_execution());
     }
 
     #[test]

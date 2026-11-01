@@ -332,7 +332,14 @@ fn argument_strings(value: &serde_json::Value) -> Vec<&str> {
 pub(crate) fn capability_text(facts: &TurnCapabilityFacts, manifest: &ToolManifest) -> String {
     let sandbox = match facts.sandbox {
         SandboxMode::ReadOnly => "read-only (no writes, no command execution)",
-        SandboxMode::LocalProcess => "local (commands run on the host, confined to the workspace)",
+        // The local backend starts no high-risk action at all: a command runs as
+        // this user, so `shell.run` (l3) is refused rather than confined. The
+        // line says what the backend does, not what the host hoped for.
+        SandboxMode::LocalProcess => {
+            "local (file tools are confined to the workspace; actions that start a process or \
+             write a path at risk l2+ are refused on this backend, so `shell.run` cannot run — \
+             that needs app-container)"
+        }
         SandboxMode::WorkspaceSandbox => {
             "app-container (commands run under an OS confinement, confined to the workspace)"
         }

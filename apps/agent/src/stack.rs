@@ -583,6 +583,35 @@ pub async fn assemble_with_delegation(
     inputs: Inputs,
     delegation: subagents::Delegation,
 ) -> Result<Runtime, StackError> {
+    // The backend is chosen before anything is built on it, and a backend this
+    // build cannot supply stops assembly. Nothing below decides to use a less
+    // confined one instead: that would run the tools under a boundary nobody
+    // selected.
+    let env = environment_for(
+        inputs.sandbox,
+        &inputs.workspace_root,
+        &inputs.data_dir,
+        inputs.network_allowed,
+    )?;
+    assemble_over(inputs, delegation, env).await
+}
+
+/// Assemble the stack over a backend the caller already built.
+///
+/// Every product path reaches this through [`assemble_with_delegation`], which
+/// builds the backend [`Inputs::sandbox`] names and refuses when this build has
+/// none. This entry point exists so a case whose subject is **the decision
+/// chain** — approval, resume, refusal — can state the backend it runs over
+/// without this build needing a real AppContainer on the machine: the
+/// isolation floor asks the backend what it is, and a test that answers
+/// "app-container" is a test about what the chain does once that question has
+/// an isolating answer (stage B plan §9: a fake-backend case beside the
+/// ignored real-run command). Nothing in `apps/agent` calls it.
+pub async fn assemble_over(
+    inputs: Inputs,
+    delegation: subagents::Delegation,
+    env: Arc<dyn ExecutionEnvironment>,
+) -> Result<Runtime, StackError> {
     let Inputs {
         session,
         workspace_root,
@@ -590,7 +619,11 @@ pub async fn assemble_with_delegation(
         mut resolved,
         model,
         decisions,
-        sandbox,
+        // The backend was built by the caller and is what every decision below
+        // asks; what the host named is not read again here, because a second
+        // reading is how a run comes to describe a confinement it does not
+        // have.
+        sandbox: _,
         network_allowed,
         judgment,
     } = inputs;
@@ -598,12 +631,6 @@ pub async fn assemble_with_delegation(
     let store = Arc::new(JsonlEventStore::new(&data_dir));
 
     let approvals = Arc::new(ApprovalService::new(store.clone()).with_session_scope(true));
-
-    // The backend is chosen before anything is built on it, and a backend this
-    // build cannot supply stops assembly. Nothing below decides to use a less
-    // confined one instead: that would run the tools under a boundary nobody
-    // selected.
-    let env = environment_for(sandbox, &workspace_root, &data_dir, network_allowed)?;
     // What the gateway may resolve when a tool argument names a reference. The
     // same list is what the model is told it may name, one fact read once.
     let tool_secrets = tool_secret_refs(std::env::var("AGENT_TOOL_SECRETS").ok().as_deref());
@@ -616,6 +643,11 @@ pub async fn assemble_with_delegation(
     // handed out. The policy and the plugin surface both ask this question and
     // must get the same answer.
     let advertised = env.advertised_capabilities();
+    // The mode the backend really is, read from the backend rather than from
+    // the host's setting: the permission floor, the policy and the surface all
+    // answer from what was built, so none of them can describe a confinement
+    // the run does not have (CONTRACT §7 #179).
+    let sandbox_mode = env.mode();
     // The policy is decided over what this run's backend actually advertises,
     // not over what the build can do in principle: a read-only run must refuse
     // a configured fs.write as unavailable rather than let a rule grant it.
@@ -1017,6 +1049,7 @@ pub async fn assemble_with_delegation(
     )
     .with_offload_limit(resolved.budget.tool_output_limit_bytes())
     .with_redactor(redactor.clone())
+    .with_sandbox_mode(sandbox_mode)
     .with_secrets(Arc::new(EnvSecretProvider::new(
         tool_secrets.iter().map(|secret| secret.name.clone()),
     )))
@@ -1113,6 +1146,9 @@ pub async fn assemble_with_delegation(
             )
             .with_offload_limit(resolved.budget.tool_output_limit_bytes())
             .with_redactor(redactor.clone())
+            // The child runs under the same backend as the parent, so the same
+            // isolation floor applies to it.
+            .with_sandbox_mode(sandbox_mode)
             // A delegated call is a tool call: it is decided and recorded
             // in the same ledger, so an audit of the session does not stop
             // at the thing that spawned work in it.
@@ -1182,7 +1218,11 @@ pub async fn assemble_with_delegation(
         // The boundary the host chose, told to the model before it reaches it.
         // These are the same two facts the environment was built over, not a
         // second reading of the environment.
-        .with_capability(TurnCapabilityFacts { sandbox, network_allowed, tool_secrets });
+        .with_capability(TurnCapabilityFacts {
+            sandbox: sandbox_mode,
+            network_allowed,
+            tool_secrets,
+        });
     // The same sidecar that observes routes is asked what an unclear message
     // means — a second, independent call with its own bound context, never a
     // continuation of the executing session. No sidecar means no adjudicator,
@@ -1346,6 +1386,35 @@ mod tests {
             StackError::SandboxUnavailable { mode: "docker", reason } => {
                 assert!(reason.contains("Docker"), "{reason}");
             }
+            other => panic!("expected a docker refusal, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_sandbox_never_falls_back_to_local() {
+        // The same refusal seen from the caller: `assemble` answers with the
+        // named backend and nothing else. A run that asked for a container and
+        // got a local process would enforce nothing while every line about it
+        // still said `docker`, so there is no runtime to inspect here — the
+        // refusal is the whole result.
+        let dir = tempfile::tempdir().unwrap();
+        let error = assemble(Inputs {
+            session: agent_protocol::ids::SessionId::from_string("s"),
+            workspace_root: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+            resolved: agent_config::resolve(agent_config::Layers::default())
+                .expect("the defaults resolve"),
+            model: None,
+            decisions: Decisions::Unobserved,
+            sandbox: SandboxMode::Container,
+            network_allowed: false,
+            judgment: false,
+        })
+        .await
+        .err()
+        .expect("a backend this build does not ship must not be built");
+        match error {
+            StackError::SandboxUnavailable { mode: "docker", .. } => {}
             other => panic!("expected a docker refusal, got {other}"),
         }
     }

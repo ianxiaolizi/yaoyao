@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agent_ports::event_store::{EventStore, EventStoreError};
+use agent_ports::execution_environment::SandboxMode;
 use agent_ports::permission_classifier::{PermissionClassifier, PermissionClassifierInput};
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{ApprovalId, EventId, EventSeq, SchemaVersion, SessionId};
@@ -96,6 +97,26 @@ impl PermissionBaseline {
         Self {
             decision: PolicyDecision::Deny,
             refusals: BTreeMap::new(),
+            reason: Some(reason.into()),
+            approved: false,
+            approval_id: None,
+        }
+    }
+
+    /// A refusal the execution sandbox makes, naming the layer for each of the
+    /// capabilities the refused action declares.
+    ///
+    /// The layer is the one a reader fixes in a different place from a rule:
+    /// nothing about this call is forbidden by policy, and no person's answer
+    /// would change it — the backend it would run under cannot confine it.
+    pub fn refused_by_sandbox(capabilities: &[Capability], reason: impl Into<String>) -> Self {
+        Self {
+            decision: PolicyDecision::Deny,
+            refusals: capabilities
+                .iter()
+                .cloned()
+                .map(|capability| (capability, RefusalLayer::SandboxUnavailable))
+                .collect(),
             reason: Some(reason.into()),
             approved: false,
             approval_id: None,
@@ -492,6 +513,36 @@ pub async fn judge(
     Some(classifier.classify(&input).await)
 }
 
+/// The isolation floor: an action that needs confinement, on a backend that
+/// cannot provide it.
+///
+/// This is a fact about the pair, not a decision anyone made, so it is taken
+/// before the policy is asked anything and nothing below can lift it — a rule
+/// that allows the capability, a person's standing grant and a confident
+/// classifier all answer a different question. Running the call anyway is the
+/// failure the floor exists to prevent: it would execute as the invoking user
+/// while the log said the call had been approved (CONTRACT §7 #179).
+///
+/// `None` means "this pair raises no question": either the backend confines
+/// high-risk workspace actions, or the action does not need one. A gateway
+/// assembled without a backend still says which mode it *is* — silence is not
+/// one of the answers.
+pub fn isolation_floor(action: &ActionFacts, mode: SandboxMode) -> Option<PermissionBaseline> {
+    if mode.supports_high_risk_workspace_actions() || !action.requires_isolated_execution() {
+        return None;
+    }
+    Some(PermissionBaseline::refused_by_sandbox(
+        &action.capabilities,
+        format!(
+            "the {} backend cannot isolate this action (risk {}): starting a process or writing a \
+             path at that risk runs as this user, so the call is refused rather than downgraded; \
+             run it under AGENT_SANDBOX=app-container",
+            mode.as_str(),
+            action.risk.as_str()
+        ),
+    ))
+}
+
 fn refusals_sentence(refusals: &BTreeMap<Capability, RefusalLayer>) -> String {
     if refusals.is_empty() {
         return "the call was refused before it ran".to_string();
@@ -508,7 +559,7 @@ fn refusals_sentence(refusals: &BTreeMap<Capability, RefusalLayer>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_protocol::permission::{ActionSpec, Reversibility, RiskLevel};
+    use agent_protocol::permission::{ActionSpec, ActionTarget, Reversibility, RiskLevel};
     use agent_protocol::permission_classifier::{PermissionSuggestion, SuggestionDecision};
     use agent_testkit::FakeEventStore;
 
@@ -790,7 +841,11 @@ mod tests {
             ResourceGuard::new(workspace()),
             Arc::new(InMemoryArtifactStore::default()),
         )
-        .with_permission_service(permissions.clone());
+        .with_permission_service(permissions.clone())
+        // The provider is scripted, so the backend this chain names is one
+        // that would isolate a high-risk call: what these cases ask about is
+        // the decision chain, and the isolation floor has cases of its own.
+        .with_sandbox_mode(SandboxMode::WorkspaceSandbox);
         (gateway, approvals, permissions)
     }
 
@@ -1045,6 +1100,9 @@ mod tests {
         )
         .with_permission_service(Arc::new(PermissionService::new(store)))
         .with_permission_classifier(classifier)
+        // Same reason as `gateway_over`: the provider is scripted, and these
+        // cases ask what the classifier is shown, not what the backend can run.
+        .with_sandbox_mode(SandboxMode::WorkspaceSandbox)
     }
 
     fn network_call() -> ToolInvocation {
@@ -1328,6 +1386,117 @@ mod tests {
         assert!(
             recorded[0].classifier.is_none(),
             "no judge was configured, so the record names none"
+        );
+    }
+
+    // ---- The isolation floor (B5) ----
+    //
+    // A backend that cannot confine a high-risk workspace action refuses it,
+    // and nothing below the refusal can lift it. These are about the floor
+    // itself; the gateway's use of it is checked in `guarded`.
+
+    fn command_facts(risk: RiskLevel) -> ActionFacts {
+        ActionFacts::from_spec(ActionSpec {
+            task_id: "intent-1".to_string(),
+            task_revision: 0,
+            tool_name: "shell.run".to_string(),
+            capabilities: vec![Capability::new(Capability::PROCESS_SPAWN)],
+            risk,
+            reversibility: Reversibility::for_risk(risk),
+            targets: vec![ActionTarget::Command {
+                program: "shell".to_string(),
+                args: vec!["cargo test".to_string()],
+                cwd: None,
+            }],
+            arguments: serde_json::json!({ "command": "cargo test" }),
+            summary: "shell cargo test".to_string(),
+        })
+    }
+
+    fn path_facts(risk: RiskLevel) -> ActionFacts {
+        ActionFacts::from_spec(ActionSpec {
+            task_id: "intent-1".to_string(),
+            task_revision: 0,
+            tool_name: "fs.write".to_string(),
+            capabilities: vec![Capability::new(Capability::FS_WRITE)],
+            risk,
+            reversibility: Reversibility::for_risk(risk),
+            targets: vec![ActionTarget::WorkspacePath {
+                path: "notes/a.txt".to_string(),
+                writable_root: None,
+            }],
+            arguments: serde_json::json!({ "path": "notes/a.txt" }),
+            summary: "fs.write notes/a.txt".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn l2_and_l3_workspace_actions_are_denied_when_the_backend_is_local() {
+        let action = command_facts(RiskLevel::L3);
+        let floor = isolation_floor(&action, SandboxMode::LocalProcess)
+            .expect("a local backend cannot isolate an L3 command");
+
+        assert_eq!(floor.decision, PolicyDecision::Deny);
+        assert_eq!(
+            floor.refusals.get(&Capability::new(Capability::PROCESS_SPAWN)),
+            Some(&RefusalLayer::SandboxUnavailable),
+            "the record names the layer, not merely that one refused"
+        );
+
+        // The written decision, in full: a confident classifier and a person's
+        // standing grant are both in play, and neither turns it into a run.
+        let trace = ClassifierTrace {
+            outcome: ClassifierOutcome::Allow,
+            suggestion: Some(PermissionSuggestion {
+                decision: SuggestionDecision::Allow,
+                confidence: 1.0,
+                risk: None,
+                reversible: None,
+                requires_confirmation: false,
+                reason: "harmless".to_string(),
+            }),
+            ..ClassifierTrace::unavailable("scripted")
+        };
+        let record = rule(action, floor, Some(trace));
+        assert_eq!(record.decision, PolicyDecision::Deny);
+        assert_eq!(record.authorization_source, AuthorizationSource::Policy);
+        assert!(record.reason.contains("app-container"), "{}", record.reason);
+
+        // An `L2` command is the same answer, and so is an `L2` write.
+        assert!(
+            isolation_floor(&command_facts(RiskLevel::L2), SandboxMode::LocalProcess).is_some()
+        );
+        assert!(isolation_floor(&path_facts(RiskLevel::L2), SandboxMode::LocalProcess).is_some());
+
+        // The recoverable write this build actually ships stays where it was:
+        // the workspace boundary, not a sandbox, is what bounds it.
+        assert!(isolation_floor(&path_facts(RiskLevel::L1), SandboxMode::LocalProcess).is_none());
+    }
+
+    #[test]
+    fn read_only_mode_denies_all_high_risk_actions() {
+        // Read-only is not an isolating backend either: it starts no process to
+        // confine, so an action that needs confinement is refused rather than
+        // quietly attempted against a boundary that was never there.
+        for action in [command_facts(RiskLevel::L2), path_facts(RiskLevel::L3)] {
+            let floor = isolation_floor(&action, SandboxMode::ReadOnly)
+                .expect("read-only cannot run a high-risk workspace action");
+            assert_eq!(floor.decision, PolicyDecision::Deny);
+        }
+        // And nothing below the line is touched.
+        assert!(isolation_floor(&path_facts(RiskLevel::L1), SandboxMode::ReadOnly).is_none());
+    }
+
+    #[test]
+    fn an_isolating_backend_leaves_the_policy_answer_alone() {
+        // The floor answers a question about the pair. With the AppContainer
+        // the question does not arise, and the policy's own answer — whatever
+        // it is — is the one that stands.
+        assert!(
+            isolation_floor(&command_facts(RiskLevel::L3), SandboxMode::WorkspaceSandbox).is_none()
+        );
+        assert!(
+            isolation_floor(&path_facts(RiskLevel::L2), SandboxMode::WorkspaceSandbox).is_none()
         );
     }
 
