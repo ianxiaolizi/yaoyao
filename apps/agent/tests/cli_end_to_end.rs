@@ -690,12 +690,7 @@ fn a_second_process_asking_the_same_session_is_told_it_is_busy() {
     // the log grows by two lines, in that order.
     let after = std::fs::read_to_string(session_dir.join("events.jsonl")).expect("the log");
     let written: Vec<&str> = after.lines().skip(before.lines().count()).collect();
-    assert_eq!(
-        written.len(),
-        2,
-        "only the intent and the queued text may be written: {}",
-        after
-    );
+    assert_eq!(written.len(), 2, "only the intent and the queued text may be written: {}", after);
     assert!(written[0].contains("intent/recorded"), "the intent comes first: {written:?}");
     assert!(written[1].contains("inbox/appended"), "then the item it asks for: {written:?}");
     assert_eq!(after.matches("run/started").count(), before.matches("run/started").count());
