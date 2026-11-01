@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_cli::reason::WhyError;
+use agent_kernel::approval::ApprovalAuthority;
 use agent_kernel::inbox::{Inbox, scheduled_due_at};
 use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::event_store::EventStore;
@@ -329,6 +330,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/diff", get(diff))
         .route("/api/sessions/{id}/context", get(context))
         .route("/api/sessions/{id}/plan", get(plan))
+        .route("/api/sessions/{id}/status", get(status))
         .route("/api/sessions/{id}/subagents", get(subagents))
         .route("/api/sessions/{id}/schedules", get(schedules).post(schedule))
         .route("/api/sessions/{id}/schedules/{item_id}", axum::routing::delete(cancel_schedule))
@@ -645,6 +647,25 @@ async fn plan(
             "这个会话还没有 plan.update；计划是模型自己写的，不是页面编的",
         )),
     }
+}
+
+/// `GET /api/sessions/{id}/status`: execution, delivery and verification, the
+/// instruction still standing, and the latest adjudication.
+///
+/// A read, and the axis words are the kernel's own fold — the page must not
+/// spell "verified complete" differently from `agent status` (CONTRACT §7
+/// #166). The response carries one `v` and the session id like its neighbours,
+/// and the payload's fields are additive: a page from before this endpoint
+/// simply does not call it.
+async fn status(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiFailure> {
+    check_session(&state, &id)?;
+    let report = sessions::status(state.store.clone(), &SessionId::from_string(&id))
+        .await
+        .map_err(ApiFailure::read)?;
+    Ok(Json(report))
 }
 
 /// `GET /api/sessions/{id}/subagents`: children this session delegated to.
@@ -1037,11 +1058,19 @@ async fn approve(
         }
     }
 
+    // The request already passed the gate, which is where the token was
+    // checked; carrying it here is what turns "someone on loopback" into "the
+    // authenticated GUI handler", and it is the only way an answer from this
+    // process is recorded as a person's. (B4)
+    let authority = ApprovalAuthority::local_http(&state.token)
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
     let state_for_task = state.clone();
     let sink = state.live_sink(&id);
     let approval_for_task = approval_id.clone();
     tokio::spawn(async move {
-        let result = backend.settle_approval(&session, &approval_for_task, decision, &sink).await;
+        let result = backend
+            .settle_approval(&session, &approval_for_task, decision, &authority, &sink)
+            .await;
         if let Err(error) = result {
             let _ = sink.send(LiveChunk::notice(format!(
                 "审批没有续跑（{}）：{}",

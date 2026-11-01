@@ -57,7 +57,7 @@ use agent_protocol::reason::{
 use agent_protocol::redactor::Redactor;
 use agent_protocol::state::{self, WorkState};
 use agent_protocol::tool::{
-    APPROVAL_PENDING_OUTCOME, GATE_REFUSED_OUTCOME, GATEWAY_REFUSED_OUTCOME, ToolSideEffect,
+    APPROVAL_PENDING_OUTCOME, GATE_REFUSED_OUTCOME, GATEWAY_REFUSED_OUTCOME, TrustLevel,
 };
 use agent_protocol::usertext::UserText;
 
@@ -67,7 +67,7 @@ use crate::verdict;
 use chrono::Utc;
 
 use crate::context_layers::{
-    ContextLayers, ContextNotice, PendingFailure, StaleRead, TaskLedger, ToolAdvice,
+    ContextLayers, ContextNotice, PendingFailure, StaleRead, TaskLedger, ToolAdvice, ToolSets,
     capability_text, context_notice, identity_text, repair_note, stale_read, state_text, task_text,
     tool_source, truncate, user_text,
 };
@@ -80,6 +80,7 @@ use wording::{
 mod budget;
 mod completion;
 mod context_recovery;
+mod cycles;
 mod event_drafts;
 mod loop_call;
 mod output_recovery;
@@ -438,10 +439,8 @@ impl DefaultAgentLoop {
         // main route's million-token working set would send the fast model a
         // request it cannot accept. The frozen summary budget is the number
         // that request must fit; everything else uses the turn's own budget.
-        let mut request_route = route.clone();
-        let (mut profile_context, mut profile_effort) =
-            budget::summary_route_profile(turn, &request_route);
-        let mut route_fallback: Option<&'static str> = None;
+        let (mut request_route, mut route_fallback, mut profile_context, mut profile_effort) =
+            budget::summary_route_selection(turn, route);
         let original_candidate_tokens = candidate.estimated_tokens;
         if !candidate.messages.is_empty() {
             let fit = |context: ResolvedContextBudget| {
@@ -601,7 +600,7 @@ impl DefaultAgentLoop {
         // render the same lines, and a call cannot appear in it that did not
         // run. Its files and failures are exactly the facts a summary is known
         // to drop, so the two no longer compete for the same text.
-        let ledger = Ledger::build(&candidate.messages, &turn.write_tools);
+        let ledger = Ledger::build(&candidate.messages, &turn.tool_sets.writes);
         let ledger_text = ledger.render();
         let truncated = text.chars().count() > MAX_SUMMARY_CHARS;
         let summary = truncate(&text, MAX_SUMMARY_CHARS);
@@ -866,19 +865,11 @@ struct LoopTurn {
     /// either no trigger was configured, it was not reached, or it was already
     /// done this turn.
     compaction: Option<CompactionCandidate>,
-    /// Tools whose declared side effect is `Write`, as of this turn's frozen
-    /// manifest. Rehydration reads it to tell "this call changed a file" from
-    /// "this call only read one".
-    write_tools: Vec<String>,
-    /// Tools whose declared side effect is `Read`. The task layer only asks
-    /// for a look when the turn offers a way to look; advice the model has no
-    /// call to satisfy is noise, not a reminder.
-    read_tools: Vec<String>,
-    /// Tools that change the world and cannot be retried safely (`Write`,
-    /// `Network` or `Destructive`, and not idempotent). The task layer names
-    /// them before the model's first call, so the two ways and the way back
-    /// are stated while the choice is still open.
-    irreversible_tools: Vec<String>,
+    /// The tool sets this turn's frozen manifest declares, by side effect.
+    /// Rehydration reads the writes to tell "this call changed a file" from
+    /// "this call only read one", and the task layer reads all four to say
+    /// what the turn's calls mean before the model makes one.
+    tool_sets: ToolSets,
     /// The signature (tool and arguments) of the last call that ran, and how
     /// many times in a row it has run unchanged. The repeat gate fires on the
     /// third, not the second: the second may be the one retry a transient
@@ -887,6 +878,11 @@ struct LoopTurn {
     identical_streak: u32,
     /// Whether the repeat gate already refused once for this streak.
     repeat_refused: bool,
+    /// The highest budget checkpoint (50, 75, 90 per cent) this turn has
+    /// recorded. A checkpoint is written once per turn, not once per step that
+    /// sits above it: the demand to write the state down is a request, and
+    /// repeating it every step would make it the loudest thing in the request.
+    checkpoint_written: u32,
     /// How many mid-turn compactions this turn has attempted. A failed attempt
     /// counts (see `MAX_IN_FLIGHT_COMPACTIONS`), so this is a record of spent
     /// attempts, not of successes.
@@ -1041,7 +1037,7 @@ impl LoopTurn {
 
 /// The advice this turn's task layer carries, from its frozen tool sets.
 fn tool_advice(turn: &LoopTurn) -> ToolAdvice {
-    ToolAdvice::new(&turn.irreversible_tools, &turn.write_tools, &turn.read_tools)
+    ToolAdvice::new(&turn.tool_sets)
 }
 
 /// Enter a posture that differs from the one the turn opened in.
@@ -1146,7 +1142,7 @@ impl AgentLoop for DefaultAgentLoop {
         // somehow offers the name is made to lose it: the loop intercepts the
         // call before dispatch, so the provider's definition would only
         // describe a tool that can never run.
-        let (manifest, write_tools, read_tools, irreversible_tools) = if self.offers_tools() {
+        let (manifest, tool_sets) = if self.offers_tools() {
             // What the gateway offers this model, not everything it could
             // execute: a tool every possible call would be refused is not a
             // choice, and a manifest that lists it is one more entry to read.
@@ -1158,37 +1154,10 @@ impl AgentLoop for DefaultAgentLoop {
             });
             // Recorded beside the manifest because the manifest itself keeps
             // only what reaches the wire; rehydration needs the declared side
-            // effect, which does not.
-            let write_tools: Vec<String> = definitions
-                .iter()
-                .filter(|definition| definition.side_effect == ToolSideEffect::Write)
-                .map(|definition| definition.name.clone())
-                .collect();
-            // The observations a later turn may restate. Read-only tools are
-            // the only calls whose arguments are a fact about the world rather
-            // than a change to it.
-            let read_tools: Vec<String> = definitions
-                .iter()
-                .filter(|definition| definition.side_effect == ToolSideEffect::Read)
-                .map(|definition| definition.name.clone())
-                .collect();
-            // A call with no way back: it changes the world (a file, a remote
-            // service, a process) and a repeat is not safe. `idempotent` alone
-            // is not enough — a write that can be replayed may still overwrite
-            // what was there.
-            let irreversible_tools: Vec<String> = definitions
-                .iter()
-                .filter(|definition| {
-                    !definition.idempotent
-                        && matches!(
-                            definition.side_effect,
-                            ToolSideEffect::Write
-                                | ToolSideEffect::Network
-                                | ToolSideEffect::Destructive
-                        )
-                })
-                .map(|definition| definition.name.clone())
-                .collect();
+            // effect, which does not. Derived before the loop's own tools are
+            // appended: those are ledgers the loop answers, not calls that
+            // touch the world.
+            let tool_sets = ToolSets::from_definitions(&definitions);
             definitions.push(plan::tool_definition());
             // The work state is the second loop-owned ledger, on the same
             // terms: the loop answers it, so a provider's definition of the
@@ -1200,16 +1169,11 @@ impl AgentLoop for DefaultAgentLoop {
             if self.judgment_ledger {
                 definitions.push(judgment::tool_definition());
             }
-            (
-                ToolManifest::from_definitions(&definitions),
-                write_tools,
-                read_tools,
-                irreversible_tools,
-            )
+            (ToolManifest::from_definitions(&definitions), tool_sets)
         } else {
-            (ToolManifest::empty(), Vec::new(), Vec::new(), Vec::new())
+            (ToolManifest::empty(), ToolSets::default())
         };
-        let advice = ToolAdvice::new(&irreversible_tools, &write_tools, &read_tools);
+        let advice = ToolAdvice::new(&tool_sets);
 
         // The derivation is [run preamble, ...history]. A summary or ledger is
         // history even though it is a system message, so the split stops at
@@ -1247,7 +1211,7 @@ impl AgentLoop for DefaultAgentLoop {
         // Time, read off the log: a read an earlier turn made that this turn's
         // own words name again. The history is the settled prefix only, so a
         // call this turn makes later is never mistaken for an old one.
-        let stale = stale_read(&derived_messages, &user_text(&ctx.user_input), &read_tools);
+        let stale = stale_read(&derived_messages, &user_text(&ctx.user_input), &tool_sets.reads);
 
         // The situation is derived, not narrated: every field comes from the
         // turn context, the frozen tool set and the settled history. The
@@ -1273,9 +1237,9 @@ impl AgentLoop for DefaultAgentLoop {
             plan_total: ctx.plan.as_ref().map_or(0, |plan| plan.items.len()),
             pending_failure: ctx.pending_failure.as_ref().map(|failure| failure.tool.clone()),
             stale_read: stale.as_ref().map(|stale| stale.target.clone()),
-            read_tools: read_tools.len(),
-            write_tools: write_tools.len(),
-            irreversible: irreversible_tools.clone(),
+            read_tools: tool_sets.reads.len(),
+            write_tools: tool_sets.writes.len(),
+            irreversible: tool_sets.irreversible.clone(),
             sandbox: ctx.capability.as_ref().map(|facts| sandbox_word(facts.sandbox).to_string()),
             network_allowed: ctx.capability.as_ref().map(|facts| facts.network_allowed),
             judgment_stage: ctx
@@ -1480,12 +1444,11 @@ impl AgentLoop for DefaultAgentLoop {
                 history_start,
                 history_end,
                 compaction,
-                write_tools,
-                read_tools,
-                irreversible_tools,
+                tool_sets,
                 last_signature: None,
                 identical_streak: 0,
                 repeat_refused: false,
+                checkpoint_written: 0,
                 in_flight_compactions: 0,
                 in_flight_newest: None,
                 observed_input_tokens: None,
@@ -1727,7 +1690,15 @@ impl AgentLoop for DefaultAgentLoop {
             // more specific problem when both apply, and the budget line is the
             // last thing the request says either way.
             let stall_notice = stall::place_stall_notice(turn, &ctx.turn_id);
-            let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id);
+            // A budget checkpoint is a demand to write the state down, made at
+            // the point where there is still enough budget to act on it. The
+            // record of having made it is the log's, so a reader can tell a
+            // run that was asked from one that volunteered.
+            let checkpoint = turn.crossed_checkpoint();
+            let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id, checkpoint);
+            if let Some(point) = checkpoint {
+                events.push(budget::checkpoint_event(turn, ctx, &step_id, point));
+            }
 
             let mut request = ModelRequest {
                 session_id: ctx.session_id.clone(),
@@ -2393,6 +2364,9 @@ impl AgentLoop for DefaultAgentLoop {
                     ReasonSource::Kernel,
                 );
                 events.push(reason_event(ctx, Some(&step_id), &gate));
+                // The same cycle the dispatch path records, for the case where
+                // the gate stops it before it runs (see `cycles`).
+                events.push(cycles::held(ctx, &step_id, call, turn.identical_streak + 1));
                 events.push(draft(
                     ctx,
                     &step_id,
@@ -2816,16 +2790,10 @@ impl AgentLoop for DefaultAgentLoop {
                         turn.checked_since_failure = true;
                         turn.acted_this_turn = true;
                         turn.stale = None;
-                        // The repeat gate's bookkeeping: a call that ran is
-                        // the one a third identical call would repeat. The
-                        // loop's own ledgers never reach this point.
-                        let signature = call_signature(&call.tool_name, &call.arguments);
-                        if turn.last_signature.as_deref() == Some(signature.as_str()) {
-                            turn.identical_streak += 1;
-                        } else {
-                            turn.last_signature = Some(signature);
-                            turn.identical_streak = 1;
-                            turn.repeat_refused = false;
+                        // The repeat gate's bookkeeping, and the cycle record
+                        // when this run is the third of a streak (`cycles`).
+                        if let Some(cycle) = cycles::note_run(turn, ctx, &step_id, call) {
+                            events.push(cycle);
                         }
                         // What happened to the result on its way here, recorded
                         // before the result itself. These are the facts a reader
@@ -2906,6 +2874,13 @@ impl AgentLoop for DefaultAgentLoop {
                         // payload this loop wrote before the field existed.
                         if !result.facts.is_empty() {
                             payload["facts"] = serde_json::to_value(&result.facts)?;
+                        }
+                        // Where the text came from, when it is not this
+                        // session's own work: the projection shows untrusted
+                        // results as data. Omitted for a trusted result, which
+                        // leaves the payload unchanged from before the field.
+                        if result.trust == TrustLevel::Untrusted {
+                            payload["trust"] = serde_json::json!(result.trust);
                         }
                         // The gate's own statement of what it decided, beside
                         // the result it decided about: a reader can see which
@@ -5395,6 +5370,7 @@ mod tests {
             }],
             truncated: true,
             facts: ToolFacts { exit_code: Some(0), line_count: Some(2500) },
+            trust: agent_protocol::tool::TrustLevel::Trusted,
             policy: None,
             redaction_metadata: RedactionMetadata {
                 redacted: true,
@@ -5874,6 +5850,7 @@ mod tests {
             .expect("a compaction start event");
         assert_eq!(started.payload["route"]["model"], "small");
         assert_eq!(started.payload["route"]["tier"], "fast");
+        assert!(started.payload.get("route_fallback").is_none());
 
         // The turn's own attempt still says it was routed to `main`: the two
         // calls are told apart in the log, not by trusting the event order.
@@ -7257,7 +7234,7 @@ mod tests {
                 reason: "capability process.spawn is not provided by this build's execution \
                          sandbox"
                     .to_string(),
-                policy: self.0.clone(),
+                policy: Box::new(self.0.clone()),
             })
         }
     }

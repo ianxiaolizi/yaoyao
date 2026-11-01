@@ -7,8 +7,10 @@
 //!
 //!   1. no source file under `crates/*/src` or `apps/*/src` may pass 2,000
 //!      lines, and
-//!   2. the four files that already passed it have an exact ceiling — their
-//!      current size — so they can shrink but never grow.
+//!   2. the files that already passed it have an exact ceiling — their size on
+//!      the day the guard landed — so they can shrink but never grow. A file
+//!      that shrinks back under the ceiling leaves the list: `resume.rs` did
+//!      that in B4, when its tests moved out of line.
 //!
 //! The ceilings are line counts, not byte counts: a line is the unit the
 //! reader pays for and the one `wc -l` reports, so the number here is one a
@@ -27,7 +29,6 @@ const RATCHETS: &[(&str, usize)] = &[
     ("crates/agent-loop/src/default.rs", 7737),
     ("crates/agent-kernel/src/scheduler.rs", 2928),
     ("crates/agent-kernel/src/guarded.rs", 2226),
-    ("crates/agent-kernel/src/resume.rs", 2074),
 ];
 
 fn workspace_root() -> PathBuf {

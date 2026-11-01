@@ -25,11 +25,13 @@ mod support;
 use commands::approval::{approve, deny, tool};
 use commands::inspect::{artifact, context, memory, metrics};
 use commands::plugin::plugin;
+use commands::rollback::rollback;
 use commands::sandbox::{doctor, sandbox_command};
 use commands::schedule::{schedule, tick};
 use commands::session::session;
 use commands::subagent::subagent;
 use commands::turn::{export, fork, interrupt, resume, run, status, steer, why};
+use commands::verify::verify;
 use commands::web::{serve, web};
 
 /// The exit status of a command whose subject answered "no".
@@ -128,6 +130,7 @@ async fn main() {
         "interrupt" => interrupt(&args).await,
         "export" => export(&args).await,
         "status" => status(&args).await,
+        "verify" => verify(&args).await,
         "why" => why(&args).await,
         "approve" => approve(&args).await,
         "deny" => deny(&args).await,
@@ -142,6 +145,7 @@ async fn main() {
         "context" => context(&args).await,
         "metrics" => metrics(&args).await,
         "artifact" => artifact(&args).await,
+        "rollback" => rollback(&args).await,
         "sandbox" => sandbox_command(&args),
         "subagent" => subagent(&args).await,
         other => {
@@ -166,6 +170,7 @@ pub(crate) fn usage() {
          export --redacted          Same, with secret-shaped tokens replaced by ***\n  \
          why [--turn <id>] [--depth <n>]\n                              Explain that turn's reasoning chain, backwards\n                              (--help says what a turn's end and verdict mean)\n  \
          status                     Show session state\n  \
+         verify [flags] -- <program> [args]\n                              Run a check without a shell and record what it found\n  \
          approve <id> [scope]       Approve a pending request [once|turn|session|always]\n  \
          deny <id> [--only]         Deny a pending request (cascades to the session's pending)\n  \
          tool <name> [json-args]    Run a tool through the policy gateway\n  \
@@ -193,6 +198,7 @@ pub(crate) fn usage() {
          context inspect            Show what the next request would carry (size, kinds, budget)\n  \
          metrics [--out <path>]     Count turns, tools, approvals, tokens and time\n                              from the event log (every session unless --session names one)\n  \
          artifact get <ref> [--out] Fetch a stored blob (locator or hash). Text to stdout otherwise\n  \
+         rollback <snapshot_id>     Restore the workspace to a recovery point; --session names\n                              the log the rollback is recorded in\n  \
          sandbox setup              Create the AppContainer profile and its grants (elevated)\n  \
          sandbox status             Report whether the AppContainer setup is in place\n  \
          doctor                     Run health checks\n\n\

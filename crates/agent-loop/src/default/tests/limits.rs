@@ -319,3 +319,116 @@ async fn a_context_without_a_configured_window_carries_no_notice() {
     assert!(payload.get("context_notice").is_none(), "{payload}");
     assert_eq!(payload["message_count"], 2, "the identity layer and the input");
 }
+
+/// The checkpoints a turn wrote, in order.
+fn checkpoints(outcome: &DrivenTurn) -> Vec<u32> {
+    outcome
+        .events
+        .iter()
+        .filter(|e| e.event_type.as_str() == EventType::BUDGET_CHECKPOINT)
+        .map(|e| u32::try_from(e.payload["checkpoint"].as_u64().unwrap_or(0)).unwrap_or(0))
+        .collect()
+}
+
+/// The prepared requests that carried a checkpoint notice, and which point.
+fn checkpoint_notices(outcome: &DrivenTurn) -> Vec<u32> {
+    outcome
+        .events
+        .iter()
+        .filter(|e| e.event_type.as_str() == EventType::MODEL_REQUEST_PREPARED)
+        .filter_map(|e| {
+            e.payload
+                .get("budget_notice")?
+                .get("checkpoint")?
+                .as_u64()
+                .map(|point| u32::try_from(point).unwrap_or(0))
+        })
+        .collect()
+}
+
+/// The run is made to write its state down at 50 and 75 per cent, once each,
+/// and the request it is made in says so. A checkpoint that repeated every step
+/// would be the loudest thing in the request and the first thing read past.
+#[tokio::test]
+async fn the_run_is_asked_to_write_its_state_at_the_budget_checkpoints() {
+    let model = Arc::new(FakeModelProvider::new(
+        (0..8).map(|_| priced_call(100, 0, 0)).collect::<Vec<_>>(),
+    ));
+    let loop_ = echo_loop(model.clone());
+
+    let mut turn = ctx();
+    turn.state = Some(TurnStateFacts {
+        budget: RunBudget { max_total_tokens: Some(450), ..RunBudget::default() },
+        ..facts()
+    });
+    let outcome = run_turn(&loop_, &turn).await;
+
+    // 22% -> 44% -> 66% -> 88% -> spent.
+    assert_eq!(outcome.stop_reason, StopReason::TokenBudgetExceeded);
+    assert_eq!(checkpoints(&outcome), [50, 75], "each point once, in order");
+    assert_eq!(checkpoint_notices(&outcome), [50, 75], "the demand travels with the request");
+    let text = model.requests()[3].messages.last().unwrap().text_content();
+    assert!(text.contains("Budget checkpoint 50%"), "{text}");
+    assert!(text.contains("`state.update`"), "the checkpoint names the call to make: {text}");
+}
+
+/// A run that jumps from under one point to over the next records the one it
+/// landed on: the question at each point is the same, and asking it twice in
+/// one request would only make it longer.
+#[tokio::test]
+async fn a_run_that_jumps_over_a_checkpoint_records_the_point_it_landed_on() {
+    let model =
+        Arc::new(FakeModelProvider::new(vec![priced_call(950, 0, 0), priced_call(950, 0, 0)]));
+    let loop_ = echo_loop(model);
+
+    let mut turn = ctx();
+    turn.state = Some(TurnStateFacts {
+        budget: RunBudget { max_total_tokens: Some(1_000), ..RunBudget::default() },
+        ..facts()
+    });
+    let outcome = run_turn(&loop_, &turn).await;
+
+    assert_eq!(outcome.stop_reason, StopReason::TokenBudgetExceeded);
+    assert_eq!(checkpoints(&outcome), [90], "95% is past 50 and 75; 90 is the point it is at");
+}
+
+/// A third byte-identical call is recorded as a cycle, and the request that
+/// follows says so rather than leaving the model to notice on its own.
+#[tokio::test]
+async fn a_repeated_call_is_recorded_as_a_cycle_and_the_next_request_says_so() {
+    let model = Arc::new(FakeModelProvider::new(
+        (0..8)
+            .map(|_| FakeModelProvider::tool_call("echo", serde_json::json!({"s": "hi"})))
+            .collect::<Vec<_>>(),
+    ));
+    let loop_ = echo_loop(model.clone());
+
+    let mut turn = ctx();
+    turn.state = Some(TurnStateFacts {
+        // Large enough that only the repeat, not the budget, ends this turn.
+        budget: RunBudget { max_total_tokens: Some(1_000_000), ..RunBudget::default() },
+        ..facts()
+    });
+    let outcome = drive_turn(&loop_, &turn, 6).await.expect("the turn ran");
+
+    let cycles: Vec<_> = outcome
+        .events
+        .iter()
+        .filter(|e| e.event_type.as_str() == EventType::TOOL_DUPLICATE_CYCLE)
+        .collect();
+    assert_eq!(cycles.len(), 1, "one record per streak, not one per step");
+    assert_eq!(cycles[0].payload["tool_name"], "echo");
+    assert_eq!(cycles[0].payload["repeats"], 3);
+    assert_eq!(
+        cycles[0].payload["held"], true,
+        "the gate stops the third call, and that is the cycle"
+    );
+
+    let noticed = model.requests().iter().any(|request| {
+        request
+            .messages
+            .last()
+            .is_some_and(|message| message.text_content().contains("Repeat notice"))
+    });
+    assert!(noticed, "the request after the cycle says what is happening");
+}

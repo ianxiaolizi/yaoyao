@@ -122,39 +122,31 @@ mod tests {
         assert!(matches!(workspace.validate(), Err(WorkspaceError::InvalidWritableRoot(_))));
     }
 
+    /// A capability-wide lease, the shape these two tests are about.
+    fn lease(expires_at: Option<DateTime<Utc>>) -> LeaseSpec {
+        LeaseSpec {
+            capability: Capability::new("fs.write"),
+            scope: ApprovalScope::AllowOnce,
+            expires_at,
+            action_digest: None,
+            task_id: None,
+            task_revision: None,
+            risk: None,
+        }
+    }
+
     #[test]
     fn lease_expiry() {
         let now = Utc::now();
-        let none = LeaseSpec {
-            capability: Capability::new("fs.write"),
-            scope: ApprovalScope::AllowOnce,
-            expires_at: None,
-        };
-        assert!(!none.is_expired(now));
-
-        let past = LeaseSpec {
-            capability: Capability::new("fs.write"),
-            scope: ApprovalScope::AllowOnce,
-            expires_at: Some(now - chrono::Duration::seconds(1)),
-        };
-        assert!(past.is_expired(now));
-
-        let future = LeaseSpec {
-            capability: Capability::new("fs.write"),
-            scope: ApprovalScope::AllowOnce,
-            expires_at: Some(now + chrono::Duration::seconds(1)),
-        };
-        assert!(!future.is_expired(now));
+        assert!(!lease(None).is_expired(now));
+        assert!(lease(Some(now - chrono::Duration::seconds(1))).is_expired(now));
+        assert!(!lease(Some(now + chrono::Duration::seconds(1))).is_expired(now));
     }
 
     #[test]
     fn lease_serializes_only_references() {
         // A lease is references + metadata only — never handles, tokens, or env.
-        let lease = LeaseSpec {
-            capability: Capability::new("fs.write"),
-            scope: ApprovalScope::AllowOnce,
-            expires_at: None,
-        };
+        let lease = lease(None);
         let value = serde_json::to_value(&lease).unwrap();
         let obj = value.as_object().unwrap();
         assert_eq!(obj.len(), 3);

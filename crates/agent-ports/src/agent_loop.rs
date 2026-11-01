@@ -245,6 +245,11 @@ pub enum TurnEnding {
     /// turn until `resume` settles the call, but the fold still reports it
     /// rather than pretending the turn vanished.
     Yielded,
+    /// Stopped because its budget ran out, not because anything is waiting on
+    /// a decision. It is its own ending because the two asks are opposite: a
+    /// yielded turn waits for the session, a parked one waits for nothing —
+    /// the next message continues it (CONTRACT §7 #173).
+    Parked,
 }
 
 /// Text the user injected between two steps of a turn already in flight.
@@ -370,6 +375,41 @@ pub enum StopReason {
     /// other endings this one is not the model's claim: a command's exit code
     /// (or an HTTP status) decided it.
     Completed,
+    /// The turn's answer was withheld because the independent security review
+    /// of a high-risk task did not pass (B9, CONTRACT §7 #183).
+    ///
+    /// The model did its work and the loop ended normally; what failed is the
+    /// claim that the result may be handed over. Written by the scheduler after
+    /// the review, so it is never a reason the loop itself returns. The text the
+    /// model produced stays in the log and is shown with this reason attached —
+    /// the same shape a truncated answer has, because it is the same situation:
+    /// something that reads like an answer and is not one.
+    SecurityBlocked,
+}
+
+impl StopReason {
+    /// The word this reason is written as, in the log and in the parked record.
+    ///
+    /// The serde representation is the same string. It exists so a caller that
+    /// has to name a reason in a payload does not have to go through JSON to
+    /// find out what it is called.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FinalAnswer => "final_answer",
+            Self::MaxSteps => "max_steps",
+            Self::NeedsUserInput => "needs_user_input",
+            Self::FatalError => "fatal_error",
+            Self::UserCancelled => "user_cancelled",
+            Self::MaxToolCalls => "max_tool_calls",
+            Self::WallClockExceeded => "wall_clock_exceeded",
+            Self::MaxOutputTokens => "max_output_tokens",
+            Self::ContentFiltered => "content_filtered",
+            Self::TokenBudgetExceeded => "token_budget_exceeded",
+            Self::Stalled => "stalled",
+            Self::Completed => "completed",
+            Self::SecurityBlocked => "security_blocked",
+        }
+    }
 }
 
 /// Port for how a turn advances. Implementations are assembled at the app layer.

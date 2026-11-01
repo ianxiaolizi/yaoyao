@@ -7,9 +7,11 @@
 pub(crate) mod approval;
 pub(crate) mod inspect;
 pub(crate) mod plugin;
+pub(crate) mod rollback;
 pub(crate) mod sandbox;
 pub(crate) mod schedule;
 pub(crate) mod session;
 pub(crate) mod subagent;
 pub(crate) mod turn;
+pub(crate) mod verify;
 pub(crate) mod web;

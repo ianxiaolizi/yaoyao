@@ -22,8 +22,9 @@ pub use budget::{BudgetPolicy, BudgetResolution, resolve_context_budget};
 
 pub use layers::{
     BudgetSpec, DecisionsSpec, Disposition, LayaSpec, ManagedPolicy, McpServer, McpSpec,
-    MemorySpec, ModelSpec, PluginsSpec, PolicySpec, Profile, ProfileDecisions, SubagentSpec,
-    ToolsSpec, UserConfig, WorkspaceConfig, WorkspaceTools, parse_duration_ms,
+    MemorySpec, ModelSpec, NetworkSpec, PluginsSpec, PolicySpec, Profile, ProfileDecisions,
+    SecretsSpec, SubagentSpec, ToolsSpec, UserConfig, WorkspaceConfig, WorkspaceTools,
+    parse_duration_ms,
 };
 pub use resolve::{
     Directive, Layers, McpServerConfig, McpTransport, ResolvedLaya, ResolvedPolicy,
@@ -1560,6 +1561,25 @@ decisions = { laya = true }
         assert_eq!(completion.url, None);
         assert_eq!(completion.interval_steps, 5, "the shipped interval");
         assert_eq!(completion.timeout_ms, 120_000, "the shipped timeout");
+        assert!(completion.apparatus.is_empty(), "a profile that names none freezes nothing");
+    }
+
+    #[test]
+    fn an_apparatus_list_is_kept_beside_the_criterion() {
+        let resolved = resolve(completion_config(
+            &["process.spawn"],
+            "[profiles.p.policy]\nshell = \"allow\"\n\
+             [profiles.p.completion]\nkind = \"command\"\ncommand = \"python check.py\"\n\
+             apparatus = [\"tests/**\", \" benches/** \"]\n",
+        ))
+        .unwrap();
+
+        let completion = resolved.completion.expect("the criterion is resolved");
+        assert_eq!(
+            completion.apparatus,
+            ["tests/**", "benches/**"],
+            "globs are trimmed to the paths they name"
+        );
     }
 
     #[test]
@@ -1585,7 +1605,7 @@ decisions = { laya = true }
         // Each of these is a check that could never pass — or never run — and
         // saying so at resolution is what keeps the run from recording a
         // refused check on every step instead.
-        let cases: [(&str, &str, &str); 5] = [
+        let cases: [(&str, &str, &str); 8] = [
             (
                 "[profiles.p.policy]\nshell = \"allow\"\n[profiles.p.completion]\ncommand = \"x\"\n",
                 "kind",
@@ -1610,6 +1630,21 @@ decisions = { laya = true }
                 "[profiles.p.completion]\nkind = \"http\"\nurl = \"https://x.test/\"\ninterval_steps = 0\n",
                 "interval_steps",
                 "an interval of zero",
+            ),
+            (
+                "[profiles.p.policy]\nshell = \"allow\"\n[profiles.p.completion]\nkind = \"command\"\ncommand = \"x\"\napparatus = [\"/etc/**\"]\n",
+                "absolute",
+                "an absolute apparatus glob",
+            ),
+            (
+                "[profiles.p.policy]\nshell = \"allow\"\n[profiles.p.completion]\nkind = \"command\"\ncommand = \"x\"\napparatus = [\"../outside/**\"]\n",
+                "above the workspace root",
+                "an apparatus glob that climbs out",
+            ),
+            (
+                "[profiles.p.policy]\nshell = \"allow\"\n[profiles.p.completion]\nkind = \"command\"\ncommand = \"x\"\napparatus = [\"tests\\\\**\"]\n",
+                "/",
+                "an apparatus glob written with backslashes",
             ),
         ];
         for (profile, expected, what) in cases {

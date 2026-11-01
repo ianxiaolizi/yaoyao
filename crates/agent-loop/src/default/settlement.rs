@@ -114,7 +114,7 @@ pub(super) fn settle(
         })
         .collect();
 
-    let ledger = Ledger::build(&traffic, &turn.write_tools);
+    let ledger = Ledger::build(&traffic, &turn.tool_sets.writes);
     let subjective = !work.is_empty();
     let text = record_text(turn, &work, &ledger, dropped.len());
     let attempt_id = AttemptId::new();

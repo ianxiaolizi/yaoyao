@@ -92,6 +92,54 @@ pub struct UserConfig {
     /// not about one scenario — and a repository must not be able to make its
     /// own memories appear.
     pub memory: Option<MemorySpec>,
+    /// The remote origins `web.request` may reach.
+    ///
+    /// Here for the same reason as `capabilities`: an allowlist is an
+    /// authorization about the machine's egress, and a repository that could
+    /// write one could make its own endpoints reachable from every session
+    /// opened inside it. An absent section means no origin is reachable —
+    /// opening the network to a set of sites is a decision a person makes.
+    pub network: Option<NetworkSpec>,
+    /// The secret names a tool argument may reference.
+    ///
+    /// Here for the same reason as `network`: which values this machine hands
+    /// to a model-driven call is a fact about the machine, and a repository
+    /// that could write a list could name its own environment. This section
+    /// can only ever *narrow* what the host allows (`AGENT_TOOL_SECRETS`): an
+    /// absent section narrows nothing, and `allow = []` turns secret use off.
+    pub secrets: Option<SecretsSpec>,
+}
+
+/// The `[secrets]` section: which names a reference may use.
+///
+/// Names, not values. A value in a configuration file is a secret written to
+/// disk in cleartext, so this file never carries one; the backend
+/// (`agent-store-secret`) is the only thing that produces one, and only at the
+/// moment an approved call runs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsSpec {
+    /// Secret names, intersected with the ones the host allows this process to
+    /// resolve. An empty list turns secret use off.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+/// The `[network]` section: which remote origins a read may reach.
+///
+/// The entries are origins, not URLs: `https://api.github.com`, never
+/// `https://api.github.com/repos`. A path would read as if one page were
+/// authorized and the rest forbidden, and the guard cannot enforce that
+/// without re-reading every redirect against a pattern language. The origin is
+/// the unit a request is actually made to.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSpec {
+    /// Absolute `http`/`https` origins. Canonicalized and validated by the web
+    /// tool when the run starts (`agent-tools-web`), because this crate reads
+    /// no URLs.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 /// The `[memory]` section: whether runs on this machine offer the model the
@@ -203,6 +251,10 @@ pub struct CompletionSpecConfig {
     pub interval_steps: Option<u32>,
     /// What one check may spend, in milliseconds. Omit for 120,000.
     pub timeout_ms: Option<u64>,
+    /// Globs naming the files the check is graded against — test files,
+    /// benchmarks, scoring rules — relative to the workspace root. Omit to
+    /// freeze nothing.
+    pub apparatus: Option<Vec<String>>,
 }
 
 /// How a completion criterion is checked, as configuration spells it.
@@ -621,6 +673,117 @@ mod tests {
     fn a_memory_section_with_a_typo_is_a_refusal_not_a_default() {
         let error = UserConfig::from_toml_str("[memory]\nEnable = true\n")
             .expect_err("a misspelled key must not read as off");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn only_the_user_layer_can_open_the_network() {
+        // The allowlist is an authorization, so it lives in the layer that
+        // authorizes. A project that could write one could make its own
+        // endpoints reachable in every session opened inside it, which is the
+        // same hazard `capabilities` has.
+        let user = UserConfig::from_toml_str(
+            "[network]\nallow = [\"https://api.github.com\", \"http://docs.rs\"]\n",
+        )
+        .expect("the user layer may name origins");
+        assert_eq!(
+            user.network.map(|network| network.allow),
+            Some(vec!["https://api.github.com".to_string(), "http://docs.rs".to_string()])
+        );
+
+        let project =
+            WorkspaceConfig::from_toml_str("[network]\nallow = [\"https://evil.test\"]\n");
+        assert!(project.is_err(), "a project may not open the network");
+        let managed = ManagedPolicy::from_toml_str("[network]\nallow = [\"https://evil.test\"]\n");
+        assert!(managed.is_err(), "nor may the operator layer, which only refuses");
+    }
+
+    #[test]
+    fn project_config_cannot_add_network_allowlist() {
+        // The refusals are the whole point of separate types: a project that
+        // wrote `[network]` must be a parse error naming the field, not a
+        // section that is quietly dropped while the project believes it opened
+        // the network (CONTRACT §7 #180).
+        for (label, parsed) in [
+            (
+                "workspace",
+                WorkspaceConfig::from_toml_str("[network]\nallow = [\"https://evil.test\"]\n")
+                    .map(|_| ()),
+            ),
+            (
+                "managed",
+                ManagedPolicy::from_toml_str("[network]\nallow = [\"https://evil.test\"]\n")
+                    .map(|_| ()),
+            ),
+            (
+                "profile",
+                UserConfig::from_toml_str(
+                    "[profiles.coding.network]\nallow = [\"https://evil.test\"]\n",
+                )
+                .map(|_| ()),
+            ),
+        ] {
+            let error = parsed.expect_err("only the user layer names origins");
+            assert!(error.to_string().contains("unknown field"), "{label}: {error}");
+        }
+
+        // And the user layer's own section is the only place it parses.
+        let user = UserConfig::from_toml_str("[network]\nallow = [\"https://docs.rs\"]\n")
+            .expect("the user layer may name origins");
+        assert_eq!(user.network.map(|network| network.allow), Some(vec!["https://docs.rs".into()]));
+    }
+
+    #[test]
+    fn a_network_section_with_a_typo_is_a_refusal_not_an_empty_allowlist() {
+        // An empty allowlist and a misspelled one do the same thing — refuse
+        // every call — which is exactly why the typo must not parse: the
+        // person who wrote `allowed` would otherwise never learn why the tool
+        // stopped working.
+        let error = UserConfig::from_toml_str("[network]\nallowed = [\"https://docs.rs\"]\n")
+            .expect_err("a misspelled key must not read as an empty allowlist");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn only_the_user_layer_can_name_secrets() {
+        // A list of names is an authorization about this machine's
+        // environment, and a repository that could write one could name a
+        // variable the person never meant to hand it. The names are not
+        // values: a value in a config file would be a secret written to disk.
+        let user = UserConfig::from_toml_str("[secrets]\nallow = [\"OPENAI_API_KEY\"]\n")
+            .expect("the user layer may name secrets");
+        assert_eq!(
+            user.secrets.map(|secrets| secrets.allow),
+            Some(vec!["OPENAI_API_KEY".to_string()])
+        );
+
+        for (label, parsed) in [
+            (
+                "workspace",
+                WorkspaceConfig::from_toml_str("[secrets]\nallow = [\"TOKEN\"]\n").map(|_| ()),
+            ),
+            (
+                "managed",
+                ManagedPolicy::from_toml_str("[secrets]\nallow = [\"TOKEN\"]\n").map(|_| ()),
+            ),
+            (
+                "profile",
+                UserConfig::from_toml_str("[profiles.coding.secrets]\nallow = [\"TOKEN\"]\n")
+                    .map(|_| ()),
+            ),
+        ] {
+            let error = parsed.expect_err("only the user layer names secrets");
+            assert!(error.to_string().contains("unknown field"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_secrets_section_with_a_typo_is_a_refusal_not_a_silent_no_op() {
+        // A misspelled section would otherwise read as "the user said
+        // nothing", and the host's list would govern the run while the person
+        // believed they had narrowed it.
+        let error = UserConfig::from_toml_str("[secrets]\nallowed = [\"TOKEN\"]\n")
+            .expect_err("a misspelled key must not read as no section");
         assert!(error.to_string().contains("unknown field"), "{error}");
     }
 

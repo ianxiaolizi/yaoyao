@@ -1044,6 +1044,12 @@ fn run_turn(
         };
         approved.insert(id.clone());
 
+        // `deny` is answerable from anywhere — it only takes permission away.
+        // `approve` is not: since B4 it needs a terminal, because a pipe cannot
+        // prove a person is watching. A fixture that starts to raise a call
+        // needing a yes will fail here with "an approval must come from an
+        // interactive terminal"; the answer is to settle it in process
+        // (`ApprovalAuthority::test()`), not to widen the grant or the scope.
         let decision = if deny_approvals {
             run_agent(repo, &["deny", &id, "--only", "--session", SESSION, "--events"])
         } else {
@@ -1617,10 +1623,14 @@ fn chain_reading(events: &[Value]) -> ChainReading {
 /// Whether the step budget, rather than the loop, ended a turn in this run.
 ///
 /// The kernel writes `stop_reason: "max_steps"` on the terminal event since
-/// 2026-10-24; before that the log said nothing and only stdout did.
+/// 2026-10-24; before that the log said nothing and only stdout did. Since
+/// 2026-11-01 that terminal is `turn/yielded` (a budget stop is a pause), but
+/// the check accepts both spellings: exported logs from before the change are
+/// still readable by this evaluator.
 fn cut_by_budget(events: &[Value]) -> bool {
     events.iter().any(|event| {
-        event["type"] == EventType::TURN_COMPLETED && event["payload"]["stop_reason"] == "max_steps"
+        matches!(event["type"].as_str(), Some(EventType::TURN_COMPLETED | EventType::TURN_YIELDED))
+            && event["payload"]["stop_reason"] == "max_steps"
     })
 }
 

@@ -41,7 +41,10 @@ async fn the_capability_layer_states_the_boundary_and_indexes_the_tools() {
     assert_eq!(messages[0].message_uid.as_str(), format!("msg/capability/{}", turn.run_id));
     let text = messages[0].text_content();
     assert!(text.starts_with("Capabilities in this run:\n"), "{text}");
-    assert!(text.contains("- sandbox: local (commands run on the host"), "{text}");
+    assert!(
+        text.contains("- sandbox: local (file tools are confined to the workspace; actions that"),
+        "{text}"
+    );
     // This backend runs commands on the host; the run cannot deny the
     // network, and the layer does not claim it does.
     assert!(

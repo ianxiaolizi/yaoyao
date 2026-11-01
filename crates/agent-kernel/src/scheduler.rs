@@ -15,9 +15,11 @@ use agent_ports::agent_loop::{
     AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, TurnCapabilityFacts, TurnContext,
     TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
 };
-use agent_ports::control::{ControlError, ControlHandler, ControlOutcome, ControlRequest};
+use agent_ports::control::ControlHandler;
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
 use agent_ports::instructions::{InstructionError, InstructionSource};
+use agent_ports::intent_adjudication::IntentAdjudicator;
+use agent_ports::security_reviewer::SecurityReviewer;
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{EventSeq, InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::inbox::{InboxItem, InboxKind};
@@ -32,11 +34,14 @@ use crate::plan;
 use crate::session_lifecycle;
 use crate::state;
 
+mod completion;
+mod controls;
 mod draft;
 mod endings;
 mod journal;
 mod rebuilt;
 mod report;
+mod security;
 mod snapshot;
 
 pub(crate) use draft::draft;
@@ -47,8 +52,8 @@ pub use report::RunReport;
 
 /// Drives runs: claims input, enforces a single active run, and settles turns.
 pub struct Scheduler {
-    store: Arc<dyn EventStore>,
-    inbox: Inbox,
+    pub(crate) store: Arc<dyn EventStore>,
+    pub(crate) inbox: Inbox,
     loop_: Arc<dyn AgentLoop>,
     max_steps: u32,
     /// The rest of the run's budget. `max_steps` above is the binding step
@@ -78,6 +83,10 @@ pub struct Scheduler {
     /// no capability layer rather than describing a boundary that does not
     /// exist.
     capability: Option<TurnCapabilityFacts>,
+    pub(crate) adjudicator: Option<Arc<dyn IntentAdjudicator>>,
+    /// Who reviews the L2/L3 actions of a session before its answer is handed
+    /// over (B9). `None` is not consent: a high-risk task then cannot complete.
+    security: Option<Arc<dyn SecurityReviewer>>,
 }
 
 /// Errors from Scheduler operations.
@@ -134,6 +143,8 @@ impl Scheduler {
             controls: Vec::new(),
             instructions: None,
             capability: None,
+            adjudicator: None,
+            security: None,
         }
     }
 
@@ -230,6 +241,14 @@ impl Scheduler {
         &self.inbox
     }
 
+    /// A read-only view of the session's intent ledger.
+    ///
+    /// Cheap to construct: it holds the store handle and every read folds the
+    /// log, so there is no second copy of the truth to keep in step.
+    pub fn intents(&self) -> crate::intent::IntentLedger {
+        crate::intent::IntentLedger::new(self.store.clone())
+    }
+
     /// The current open-entity lifecycle for this session.
     pub async fn lifecycle(
         &self,
@@ -294,6 +313,8 @@ impl Scheduler {
         // are appended as one, and a change made *between* turns is not part of
         // one.
         self.apply_controls(session_id).await?;
+        // Once per boundary: an `unclear` message's relation to the queued work.
+        self.adjudicate_pending(session_id).await?;
 
         let Some(item) = self.inbox.next_turn(session_id).await? else {
             return Ok(None);
@@ -543,10 +564,15 @@ impl Scheduler {
             None,
             None,
         ));
+        // What this turn is an answer *to*, written beside what it consumed.
+        // Why the binding sits on `turn/started` rather than on the terminal
+        // payload is recorded with the payload itself.
+        let answered_intent = crate::inbox::item_intent_id(&item);
+        let turn_started_payload = report::turn_started_payload(&item, answered_intent.as_ref());
         pending.push(draft(
             session_id,
             EventType::TURN_STARTED,
-            serde_json::json!({ "inbox_item": item.item_id }),
+            turn_started_payload,
             Actor::Scheduler,
             Some(&run_id),
             Some(&turn_id),
@@ -623,6 +649,22 @@ impl Scheduler {
 
         let (stop_reason, final_content, turn_terminal, run_terminal, mut turn_payload) =
             ending.settle();
+        // The review runs before any terminal; it returns the log as it then stands (B9).
+        let (stop_reason, so_far) = self
+            .review_before_claim(
+                (session_id, &run_id, &turn_id, stop_reason),
+                (&mut pending, &journal, &mut turn_payload),
+            )
+            .await?;
+        // Read from the counters the terminal payload will carry, and before
+        // `spent` moves into `Finished`: the parked record's percentage has to
+        // describe the same run the spend does.
+        let parked_percent = crate::parking::percent_of(
+            u32::try_from(journal.steps()).unwrap_or(u32::MAX),
+            self.max_steps,
+            spent.total_tokens(),
+            self.budget.max_total_tokens,
+        );
         let finished = Finished::now(
             spent,
             journal.steps(),
@@ -636,6 +678,31 @@ impl Scheduler {
         // run-level audit must not have to walk back to find what it cost.
         let mut run_payload = serde_json::json!({ "stop_reason": &stop_reason });
         finished.decorate(&mut run_payload, false);
+        completion::note_claims(
+            &history,
+            &so_far,
+            &stop_reason,
+            final_content.as_deref(),
+            (session_id, &run_id, &turn_id),
+            &mut pending,
+        );
+        // A limit ending is a pause, and this is what it paused with. Written
+        // in the same batch as the terminal events, so a crash cannot leave a
+        // yielded turn with nothing saying where it stopped. The record is built
+        // from the log's own plan, state and ledger — not asked of the model,
+        // which is the party that just ran out of budget (CONTRACT §7 #173).
+        if endings::is_limit(&stop_reason) {
+            let parked = crate::parking::state_of(&so_far, stop_reason.as_str(), parked_percent);
+            pending.push(draft(
+                session_id,
+                EventType::BUDGET_PARKED,
+                serde_json::json!({ "parked": parked }),
+                Actor::Scheduler,
+                Some(&run_id),
+                Some(&turn_id),
+                None,
+            ));
+        }
         // The item is claimed only now: the claim is the fact "this input has
         // been answered", and a turn that never reached its end has not
         // answered it. Writing the claim at the opening would consume the
@@ -666,102 +733,7 @@ impl Scheduler {
         // durable rather than merely accepted.
         journal.commit(std::mem::take(&mut pending)).await?;
 
-        Ok(finished.report(run_id, turn_id, stop_reason, final_content))
-    }
-
-    /// Apply the changes waiting at this boundary, one at a time, in order.
-    ///
-    /// Each item is decided before it is recorded, because the record is the
-    /// decision: a control that took effect is *claimed* — the queue's word for
-    /// "taken out, and not by a run" — and one that did not is *discarded with
-    /// the reason*. Recording first and deciding after would make a refused
-    /// control look exactly like an applied one to anyone reading the log.
-    ///
-    /// The order matters for the failure it leaves behind: the handler acts
-    /// before the claim is written, so a process that dies in between leaves the
-    /// item pending and the change already made. Applying it again is then
-    /// harmless — the second attempt refuses, because there is nothing left to
-    /// do — which is why this is safe to run on every boundary rather than
-    /// exactly once.
-    async fn apply_controls(&self, session_id: &SessionId) -> Result<(), SchedulerError> {
-        for item in self.inbox.controls(session_id).await? {
-            let control = item
-                .payload
-                .get("control")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let handler = self.controls.iter().find(|h| h.handles().contains(&control));
-
-            // The three ways a control can fail to take effect are different
-            // facts — nobody claimed it, a handler declined, a handler broke —
-            // and the port says they are recorded differently. The cause is
-            // what carries that distinction into the log; the sentence beside
-            // it is for the person reading (C-1).
-            let refusal = match handler {
-                None => Some((DiscardCause::Unhandled, self.nothing_handles(&control))),
-                Some(handler) => {
-                    let request = ControlRequest {
-                        session_id: session_id.clone(),
-                        item_id: item.item_id.clone(),
-                        control: control.clone(),
-                        payload: item.payload.clone(),
-                    };
-                    match handler.apply(request).await {
-                        Ok(ControlOutcome::Applied { .. }) => None,
-                        Ok(ControlOutcome::Refused { reason }) => Some((
-                            DiscardCause::Refused,
-                            format!("{} refused it: {reason}", handler.name()),
-                        )),
-                        Err(ControlError::Failed { message, .. }) => Some((
-                            DiscardCause::Failed,
-                            format!("{} could not apply it: {message}", handler.name()),
-                        )),
-                    }
-                }
-            };
-
-            match refusal {
-                // Applied: the change is already made and recorded by whoever
-                // made it. What is left is to take the item out of the queue.
-                None => {
-                    // Claim and append are one step, like every other writer
-                    // here: the item is re-read to build the claim, and the
-                    // append must land on the log that read saw. (YA-36)
-                    let _lease = self.store.lease(session_id).await?;
-                    let draft = self.inbox.claim_draft(session_id, &item.item_id, None).await?;
-                    let next = self.next_seq(session_id).await?;
-                    self.store.append(session_id, next, vec![draft]).await?;
-                }
-                Some((cause, reason)) => {
-                    self.inbox.discard(session_id, &item.item_id, cause, Some(&reason)).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// What to say when nobody claims a control.
-    ///
-    /// A refusal that only said "no" would send the operator to read the source;
-    /// naming the handlers is what lets them see that the control they sent is
-    /// one this build does not have — or that it has none at all.
-    fn nothing_handles(&self, control: &str) -> String {
-        let handled: Vec<String> = self
-            .controls
-            .iter()
-            .flat_map(|h| h.handles())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        if handled.is_empty() {
-            format!("no control '{control}' can be applied: this run registered no handlers")
-        } else {
-            format!(
-                "no handler claims control '{control}'; this run handles: {}",
-                handled.join(", ")
-            )
-        }
+        Ok(finished.report(run_id, turn_id, stop_reason, final_content, answered_intent))
     }
 
     /// Claim what the user injected for this turn, and describe it to the loop.
@@ -831,8 +803,8 @@ impl Scheduler {
         Ok(inputs)
     }
 
-    async fn next_seq(&self, session_id: &SessionId) -> Result<EventSeq, SchedulerError> {
-        let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+    pub(crate) async fn next_seq(&self, session: &SessionId) -> Result<EventSeq, SchedulerError> {
+        let events = self.store.read_stream(session, EventSeq::ZERO, usize::MAX).await?;
         Ok(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO))
     }
 }
@@ -843,6 +815,7 @@ mod tests {
     use crate::scheduler::snapshot::snapshot_with_budget;
     use agent_loop::DefaultAgentLoop;
     use agent_ports::agent_loop::{StepOutcome, StopReason, TurnState};
+    use agent_ports::control::{ControlError, ControlOutcome, ControlRequest};
     use agent_ports::execution_environment::SandboxMode;
     use agent_ports::instructions::{InstructionError, InstructionSource};
     use agent_ports::model_provider::{
@@ -1621,10 +1594,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_exhausted_step_budget_completes_the_turn() {
+    async fn an_exhausted_step_budget_parks_the_turn_instead_of_completing_it() {
         // The budget is the Scheduler's policy, so only the Scheduler can report
         // this ending. The model here would call tools forever: it never stops on
         // its own, which is why something outside the loop has to.
+        //
+        // A budget stop is a pause, not an answer (CONTRACT §7 #173): the turn
+        // ends `turn/yielded`, so the delivery axis cannot offer whatever text
+        // the model happened to have written as the result, and the
+        // `budget/parked` record beside it says what was left.
         let store = Arc::new(FakeEventStore::new());
         let sid = SessionId::from_string("budget-session");
         let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::tool_call(
@@ -1644,32 +1622,61 @@ mod tests {
         assert!(report.final_content.is_none());
         assert_eq!(model.requests().len(), 2, "the budget counts steps, not requests");
         let types = event_types(&store, &sid).await;
-        assert!(types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
-        assert!(types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
-        // A budget stop says so in the log, not only on stdout: without it the
-        // event is indistinguishable from a turn that ended with nothing to say.
+        assert!(types.contains(&EventType::TURN_YIELDED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::RUN_YIELDED.to_string()), "{types:?}");
+        assert!(!types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
+        assert!(!types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
+
         let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = events
+        // The pause still says why it paused and how far it got: a limit hit at
+        // once and one hit after a long run write the same stop reason, so the
+        // numbers beside it are what tell them apart.
+        let yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
-            .expect("the turn completed");
-        assert_eq!(completed.event.payload["stop_reason"], serde_json::json!("max_steps"));
-        // And how far the turn got: a limit hit at once and one hit after a long
-        // run write the same stop reason, so the numbers beside it are what tell
-        // them apart.
-        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(2));
-        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(2));
-        assert!(completed.event.payload["budget"]["elapsed_ms"].is_u64());
-        // The run's terminal event is the one an operator reads when asking
-        // what a finished run cost. It must carry the same spend as the turn.
-        let run_completed = events
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_YIELDED)
+            .expect("the turn yielded");
+        assert_eq!(yielded.event.payload["stop_reason"], serde_json::json!("max_steps"));
+        assert_eq!(yielded.event.payload["budget"]["steps"], serde_json::json!(2));
+        assert_eq!(yielded.event.payload["budget"]["tool_calls"], serde_json::json!(2));
+        assert!(yielded.event.payload["budget"]["elapsed_ms"].is_u64());
+        let run_yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::RUN_COMPLETED)
-            .expect("the run completed");
-        assert_eq!(run_completed.event.payload["stop_reason"], serde_json::json!("max_steps"));
-        assert_eq!(run_completed.event.payload["spent"]["steps"], serde_json::json!(2));
-        assert_eq!(run_completed.event.payload["spent"]["tool_calls"], serde_json::json!(2));
-        assert!(run_completed.event.payload["spent"]["input_tokens"].is_u64());
+            .find(|stored| stored.event.event_type.as_str() == EventType::RUN_YIELDED)
+            .expect("the run yielded");
+        assert_eq!(run_yielded.event.payload["stop_reason"], serde_json::json!("max_steps"));
+        assert_eq!(run_yielded.event.payload["spent"]["steps"], serde_json::json!(2));
+        assert_eq!(run_yielded.event.payload["spent"]["tool_calls"], serde_json::json!(2));
+        assert!(run_yielded.event.payload["spent"]["input_tokens"].is_u64());
+
+        // What it parked with: the reason, how much of the budget went, and —
+        // because this turn wrote no plan or state — empty goal and evidence
+        // lists rather than invented ones.
+        let parked = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::BUDGET_PARKED)
+            .expect("the pause is recorded");
+        assert_eq!(parked.event.payload["parked"]["reason"], serde_json::json!("max_steps"));
+        assert_eq!(parked.event.payload["parked"]["percent"], serde_json::json!(100));
+        assert_eq!(parked.event.payload["parked"]["remaining_goals"], serde_json::json!([]));
+        assert!(
+            parked.event.payload["parked"].get("next_step").is_none(),
+            "{:?}",
+            parked.event.payload
+        );
+
+        // The status axes read the pause as what it is: nothing delivered and no
+        // completion to claim.
+        let axes = crate::status::derive(&events);
+        assert_eq!(axes.delivery_status, agent_protocol::status::DeliveryStatus::Unanswered);
+        assert_eq!(
+            axes.completion_status,
+            Some(agent_protocol::status::CompletionStatus::BlockedOrParked)
+        );
+
+        // The item the turn used is claimed in the same batch, so a later turn
+        // does not re-claim work this one already did — which is the whole of
+        // "resume from parked does not take the old queue items again".
+        assert!(scheduler.inbox.pending(&sid).await.unwrap().is_empty());
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
     }
 
@@ -1702,18 +1709,24 @@ mod tests {
         let types = event_types(&store, &sid).await;
         assert!(types.contains(&EventType::TOOL_NOT_STARTED.to_string()), "{types:?}");
         assert!(!types.contains(&EventType::TOOL_STARTED.to_string()), "{types:?}");
-        // A limit the loop enforced ends the turn the way an exhausted step
+        // A limit the loop enforced pauses the turn the way an exhausted step
         // budget does; leaving it as `{}` would hide the reason in the log.
-        assert!(types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
-        assert!(types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::TURN_YIELDED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::RUN_YIELDED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::BUDGET_PARKED.to_string()), "{types:?}");
         let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = events
+        let yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
-            .expect("the turn completed");
-        assert_eq!(completed.event.payload["stop_reason"], serde_json::json!("max_tool_calls"));
-        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(1));
-        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(0));
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_YIELDED)
+            .expect("the turn yielded");
+        assert_eq!(yielded.event.payload["stop_reason"], serde_json::json!("max_tool_calls"));
+        assert_eq!(yielded.event.payload["budget"]["steps"], serde_json::json!(1));
+        assert_eq!(yielded.event.payload["budget"]["tool_calls"], serde_json::json!(0));
+        let parked = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::BUDGET_PARKED)
+            .expect("the pause is recorded");
+        assert_eq!(parked.event.payload["parked"]["reason"], serde_json::json!("max_tool_calls"));
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
     }
 
@@ -1744,16 +1757,17 @@ mod tests {
         let types = event_types(&store, &sid).await;
         assert!(!types.contains(&EventType::STEP_STARTED.to_string()), "{types:?}");
         let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = events
+        let yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
-            .expect("the turn completed");
-        assert_eq!(
-            completed.event.payload["stop_reason"],
-            serde_json::json!("wall_clock_exceeded")
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_YIELDED)
+            .expect("the turn yielded");
+        assert_eq!(yielded.event.payload["stop_reason"], serde_json::json!("wall_clock_exceeded"));
+        assert_eq!(yielded.event.payload["budget"]["steps"], serde_json::json!(0));
+        assert_eq!(yielded.event.payload["budget"]["tool_calls"], serde_json::json!(0));
+        assert!(
+            types.contains(&EventType::BUDGET_PARKED.to_string()),
+            "a spent clock parks the turn like any other limit: {types:?}"
         );
-        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(0));
-        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(0));
     }
 
     #[tokio::test]
@@ -1800,6 +1814,11 @@ mod tests {
                 EventType::BUDGET_UPDATED,
                 "reason/recorded",
                 EventType::STEP_COMPLETED,
+                // The turn answered after a tool call and nothing checked it.
+                // A5 writes the delivery fact here, before the item is claimed:
+                // the claim says the input was answered, and this says what
+                // stood behind the answer (nothing).
+                EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
                 EventType::INBOX_CLAIMED,
                 EventType::TURN_COMPLETED,
                 EventType::RUN_COMPLETED,

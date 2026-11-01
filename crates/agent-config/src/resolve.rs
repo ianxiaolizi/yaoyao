@@ -73,6 +73,22 @@ pub struct ResolvedProfile {
     /// only decides whether they are on the surface at all — so a run with the
     /// store off has no way to reach it even by naming a tool.
     pub memory_enabled: bool,
+    /// The remote origins this run may reach, as the user layer wrote them.
+    ///
+    /// Read from `[network] allow` in the user layer and nowhere else. The
+    /// strings are not validated here — this crate reads no URLs; assembly
+    /// canonicalizes them into the web tool's allowlist and refuses the run if
+    /// one is not an origin. Empty means no egress at all, which is the
+    /// shipped posture: a run reaches the sites a person named and no others.
+    pub network_allow: Vec<String>,
+    /// The secret names this run may resolve, as the user layer narrowed them.
+    ///
+    /// `None` is "the user layer said nothing", and the host's own list
+    /// (`AGENT_TOOL_SECRETS`) governs unchanged. `Some(names)` is a narrowing:
+    /// the run resolves the intersection, so a name the host does not allow is
+    /// still not resolvable. Values never appear here — this is a list of
+    /// names, and the backend is the only producer of a value.
+    pub secret_allow: Option<Vec<String>>,
     pub capability_set: CapabilitySet,
     pub plugin_versions: BTreeMap<String, String>,
     /// The MCP servers this run starts, one per enabled `mcp.<server>` plugin,
@@ -455,6 +471,13 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
             .or_else(|| composed.model.as_ref().and_then(|model| model.main.clone())),
         model_tiers: model_tiers(&layers, composed.model.as_ref()),
         memory_enabled: layers.user.memory.as_ref().is_some_and(|memory| memory.enabled),
+        network_allow: layers
+            .user
+            .network
+            .as_ref()
+            .map(|network| network.allow.clone())
+            .unwrap_or_default(),
+        secret_allow: layers.user.secrets.as_ref().map(|secrets| secrets.allow.clone()),
         capability_set,
         plugin_versions,
         mcp_servers,
@@ -915,6 +938,10 @@ fn completion(
         ));
     }
     let timeout_ms = spec.timeout_ms.unwrap_or(DEFAULT_COMPLETION_TIMEOUT_MS);
+    let apparatus = match apparatus_globs(spec.apparatus.as_deref()) {
+        Ok(globs) => globs,
+        Err(detail) => return refuse(detail),
+    };
     let (command, url) = match kind {
         CompletionKindSpec::Command => {
             let command = spec.command.as_deref().map(str::trim).unwrap_or_default();
@@ -994,7 +1021,48 @@ fn completion(
         url,
         interval_steps,
         timeout_ms,
+        apparatus,
     }))
+}
+
+/// The apparatus globs, checked for the shapes a walk cannot honour.
+///
+/// A glob is a path the manifest walker will follow, so an absolute one, a
+/// `..` segment or a Windows separator is refused here — where the operator can
+/// see which line is wrong — rather than becoming a manifest that quietly
+/// covers the wrong files, or a walk that reaches outside the workspace and is
+/// refused at its first step with a message about a file nobody named.
+fn apparatus_globs(globs: Option<&[String]>) -> std::result::Result<Vec<String>, String> {
+    let Some(globs) = globs else {
+        return Ok(Vec::new());
+    };
+    let mut checked = Vec::with_capacity(globs.len());
+    for glob in globs {
+        let glob = glob.trim();
+        if glob.is_empty() {
+            return Err(String::from("`apparatus` contains an empty glob"));
+        }
+        if glob.starts_with('/') || glob.starts_with('\\') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} is absolute; globs are relative to the workspace root"
+            ));
+        }
+        if glob.contains('\\') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} uses `\\`; write workspace-relative paths with `/`"
+            ));
+        }
+        if glob.contains(':') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} names a drive or a stream; globs are workspace-relative"
+            ));
+        }
+        if glob.split('/').any(|segment| segment == "..") {
+            return Err(format!("`apparatus` glob {glob:?} reaches above the workspace root"));
+        }
+        checked.push(glob.to_string());
+    }
+    Ok(checked)
 }
 
 /// The longest a command check may run, matching `shell.run`'s own ceiling.
@@ -1676,5 +1744,54 @@ impl From<Disposition> for PolicyDecision {
             Disposition::Ask => Self::Ask,
             Disposition::Deny => Self::Deny,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_user_layers_allowlist_reaches_the_resolution() {
+        // The resolution is the one place both the profile and the app can
+        // read, so the entries have to survive it unchanged: canonicalization
+        // belongs to the tool, and a resolution that quietly dropped one would
+        // turn a configured origin into an unlisted one.
+        let layers = Layers {
+            user: UserConfig::from_toml_str(
+                "[network]\nallow = [\"https://api.github.com\", \"https://docs.rs\"]\n",
+            )
+            .unwrap(),
+            ..Layers::default()
+        };
+        assert_eq!(
+            resolve(layers).unwrap().network_allow,
+            vec!["https://api.github.com".to_string(), "https://docs.rs".to_string()]
+        );
+
+        // Nothing configured is no egress, not "any origin".
+        assert!(resolve(Layers::default()).unwrap().network_allow.is_empty());
+    }
+
+    #[test]
+    fn the_user_layers_secret_names_reach_the_resolution_as_written() {
+        // `None` is not the same answer as `Some([])`: the first is "the user
+        // layer said nothing, the host's list governs", and the second is
+        // "this run resolves nothing". Collapsing them would make an absent
+        // section silently turn secrets off, or an empty one silently leave
+        // them on.
+        assert_eq!(resolve(Layers::default()).unwrap().secret_allow, None);
+
+        let layers = Layers {
+            user: UserConfig::from_toml_str("[secrets]\nallow = [\"OPENAI_API_KEY\"]\n").unwrap(),
+            ..Layers::default()
+        };
+        assert_eq!(resolve(layers).unwrap().secret_allow, Some(vec!["OPENAI_API_KEY".to_string()]));
+
+        let empty = Layers {
+            user: UserConfig::from_toml_str("[secrets]\nallow = []\n").unwrap(),
+            ..Layers::default()
+        };
+        assert_eq!(resolve(empty).unwrap().secret_allow, Some(Vec::new()));
     }
 }

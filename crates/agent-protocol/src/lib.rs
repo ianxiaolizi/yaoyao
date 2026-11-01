@@ -10,25 +10,36 @@
 
 #![deny(unsafe_code)]
 
+pub mod apparatus;
 pub mod compaction;
 pub mod decision;
 pub mod diagnostics;
 pub mod digest;
 pub mod events;
+pub mod evidence;
 pub mod failures;
 pub mod ids;
 pub mod inbox;
 pub mod instructions;
+pub mod intent;
+pub mod intent_adjudication;
 pub mod judgment;
 pub mod ledger;
 pub mod model;
+pub mod parking;
+pub mod permission;
+pub mod permission_classifier;
 pub mod permissions;
 pub mod plan;
 pub mod plugin;
 pub mod profile;
 pub mod reason;
 pub mod redactor;
+pub mod security_review;
 pub mod state;
+pub mod status;
 pub mod tool;
 pub mod usertext;
+pub mod verification;
 pub mod versioning;
+pub mod workspace_snapshot;

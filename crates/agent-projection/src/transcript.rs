@@ -24,6 +24,7 @@ use agent_protocol::events::{EventType, StoredEvent};
 use agent_protocol::ids::{ApprovalId, EventSeq, StepId, TurnId};
 use agent_protocol::inbox::{InboxItem, InboxKind};
 use agent_protocol::model::{ContentBlock, ModelResponse, Usage};
+use agent_protocol::permission::{ActionTarget, Reversibility, RiskLevel};
 use agent_protocol::tool::{
     APPROVAL_DENIED_OUTCOME, APPROVAL_PENDING_OUTCOME, GATE_REFUSED_OUTCOME,
     GATEWAY_REFUSED_OUTCOME,
@@ -90,6 +91,21 @@ pub enum ItemBody {
         /// clock.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         created_at: Option<DateTime<Utc>>,
+        /// The exact action the question is about, by fingerprint.
+        ///
+        /// The card is the moment before the act, so it carries what the
+        /// person is agreeing to: how bad it could be, whether it can be taken
+        /// back, and what it would touch. All four are copied from the request
+        /// rather than derived here — a projection that recomputed risk would be
+        /// a second opinion about the thing being approved. (B4)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk: Option<RiskLevel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reversibility: Option<Reversibility>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        targets: Vec<ActionTarget>,
     },
     /// What the model said.
     Answer { text: String },
@@ -586,6 +602,10 @@ impl ProjectionDefinition for TranscriptProjection {
                         summary: request.args_summary,
                         state: ApprovalState::Pending,
                         created_at: Some(request.created_at),
+                        action_digest: request.action_digest,
+                        risk: request.risk,
+                        reversibility: request.reversibility,
+                        targets: request.targets,
                     },
                 );
             }
@@ -653,7 +673,21 @@ impl ProjectionDefinition for TranscriptProjection {
                         Some("content_filtered") => TurnEnding::ContentFiltered,
                         _ => TurnEnding::Answered,
                     },
-                    EventType::TURN_YIELDED => TurnEnding::Yielded,
+                    // A yielded turn says why it yielded when it can. A budget
+                    // pause is not a question for a person: reporting it as
+                    // `Yielded` would send a reader to answer a decision nobody
+                    // is being asked (CONTRACT §7 #173).
+                    EventType::TURN_YIELDED => match stop_reason.as_deref() {
+                        Some("max_steps") => TurnEnding::MaxSteps,
+                        Some(
+                            "max_tool_calls"
+                            | "wall_clock_exceeded"
+                            | "max_output_tokens"
+                            | "token_budget_exceeded"
+                            | "stalled",
+                        ) => TurnEnding::LimitReached,
+                        _ => TurnEnding::Yielded,
+                    },
                     EventType::TURN_FAILED => TurnEnding::Failed,
                     _ => TurnEnding::Cancelled,
                 };
@@ -1066,6 +1100,12 @@ mod tests {
             args_summary: "cargo test".to_string(),
             status: ApprovalStatus::Pending,
             created_at: Utc::now(),
+            action_digest: None,
+            risk: None,
+            task_id: None,
+            task_revision: None,
+            reversibility: None,
+            targets: Vec::new(),
         };
         let state = apply(
             &TranscriptProjection::new().init(),
@@ -1090,6 +1130,9 @@ mod tests {
                     scope: ApprovalScope::AllowOnce,
                     actor: "user".to_string(),
                     created_at: Utc::now(),
+                    action_digest: None,
+                    risk: None,
+                    authority: None,
                 })
                 .unwrap(),
             ),
@@ -1121,6 +1164,12 @@ mod tests {
             args_summary: "cargo test".to_string(),
             status: ApprovalStatus::Pending,
             created_at: Utc::now(),
+            action_digest: None,
+            risk: None,
+            task_id: None,
+            task_revision: None,
+            reversibility: None,
+            targets: Vec::new(),
         };
         // This is the shape the scheduler actually writes: the approval has no
         // turn of its own.

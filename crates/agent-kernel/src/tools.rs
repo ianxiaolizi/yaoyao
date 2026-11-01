@@ -101,6 +101,14 @@ impl ToolProvider for CompositeToolProvider {
         self.providers.iter().find_map(|provider| provider.side_effect(tool_name))
     }
 
+    /// Ask the provider that owns the call. The owner is the layer that wrote
+    /// the tool and is the only one that can tell a `GET` from a `POST`; a name
+    /// no member claims gets `None`, which the gateway reads as
+    /// [`agent_protocol::permission::RiskLevel::UNKNOWN`].
+    fn risk(&self, invocation: &ToolInvocation) -> Option<agent_protocol::permission::RiskLevel> {
+        self.owner(&invocation.tool_name).and_then(|provider| provider.risk(invocation))
+    }
+
     /// Ask the provider that owns the tool. A name no member claims gets no
     /// path arguments — it is about to be refused as unknown, and inventing a
     /// boundary for it would be answering a question nobody asked.

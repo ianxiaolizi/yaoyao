@@ -145,7 +145,13 @@ async fn a_decision_for_a_turn_that_is_not_waiting_is_refused_by_name() {
     // No turn has ever been yielded, so there is no card to settle. The refusal
     // is about the approval, not about the server.
     let refused = backend
-        .settle_approval(&session, "no-such-approval", Decision::Once, &sink())
+        .settle_approval(
+            &session,
+            "no-such-approval",
+            Decision::Once,
+            &agent_kernel::approval::ApprovalAuthority::test(),
+            &sink(),
+        )
         .await
         .expect_err("nothing to settle");
     assert_eq!(refused.code, "approval_not_pending", "{refused:?}");

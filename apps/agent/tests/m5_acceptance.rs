@@ -36,6 +36,9 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+
+#[path = "support/claimed_isolation.rs"]
+mod claimed_isolation;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -280,24 +283,34 @@ struct Process {
 /// Assemble a process the way the binary does, over a scripted model.
 async fn process(workspace: &Path, data_dir: &Path, script: Vec<String>) -> Process {
     let transport = Arc::new(ScriptedTransport::new(script));
-    let stack = stack::assemble(stack::Inputs {
-        session: SessionId::from_string(SESSION),
-        workspace_root: workspace.to_path_buf(),
-        data_dir: data_dir.to_path_buf(),
-        resolved: default_profile(),
-        model: Some(SelectedProvider {
-            provider: scripted_provider(transport.clone()),
-            route: route(),
-        }),
-        decisions: Decisions::FromConfiguration,
-        sandbox: SandboxMode::LocalProcess,
-        network_allowed: false,
-        // The subject here is the approval and resume boundary, and the model
-        // is a fixed script counted in attempts. The thinking pipeline would
-        // hold the scripted edit for a branch record it was never scripted to
-        // write, which would measure this test's premise instead of its task.
-        judgment: false,
-    })
+    let stack = stack::assemble_over(
+        stack::Inputs {
+            session: SessionId::from_string(SESSION),
+            workspace_root: workspace.to_path_buf(),
+            data_dir: data_dir.to_path_buf(),
+            resolved: default_profile(),
+            model: Some(SelectedProvider {
+                provider: scripted_provider(transport.clone()),
+                route: route(),
+            }),
+            decisions: Decisions::FromConfiguration,
+            // The backend is supplied below rather than built from this: the case
+            // is about the approval and resume boundary, so it says the machine
+            // would confine the run (see `support/claimed_isolation.rs`) instead
+            // of requiring this machine to have a real AppContainer. With a local
+            // backend the isolation floor refuses `shell.run` before a person is
+            // ever asked — which is the right answer, and not this case's subject.
+            sandbox: SandboxMode::WorkspaceSandbox,
+            network_allowed: false,
+            // The subject here is the approval and resume boundary, and the model
+            // is a fixed script counted in attempts. The thinking pipeline would
+            // hold the scripted edit for a branch record it was never scripted to
+            // write, which would measure this test's premise instead of its task.
+            judgment: false,
+        },
+        agent::subagents::Delegation::Background,
+        claimed_isolation::isolating(workspace),
+    )
     .await
     .expect("the assembly the binary runs");
 
@@ -461,7 +474,13 @@ async fn a_task_in_a_real_repository_is_done_and_the_world_says_so() {
     second
         .stack
         .approvals
-        .grant(&second.session_id, &approval_id, ApprovalScope::AllowOnce, "user")
+        .grant(
+            &second.session_id,
+            &approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
         .await
         .expect("grant");
 

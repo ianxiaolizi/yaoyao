@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use agent_kernel::approval::PENDING_TTL;
+use agent_kernel::inbox::{Inbox, item_intent_id};
 use agent_kernel::model_selection::ModelChoice;
 use agent_ports::event_store::EventStore;
 use agent_projection::{
@@ -17,6 +19,8 @@ use agent_projection::{
 };
 use agent_protocol::events::StoredEvent;
 use agent_protocol::ids::{EventSeq, SessionId};
+use agent_protocol::intent::IntentStatus;
+use agent_protocol::permission::Reversibility;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
@@ -334,6 +338,59 @@ pub(crate) async fn transcript(
     }))
 }
 
+/// A session's status axes, the instruction ledger behind them, and the latest
+/// adjudication.
+///
+/// The axes come from the kernel's own fold rather than a second reading of
+/// the same events: the page and `agent status` must not disagree about what
+/// "verified complete" means. The instruction and adjudication reads use the
+/// same event slice, so one request cannot report a session from two logs.
+pub(crate) async fn status(
+    store: Arc<dyn EventStore>,
+    session: &SessionId,
+) -> Result<Value, ReadError> {
+    let session_name = session.as_str().to_string();
+    let failed = |message: String| ReadError::Session { session: session_name.clone(), message };
+    let events = store
+        .read_stream(session, EventSeq::ZERO, usize::MAX)
+        .await
+        .map_err(|error| failed(error.to_string()))?;
+    let axes = agent_kernel::status::derive(&events);
+    let intents =
+        agent_kernel::intent::fold_intents(&events).map_err(|error| failed(error.to_string()))?;
+    let active = intents.iter().rev().find(|intent| intent.status == IntentStatus::Active);
+    // The instructions whose queue entries are still waiting, in queue order.
+    // A pending item with no instruction behind it contributes nothing, for
+    // the same reason `status` reports none: it is not work a person asked for.
+    let pending = Inbox::new(store.clone())
+        .pending(session)
+        .await
+        .map_err(|error| failed(error.to_string()))?;
+    let mut pending_intents: Vec<String> = Vec::new();
+    for item in &pending {
+        let Some(intent_id) = item_intent_id(item) else {
+            continue;
+        };
+        if !pending_intents.iter().any(|id| id == intent_id.as_str()) {
+            pending_intents.push(intent_id.as_str().to_string());
+        }
+    }
+    let adjudication = agent_kernel::intent_adjudication::latest(&events)
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(json!({
+        "v": 1,
+        "session": session.as_str(),
+        "run_status": axes.run_status,
+        "delivery_status": axes.delivery_status,
+        "verification_status": axes.verification_status,
+        "completion_status": axes.completion_status,
+        "active_intent_id": active.map(|intent| intent.intent_id.as_str()),
+        "active_intent_summary": active.map(|intent| intent.summary.as_str()),
+        "pending_intents": pending_intents,
+        "adjudication": adjudication,
+    }))
+}
+
 /// The newest `git.diff` observation in a session, as a reader-shaped report.
 ///
 /// This is a projection of an observation the kernel already recorded, not a
@@ -601,12 +658,41 @@ fn wire_item_at(item: &TranscriptItem, now: DateTime<Utc>) -> Value {
                 row.insert("duration_ms".to_string(), (*duration_ms).into());
             }
         }
-        ItemBody::Approval { approval_id, tool, summary, state, created_at } => {
+        ItemBody::Approval {
+            approval_id,
+            tool,
+            summary,
+            state,
+            created_at,
+            action_digest,
+            risk,
+            reversibility,
+            targets,
+        } => {
             let expired = *state == ApprovalState::Pending && approval_expired(*created_at, now);
             row.insert("kind".to_string(), "approval".into());
             row.insert("approval_id".to_string(), approval_id.as_str().into());
             row.insert("tool".to_string(), tool.clone().into());
             row.insert("summary".to_string(), summary.clone().into());
+            // What the person is being asked to agree to, carried to the card
+            // rather than left in the log: the risk, whether it can be taken
+            // back, and everything it would touch — paths, the command line,
+            // origins, and named data stores. Absent on a request written
+            // before B4 raised them. (CONTRACT.md §7 #178)
+            if let Some(digest) = action_digest {
+                row.insert("action_digest".to_string(), digest.clone().into());
+            }
+            if let Some(risk) = risk {
+                row.insert("risk".to_string(), risk.as_str().into());
+            }
+            if let Some(reversibility) = reversibility {
+                row.insert("reversibility".to_string(), reversibility_name(*reversibility).into());
+            }
+            if !targets.is_empty()
+                && let Ok(value) = serde_json::to_value(targets)
+            {
+                row.insert("targets".to_string(), value);
+            }
             row.insert(
                 "state".to_string(),
                 if expired { "expired" } else { approval_state(*state) }.into(),
@@ -647,6 +733,19 @@ fn action_status(status: ActionStatus) -> &'static str {
         ActionStatus::Refused => "refused",
         ActionStatus::Waiting => "waiting",
         ActionStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Whether a card says the action can be taken back.
+///
+/// The risk word is the log's own ([`RiskLevel::as_str`]); this one is derived
+/// here because the vocabulary is the card's, not the ledger's — the page
+/// translates all three to a sentence either way.
+fn reversibility_name(reversibility: Reversibility) -> &'static str {
+    match reversibility {
+        Reversibility::Reversible => "reversible",
+        Reversibility::Compensatable => "compensatable",
+        Reversibility::Irreversible => "irreversible",
     }
 }
 

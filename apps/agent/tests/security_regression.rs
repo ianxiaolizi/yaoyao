@@ -12,6 +12,12 @@
 //! | a dangerous call ⇒ ask | `a_dangerous_call_stops_the_turn_for_an_answer` |
 //! | a denied approval ⇒ never execute | `a_denied_call_never_touches_the_world` |
 //! | the UI/model is not the source of truth | `state_comes_from_the_log_not_from_a_claim` |
+//! | the model cannot answer its own question | `an_approval_issued_by_a_tool_child_is_refused` |
+//!
+//! The last row is B4's, and it is not one of the six: a person approves a
+//! concrete action, and a process a model can start — a tool child, which is a
+//! process with pipes and no terminal — cannot produce that answer, whatever it
+//! is handed.
 //!
 //! These tests do not replace the deeper ones. `policy.rs`, `guarded.rs`,
 //! `resource_guard.rs`, `resume.rs` and `m5_acceptance.rs` each prove one layer
@@ -33,6 +39,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "support/claimed_isolation.rs"]
+mod claimed_isolation;
+
 use agent::providers::SelectedProvider;
 use agent::stack::{self, Decisions};
 use agent_config::{Layers, ResolvedProfile};
@@ -44,20 +53,23 @@ use agent_model_openai::{
     TransportResponse, to_wire_name,
 };
 use agent_ports::agent_loop::StopReason;
+use agent_ports::decision::FastDecisionProvider;
 use agent_ports::event_store::EventStore;
 use agent_ports::execution_environment::SandboxMode;
 use agent_ports::model_router::{ModelRoute, ModelTier};
+use agent_ports::security_reviewer::SecurityReviewer;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::{
     ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
     ToolSource,
 };
+use agent_protocol::decision::DecisionValue;
 use agent_protocol::events::{Actor, EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, PluginId, SessionId};
 use agent_protocol::inbox::InboxKind;
-use agent_protocol::permissions::{ApprovalStatus, Capability, CapabilitySet};
+use agent_protocol::permissions::{ApprovalScope, ApprovalStatus, Capability, CapabilitySet};
 use agent_protocol::plugin::{PluginCapabilities, PluginContributions, PluginManifest};
-use agent_testkit::FixedSecret;
+use agent_testkit::{FakeDecisionBehaviour, FakeDecisionProvider, FixedSecret};
 use chrono::Utc;
 use tempfile::TempDir;
 
@@ -180,29 +192,74 @@ struct Process {
 
 /// Assemble a process the way the binary does, over a scripted model.
 async fn process(workspace: &Path, data_dir: &Path, script: Vec<String>) -> Process {
+    process_in(SESSION, workspace, data_dir, script).await
+}
+
+/// The same, in a named session — two processes over one data directory is how
+/// the test that needs a second session says so.
+async fn process_in(
+    session: &str,
+    workspace: &Path,
+    data_dir: &Path,
+    script: Vec<String>,
+) -> Process {
     let transport = Arc::new(ScriptedTransport::new(script));
-    let stack = stack::assemble(stack::Inputs {
-        session: SessionId::from_string(SESSION),
+    let stack = stack::assemble_over(
+        // Supplied below rather than built from the mode: these runs are about
+        // the policy and approval boundary, and the dangerous call they make is
+        // `shell.run`. On the default `local` backend the isolation floor
+        // refuses it before any policy or person is asked (CONTRACT §7 #179),
+        // which is `a_dangerous_call_is_refused_before_anyone_is_asked`'s case.
+        // Here the machine is said to confine the run.
+        inputs(session, workspace, data_dir, transport.clone(), SandboxMode::WorkspaceSandbox),
+        agent::subagents::Delegation::Background,
+        claimed_isolation::isolating(workspace),
+    )
+    .await
+    .expect("the assembly the binary runs");
+
+    Process { stack, transport, session: SessionId::from_string(session) }
+}
+
+/// The same run over the backend the host selects when it selects nothing.
+async fn process_local(workspace: &Path, data_dir: &Path, script: Vec<String>) -> Process {
+    let transport = Arc::new(ScriptedTransport::new(script));
+    let stack = stack::assemble(inputs(
+        SESSION,
+        workspace,
+        data_dir,
+        transport.clone(),
+        SandboxMode::LocalProcess,
+    ))
+    .await
+    .expect("the assembly the binary runs");
+
+    Process { stack, transport, session: SessionId::from_string(SESSION) }
+}
+
+/// The inputs every process above is assembled from.
+fn inputs(
+    session: &str,
+    workspace: &Path,
+    data_dir: &Path,
+    transport: Arc<ScriptedTransport>,
+    sandbox: SandboxMode,
+) -> stack::Inputs {
+    stack::Inputs {
+        session: SessionId::from_string(session),
         workspace_root: workspace.to_path_buf(),
         data_dir: data_dir.to_path_buf(),
         resolved: default_profile(),
-        model: Some(SelectedProvider {
-            provider: scripted_provider(transport.clone()),
-            route: route(),
-        }),
+        model: Some(SelectedProvider { provider: scripted_provider(transport), route: route() }),
         decisions: Decisions::FromConfiguration,
-        sandbox: SandboxMode::LocalProcess,
+        sandbox,
         network_allowed: false,
         // These runs are about the policy and approval boundary, and their
         // model scripts are fixed sequences counted in calls. The thinking
         // pipeline would hold the first irreversible call for a branch record
         // the scripts were never written to produce.
         judgment: false,
-    })
-    .await
-    .expect("the assembly the binary runs");
-
-    Process { stack, transport, session: SessionId::from_string(SESSION) }
+    }
 }
 
 impl Process {
@@ -685,6 +742,56 @@ async fn a_dangerous_call_stops_the_turn_for_an_answer() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. a dangerous call on a backend that cannot confine it ⇒ refused, no ask
+// ---------------------------------------------------------------------------
+
+/// On the default (`local`) backend the same call never becomes a question.
+///
+/// A person's "yes" is an answer about a call, not a boundary around what the
+/// command does; running it as the user and calling that approved would be the
+/// downgrade the isolation floor exists to refuse (CONTRACT §7 #179). The turn
+/// therefore reads a failed call, no approval is raised, and the world is
+/// unchanged.
+#[tokio::test]
+async fn a_dangerous_call_is_refused_before_anyone_is_asked() {
+    let (workspace, data) = dirs();
+    let process = process_local(
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": MARKER_COMMAND }),
+            ),
+            answer_body("cannot run that here"),
+        ],
+    )
+    .await;
+
+    let report = process.ask("run the command").await;
+    assert_eq!(
+        report.stop_reason,
+        StopReason::FinalAnswer,
+        "a refusal is an answer the turn can read, not a stop for input"
+    );
+
+    assert!(
+        process.stack.approvals.pending(&process.session).await.expect("pending").is_empty(),
+        "nothing may be asked: the answer could not make the call safe"
+    );
+    let failures = process.tool_events(EventType::TOOL_FAILED, "shell.run").await;
+    assert_eq!(failures.len(), 1, "the call is recorded as failed");
+    let recorded = serde_json::to_string(&failures[0].event.payload).unwrap_or_default();
+    assert!(recorded.contains("app-container"), "the refusal names the fix: {recorded}");
+    assert!(
+        process.tool_events(EventType::TOOL_COMPLETED, "shell.run").await.is_empty(),
+        "and it is not a completed one"
+    );
+    assert!(!workspace.path().join("marker.txt").exists(), "the world is unchanged");
+}
+
+// ---------------------------------------------------------------------------
 // 5. a denied approval ⇒ never execute
 // ---------------------------------------------------------------------------
 
@@ -829,6 +936,122 @@ async fn state_comes_from_the_log_not_from_a_claim() {
     assert_eq!(rebuilt.count(EventType::APPROVAL_GRANTED).await, 0);
 }
 
+// ---------------------------------------------------------------------------
+// 7. the model cannot answer its own question
+// ---------------------------------------------------------------------------
+
+/// A child process is what a model can put on a machine, and a child process
+/// has pipes for stdio. The verb that answers a question refuses one — so a
+/// person saying yes to a *command* never becomes a model saying yes to
+/// everything else.
+///
+/// Two sessions over one data directory, which is the whole point: one holds a
+/// question nobody has answered, the other is where a command runs. The person
+/// approves that command — once — and what the command tries to do is answer the
+/// other session's question, with everything a child could need in hand: the
+/// product's own verb, the live approval id, the session it is pending in, and
+/// the data directory the answer would go into.
+///
+/// The file the child writes is its own stderr, so the assertion reads what the
+/// refused process said about itself rather than what the test believes about
+/// it. (B4, plan threshold 3.)
+#[tokio::test]
+async fn an_approval_issued_by_a_tool_child_is_refused() {
+    let (workspace, data) = dirs();
+
+    // The session with the unanswered question: a command that has not run.
+    let waiting = process(
+        workspace.path(),
+        data.path(),
+        vec![tool_call_body(
+            "call_waiting",
+            &to_wire_name("shell.run"),
+            serde_json::json!({ "command": MARKER_COMMAND }),
+        )],
+    )
+    .await;
+    let stopped = waiting.ask("run that command").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput);
+    let pending = waiting.stack.approvals.pending(&waiting.session).await.expect("pending");
+    assert_eq!(pending.len(), 1, "one call is waiting for a person");
+    let approval_id = pending[0].approval_id.clone();
+
+    // The command a person approves, in another session: the product's own verb
+    // answering that question.
+    let command = format!(
+        "set \"AGENT_DATA_DIR={}\"&& set \"AGENT_WORKSPACE_DIR={}\"&&          \"{}\" approve {approval_id} always --session {SESSION} > refusal.txt 2>&1",
+        data.path().display(),
+        workspace.path().display(),
+        env!("CARGO_BIN_EXE_agent"),
+    );
+    let spawner = process_in(
+        "security-regression-child",
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": command }),
+            ),
+            answer_body("I could not approve it myself"),
+        ],
+    )
+    .await;
+    let stopped = spawner.ask("run the command").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput, "a command asks once");
+    let own = spawner.stack.approvals.pending(&spawner.session).await.expect("pending");
+    let shell = own[0].approval_id.clone();
+
+    // The person answers the command itself, and only that.
+    spawner
+        .stack
+        .approvals
+        .grant(
+            &spawner.session,
+            &shell,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
+        .await
+        .expect("grant");
+    let ran = spawner.stack.resume.resume(&spawner.session, "go ahead").await.expect("resume");
+    assert!(
+        matches!(ran, ResumeOutcome::Settled { disposition: Disposition::Ran { .. }, .. }),
+        "the approved command ran: {ran:?}"
+    );
+
+    // It ran, was handed everything it needed except a terminal, and said so in
+    // its own words.
+    let refusal = std::fs::read_to_string(workspace.path().join("refusal.txt"))
+        .expect("the child wrote what it was told");
+    assert!(
+        refusal.contains("interactive terminal"),
+        "the child was refused for having no terminal: {refusal}"
+    );
+    assert!(
+        !refusal.contains("no such approval") && !refusal.contains("not found"),
+        "the id was real, so the refusal is not about the door it knocked on: {refusal}"
+    );
+
+    // And the other session's question is still the person's to answer: no grant
+    // names it, and it is still pending.
+    assert_eq!(
+        waiting.count(EventType::APPROVAL_GRANTED).await,
+        0,
+        "a child's answer is not a decision"
+    );
+    let still = waiting.stack.approvals.pending(&waiting.session).await.expect("pending");
+    assert_eq!(still.len(), 1, "the call is still waiting");
+    assert_eq!(still[0].approval_id, approval_id);
+    assert_eq!(still[0].status, ApprovalStatus::Pending);
+    assert!(
+        !workspace.path().join("marker.txt").exists(),
+        "and the command it was about never ran either"
+    );
+}
+
 /// A fresh assembly with no model: this test only reads and recovers.
 ///
 /// `stack::Inputs.model` is optional, which is exactly the "there is no endpoint
@@ -850,4 +1073,255 @@ async fn process_without_model(workspace: &Path, data_dir: &Path) -> Process {
     .expect("the assembly the binary runs");
 
     Process { stack, transport, session: SessionId::from_string(SESSION) }
+}
+
+#[tokio::test]
+async fn assembly_refuses_a_network_entry_that_is_not_an_origin() {
+    // A typo in `[network] allow` must stop the run at start, not leave a
+    // call refused later with the person believing the site was authorized
+    // (CONTRACT §7 #180). Nothing here reaches the model: the assembly is what
+    // refuses.
+    let (workspace, data) = dirs();
+    let transport = Arc::new(ScriptedTransport::new(Vec::new()));
+    let mut assembled =
+        inputs(SESSION, workspace.path(), data.path(), transport, SandboxMode::WorkspaceSandbox);
+    // An absent `[network]` section is the shipped posture: no origin at all.
+    assert!(assembled.resolved.network_allow.is_empty());
+    // A path, not an origin — the shape the guard cannot compare per hop.
+    assembled.resolved.network_allow = vec!["https://docs.rs/serde".to_string()];
+
+    let error = match stack::assemble(assembled).await {
+        Ok(_) => panic!("an entry the tool cannot honor must stop the run at start"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, stack::StackError::NetworkAllowlist(_)), "{error:?}");
+    assert!(error.to_string().contains("not an origin"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// 7. a high-risk task is reviewed, and the assembly carries the reviewer
+// ---------------------------------------------------------------------------
+
+/// A reviewer over the real adapter, answering what `verdict` says.
+///
+/// The backend is a scripted decision provider, so the path under test is the
+/// one production takes: pack, broker, timeout, contract parse, evidence.
+fn reviewer(
+    verdict: &str,
+    confidence: f64,
+    findings: serde_json::Value,
+) -> Arc<dyn SecurityReviewer> {
+    let backend = Arc::new(
+        FakeDecisionProvider::new(
+            "stub",
+            FakeDecisionBehaviour::Answer(vec![(
+                agent_protocol::security_review::QUESTION_ID.to_string(),
+                DecisionValue::Structured {
+                    value: serde_json::json!({
+                        "verdict": verdict,
+                        "confidence": confidence,
+                        "findings": findings,
+                    }),
+                },
+            )]),
+        )
+        .with_revision("rev-1"),
+    );
+    agent_decision::security_reviewer::reviewer_for(Some(backend as Arc<dyn FastDecisionProvider>))
+        .expect("a backend was given")
+}
+
+/// The product's assembly, with a supplied reviewer in place of the sidecar
+/// one configuration would build.
+async fn reviewing_process(
+    workspace: &Path,
+    data_dir: &Path,
+    script: Vec<String>,
+    reviewer: Arc<dyn SecurityReviewer>,
+) -> Process {
+    let transport = Arc::new(ScriptedTransport::new(script));
+    let mut assembled =
+        inputs(SESSION, workspace, data_dir, transport.clone(), SandboxMode::WorkspaceSandbox);
+    assembled.decisions = Decisions::Reviewing(reviewer);
+    let stack = stack::assemble_over(
+        assembled,
+        agent::subagents::Delegation::Background,
+        claimed_isolation::isolating(workspace),
+    )
+    .await
+    .expect("the assembly the binary runs");
+    Process { stack, transport, session: SessionId::from_string(SESSION) }
+}
+
+/// A high-risk call the person approves, and the turn that follows it.
+///
+/// Returns the report of the continuation turn — the one that ends with the
+/// model's answer and is therefore the one a review is taken at the end of.
+async fn approved_dangerous_call(process: &Process, answer: &str) -> RunReport {
+    let stopped = process.ask("write the marker").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput, "the L3 call asks first");
+    let pending = process.stack.approvals.pending(&process.session).await.expect("pending");
+    assert_eq!(pending.len(), 1, "one call is waiting");
+    process
+        .stack
+        .approvals
+        .grant(
+            &process.session,
+            &pending[0].approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
+        .await
+        .expect("grant");
+    let resumed = process.stack.resume.resume(&process.session, "go ahead").await.expect("resume");
+    assert!(matches!(resumed, ResumeOutcome::Settled { .. }), "the approved call ran: {resumed:?}");
+    let report = process
+        .stack
+        .scheduler
+        .run_pending(&process.session, Utc::now())
+        .await
+        .expect("run the continuation")
+        .expect("the continuation ran");
+    assert_eq!(
+        report.stop_reason,
+        StopReason::FinalAnswer,
+        "the model answered; the review is what decides delivery: {}",
+        answer
+    );
+    report
+}
+
+/// The security-review evidence in the log, oldest first.
+async fn reviews(process: &Process) -> Vec<agent_protocol::evidence::Evidence> {
+    process
+        .log()
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.event.event_type.as_str() == EventType::VERIFICATION_RECORDED
+                && e.event.payload["kind"] == "security_review"
+        })
+        .map(|e| serde_json::from_value(e.event.payload).expect("the payload is evidence"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_security_review_pass_records_model_and_context_hash() {
+    let (workspace, data) = dirs();
+    let process = reviewing_process(
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": MARKER_COMMAND }),
+            ),
+            answer_body("the marker is written"),
+        ],
+        reviewer("pass", 0.95, serde_json::json!([])),
+    )
+    .await;
+
+    approved_dangerous_call(&process, "the marker is written").await;
+
+    let reviews = reviews(&process).await;
+    assert_eq!(reviews.len(), 1, "one review of the work the turn left behind");
+    let review = &reviews[0];
+    assert_eq!(review.status, agent_protocol::evidence::EvidenceStatus::Passed);
+    assert_eq!(review.kind, agent_protocol::evidence::EvidenceKind::SecurityReview);
+    assert_eq!(review.verifier_identity, "security_reviewer:stub");
+    assert_eq!(review.verifier_model.as_deref(), Some("stub"));
+    assert!(
+        review.verifier_context_hash.as_deref().is_some_and(|hash| !hash.is_empty()),
+        "the record says which input was reviewed: {review:?}"
+    );
+    assert_eq!(review.authorization_source, "profile.security");
+    assert_eq!(
+        process.count(EventType::SECURITY_REVIEW_FAILED).await,
+        0,
+        "a pass is not a refusal"
+    );
+    assert!(workspace.path().join("marker.txt").exists(), "the approved command ran");
+}
+
+#[tokio::test]
+async fn a_security_review_failure_blocks_delivery() {
+    let (workspace, data) = dirs();
+    let process = reviewing_process(
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": MARKER_COMMAND }),
+            ),
+            answer_body("all done"),
+        ],
+        reviewer(
+            "fail",
+            0.95,
+            serde_json::json!([{
+                "severity": "high",
+                "category": "unreviewed_change",
+                "summary": "the command wrote a file nobody asked for",
+            }]),
+        ),
+    )
+    .await;
+
+    // The turn itself ends normally — the model answered and the loop had
+    // nothing left to do. What the scheduler writes afterwards withholds it.
+    let stopped = process.ask("write the marker").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput);
+    let pending = process.stack.approvals.pending(&process.session).await.expect("pending");
+    process
+        .stack
+        .approvals
+        .grant(
+            &process.session,
+            &pending[0].approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
+        .await
+        .expect("grant");
+    process.stack.resume.resume(&process.session, "go ahead").await.expect("resume");
+    let report = process
+        .stack
+        .scheduler
+        .run_pending(&process.session, Utc::now())
+        .await
+        .expect("run the continuation")
+        .expect("the continuation ran");
+
+    assert_eq!(
+        report.stop_reason,
+        StopReason::SecurityBlocked,
+        "the answer is not handed over as a delivered result"
+    );
+
+    let terminal = process
+        .log()
+        .await
+        .into_iter()
+        .rfind(|e| e.event.event_type.as_str() == EventType::TURN_COMPLETED)
+        .expect("the turn ended");
+    assert_eq!(terminal.event.payload["stop_reason"], "security_blocked");
+    assert_eq!(terminal.event.payload["incomplete"], true, "{}", terminal.event.payload);
+    assert!(
+        terminal.event.payload["security_review"]["check_id"].as_str().is_some(),
+        "the refusal names the record it came from: {}",
+        terminal.event.payload
+    );
+
+    let failed = process.count(EventType::SECURITY_REVIEW_FAILED).await;
+    assert_eq!(failed, 1, "one refusal, written once");
+    let reviews = reviews(&process).await;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, agent_protocol::evidence::EvidenceStatus::Failed);
 }

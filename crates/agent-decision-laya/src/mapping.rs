@@ -61,7 +61,11 @@ fn wire_kind(kind: DecisionKind) -> Option<&'static str> {
         DecisionKind::Categorical => Some("choice"),
         DecisionKind::Ordinal => Some("score"),
         DecisionKind::Binary => Some("noul"),
-        DecisionKind::Ranking => None,
+        // Laya answers one scalar per question. A structured answer (the
+        // intent-adjudication family) is a record, which this sidecar has no
+        // primitive for — refused by name rather than flattened into a choice
+        // the kernel would then misread.
+        DecisionKind::Ranking | DecisionKind::Structured => None,
     }
 }
 
@@ -97,9 +101,9 @@ pub(crate) fn questions_of(
     for question in &pack.questions {
         let Some(kind) = wire_kind(question.kind) else {
             return Err(DecisionError::Payload(format!(
-                "question '{}' is a ranking, which this backend has no primitive for; Laya \
+                "question '{}' is {:?}, which this backend has no primitive for; Laya \
                  answers choice, score, and noul only",
-                question.question_id
+                question.question_id, question.kind
             )));
         };
 
@@ -130,7 +134,9 @@ pub(crate) fn questions_of(
             // sides to false/true. Sending an empty object is not the same as
             // sending nothing, so nothing is sent.
             DecisionKind::Binary => None,
-            DecisionKind::Ranking => unreachable!("refused above"),
+            DecisionKind::Ranking | DecisionKind::Structured => {
+                unreachable!("refused above")
+            }
         };
 
         let wire = WireQuestion { kind, instructions: question.prompt.clone(), criteria };
@@ -356,7 +362,27 @@ mod tests {
         );
         let error = questions_of(&pack, &DEFAULT_ORDINAL_LEVELS).unwrap_err();
         assert_eq!(error.kind(), "payload");
-        assert!(error.to_string().contains("ranking"), "{error}");
+        assert!(error.to_string().contains("Ranking"), "{error}");
+    }
+
+    #[test]
+    fn a_structured_question_is_refused_by_name_rather_than_flattened() {
+        // The intent-adjudication family asks for a record; this sidecar answers
+        // one scalar per question. Refusing says so; flattening a record into a
+        // choice would hand the kernel an answer it would misread.
+        let pack = QuestionPack::new(
+            DecisionFamily::new("intent_adjudication"),
+            "v1",
+            vec![DecisionQuestion {
+                question_id: "relation".to_string(),
+                kind: DecisionKind::Structured,
+                prompt: "What does this message ask?".to_string(),
+                options: Vec::new(),
+            }],
+        );
+        let error = questions_of(&pack, &DEFAULT_ORDINAL_LEVELS).unwrap_err();
+        assert_eq!(error.kind(), "payload");
+        assert!(error.to_string().contains("Structured"), "{error}");
     }
 
     #[test]

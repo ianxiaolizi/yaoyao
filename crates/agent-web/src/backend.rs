@@ -14,6 +14,7 @@
 //! joins the same run, and a connection that is gone costs nothing but a failed
 //! `send`.
 
+use agent_kernel::approval::ApprovalAuthority;
 use agent_kernel::model_selection::ModelChoice;
 use agent_protocol::ids::SessionId;
 use serde::{Deserialize, Serialize};
@@ -151,11 +152,17 @@ pub trait Backend: Send + Sync {
     ) -> Result<(), BackendError>;
 
     /// Record a decision and carry the yielded turn forward.
+    ///
+    /// `authority` is what the request proved before it got here: the loopback
+    /// token, held only by the authenticated GUI handler. The backend does not
+    /// judge it — it passes it on as the attestation the approval service
+    /// records (B4).
     async fn settle_approval(
         &self,
         session: &SessionId,
         approval_id: &str,
         decision: Decision,
+        authority: &ApprovalAuthority,
         live: &LiveSink,
     ) -> Result<(), BackendError>;
 

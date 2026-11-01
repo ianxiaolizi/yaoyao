@@ -68,8 +68,14 @@ pub enum ToolGatewayError {
     /// is the same message for an administrator's managed deny, a rule
     /// somebody wrote, and a capability this build's sandbox does not have, and
     /// those are three different places to fix.
+    ///
+    /// The record is boxed because this enum is returned by value from every
+    /// fallible step between the caller and the tool, and the record is the
+    /// only large thing any of them carries. Boxing it keeps the refusal cheap
+    /// to pass around without taking the record apart, which `clippy` would
+    /// otherwise have this enum's every caller pay for.
     #[error("policy denied tool '{tool}': {reason}")]
-    PolicyDenied { tool: String, reason: String, policy: ToolPolicyRecord },
+    PolicyDenied { tool: String, reason: String, policy: Box<ToolPolicyRecord> },
     #[error("approval pending for tool '{tool}': {approval_id}")]
     ApprovalPending { tool: String, approval_id: String },
     #[error("resource boundary violation for tool '{tool}': {reason}")]
@@ -117,6 +123,23 @@ pub enum ToolGatewayError {
     /// is what says whether the tool ran and failed or never started — the
     /// difference between exit 1 and exit 2 (C3.1). The provider error already
     /// names the tool, so nothing is lost by not repeating it here.
+    /// The decision ledger could not be written, so the call was not made.
+    ///
+    /// Fail-closed, and deliberately a refusal rather than a warning: a chain
+    /// whose audit is "usually written" is a chain whose audit a caller can
+    /// avoid by making the write fail. The call did not run and the tool never
+    /// saw it; what is missing is the record of why.
+    #[error("tool '{tool}' was not run: its permission decision could not be recorded: {reason}")]
+    PermissionAudit { tool: String, reason: String },
+    /// The recovery point this call needed could not be taken, so the call did
+    /// not run.
+    ///
+    /// A refusal rather than a warning: the alternative — running a write with
+    /// no way back — is the state this gate exists to make unreachable. The
+    /// reason carries the snapshotter's own answer (over budget, a reparse
+    /// point, an unwritable store), which is what a caller has to change.
+    #[error("tool '{tool}' was not run: no recovery point could be taken: {reason}")]
+    SnapshotRefused { tool: String, reason: String },
     #[error("tool execution failed: {0}")]
     Tool(ToolProviderError),
     #[error("approval service failed: {0}")]
@@ -139,8 +162,16 @@ impl ToolGatewayError {
             Self::InvalidArguments { .. } => Some(ToolErrorKind::InvalidArguments),
             Self::InvalidSchema { .. } => Some(ToolErrorKind::Protocol),
             Self::SecretUnavailable { kind, .. } => Some(*kind),
+            // Nothing behind the tool was reached: the recovery point it needed
+            // could not be taken. That is an unavailable dependency, not a
+            // judgement about the call.
+            Self::SnapshotRefused { .. } => Some(ToolErrorKind::Unavailable),
             Self::Tool(error) => Some(error.kind()),
-            Self::ApprovalPending { .. } | Self::Approval(_) => None,
+            // Not a class of refusal the world gave: the gate could not write
+            // its own record. `None` leaves `error_kind` off the event, which
+            // is honest — the sentence says what happened, and no word in
+            // `ToolErrorKind` claims a policy refused this call.
+            Self::PermissionAudit { .. } | Self::ApprovalPending { .. } | Self::Approval(_) => None,
         }
     }
 }

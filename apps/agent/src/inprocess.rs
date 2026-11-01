@@ -483,6 +483,17 @@ pub(crate) fn describe_report(
             ),
             side_effects: Vec::new(),
         },
+        // A child turn runs read-only (CONTRACT §7 #133), so it cannot run the
+        // L2/L3 action a review is about and has nothing that reaches this arm.
+        // If a child ever did, the answer would still not be one this parent may
+        // pass on: an unaccepted review is a withheld result, in a child exactly
+        // as in a turn.
+        StopReason::SecurityBlocked => SubagentOutcome::Failed {
+            message: "the child's answer was withheld: the independent security review of its \
+                      actions did not pass"
+                .to_string(),
+            side_effects: Vec::new(),
+        },
         StopReason::UserCancelled => SubagentOutcome::Cancelled,
         StopReason::FatalError => {
             let mut message = "the child's attempt failed".to_string();
@@ -732,15 +743,22 @@ mod tests {
             other => panic!("a child held to one step did not answer: {other:?}"),
         }
         let stored = store.read_stream(&child(), EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = stored
+        // A child held to its step budget parked, it did not complete: the
+        // parent is told the limit, and the log says the same thing
+        // (CONTRACT §7 #173).
+        let yielded = stored
             .iter()
-            .find(|event| event.event.event_type.as_str() == "turn/completed")
-            .expect("the turn ended");
+            .find(|event| event.event.event_type.as_str() == "turn/yielded")
+            .expect("the turn yielded");
         assert_eq!(
-            completed.event.payload.pointer("/budget/steps").and_then(|v| v.as_u64()),
+            yielded.event.payload.pointer("/budget/steps").and_then(|v| v.as_u64()),
             Some(1),
             "the child's terminal event says what it was held to: {}",
-            completed.event.payload
+            yielded.event.payload
+        );
+        assert!(
+            stored.iter().any(|event| event.event.event_type.as_str() == "budget/parked"),
+            "the pause is recorded for the child too"
         );
     }
 
@@ -815,6 +833,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         let outcome = ended(Ok(Some(report)), &child(), Some(Asked::Cancelled), DEFAULT_CEILING);
@@ -836,6 +855,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         assert_eq!(
@@ -873,6 +893,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         match describe_report(&report, &child()) {

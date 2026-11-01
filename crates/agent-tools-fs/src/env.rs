@@ -68,7 +68,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// The exit code reported for a command killed at its deadline, matching
 /// `timeout(1)` so the convention is not something a reader has to learn here.
-const TIMEOUT_EXIT_CODE: i32 = 124;
+pub(crate) const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// Directories a write may not create or modify, relative to the workspace
 /// root. Lower-cased and compared component-wise; on a case-insensitive

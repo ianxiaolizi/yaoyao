@@ -8,11 +8,13 @@ pub mod context;
 pub mod memory;
 pub mod reason;
 pub mod schedule;
+pub mod verify;
 
-use agent_kernel::approval::ApprovalService;
+use agent_kernel::approval::{ApprovalAuthority, ApprovalService};
 use agent_kernel::doctor::KernelDoctor;
 use agent_kernel::fork::{Fork, ForkOutcome};
 use agent_kernel::inbox::Inbox;
+use agent_kernel::permission::{PermissionService, WorkspaceRecord};
 use agent_kernel::recovery::RecoveryReport;
 use agent_kernel::resume::{Disposition, Resume, ResumeOutcome};
 use agent_kernel::scheduler::{RunReport, Scheduler};
@@ -21,12 +23,14 @@ use agent_ports::artifact_store::{ArtifactStore, ArtifactStoreError};
 use agent_ports::event_store::EventStore;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolInvocation;
+use agent_ports::workspace_snapshot::WorkspaceSnapshotter;
 use agent_protocol::diagnostics::HealthStatus;
 use agent_protocol::events::{EventType, StoredEvent};
-use agent_protocol::ids::{EventSeq, SchemaVersion, SessionId, TurnId};
+use agent_protocol::ids::{EventSeq, IntentId, SchemaVersion, SessionId, TurnId};
 use agent_protocol::permissions::{ApprovalScope, ArtifactRef};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::ToolStatus;
+use agent_protocol::workspace_snapshot::RollbackReport;
 use chrono::{DateTime, Utc};
 
 /// The one shape a rendered `--json` answer has.
@@ -72,6 +76,7 @@ mod shape {
 }
 
 pub use shape::{JsonDoc, json_output};
+pub use verify::run_verify;
 
 /// Run a CLI command and return output.
 #[derive(Debug)]
@@ -310,21 +315,30 @@ pub async fn run_ask(
 
     match started {
         commands::TurnStart::Ran(r) => {
+            // What this answer is an answer *to*, and whether it is still the
+            // session's newest instruction. The second half is the 2026-11-01
+            // rule stated as a display decision: an answer whose request has
+            // since been overtaken is printed, with the fact that it is older
+            // stated beside it (CONTRACT §7 #160).
+            let stale = stale_note(scheduler, session_id, r.intent_id.as_ref()).await;
             let output = if json {
                 let value = serde_json::json!({
                     "run_id": r.run_id.as_str(),
                     "turn_id": r.turn_id.as_str(),
                     "stop_reason": r.stop_reason,
                     "final_content": r.final_content,
+                    "intent_id": r.intent_id.as_ref().map(|id| id.as_str()),
+                    "stale": stale.is_some(),
                 });
                 CliOutput::Json(json_output(&value)?)
             } else if halted(&r.stop_reason) {
-                CliOutput::Text(stopped_text(&r))
+                CliOutput::Text(with_note(stopped_text(&r), stale.as_deref()))
             } else {
-                match r.final_content {
-                    Some(content) => CliOutput::Text(content),
-                    None => CliOutput::Text(format!("[turn ended: {:?}]", r.stop_reason)),
-                }
+                let text = match r.final_content {
+                    Some(content) => content,
+                    None => format!("[turn ended: {:?}]", r.stop_reason),
+                };
+                CliOutput::Text(with_note(text, stale.as_deref()))
             };
             // A halted response is not an answer: the provider cut the model off
             // at the run's output limit, or withheld what it wrote. What is on
@@ -346,6 +360,72 @@ pub async fn run_ask(
                 "no run: a run is already active or there is no pending input".to_string(),
             )
         })),
+        // A stop is not a turn: nothing was asked of the model. Whether it
+        // *did* something decides the exit code, the same way `interrupt`
+        // answers a session with nothing in flight (CONTRACT §7 #6).
+        commands::TurnStart::Stopped(receipt) => {
+            let stopped = receipt.stopped_anything();
+            let output = if json {
+                let value = serde_json::json!({
+                    "outcome": "stopped",
+                    "withdrawn": receipt.withdrawn.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                    "cancelled_intents":
+                        receipt.cancelled.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                    "interrupt": receipt.interrupt.as_ref().map(|id| id.as_str()),
+                });
+                CliOutput::Json(json_output(&value)?)
+            } else if !stopped {
+                CliOutput::Text(
+                    "nothing to stop: no run is in flight and no instruction is queued".to_string(),
+                )
+            } else {
+                let mut lines = vec![format!(
+                    "stopped: withdrew {} queued instruction(s)",
+                    receipt.withdrawn.len()
+                )];
+                if let Some(item) = &receipt.interrupt {
+                    lines.push(format!(
+                        "the run will stop at the next step boundary (item {})",
+                        item.as_str()
+                    ));
+                }
+                CliOutput::Text(lines.join("\n"))
+            };
+            Ok(if stopped { CliOutcome::ok(output) } else { CliOutcome::did_not_run(output) })
+        }
+    }
+}
+
+/// The sentence that marks an answer as older than the session's newest
+/// instruction, or `None` when the answer is the current one.
+///
+/// Only an instruction that still stands can make an answer stale: one that was
+/// superseded, withdrawn, or already discharged is not owed an answer, so an
+/// older answer is not standing in for it.
+async fn stale_note(
+    scheduler: &Scheduler,
+    session_id: &SessionId,
+    answered: Option<&IntentId>,
+) -> Option<String> {
+    let latest = scheduler.intents().latest(session_id).await.ok().flatten()?;
+    if latest.status != agent_protocol::intent::IntentStatus::Active {
+        return None;
+    }
+    if answered == Some(&latest.intent_id) {
+        return None;
+    }
+    Some(format!(
+        "[stale answer: it belongs to intent {}; the newest instruction {} has not run yet]",
+        answered.map_or("(none)".to_string(), |id| id.as_str().to_string()),
+        latest.intent_id.as_str()
+    ))
+}
+
+/// Append a note to a body of text, on its own line.
+fn with_note(text: String, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("{text}\n\n{note}"),
+        None => text,
     }
 }
 
@@ -448,6 +528,10 @@ pub(crate) fn halted(reason: &StopReason) -> bool {
             | StopReason::WallClockExceeded
             | StopReason::TokenBudgetExceeded
             | StopReason::Stalled
+            // Not an answer either: the work was done, the review of it refused,
+            // and handing the text over as a delivered result is the one thing
+            // that review exists to prevent (B9, CONTRACT §7 #183).
+            | StopReason::SecurityBlocked
     )
 }
 
@@ -464,6 +548,20 @@ pub(crate) fn stopped_text(report: &RunReport) -> String {
     match report.stop_reason {
         StopReason::MaxOutputTokens | StopReason::ContentFiltered => {
             halted_text(&report.stop_reason, report.final_content.as_deref())
+        }
+        // Not a limit and not a cut: the run finished and the answer was
+        // withheld. The advice a limit gets ("raise the budget") would be
+        // wrong here — the same task rerun asks the same reviewer the same
+        // question — so the notice names the record instead.
+        StopReason::SecurityBlocked => {
+            let notice = "withheld: the independent security review of this task's high-risk \
+                          actions did not pass. The text above is what the model said, not a \
+                          delivered result; `security/review.failed` in the session log says \
+                          which review and why";
+            match report.final_content.as_deref() {
+                Some(text) if !text.trim().is_empty() => format!("{text}\n\n[{notice}]"),
+                _ => format!("[{notice}]"),
+            }
         }
         _ => limit_text(report),
     }
@@ -642,6 +740,10 @@ pub async fn run_status(
     let open_run = report.open_run.as_ref().map(|id| id.as_str());
     let open_turn = report.open_turn.as_ref().map(|id| id.as_str());
     let open_step = report.open_step.as_ref().map(|id| id.as_str());
+    let latest_intent = report.latest_intent_id.as_ref().map(|id| id.as_str());
+    let answered_intent = report.answered_intent_id.as_ref().map(|id| id.as_str());
+    let active_intent = report.active_intent_id.as_ref().map(|id| id.as_str());
+    let pending_intents: Vec<&str> = report.pending_intents.iter().map(|id| id.as_str()).collect();
 
     if json {
         let value = serde_json::json!({
@@ -650,6 +752,20 @@ pub async fn run_status(
             "open_turn": open_turn,
             "open_step": open_step,
             "pending": report.pending,
+            "latest_intent_id": latest_intent,
+            "answered_intent_id": answered_intent,
+            "stale_answer": report.stale_answer,
+            "stale_items": report.stale_items.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            "intent_adjudication": report.intent_adjudication,
+            // The three axes and the completion they derive. Fields are only
+            // added here — a consumer that predates them reads the same session
+            // it always did (CONTRACT §6 C6.2).
+            "run_status": report.run_status,
+            "delivery_status": report.delivery_status,
+            "verification_status": report.verification_status,
+            "completion_status": report.completion_status,
+            "active_intent_id": active_intent,
+            "pending_intents": pending_intents,
         });
         Ok(CliOutput::Json(json_output(&value)?))
     } else {
@@ -658,8 +774,80 @@ pub async fn run_status(
         lines.push(format!("open turn: {}", open_turn.unwrap_or("none")));
         lines.push(format!("open step: {}", open_step.unwrap_or("none")));
         lines.push(format!("pending:   {}", report.pending));
+        lines.push(format!("intent:    {}", latest_intent.unwrap_or("none")));
+        lines.push(format!("answered:  {}", answered_intent.unwrap_or("none")));
+        // Execution, delivery and verification are separate lines because they
+        // are separate facts: a run can end without an answer, and an answer
+        // can arrive without anything having checked the work (CONTRACT §7
+        // #166).
+        lines.push(format!(
+            "execution:  {}",
+            report.run_status.map(|status| status.as_str()).unwrap_or("none")
+        ));
+        lines.push(format!("delivery:   {}", report.delivery_status.as_str()));
+        lines.push(format!("verify:     {}", report.verification_status.as_str()));
+        lines.push(format!(
+            "completion: {}",
+            report.completion_status.map(|status| status.as_str()).unwrap_or("-")
+        ));
+        if let Some(active) = active_intent {
+            lines.push(format!("standing:   {active}"));
+        }
+        if !pending_intents.is_empty() {
+            lines.push(format!("queued:     {}", pending_intents.join(", ")));
+        }
+        if report.stale_answer {
+            // The one line a person has to read before trusting the last
+            // answer: it was written for an instruction that is no longer the
+            // newest one.
+            lines.push(
+                "note:      the last answer belongs to an older instruction; the newest one has \
+                 not run yet"
+                    .to_string(),
+            );
+        }
+        if !report.stale_items.is_empty() {
+            // Queue entries that belong to instructions which no longer stand.
+            // A session this version wrote will not have any; an older log can.
+            lines.push(format!(
+                "note:      {} queued item(s) belong to instructions that no longer stand: {}",
+                report.stale_items.len(),
+                report.stale_items.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if let Some(adjudication) = &report.intent_adjudication {
+            lines.push(adjudication_line(adjudication));
+            if let Some(question) = &adjudication.question {
+                // The kernel's one question for a person. It is printed here
+                // rather than asked inline: `status` is read-only, and a
+                // question a command blocks on would be a new prompt surface.
+                lines.push(format!("question:  {question}"));
+            }
+        }
         Ok(CliOutput::Text(lines.join("\n")))
     }
+}
+
+/// One line describing the latest intent adjudication.
+///
+/// The relation and the confidence are the model's; the decision and the cause
+/// are the kernel's. Both are shown because the whole point of recording them
+/// apart is that a reader can tell which one went wrong.
+fn adjudication_line(status: &agent_kernel::intent_adjudication::AdjudicationStatus) -> String {
+    let mut line = format!("adjudicated: {}", status.decision.as_deref().unwrap_or("-"));
+    if let Some(relation) = &status.relation {
+        line.push_str(&format!(" (relation {relation}"));
+        if let Some(confidence) = status.confidence {
+            line.push_str(&format!(", confidence {confidence:.2}"));
+        }
+        line.push(')');
+    }
+    if let Some(cause) = &status.cause
+        && cause != "accepted"
+    {
+        line.push_str(&format!(" cause: {cause}"));
+    }
+    line
 }
 
 /// Execute the `approve` command: record a grant decision for a pending approval
@@ -670,19 +858,31 @@ pub async fn run_status(
 /// means when they answer a question with "always". A wakeup is enqueued for
 /// each approval that was settled, not just the one that was named — each is a
 /// decision the paused turn may be waiting on.
+///
+/// `authority` is what the caller had to prove before it could answer: an
+/// interactive terminal for a person at a prompt, the loopback token for the
+/// GUI. A process that can produce neither cannot approve anything (B4).
 pub async fn run_approve(
     approvals: &ApprovalService,
     inbox: &Inbox,
     session_id: &SessionId,
     approval_id: &str,
     scope: &str,
+    authority: &ApprovalAuthority,
     json: bool,
 ) -> Result<CliOutput, String> {
     let grant = commands::Grant::from_name(scope).map_err(|e| e.to_string())?;
-    let receipt =
-        commands::grant_approval(approvals, inbox, session_id, approval_id, grant, "user")
-            .await
-            .map_err(|e| e.to_string())?;
+    let receipt = commands::grant_approval(
+        approvals,
+        inbox,
+        session_id,
+        approval_id,
+        grant,
+        "user",
+        authority,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let replies = receipt.replies;
 
     let settled = replies.iter().map(|r| r.approval_id.as_str()).collect::<Vec<_>>();
@@ -1306,4 +1506,101 @@ fn scope_label(scope: ApprovalScope) -> &'static str {
         ApprovalScope::AllowForTurn => "turn",
         ApprovalScope::AllowForSession => "session",
     }
+}
+
+/// Restore the workspace to `snapshot_id`, and say what it did.
+///
+/// The restore itself is the snapshotter's; what lives here is the two things a
+/// command owes around it. First, the ledger: a rollback is a fact about this
+/// session — it changed the files a call under this session had changed — so it
+/// is written to the same stream as the snapshot it undoes, and a ledger that
+/// cannot take the write is a refused command rather than a silent one. Second,
+/// the report: restored, removed, skipped and what the snapshot never covered,
+/// because "restored 12" without the skips is a number a person cannot check.
+///
+/// A snapshot that is unknown, corrupt, or whose manifest names paths that
+/// escape the workspace is `DidNotRun` with the reason as its answer: the
+/// command could not put anything back, and saying which of those it was is the
+/// only useful thing it can do.
+pub async fn run_rollback(
+    snapshots: &dyn WorkspaceSnapshotter,
+    permissions: &PermissionService,
+    session: &SessionId,
+    snapshot_id: &str,
+    json: bool,
+) -> Result<CliOutcome, String> {
+    let report: RollbackReport = match snapshots.restore(snapshot_id).await {
+        Ok(report) => report,
+        Err(error) => {
+            let text = format!("cannot roll back: {error}");
+            return Ok(CliOutcome::did_not_run(if json {
+                CliOutput::Json(json_output(&serde_json::json!({
+                    "snapshot_id": snapshot_id,
+                    "rolled_back": false,
+                    "reason": error.to_string(),
+                }))?)
+            } else {
+                CliOutput::Text(text)
+            }));
+        }
+    };
+    permissions
+        .record_workspace(
+            session,
+            WorkspaceRecord {
+                event_type: EventType::WORKSPACE_ROLLBACK_COMPLETED,
+                payload: serde_json::to_value(&report).map_err(|e| e.to_string())?,
+                recorded_at: Utc::now(),
+            },
+        )
+        .await
+        .map_err(|e| format!("the rollback happened but could not be recorded: {e}"))?;
+
+    let output = if json {
+        CliOutput::Json(json_output(&serde_json::json!({
+            "snapshot_id": report.snapshot_id.to_string(),
+            "restored": report.restored,
+            "removed": report.removed,
+            "skipped": report.skipped,
+            "unrecoverable_scope": report.unrecoverable_scope,
+            "complete": report.complete,
+        }))?)
+    } else {
+        let mut text = format!(
+            "restored {}, removed {}, skipped {}",
+            report.restored.len(),
+            report.removed.len(),
+            report.skipped.len()
+        );
+        for path in &report.restored {
+            text.push_str(&format!(
+                "
+  restored {path}"
+            ));
+        }
+        for path in &report.removed {
+            text.push_str(&format!(
+                "
+  removed {path}"
+            ));
+        }
+        for skip in &report.skipped {
+            text.push_str(&format!(
+                "
+  skipped {}: {}",
+                skip.relative_path, skip.reason
+            ));
+        }
+        // Repeated rather than referenced: a person reading this after a
+        // rollback is asking what is *not* back, and the manifest is not in
+        // front of them.
+        for scope in &report.unrecoverable_scope {
+            text.push_str(&format!(
+                "
+  not covered: {scope}"
+            ));
+        }
+        CliOutput::Text(text)
+    };
+    Ok(if report.complete { CliOutcome::ok(output) } else { CliOutcome::failed(output) })
 }

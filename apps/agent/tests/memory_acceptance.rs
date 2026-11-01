@@ -34,7 +34,7 @@ struct Harness {
     session: SessionId,
     /// Kept alive for the test: the tool's database lives under the data dir.
     data_dir: tempfile::TempDir,
-    _workspace: tempfile::TempDir,
+    workspace: tempfile::TempDir,
 }
 
 fn profile(layers: Layers) -> ResolvedProfile {
@@ -73,7 +73,7 @@ async fn harness_with(
     })
     .await
     .expect("the assembly the binary runs");
-    Harness { stack, model, session, data_dir, _workspace: workspace }
+    Harness { stack, model, session, data_dir, workspace }
 }
 
 /// Whether the first request the model saw offered `tool`.
@@ -338,6 +338,7 @@ async fn remembering_waits_for_a_person_even_when_memory_is_on() {
             &approval_id,
             agent_protocol::permissions::ApprovalScope::AllowOnce,
             "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
         )
         .await
         .expect("grant");
@@ -375,6 +376,99 @@ async fn remembering_waits_for_a_person_even_when_memory_is_on() {
     let source = facts[0].source.as_ref().expect("a fact the model wrote carries its source");
     assert_eq!(source.session, harness.session);
     assert!(source.call.is_some(), "the tool-use id names the exchange in the log");
+}
+
+/// A grant stands for one fingerprint, across processes.
+///
+/// The lease is written to the session's log, so a *later* process — the
+/// binary, started the way a person starts it — folds the same answer and runs
+/// the same call without asking again. That is what "allow for this session"
+/// buys: the person answered about this exact call, and every identical call
+/// after it is the same question. The second half is the part no kernel test can
+/// see: the store the model writes is the store the person's own verbs read.
+///
+/// The answer itself is given with the `Test` authority, because a test is not a
+/// person at a terminal; `agent approve` refuses a process without one (B4), and
+/// `cli_end_to_end` asserts exactly that. What this test covers is the lease the
+/// answer leaves behind, not the way it was given.
+#[tokio::test]
+async fn a_grant_for_one_call_lets_a_later_process_run_the_same_call() {
+    let harness = harness_with(
+        memory_layers(true),
+        SandboxMode::LocalProcess,
+        vec![
+            FakeModelProvider::tool_call(
+                "memory.remember",
+                json!({"text": "the deploy window is Tuesday", "key": "deploy-window"}),
+            ),
+            FakeModelProvider::answer("stored it"),
+        ],
+    )
+    .await;
+
+    let stopped =
+        harness.drive("remember that deploys go out on Tuesday").await.expect("a turn ran");
+    assert_eq!(
+        stopped.stop_reason,
+        agent_ports::agent_loop::StopReason::NeedsUserInput,
+        "the write is a question before it is a call"
+    );
+    let pending = harness.stack.approvals.pending(&harness.session).await.expect("pending");
+    let approval_id = pending[0].approval_id.clone();
+    harness
+        .stack
+        .approvals
+        .grant(
+            &harness.session,
+            &approval_id,
+            agent_protocol::permissions::ApprovalScope::AllowForSession,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
+        .await
+        .expect("grant");
+
+    // A separate process, the same session, the same call. It reads the log the
+    // answer went into rather than the process that took it.
+    let user_config = harness.workspace.path().join("memory.toml");
+    std::fs::write(&user_config, "[memory]\nenabled = true\n").expect("a configuration");
+    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_agent"))
+        .args([
+            "tool",
+            "memory.remember",
+            r#"{"text":"the deploy window is Tuesday","key":"deploy-window"}"#,
+        ])
+        .args(["--session", "memory"])
+        .env("AGENT_DATA_DIR", harness.data_dir.path())
+        .env("AGENT_WORKSPACE_DIR", harness.workspace.path())
+        .env("AGENT_MODEL_PROVIDER", "echo")
+        .env("AGENT_USER_CONFIG", &user_config)
+        .env_remove("AGENT_MANAGED_POLICY")
+        .env_remove("AGENT_SANDBOX")
+        .output()
+        .expect("the binary starts");
+    let out = String::from_utf8_lossy(&ran.stdout).to_string();
+    let err = String::from_utf8_lossy(&ran.stderr).to_string();
+    assert!(ran.status.success(), "the granted call runs on the next process: {out}{err}");
+    assert!(out.contains("remembered mem_"), "{out}");
+
+    // The person's own verbs read the store the model wrote.
+    let listed = std::process::Command::new(env!("CARGO_BIN_EXE_agent"))
+        .args(["memory", "list"])
+        .env("AGENT_DATA_DIR", harness.data_dir.path())
+        .env("AGENT_WORKSPACE_DIR", harness.workspace.path())
+        .env("AGENT_MODEL_PROVIDER", "echo")
+        .env("AGENT_USER_CONFIG", &user_config)
+        .env_remove("AGENT_MANAGED_POLICY")
+        .env_remove("AGENT_SANDBOX")
+        .output()
+        .expect("the binary starts");
+    let listed_out = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        listed_out.contains("the deploy window is Tuesday"),
+        "the CLI lists what the model wrote: {listed_out}{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
 }
 
 #[tokio::test]

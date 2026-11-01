@@ -217,6 +217,7 @@ mod tests {
             url: None,
             interval_steps: 1,
             timeout_ms: 1_000,
+            apparatus: Vec::new(),
         }
     }
 

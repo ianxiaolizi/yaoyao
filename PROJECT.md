@@ -62,7 +62,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-protocol` | IDs, Event, DTO, schema 版本（零业务依赖）；请求面是 `InboxItem`；`reason` 是推理链节点与具名规则表 |
 | `agent-ports` | EventStore / ModelProvider / ToolProvider / AgentLoop / ToolGateway / ContextEngine 等 trait 缝 |
 | `agent-config` | 配置分层与解析 |
-| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded、reason 链折叠 |
+| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、PermissionService（执行前决策账本）、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded（含秘密引用、快照、安全审查门）、reason 链折叠 |
 | `agent-loop` | `DefaultAgentLoop`（model → tool → model → answer） |
 | `agent-projection` | 投影引擎 + SessionProjection + ModelContextProjection（纯 fold + checkpoint） |
 | `agent-context` | `ProjectionContextEngine`（唯一同时看见 projection 引擎与 loop 面向的端口 `agent-ports` 的 crate；运行期不依赖 `agent-loop`，那是 dev 依赖） |
@@ -74,7 +74,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-tools-fs` | `FsToolProvider`（`fs.list`/`fs.glob`/`fs.grep`/`fs.read`/`fs.write`/`fs.edit`/`shell.run`）+ `LocalExecutionEnvironment`（含 `list_dir`，符号链接只报告不跟随） |
 | `agent-tools-git` | git 工具（编码证据链）：`git.status`/`git.diff` 由进程内 libgit2 读取仓库，不 spawn `git`（AppContainer 下 git 拿不到工作目录，`CONTRACT.md` §7 #59） |
 | `agent-tools-mcp` | MCP 工具适配器（能力闸门下的注册） |
-| `agent-tools-web` | `web.request`：一次 HTTP 调用，只去公网地址（每跳重定向重新校验、DNS 钉住已校验地址）、body 截在 1 MB、per-call 超时上限 120 s（`CONTRACT.md` §7 #144） |
+| `agent-tools-web` | `web.request`：一次只读（`GET`/`HEAD`）HTTP 调用，只去公网地址与用户层 allowlist 里的 origin（每跳重定向重新校验并重新比对 allowlist、DNS 钉住已校验地址）、结果标 `Untrusted`、body 截在 1 MB、per-call 超时上限 120 s（`CONTRACT.md` §7 #144/#180） |
 | `agent-subagent-stdio` | 外部 CLI subagent 适配器（stdio 后端） |
 | `agent-sandbox-win` | Windows AppContainer 执行后端：profile/SID、ACL 授予、`STARTUPINFOEX` + Job Object 启动；唯一允许 `unsafe` 的 crate（`CONTRACT.md` §7 #38） |
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |
@@ -142,7 +142,7 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 
 `app-container` 需要先以管理员权限运行 `sandbox setup`。它的授权、网络策略、启动和保活细节由 `CONTRACT.md` §7 约束；选中但环境未准备好时退 `2`，不会悄悄回落到 `local`。`AGENT_SANDBOX_NETWORK=allow|deny` 控制沙箱网络，默认 `deny`。它只对能收回网络的后端生效：`local` 以你的用户身份起命令，网络就是你的网络，`deny` 在那里没有作用（装配时打一行提示，能力层也如实告诉模型「不被该后端限制」）。
 
-模型档位写在 profile 的 `[model]` 里：`main` 是本次运行的模型，`fast` / `thinking` 留给摘要与审查；`--model` 只覆盖 `main`，不会动另两档。今天**只有上下文压缩**按 `summarize` 真的走到 `fast`，`review` 还没有生产者，所以配了 `thinking` 也只会被记录、不会被用到。档位只换模型名，不换 provider——一个进程仍然只说一种 provider kind。没配任何档位时行为与以前完全一致，`profile/resolved` 也不多一个字段（`CONTRACT.md` §7 #118）。配了 `fast` 时，摘要请求用那个模型自己的数字：窗口与补全上限按它声明的派生，推理深度只从它声明过的档位里挑；摘要候选装不下时按整组取最旧的那段，一段都装不下才回落到 `main`（`CONTRACT.md` §7 #157）。
+模型档位写在 profile 的 `[model]` 里：`main` 是本次运行的模型，`fast` / `thinking` 留给摘要与审查；`--model` 只覆盖 `main`，不会动另两档。今天**只有上下文压缩**按 `summarize` 真的走到 `fast`，`review` 还没有生产者，所以配了 `thinking` 也只会被记录、不会被用到。档位只换模型名，不换 provider——一个进程仍然只说一种 provider kind。没配任何档位时行为与以前完全一致，`profile/resolved` 也不多一个字段（`CONTRACT.md` §7 #118）。配了 `fast` 时，摘要请求用那个模型自己的数字：窗口与补全上限按它声明的派生，推理深度只从它声明过的档位里挑；摘要候选装不下时按整组取最旧的那段，一段都装不下才回落到 `main`；只有 cap、没有完整摘要预算的旧快照同样强制回落到 `main`。显式 reasoning effort 若 fast 模型未声明会在装配期拒绝启动（`CONTRACT.md` §7 #157）。
 
 上下文预算不再写死。路由确定后，爻爻先 `GET /models` 问模型自己声明能装多少，再按预设（`[budget] preset`：`frugal`/`balanced`/`deep`/`max`，默认 `balanced` = 窗口的 1/4）派生这一轮冻结的 `ResolvedContextBudget`：物理窗口、输入工作集、补全上限（**含 reasoning tokens**）、补全上界、压缩预留、压缩触发点、最近保留量。派生是纯整数运算，每个字段的来源（`provider:/models`、`preset:balanced`、`derived:0.25W`、`config`、`fallback`）随 `profile/resolved` 一起落盘，`context inspect` 读的就是这份记录。端点答不出时用保守的 131,072 窗口并标 `fallback`，不再回到 8,000。旧配置里的 `max_input_tokens`/`max_output_tokens` 仍可用；`reserved_output_tokens` 接受但忽略（记一条 note）。模型只产出思路、`finish_reason = length` 时，本次运行会带更大额度（已在物理上限时改降推理深度）重问一次；第二次仍是纯思考才以 `max_output_tokens` 结束，并说明是思考烧完了额度。provider 明确拒绝一条请求太长时（413，或带上下文长度信号的 400），本次运行不重发同一份字节：先结算，再按原子组从最旧删到工作集与触发点取小者以下，把删掉的东西记成一条 `context/compacted`（`strategy = "overflow-trim"`），换新 attempt 只重试一次；再被拒就以 `FatalError` 结束，不会循环。当前用户输入、回合中的用户消息和最新工具周期永远不在删除范围里（`CONTRACT.md` §7 #156、#158）。传输层同理：连接 30 秒、首事件 60 秒、流内空闲 300 秒，没有总时长上限——持续出字的流不会被砍（`CONTRACT.md` §7 #151–#158）。
 

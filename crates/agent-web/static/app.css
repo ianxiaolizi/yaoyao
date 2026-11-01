@@ -211,9 +211,27 @@
   /* ═══ main ═══ */
   .main{
     display:grid;grid-template-columns:minmax(0,1fr);
-    grid-template-rows:46px minmax(0,1fr) auto;
+    /* header · status strip (collapses when hidden) · timeline · composer */
+    grid-template-rows:46px auto minmax(0,1fr) auto;
     min-width:0;min-height:0;background:var(--glass-main);position:relative;
   }
+  /* Execution, delivery and verification, side by side. A sentence-shaped
+     completion ("结果已交付，无机器验收标准") is one of the values, so the strip
+     wraps rather than truncating the one line a person must read. */
+  .strip{
+    display:flex;align-items:center;flex-wrap:wrap;gap:3px 14px;
+    padding:5px 18px 6px;border-bottom:1px solid var(--line);
+    font-size:10.5px;color:var(--ink-3);min-width:0;
+  }
+  .strip[hidden]{display:none}
+  .strip .kv{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}
+  .strip .kv b{font-weight:500;color:var(--ink-2)}
+  .strip .kv.ok b,.strip .kv.ok{color:#2f9e64}
+  [data-theme="dark"] .strip .kv.ok b,[data-theme="dark"] .strip .kv.ok{color:#5ec98f}
+  .strip .kv.warn b,.strip .kv.warn{color:var(--red-ink)}
+  [data-theme="dark"] .strip .kv.warn b,[data-theme="dark"] .strip .kv.warn{color:var(--red)}
+  .strip .kv.mut b,.strip .kv.mut{color:var(--ink-4)}
+  .strip .kv.live b,.strip .kv.live{color:var(--ink-2)}
   .top{
     display:flex;align-items:center;gap:10px;padding:0 14px 0 18px;
     border-bottom:1px solid var(--line);
@@ -371,6 +389,12 @@
   .ask-b{padding:6px 0 8px 11px;display:grid;gap:9px}
   .ask-cmd{font-family:var(--mono);font-size:12px;color:var(--ink);overflow-wrap:anywhere}
   .ask-why{font-size:11.5px;line-height:1.65;color:var(--ink-2)}
+  /* What the action is, before someone agrees to it: risk, reversibility, and
+     everything it would touch. */
+  .ask-facts{display:grid;gap:3px}
+  .ask-fact{font-size:11.5px;line-height:1.6;color:var(--ink-2)}
+  .ask-fact .k{display:inline-block;min-width:52px;margin-right:6px;color:var(--ink-3);font-size:10.5px}
+  .ask-targets{margin:0;padding-left:16px;font-family:var(--mono);font-size:11px;color:var(--ink);overflow-wrap:anywhere}
   .ask-act{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
   .btn{
     height:28px;padding:0 11px;border-radius:6px;font:inherit;font-size:11.5px;cursor:pointer;

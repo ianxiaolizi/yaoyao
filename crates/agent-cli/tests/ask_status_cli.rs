@@ -11,6 +11,8 @@ use agent_ports::model_provider::ModelResponse;
 use agent_ports::tool_provider::ToolSideEffect;
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{EventId, EventSeq, RunId, SchemaVersion, SessionId};
+use agent_protocol::inbox::InboxKind;
+use agent_protocol::intent::IntentStatus;
 use agent_protocol::model::{ContentBlock, FinishReason, ModelRoute, ModelTier, Usage};
 use agent_protocol::permissions::CapabilitySet;
 use agent_protocol::profile::{ResolvedProfileSnapshot, RunBudget};
@@ -27,19 +29,28 @@ fn scheduler() -> (Scheduler, SessionId) {
 
 /// The same session, with the store handed back: seeding an event needs it.
 fn scheduler_over_a_store() -> (Scheduler, Arc<FakeEventStore>, SessionId) {
+    let (scheduler, store, _, sid) = scheduler_over_a_store_and_model();
+    (scheduler, store, sid)
+}
+
+/// The same session again, with the provider handed back too: one test counts
+/// what reached the model, which is how "a control word costs nothing" is shown
+/// rather than asserted.
+fn scheduler_over_a_store_and_model()
+-> (Scheduler, Arc<FakeEventStore>, Arc<FakeModelProvider>, SessionId) {
     let store = Arc::new(FakeEventStore::new());
     let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("hello")]));
     let tools = Arc::new(FakeToolProvider::new());
     let gateway = Arc::new(FakeToolGateway::new(tools));
     let loop_ = Arc::new(DefaultAgentLoop::new(
-        model,
+        model.clone(),
         gateway,
         Arc::new(NullContextEngine::new()),
         one_model_router(),
     ));
     let scheduler = Scheduler::new(store.clone(), loop_, 8);
     let sid = SessionId::from_string("cli-session");
-    (scheduler, store, sid)
+    (scheduler, store, model, sid)
 }
 
 /// Open a run the way the scheduler opens one — a `run/started` with no terminal
@@ -47,14 +58,34 @@ fn scheduler_over_a_store() -> (Scheduler, Arc<FakeEventStore>, SessionId) {
 ///
 /// Written out field by field rather than through a helper on purpose: an open
 /// run *is* a `run/started` nothing closed, and a test that seeded it any other
-/// way would be testing the seeding helper.
-async fn seed_open_run(store: &FakeEventStore, sid: &SessionId) {
-    let draft = EventDraft {
+/// way would be testing the seeding helper. The run id comes back so a test can
+/// close the same run later.
+async fn seed_open_run(store: &FakeEventStore, sid: &SessionId) -> RunId {
+    let run_id = RunId::new();
+    append(store, sid, draft(EventType::RUN_STARTED, sid, &run_id)).await;
+    run_id
+}
+
+/// End the seeded run, so the queue can drain the way it would after a real run.
+async fn close_run(store: &FakeEventStore, sid: &SessionId, run_id: &RunId) {
+    append(store, sid, draft(EventType::RUN_COMPLETED, sid, run_id)).await;
+}
+
+/// Append one event after whatever the session already holds — the seed has to
+/// join the log the commands wrote, not fight it for sequence number zero.
+async fn append(store: &FakeEventStore, sid: &SessionId, draft: EventDraft) {
+    let events = store.read_stream(sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let next = events.last().map_or(EventSeq::ZERO, |event| event.seq.next());
+    store.append(sid, next, vec![draft]).await.unwrap();
+}
+
+fn draft(event_type: &'static str, sid: &SessionId, run_id: &RunId) -> EventDraft {
+    EventDraft {
         event_id: EventId::new(),
-        event_type: EventType::new(EventType::RUN_STARTED),
+        event_type: EventType::new(event_type),
         schema_version: SchemaVersion::from_string("0.1.0"),
         session_id: sid.clone(),
-        run_id: Some(RunId::new()),
+        run_id: Some(run_id.clone()),
         turn_id: None,
         step_id: None,
         actor: Actor::Scheduler,
@@ -64,8 +95,7 @@ async fn seed_open_run(store: &FakeEventStore, sid: &SessionId) {
         payload: serde_json::json!({}),
         metadata: serde_json::json!({}),
         ignorable: false,
-    };
-    store.append(sid, EventSeq::ZERO, vec![draft]).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -88,6 +118,24 @@ async fn ask_json_reports_final_content() {
             let value: serde_json::Value = serde_json::from_str(j.as_str()).unwrap();
             assert_eq!(value["final_content"], "hello");
             assert_eq!(value["stop_reason"], "final_answer");
+        }
+        _ => panic!("expected json output"),
+    }
+}
+
+#[tokio::test]
+async fn status_json_reports_the_latest_intent() {
+    let (scheduler, sid) = scheduler();
+    let _ = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+
+    let outcome = run_status(&scheduler, &sid, true).await.unwrap();
+    match outcome {
+        CliOutput::Json(j) => {
+            let value: serde_json::Value = serde_json::from_str(j.as_str()).unwrap();
+            assert!(
+                value["latest_intent_id"].is_string(),
+                "the instruction that was answered is identifiable: {value}"
+            );
         }
         _ => panic!("expected json output"),
     }
@@ -154,12 +202,14 @@ async fn a_truncated_answer_is_reported_as_not_answered() {
     assert!(text.starts_with("half a sen"), "the text that arrived is kept: {text}");
     assert!(text.contains("[truncated:"), "the notice says it is not whole: {text}");
 
-    // The log says the same thing, in the form `metrics` and `why` read.
+    // The log says the same thing, in the form `metrics` and `why` read. A
+    // truncated response is a limit stop, so the turn yields rather than
+    // completes (CONTRACT §7 #173).
     let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
     let end = events
         .iter()
-        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
-        .expect("the turn ended");
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_YIELDED)
+        .expect("the turn yielded");
     assert_eq!(end.event.payload["stop_reason"], "max_output_tokens");
     assert_eq!(end.event.payload["final_content"], "half a sen");
 }
@@ -271,8 +321,8 @@ async fn a_run_that_spent_its_steps_is_reported_as_not_answered() {
     let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
     let end = events
         .iter()
-        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
-        .expect("the turn ended");
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_YIELDED)
+        .expect("the turn yielded");
     assert_eq!(end.event.payload["stop_reason"], "max_steps");
     assert_eq!(end.event.payload["spent"]["steps"], 1);
     assert!(end.event.payload["spent"].get("input_tokens").is_some());
@@ -321,12 +371,347 @@ async fn a_run_that_spent_its_token_budget_is_reported_as_not_answered() {
     let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
     let end = events
         .iter()
-        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
-        .expect("the turn ended");
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_YIELDED)
+        .expect("the turn yielded");
     assert_eq!(end.event.payload["stop_reason"], "token_budget_exceeded");
     assert_eq!(end.event.payload["spent"]["input_tokens"], 100);
     assert_eq!(end.event.payload["spent"]["output_tokens"], 20);
     assert_eq!(end.event.payload["spent"]["estimated"], false);
+}
+
+/// A stop is the rule layer's answer, not a model's: the queued instruction is
+/// withdrawn, an interrupt is queued for the run in flight, and the evidence
+/// from the turn that already ran stays exactly where it is.
+///
+/// This is the cheapest of the three stage-A thresholds and the easiest one to
+/// regress: the moment a control word is "understood" by a provider, a stop
+/// costs a request and can be talked out of.
+#[tokio::test]
+async fn a_stop_withdraws_the_queue_without_asking_a_model() {
+    let (scheduler, store, model, sid) = scheduler_over_a_store_and_model();
+
+    // A turn that really ran, so there is evidence a stop must leave alone.
+    let first = run_ask(&scheduler, &sid, "跑一下测试", Utc::now(), false).await.unwrap();
+    assert_eq!(first.verdict, Verdict::Answered);
+    assert_eq!(model.requests().len(), 1);
+
+    // Then a run in flight with an instruction waiting behind it.
+    let run_id = seed_open_run(&store, &sid).await;
+    let queued = run_ask(&scheduler, &sid, "重构日志模块", Utc::now(), false).await.unwrap();
+    assert_eq!(queued.verdict, Verdict::DidNotRun, "the session was busy");
+    assert_eq!(scheduler.inbox().pending(&sid).await.unwrap().len(), 1);
+
+    let outcome = run_ask(&scheduler, &sid, "停止", Utc::now(), false).await.unwrap();
+
+    assert_eq!(model.requests().len(), 1, "a control word must not reach a provider");
+    let pending = scheduler.inbox().pending(&sid).await.unwrap();
+    assert_eq!(pending.len(), 1, "the queued instruction is gone; only the interrupt is left");
+    assert_eq!(pending[0].kind, InboxKind::Interrupt);
+    assert_eq!(pending[0].payload["reason"], "user_stop");
+
+    assert_eq!(outcome.verdict, Verdict::Answered, "a stop that withdrew something did something");
+    let CliOutput::Text(text) = outcome.output else { panic!("expected text output") };
+    assert!(text.contains("withdrew 1 queued instruction"), "the stop says what it did: {text}");
+    assert!(text.contains("next step boundary"), "and what happens to the run: {text}");
+
+    close_run(&store, &sid, &run_id).await;
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let completed = events
+        .iter()
+        .filter(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
+        .count();
+    assert_eq!(completed, 1, "the answer that was already given is still on the record");
+}
+
+/// A stop with nothing in flight and nothing queued did nothing, and says so
+/// through the exit code as well as the line.
+#[tokio::test]
+async fn a_stop_with_nothing_to_stop_did_not_run() {
+    let (scheduler, sid) = scheduler();
+
+    let outcome = run_ask(&scheduler, &sid, "停止", Utc::now(), false).await.unwrap();
+
+    assert_eq!(outcome.verdict, Verdict::DidNotRun);
+    let CliOutput::Text(text) = outcome.output else { panic!("expected text output") };
+    assert!(text.contains("nothing to stop"), "{text}");
+}
+
+/// Two instructions queued behind one run: the newer one displaces the older,
+/// and the older is on the record as `superseded` rather than being run.
+///
+/// The run is closed only after both were queued, so the queue really holds two
+/// instructions at the moment the second arrives — the situation the 2026-11-01
+/// incident was made of.
+#[tokio::test]
+async fn a_new_instruction_supersedes_the_one_still_queued() {
+    let (scheduler, store, model, sid) = scheduler_over_a_store_and_model();
+    let run_id = seed_open_run(&store, &sid).await;
+
+    let _ = run_ask(&scheduler, &sid, "第一个任务", Utc::now(), false).await.unwrap();
+    let first = scheduler.intents().latest(&sid).await.unwrap().expect("the first intent");
+    let _ = run_ask(&scheduler, &sid, "第二个任务", Utc::now(), false).await.unwrap();
+    let second = scheduler.intents().latest(&sid).await.unwrap().expect("the second intent");
+    assert_ne!(first.intent_id, second.intent_id);
+
+    // The queue holds the newer instruction only.
+    let pending = scheduler.inbox().pending(&sid).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].payload["text"], "第二个任务");
+
+    // The older one is not silently gone: it is recorded as displaced, naming
+    // the instruction that displaced it.
+    let intents = scheduler.intents().all(&sid).await.unwrap();
+    let older = intents.iter().find(|intent| intent.intent_id == first.intent_id).unwrap();
+    assert_eq!(older.status, IntentStatus::Superseded);
+    assert_eq!(older.superseded_by.as_ref(), Some(&second.intent_id));
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let superseded: Vec<_> = events
+        .iter()
+        .filter(|event| event.event.event_type.as_str() == EventType::INTENT_SUPERSEDED)
+        .collect();
+    assert_eq!(superseded.len(), 1, "one instruction was displaced");
+    assert_eq!(superseded[0].event.payload["superseded_by"], serde_json::json!(second.intent_id));
+
+    // When the run ends, the queue drains and only the newer instruction runs.
+    close_run(&store, &sid, &run_id).await;
+    let report = scheduler
+        .run_pending(&sid, Utc::now())
+        .await
+        .unwrap()
+        .expect("the queued instruction runs");
+    assert_eq!(
+        report.intent_id.as_ref(),
+        Some(&second.intent_id),
+        "the answer belongs to the instruction that displaced the other"
+    );
+    assert_eq!(model.requests().len(), 1, "the displaced instruction never reached a model");
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let started: Vec<_> = events
+        .iter()
+        .filter(|event| event.event.event_type.as_str() == EventType::TURN_STARTED)
+        .collect();
+    assert_eq!(started.len(), 1);
+    assert_eq!(
+        started[0].event.payload["intent_id"],
+        serde_json::json!(second.intent_id),
+        "the turn names the instruction it answers"
+    );
+}
+
+/// A queue entry whose instruction no longer stands is reported as stale rather
+/// than counted as work the session still owes.
+///
+/// The write path cannot produce this shape any more — it discards the item in
+/// the same append that displaces the instruction — so the test writes it the
+/// way an older log holds it: a pending item bound to an intent that is already
+/// `superseded`.
+#[tokio::test]
+async fn a_queued_item_from_a_displaced_instruction_is_reported_stale() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+    let _ = seed_open_run(&store, &sid).await;
+    let _ = run_ask(&scheduler, &sid, "第一个任务", Utc::now(), false).await.unwrap();
+    let first = scheduler.intents().latest(&sid).await.unwrap().expect("the first intent");
+    let _ = run_ask(&scheduler, &sid, "第二个任务", Utc::now(), false).await.unwrap();
+
+    let stale = scheduler
+        .inbox()
+        .append(
+            &sid,
+            InboxKind::NextTurn,
+            serde_json::json!({"text": "第一个任务", "intent_id": first.intent_id}),
+            0,
+            Actor::User,
+        )
+        .await
+        .unwrap();
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["stale_items"], serde_json::json!([stale.item_id.as_str()]));
+    assert_eq!(status["pending"], 2, "the entry is still counted, and still named");
+
+    let CliOutput::Text(text) = run_status(&scheduler, &sid, false).await.unwrap() else {
+        panic!("expected text output")
+    };
+    assert!(
+        text.contains("1 queued item(s) belong to instructions that no longer stand"),
+        "{text}"
+    );
+}
+
+/// The answer `ask` gives says which instruction it belongs to, and `status`
+/// says when the newest instruction has not been answered yet.
+///
+/// The second half is the rule from the 2026-11-01 report: an answer from an
+/// older instruction must not read as an answer to the newest one. `ask`
+/// reports its own intent; `status` compares the answered intent with the
+/// latest one and says when they differ.
+#[tokio::test]
+async fn an_answer_to_an_older_instruction_is_marked_stale() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+
+    let outcome = run_ask(&scheduler, &sid, "查一下日志", Utc::now(), true).await.unwrap();
+    let CliOutput::Json(body) = outcome.output else { panic!("expected json output") };
+    let answer: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    let answered = answer["intent_id"].as_str().expect("the answer names its intent").to_string();
+    assert_eq!(answer["stale"], false, "nothing has overtaken it yet");
+
+    // A newer instruction arrives while a run is open; it waits its turn.
+    seed_open_run(&store, &sid).await;
+    let _ = run_ask(&scheduler, &sid, "先别管日志，去修 junction 逃逸", Utc::now(), false)
+        .await
+        .unwrap();
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["answered_intent_id"], serde_json::json!(answered));
+    assert_ne!(status["latest_intent_id"], serde_json::json!(answered));
+    assert_eq!(status["stale_answer"], true, "the newest instruction has not run: {status}");
+
+    let CliOutput::Text(text) = run_status(&scheduler, &sid, false).await.unwrap() else {
+        panic!("expected text output")
+    };
+    assert!(text.contains(&format!("answered:  {answered}")), "{text}");
+    assert!(text.contains("note:"), "the text output carries the warning too: {text}");
+    assert!(text.contains("newest one has not run yet"), "{text}");
+}
+
+/// A `completion/checked` event, as the loop writes it at a step boundary.
+fn check_draft(sid: &SessionId, run_id: &RunId, status: &str) -> EventDraft {
+    let mut event = draft(EventType::COMPLETION_CHECKED, sid, run_id);
+    event.payload = serde_json::json!({ "status": status, "kind": "command", "steps": 1 });
+    event
+}
+
+/// A tool result, as the loop writes it after a call the gateway allowed.
+fn tool_draft(sid: &SessionId, run_id: &RunId) -> EventDraft {
+    let mut event = draft(EventType::TOOL_COMPLETED, sid, run_id);
+    event.payload = serde_json::json!({ "tool_name": "fs.write", "call_id": "call-1" });
+    event
+}
+
+/// An ordinary answer is delivered, but it is not a completion: nothing checked
+/// it, so the only honest word is "delivered, no machine criterion".
+#[tokio::test]
+async fn an_information_answer_has_three_axes_and_no_completion_claim() {
+    let (scheduler, sid) = scheduler();
+    let _ = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["run_status"], "completed");
+    assert_eq!(status["delivery_status"], "delivered");
+    assert_eq!(status["verification_status"], "not_applicable");
+    assert_eq!(status["completion_status"], serde_json::Value::Null);
+    assert!(status["active_intent_id"].is_string(), "{status}");
+    assert_eq!(status["pending_intents"], serde_json::json!([]));
+    // The fields that predate this slice are still there: `--json` only grew.
+    for key in [
+        "session",
+        "open_run",
+        "open_turn",
+        "open_step",
+        "pending",
+        "latest_intent_id",
+        "answered_intent_id",
+        "stale_answer",
+        "stale_items",
+        "intent_adjudication",
+    ] {
+        assert!(status.get(key).is_some(), "{key} disappeared from status --json: {status}");
+    }
+
+    let CliOutput::Text(text) = run_status(&scheduler, &sid, false).await.unwrap() else {
+        panic!("expected text output")
+    };
+    assert!(text.contains("execution:  completed"), "{text}");
+    assert!(text.contains("delivery:   delivered"), "{text}");
+    assert!(text.contains("verify:     not_applicable"), "{text}");
+    assert!(text.contains("completion: -"), "{text}");
+}
+
+/// A passing criterion is the one way a session may say it finished.
+#[tokio::test]
+async fn a_passing_check_makes_a_verified_complete() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+    let run_id = RunId::new();
+    let mut drafts = vec![draft(EventType::RUN_STARTED, &sid, &run_id)];
+    drafts.push(check_draft(&sid, &run_id, "completed"));
+    let mut turn = draft(EventType::TURN_COMPLETED, &sid, &run_id);
+    turn.turn_id = Some(agent_protocol::ids::TurnId::from_string("seeded-turn"));
+    drafts.push(turn);
+    drafts.push(draft(EventType::RUN_COMPLETED, &sid, &run_id));
+    for event in drafts {
+        append(store.as_ref(), &sid, event).await;
+    }
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["run_status"], "completed");
+    assert_eq!(status["verification_status"], "verified");
+    assert_eq!(
+        status["completion_status"], "verified_complete",
+        "a run the operator's criterion passed is the only verified complete: {status}"
+    );
+    assert_eq!(
+        status["delivery_status"], "unanswered",
+        "the check ended the turn with no prose answer to hand over"
+    );
+}
+
+/// Work after a passing check makes that check stale, and staleness is never
+/// reported as a completion.
+#[tokio::test]
+async fn work_after_a_passing_check_is_stale_and_parked() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+    let run_id = RunId::new();
+    let drafts = vec![
+        draft(EventType::RUN_STARTED, &sid, &run_id),
+        check_draft(&sid, &run_id, "completed"),
+        tool_draft(&sid, &run_id),
+        draft(EventType::RUN_COMPLETED, &sid, &run_id),
+    ];
+    for event in drafts {
+        append(store.as_ref(), &sid, event).await;
+    }
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["verification_status"], "stale");
+    assert_eq!(status["completion_status"], "blocked_or_parked");
+}
+
+/// A queued instruction is "pending", and the one still waiting is the one
+/// named — the status a person needs before assuming the answer on screen
+/// belongs to what they just asked.
+#[tokio::test]
+async fn a_queued_instruction_is_reported_as_pending() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+    seed_open_run(store.as_ref(), &sid).await;
+    let _ = run_ask(&scheduler, &sid, "先别动日志", Utc::now(), false).await.unwrap();
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["run_status"], "in_progress");
+    assert_eq!(status["completion_status"], serde_json::Value::Null);
+    let queued = status["pending_intents"].as_array().expect("a list");
+    assert_eq!(queued.len(), 1, "{status}");
+    assert_eq!(status["active_intent_id"], queued[0]);
+    assert_eq!(status["latest_intent_id"], queued[0]);
 }
 
 /// A tool-call response that reports its own usage, so the run has a next step
@@ -368,4 +753,101 @@ fn snapshot_with_budget(budget: RunBudget) -> ResolvedProfileSnapshot {
         completion: None,
     }
     .sealed()
+}
+
+/// A scheduler whose profile carries one command criterion, so a turn can end
+/// on the check rather than on a model answer.
+fn scheduler_with_criterion(command: &str) -> (Scheduler, Arc<FakeEventStore>, SessionId) {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+    let tools =
+        Arc::new(FakeToolProvider::new().with_tool("shell.run", "ok", ToolSideEffect::Pure));
+    let gateway = Arc::new(FakeToolGateway::new(tools));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    let snapshot = ResolvedProfileSnapshot {
+        completion: Some(agent_protocol::profile::CompletionSpec {
+            kind: agent_protocol::profile::CompletionKind::Command,
+            command: Some(command.to_string()),
+            url: None,
+            interval_steps: 1,
+            timeout_ms: 1_000,
+            apparatus: Vec::new(),
+        }),
+        ..snapshot_with_budget(RunBudget::default())
+    };
+    // The struct update keeps the budget and identity, but `sealed` must be
+    // re-run: the hash has to describe the fields that are there now.
+    let scheduler =
+        Scheduler::new(store.clone(), loop_, 8).with_profile_snapshot(snapshot.sealed());
+    let sid = SessionId::from_string("criterion-session");
+    (scheduler, store, sid)
+}
+
+/// An answer after tool work is delivered, and the log says at delivery time
+/// that nothing verified it — the reader does not have to re-fold the session
+/// to learn that.
+#[tokio::test]
+async fn a_worked_answer_records_that_it_was_delivered_unverified() {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![
+        FakeModelProvider::tool_call("echo", serde_json::json!({ "text": "hi" })),
+        FakeModelProvider::answer("done"),
+    ]));
+    let tools = Arc::new(FakeToolProvider::new().with_tool("echo", "hi", ToolSideEffect::Pure));
+    let gateway = Arc::new(FakeToolGateway::new(tools));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    let scheduler = Scheduler::new(store.clone(), loop_, 8);
+    let sid = SessionId::from_string("unverified-session");
+
+    let _ = run_ask(&scheduler, &sid, "write it", Utc::now(), false).await.unwrap();
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let delivered = events
+        .iter()
+        .find(|stored| {
+            stored.event.event_type.as_str() == EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED
+        })
+        .expect("the delivery fact is written beside the answer");
+    assert_eq!(delivered.event.payload["verdict"], "missing");
+}
+
+/// A criterion whose command ends in a pipeline that reports the pipe's status
+/// is not a pass: the turn still ends, and the log says why the completion does
+/// not stand.
+#[tokio::test]
+async fn a_masked_criterion_pass_is_refused_and_recorded() {
+    let (scheduler, store, sid) = scheduler_with_criterion("node --test | tail -5");
+
+    let _ = run_ask(&scheduler, &sid, "run the suite", Utc::now(), false).await.unwrap();
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let rejection = events
+        .iter()
+        .find(|stored| stored.event.event_type.as_str() == EventType::COMPLETION_CLAIM_REJECTED)
+        .expect("a refused claim is written, not silently dropped");
+    assert_eq!(rejection.event.payload["verdict"], "exit_masked");
+    assert_eq!(rejection.event.payload["operator"], "| tail");
+    assert!(
+        events
+            .iter()
+            .any(|stored| stored.event.event_type.as_str() == EventType::COMPLETION_CHECKED),
+        "the check itself is still recorded: the refusal is about what it can support"
+    );
+
+    let axes = scheduler.status_axes(&sid).await.unwrap();
+    assert_eq!(
+        axes.verification_status,
+        agent_protocol::status::VerificationStatus::Blocked,
+        "a masked pass may not be shown as verified"
+    );
 }

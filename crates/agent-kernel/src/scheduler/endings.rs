@@ -64,17 +64,32 @@ impl Ending {
             Ending::Loop { final_content, .. } => final_content.clone(),
             _ => None,
         };
+        // A limit ending is a *pause*, not an end: the turn did not answer, and
+        // a `turn/completed` would make the delivery axis offer whatever text
+        // the model happened to have written as the answer. `turn/yielded` is
+        // the log's word for "stopped, waiting", and the `budget/parked` record
+        // written beside it says what for (CONTRACT §7 #173).
         let (turn_event, run_event) = match &reason {
-            StopReason::FinalAnswer
-            | StopReason::MaxSteps
+            // Spelled out rather than a guard on `is_limit`: a match arm with a
+            // guard does not discharge exhaustiveness, and a new `StopReason`
+            // variant must force a decision here rather than fall into `_`.
+            StopReason::MaxSteps
             | StopReason::MaxToolCalls
             | StopReason::WallClockExceeded
             | StopReason::MaxOutputTokens
-            | StopReason::ContentFiltered
             | StopReason::TokenBudgetExceeded
             | StopReason::Stalled
-            | StopReason::Completed => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
-            StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
+            | StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
+            StopReason::FinalAnswer | StopReason::ContentFiltered | StopReason::Completed => {
+                (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED)
+            }
+            // The turn ended normally and the review afterwards withheld the
+            // answer (B9). Named here so a loop that ever returned this reason
+            // would be a decision rather than a fall into `_`; it is not a
+            // reason the loop produces, and the scheduler, which writes it after
+            // this method has run, rewrites the payload's `stop_reason` and sets
+            // `incomplete` itself.
+            StopReason::SecurityBlocked => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
             StopReason::FatalError => (EventType::TURN_FAILED, EventType::RUN_FAILED),
             StopReason::UserCancelled => (EventType::TURN_CANCELLED, EventType::RUN_CANCELLED),
         };
@@ -109,6 +124,17 @@ impl Ending {
                 reason: reason @ (StopReason::TokenBudgetExceeded | StopReason::Stalled),
                 final_content,
             } => {
+                let mut payload = serde_json::json!({ "stop_reason": reason, "incomplete": true });
+                if let Some(content) = final_content {
+                    payload["final_content"] = serde_json::json!(content);
+                }
+                payload
+            }
+            // Same shape as a stall: text the model produced that is not a
+            // delivered answer. Unreachable through `settle` for the reason the
+            // terminal-event arm gives, and kept so the payload never falls
+            // through to a shape that would read as an ordinary ending.
+            Ending::Loop { reason: StopReason::SecurityBlocked, final_content } => {
                 let mut payload = serde_json::json!({ "stop_reason": reason, "incomplete": true });
                 if let Some(content) = final_content {
                     payload["final_content"] = serde_json::json!(content);

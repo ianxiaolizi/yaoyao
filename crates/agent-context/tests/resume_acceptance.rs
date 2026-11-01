@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_context::ProjectionContextEngine;
-use agent_kernel::approval::ApprovalService;
+use agent_kernel::approval::{ApprovalAuthority, ApprovalService};
 use agent_kernel::guarded::GuardedToolProvider;
 use agent_kernel::policy::{PolicyEngine, PolicyRule};
 use agent_kernel::recovery::Recovery;
@@ -197,7 +197,13 @@ async fn a_call_held_for_approval_survives_the_process_that_held_it() {
     second.recovery.recover(&session_id).await.expect("recovery");
     second
         .approvals
-        .grant(&session_id, &approval_id, ApprovalScope::AllowOnce, "user")
+        .grant(
+            &session_id,
+            &approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &ApprovalAuthority::test(),
+        )
         .await
         .expect("grant");
 
@@ -287,7 +293,13 @@ async fn a_resume_does_not_act_while_another_holder_has_the_session() {
     let process = process(data_dir.path(), workspace.path(), vec![]);
     process
         .approvals
-        .grant(&session_id, &approval_id, ApprovalScope::AllowOnce, "user")
+        .grant(
+            &session_id,
+            &approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &ApprovalAuthority::test(),
+        )
         .await
         .expect("grant");
 

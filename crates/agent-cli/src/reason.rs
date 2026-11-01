@@ -248,7 +248,12 @@ impl TurnEnd {
         match (self.event.as_str(), self.stop.as_deref()) {
             (EventType::TURN_COMPLETED, Some(reason)) => reason.to_string(),
             (EventType::TURN_COMPLETED, None) => String::from("final_answer"),
-            (EventType::TURN_YIELDED, _) => String::from("needs_user_input"),
+            // A yielded turn says why it yielded when it can: a budget stop is
+            // not a question for the user, and reporting it as one would make
+            // `why` offer a decision nobody is being asked for (CONTRACT §7
+            // #173).
+            (EventType::TURN_YIELDED, Some(reason)) => reason.to_string(),
+            (EventType::TURN_YIELDED, None) => String::from("needs_user_input"),
             (EventType::TURN_FAILED, _) => String::from("fatal_error"),
             (EventType::TURN_CANCELLED, _) => String::from("user_cancelled"),
             (other, _) => other.to_string(),

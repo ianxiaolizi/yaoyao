@@ -58,6 +58,16 @@ impl Scheduler {
             controls: self.controls.clone(),
             instructions: self.instructions.clone(),
             capability: self.capability.clone(),
+            // The adjudicator is part of what makes a run a run, like the
+            // frozen profile: it is stateless, has no session of its own, and a
+            // child whose messages go unadjudicated while its parent's do not
+            // would be a difference nobody asked for.
+            adjudicator: self.adjudicator.clone(),
+            // The reviewer too: a child turn runs read-only and so has nothing
+            // for a review to stand behind, and carrying it costs nothing —
+            // dropping it would make the child's run a different run from its
+            // parent's in a way nobody asked for.
+            security: self.security.clone(),
         }
     }
 }

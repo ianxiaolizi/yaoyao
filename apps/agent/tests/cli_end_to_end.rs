@@ -388,6 +388,61 @@ fn the_selected_sandbox_is_reported_and_an_unavailable_one_stops_the_run() {
         ran_with(data.path(), workspace.path(), &[("AGENT_SANDBOX", "sandbox")], &["run", "hello"]);
     assert_eq!(unknown.code, Some(2), "{}", unknown.err);
     assert!(unknown.err.contains("unknown execution sandbox"), "{}", unknown.err);
+
+    // `AGENT_SANDBOX_NETWORK=allow` is the one value this build cannot honour:
+    // an origin allowlist bounds the requests this process makes, not the
+    // traffic of a command it starts (CONTRACT §7 #179). Read for every mode,
+    // so `local` refuses it too — and the doctor, which used not to look at the
+    // policy outside the sandboxed modes, now fails on it rather than passing a
+    // machine whose next command would not start.
+    let allow = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_SANDBOX_NETWORK", "allow")],
+        &["run", "hello"],
+    );
+    assert_eq!(allow.code, Some(2), "{}", allow.err);
+    assert!(allow.err.contains("web.request"), "the refusal names the way out: {}", allow.err);
+    let allow_doctor =
+        ran_with(data.path(), workspace.path(), &[("AGENT_SANDBOX_NETWORK", "allow")], &["doctor"]);
+    assert_eq!(allow_doctor.code, Some(1), "{}", allow_doctor.out);
+    assert!(allow_doctor.out.contains("web.request"), "{}", allow_doctor.out);
+}
+
+/// The local backend is the trusted-workspace one, and the doctor says so.
+///
+/// A run that starts a process or writes a path at `L2` or above is refused
+/// there rather than run as the user, and the refusal names the backend that
+/// can run it (CONTRACT §7 #179). `shell.run` is `L3`, so on the default
+/// backend no command runs at all — a reader who is told "confined to the
+/// workspace" and nothing else would think one could.
+#[test]
+fn doctor_reports_high_risk_requires_app_container() {
+    let (data, workspace) = dirs();
+
+    let local = ran(data.path(), workspace.path(), &["doctor"]);
+    assert_eq!(local.code, Some(0), "{}", local.err);
+    assert!(local.out.contains("mode=local"), "{}", local.out);
+    assert!(
+        local.out.contains("AGENT_SANDBOX=app-container"),
+        "the doctor names the backend that can run high-risk work: {}",
+        local.out
+    );
+    assert!(local.out.contains("shell.run"), "and the tool it means: {}", local.out);
+
+    // The run agrees: the same call is refused before it starts, and the
+    // sentence says which backend would take it. Exit `2` rather than `1`:
+    // nothing ran, which is the "did not run" verdict — the same one a backend
+    // this build does not ship gets.
+    let args = serde_json::json!({ "command": "echo hi" }).to_string();
+    let refused = ran(data.path(), workspace.path(), &["tool", "shell.run", &args]);
+    assert_eq!(refused.code, Some(2), "{} {}", refused.out, refused.err);
+    assert!(refused.err.contains("app-container"), "{}", refused.err);
+    assert!(
+        refused.err.contains("local backend cannot isolate"),
+        "the refusal says which backend it was: {}",
+        refused.err
+    );
 }
 
 /// `sandbox` is how the one-time machine setup is run and checked. The command
@@ -683,22 +738,26 @@ fn a_second_process_asking_the_same_session_is_told_it_is_busy() {
         refused.err
     );
 
-    // The text was appended before the run was refused — a queued prompt and a
-    // turn are separate facts — and nothing else was: no run opened on a
-    // session another process is driving.
+    // The instruction and the text it queued were appended before the run was
+    // refused — an intent and a queued prompt are separate facts from a turn —
+    // and nothing else was: no run opened on a session another process is
+    // driving. The intent is recorded beside its item in the same append, so
+    // the log grows by two lines, in that order.
     let after = std::fs::read_to_string(session_dir.join("events.jsonl")).expect("the log");
-    assert_eq!(
-        after.lines().count(),
-        before.lines().count() + 1,
-        "only the queued text may be written: {}",
-        after
-    );
+    let written: Vec<&str> = after.lines().skip(before.lines().count()).collect();
+    assert_eq!(written.len(), 2, "only the intent and the queued text may be written: {}", after);
+    assert!(written[0].contains("intent/recorded"), "the intent comes first: {written:?}");
+    assert!(written[1].contains("inbox/appended"), "then the item it asks for: {written:?}");
     assert_eq!(after.matches("run/started").count(), before.matches("run/started").count());
 
     // With the claim released the queued text runs, so this was a refusal and
     // not a command that never works.
+    //
+    // The follow-up is a continuation, not a new instruction: since CONTRACT §7
+    // #160 a fresh instruction would displace the queued one rather than wait
+    // behind it, and this test is about the refusal leaving the queue intact.
     drop(held);
-    let later = ran(data.path(), workspace.path(), &["ask", "third", "--session", "contended"]);
+    let later = ran(data.path(), workspace.path(), &["ask", "继续", "--session", "contended"]);
     assert!(later.ok, "{}", later.err);
     assert!(
         later.out.contains("echo: and again"),
@@ -1650,17 +1709,6 @@ fn pending_approval_id(error: &str, tool: &str) -> String {
         .unwrap_or_else(|| panic!("no pending approval for {tool} in {error:?}"))
 }
 
-/// The id out of the tool's "remembered <id>  workspace/<key>" answer.
-fn tool_remembered_id(answer: &Ran) -> String {
-    answer
-        .out
-        .trim()
-        .strip_prefix("remembered ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .map(str::to_string)
-        .unwrap_or_else(|| panic!("no remembered id in {:?}", answer.out))
-}
-
 #[test]
 fn the_memory_tools_are_unknown_until_the_configuration_turns_them_on() {
     let (data, workspace) = dirs();
@@ -1680,8 +1728,12 @@ fn the_memory_tools_are_unknown_until_the_configuration_turns_them_on() {
     }
 }
 
+/// A write waits for a person — and this is what a person looks like from the
+/// outside: a terminal. The verb that answers refuses a process without one,
+/// which is every process a model can start, so the only thing that can happen
+/// to this question here is that it stays open. (B4, CONTRACT.md §7 #178)
 #[test]
-fn a_model_write_asks_once_and_then_shares_the_store_with_the_cli() {
+fn a_model_write_asks_and_a_process_without_a_terminal_cannot_answer() {
     let (data, workspace, home) = dirs_with_config();
     let config = memory_on_config(&home);
     let remember = r#"{"text":"the deploy window is Tuesday","key":"deploy-window"}"#;
@@ -1702,53 +1754,29 @@ fn a_model_write_asks_once_and_then_shares_the_store_with_the_cli() {
         "the question left no fact behind"
     );
 
-    let granted = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
-    assert!(granted.ok, "{}", granted.err);
+    // A pipe is not a person. A tool child holds exactly this — a process with
+    // pipes for stdio — and a script that could answer its own question would
+    // be a model approving itself.
+    let answered = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
+    assert_eq!(answered.code, Some(2), "{}", answered.out);
+    assert!(answered.err.contains("interactive terminal"), "{}", answered.err);
 
-    let wrote = ran_with(
+    // The refusal left the question where it was: the call is still a question
+    // and the store is still empty.
+    let again = ran_with(
         data.path(),
         workspace.path(),
         &[("AGENT_USER_CONFIG", &config)],
         &["tool", "memory.remember", remember],
     );
-    assert!(wrote.ok, "{}", wrote.err);
-    let id = tool_remembered_id(&wrote);
-    assert!(id.starts_with("mem_"), "{id}");
-
-    // The person's own verbs read the store the model wrote.
-    let listed = ran(data.path(), workspace.path(), &["memory", "list"]);
-    assert!(listed.out.contains("the deploy window is Tuesday"), "{}", listed.out);
-
-    // Reading is allowed, so a recall goes straight through.
-    let recalled = ran_with(
-        data.path(),
-        workspace.path(),
-        &[("AGENT_USER_CONFIG", &config)],
-        &["tool", "memory.recall", r#"{"query":"Tuesday"}"#],
+    assert_eq!(again.code, Some(2), "{}", again.out);
+    pending_approval_id(&again.err, "memory.remember");
+    assert!(
+        ran(data.path(), workspace.path(), &["memory", "list"])
+            .out
+            .contains("nothing is remembered"),
+        "no answer reached the log, and no fact reached the store"
     );
-    assert!(recalled.ok, "{}", recalled.err);
-    assert!(recalled.out.contains(&id), "{}", recalled.out);
-
-    // The write grant is a grant for `memory.write`, so the delete does not
-    // ask again — that is what "always" means.
-    let forgotten = ran_with(
-        data.path(),
-        workspace.path(),
-        &[("AGENT_USER_CONFIG", &config)],
-        &["tool", "memory.forget", &format!(r#"{{"id":"{id}"}}"#)],
-    );
-    assert!(forgotten.ok, "{}", forgotten.err);
-    assert!(forgotten.out.contains(&format!("forgot {id}")), "{}", forgotten.out);
-
-    let after = ran(data.path(), workspace.path(), &["memory", "list"]);
-    assert!(after.out.contains("nothing is remembered"), "{}", after.out);
-    let recalled = ran_with(
-        data.path(),
-        workspace.path(),
-        &[("AGENT_USER_CONFIG", &config)],
-        &["tool", "memory.recall", r#"{"query":"Tuesday"}"#],
-    );
-    assert!(recalled.out.contains("nothing is remembered matching 'Tuesday'"), "{}", recalled.out);
 }
 
 #[test]
@@ -1766,20 +1794,28 @@ fn a_delete_asks_before_it_happens_when_nobody_has_answered_yet() {
     assert_eq!(asked.code, Some(2), "{}", asked.out);
     let approval = pending_approval_id(&asked.err, "memory.forget");
 
-    let granted = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
-    assert!(granted.ok, "{}", granted.err);
+    // Saying no needs no terminal, and that asymmetry is the point: a refusal
+    // is always safe to accept from anywhere, an answer is the thing that has
+    // to come from somebody.
+    let refused = ran(data.path(), workspace.path(), &["deny", &approval, "--only"]);
+    assert!(refused.ok, "{}", refused.err);
 
-    let forgotten = ran_with(
+    // Putting this one question aside does not answer the next: the delete is
+    // still a question, not an act.
+    let still_asking = ran_with(
         data.path(),
         workspace.path(),
         &[("AGENT_USER_CONFIG", &config)],
         &["tool", "memory.forget", forget],
     );
-    assert!(forgotten.ok, "{}", forgotten.err);
+    assert_eq!(still_asking.code, Some(2), "{}", still_asking.out);
+    pending_approval_id(&still_asking.err, "memory.forget");
+
+    // Nothing happened to the store while nobody answered.
     assert!(
-        forgotten.out.contains("no fact with id 'mem_nothing'"),
-        "deleting what is already gone is an answer: {}",
-        forgotten.out
+        ran(data.path(), workspace.path(), &["memory", "list"])
+            .out
+            .contains("nothing is remembered")
     );
 }
 
@@ -1949,9 +1985,10 @@ fn context_inspect_after_a_turn_reports_the_last_request() {
     // The two revisions answer different questions: the top-level one names
     // what the derivation just folded, and the request's names the prefix it
     // saw. The first turn of a session saw only what was queued for it — the
-    // start at sequence 0 and its input at sequence 1 — so its request says 1
-    // even though the log has grown since.
-    assert_eq!(last["context_revision"], 1, "{doc}");
+    // start at sequence 0, the intent recorded at sequence 1 and the input it
+    // asks for at sequence 2 — so its request says 2 even though the log has
+    // grown since.
+    assert_eq!(last["context_revision"], 2, "{doc}");
 
     // The request's messages are recorded in order, as references. Their text
     // is durable where each was produced; the list and the hashes are what
@@ -2238,4 +2275,73 @@ fn deleting_a_session_another_process_is_driving_is_refused() {
     let deleted = ran(data.path(), workspace.path(), &["session", "delete", "held"]);
     assert_eq!(deleted.code, Some(0), "{}", deleted.err);
     assert!(!log_file(data.path(), "held").exists());
+}
+
+/// A write is snapshotted before it runs, and `agent rollback` puts it back.
+///
+/// The whole slice through the real binary: the tool call takes a recovery
+/// point, the session log says so, and a later invocation of a *different*
+/// process restores the file from the id alone. Idempotence is checked by
+/// asking twice — a second rollback must find nothing to do, not fail and not
+/// rewrite.
+#[test]
+fn a_write_is_recoverable_and_rollback_restores_it() {
+    let (data, workspace) = dirs();
+    let file = workspace.path().join("notes.txt");
+    // A file that already exists, so the recovery point holds its *previous*
+    // bytes rather than its absence: rolling back has to bring the content
+    // back, not merely delete what the call added.
+    std::fs::write(&file, "zero").unwrap();
+
+    let write = serde_json::json!({ "path": "notes.txt", "content": "one" }).to_string();
+    let r = ran(data.path(), workspace.path(), &["tool", "fs.write", &write]);
+    assert_eq!(r.code, Some(0), "the write ran: {} {}", r.out, r.err);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one");
+
+    let log = std::fs::read_to_string(log_file(data.path(), "default")).expect("the log");
+    let snapshot = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("an event"))
+        .rfind(|line| line["event"]["event_type"] == "workspace/snapshot.created")
+        .expect("the write took a recovery point");
+    let snapshot_id =
+        snapshot["event"]["payload"]["snapshot_id"].as_str().expect("an id").to_string();
+    assert!(
+        log.contains("workspace/changes.recorded"),
+        "what the call changed is recorded too: {log}"
+    );
+
+    // Something else changes the file after the fact — the case a rollback is
+    // for: the recovery point is what the file looked like *before* the call.
+    std::fs::write(&file, "two").unwrap();
+
+    let rolled = ran(data.path(), workspace.path(), &["rollback", &snapshot_id]);
+    assert_eq!(
+        rolled.code,
+        Some(0),
+        "rollback said {:?} ({} {})",
+        rolled.code,
+        rolled.out,
+        rolled.err
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "zero");
+    assert!(rolled.out.contains("restored 1"), "{}", rolled.out);
+    assert!(rolled.out.contains("notes.txt"), "{}", rolled.out);
+
+    let after = std::fs::read_to_string(log_file(data.path(), "default")).unwrap();
+    assert!(after.contains("workspace/rollback.completed"), "the rollback is in the log");
+
+    let again = ran(data.path(), workspace.path(), &["rollback", &snapshot_id]);
+    assert_eq!(again.code, Some(0), "a second rollback is a no-op: {}", again.err);
+    assert!(again.out.contains("restored 0"), "{}", again.out);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "zero");
+}
+
+/// An unknown snapshot id is a refusal, not a panic and not a success.
+#[test]
+fn a_rollback_of_an_unknown_snapshot_does_not_run() {
+    let (data, workspace) = dirs();
+    let r = ran(data.path(), workspace.path(), &["rollback", "no-such-snapshot"]);
+    assert_eq!(r.code, Some(2), "said {:?} ({} {})", r.code, r.out, r.err);
+    assert!(r.out.contains("no-such-snapshot"), "the answer names it: {}", r.out);
 }
