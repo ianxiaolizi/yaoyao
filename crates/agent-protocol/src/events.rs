@@ -312,6 +312,14 @@ impl EventType {
     /// authorisation source, refusals, classifier trace — so a reader needs
     /// nothing else to reconstruct why the call happened.
     pub const PERMISSION_DECISION: &'static str = "permission/decision";
+    /// A dispatch that is about to use a secret reference.
+    ///
+    /// Written after the decision and before the tool runs, and it holds the
+    /// reference as the model wrote it, the action digest it was answered
+    /// under, the tool, and the origin the call reaches. It never holds a
+    /// value: the plaintext has no field to sit in here, so no later change to
+    /// a redactor can let one in (CONTRACT §7 #181).
+    pub const SECRET_ACCESSED: &'static str = "secret/accessed";
     /// One fast-decision call's trace. An observation, never an input
     /// to anything in this build: the shadow mode is what makes that true.
     pub const DECISION_TRACE: &'static str = "decision/trace";
@@ -438,6 +446,7 @@ impl EventType {
         Self::APPROVAL_CANCELLED,
         Self::APPROVAL_REVOKED,
         Self::PERMISSION_DECISION,
+        Self::SECRET_ACCESSED,
         Self::DECISION_TRACE,
         Self::PLUGIN_LOADED,
         Self::PLUGIN_UNLOADED,

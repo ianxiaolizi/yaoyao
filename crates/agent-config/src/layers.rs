@@ -100,6 +100,29 @@ pub struct UserConfig {
     /// opened inside it. An absent section means no origin is reachable —
     /// opening the network to a set of sites is a decision a person makes.
     pub network: Option<NetworkSpec>,
+    /// The secret names a tool argument may reference.
+    ///
+    /// Here for the same reason as `network`: which values this machine hands
+    /// to a model-driven call is a fact about the machine, and a repository
+    /// that could write a list could name its own environment. This section
+    /// can only ever *narrow* what the host allows (`AGENT_TOOL_SECRETS`): an
+    /// absent section narrows nothing, and `allow = []` turns secret use off.
+    pub secrets: Option<SecretsSpec>,
+}
+
+/// The `[secrets]` section: which names a reference may use.
+///
+/// Names, not values. A value in a configuration file is a secret written to
+/// disk in cleartext, so this file never carries one; the backend
+/// (`agent-store-secret`) is the only thing that produces one, and only at the
+/// moment an approved call runs.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsSpec {
+    /// Secret names, intersected with the ones the host allows this process to
+    /// resolve. An empty list turns secret use off.
+    #[serde(default)]
+    pub allow: Vec<String>,
 }
 
 /// The `[network]` section: which remote origins a read may reach.
@@ -718,6 +741,49 @@ mod tests {
         // stopped working.
         let error = UserConfig::from_toml_str("[network]\nallowed = [\"https://docs.rs\"]\n")
             .expect_err("a misspelled key must not read as an empty allowlist");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn only_the_user_layer_can_name_secrets() {
+        // A list of names is an authorization about this machine's
+        // environment, and a repository that could write one could name a
+        // variable the person never meant to hand it. The names are not
+        // values: a value in a config file would be a secret written to disk.
+        let user = UserConfig::from_toml_str("[secrets]\nallow = [\"OPENAI_API_KEY\"]\n")
+            .expect("the user layer may name secrets");
+        assert_eq!(
+            user.secrets.map(|secrets| secrets.allow),
+            Some(vec!["OPENAI_API_KEY".to_string()])
+        );
+
+        for (label, parsed) in [
+            (
+                "workspace",
+                WorkspaceConfig::from_toml_str("[secrets]\nallow = [\"TOKEN\"]\n").map(|_| ()),
+            ),
+            (
+                "managed",
+                ManagedPolicy::from_toml_str("[secrets]\nallow = [\"TOKEN\"]\n").map(|_| ()),
+            ),
+            (
+                "profile",
+                UserConfig::from_toml_str("[profiles.coding.secrets]\nallow = [\"TOKEN\"]\n")
+                    .map(|_| ()),
+            ),
+        ] {
+            let error = parsed.expect_err("only the user layer names secrets");
+            assert!(error.to_string().contains("unknown field"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_secrets_section_with_a_typo_is_a_refusal_not_a_silent_no_op() {
+        // A misspelled section would otherwise read as "the user said
+        // nothing", and the host's list would govern the run while the person
+        // believed they had narrowed it.
+        let error = UserConfig::from_toml_str("[secrets]\nallowed = [\"TOKEN\"]\n")
+            .expect_err("a misspelled key must not read as no section");
         assert!(error.to_string().contains("unknown field"), "{error}");
     }
 

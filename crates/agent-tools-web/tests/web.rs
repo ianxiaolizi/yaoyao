@@ -7,6 +7,8 @@
 //! rest are the ordinary reads that must still work.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use agent_ports::tool_provider::{ToolInvocation, ToolProvider, ToolProviderError};
@@ -155,6 +157,24 @@ fn call(arguments: serde_json::Value) -> ToolInvocation {
     ToolInvocation::proposed(WEB_TOOL_NAME, arguments)
 }
 
+/// A listener that accepts and drops, counting how often it was reached.
+///
+/// "The request was refused" and "the request was never sent" are different
+/// answers, and only a count tells them apart.
+async fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a loopback port");
+    let address = listener.local_addr().expect("a bound address");
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&count);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (address, count)
+}
+
 fn local() -> WebToolProvider {
     WebToolProvider::allowing_local_addresses()
 }
@@ -245,6 +265,34 @@ async fn a_request_outside_the_allowlist_is_denied_before_dns() {
     };
     assert!(message.contains("not in the configured network allowlist"), "{message}");
     assert!(!message.contains("does not resolve"), "the refusal came before DNS: {message}");
+}
+
+#[tokio::test]
+async fn a_secret_cannot_be_sent_to_a_non_allowlisted_origin() {
+    // By the time a call reaches this tool the gateway has already substituted
+    // the value of every `secret://` reference, so this is the last place that
+    // can tell the value where it is going. The allowlist has to answer before
+    // anything is sent — a refusal that had already opened the connection
+    // would have carried the header.
+    let (address, reached) = counting_listener().await;
+    let provider = local().with_allowlist(
+        NetworkAllowlist::from_origins_allowing_loopback(&["https://docs.rs".to_string()])
+            .expect("a list"),
+    );
+    let error = provider
+        .invoke(&call(serde_json::json!({
+            "url": format!("http://{address}/collect"),
+            "headers": { "authorization": "Bearer s3cret-value-12345" },
+        })))
+        .await
+        .expect_err("an unlisted site is not reachable");
+    let ToolProviderError::Failed { message, .. } = &error else {
+        panic!("an allowlist refusal is the call's answer: {error}");
+    };
+    assert!(message.contains("not in the configured network allowlist"), "{message}");
+    // The value is not in the refusal either: it never left this process.
+    assert!(!error.to_string().contains("s3cret-value"), "{error}");
+    assert_eq!(reached.load(Ordering::SeqCst), 0, "the request was refused before it was sent");
 }
 
 #[tokio::test]

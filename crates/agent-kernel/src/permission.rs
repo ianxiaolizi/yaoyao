@@ -195,6 +195,68 @@ pub enum PermissionError {
     Payload(#[from] serde_json::Error),
 }
 
+/// What one dispatch did with a secret: everything but the value.
+///
+/// Written immediately before a tool runs with a resolved reference in its
+/// arguments, so the log answers "was this action allowed to use that secret"
+/// from the same fingerprint the person answered. It names the reference as the
+/// model wrote it — the value is not a field here, not redacted out of one: it
+/// never enters this struct, so no later edit to the redactor can let it in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SecretAccessRecord {
+    /// The action this dispatch is, by the same digest the decision and the
+    /// lease are bound to.
+    pub action_digest: String,
+    pub task_id: String,
+    pub tool: String,
+    /// The references, as written, deduplicated and in sorted order: a set,
+    /// because a call naming one secret twice used one secret.
+    pub references: Vec<String>,
+    /// Where the call would send it, when the action goes anywhere at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_origin: Option<String>,
+    /// The decision that permitted this dispatch.
+    pub authorization_source: AuthorizationSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<ApprovalId>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl SecretAccessRecord {
+    /// The record for one dispatch, from the decision it is running under.
+    pub fn of(
+        action: &ActionFacts,
+        decision: &PermissionDecisionRecord,
+        references: Vec<String>,
+    ) -> Self {
+        Self {
+            action_digest: action.digest.clone(),
+            task_id: action.task_id.clone(),
+            tool: action.tool_name.clone(),
+            references,
+            target_origin: origin_of(action),
+            authorization_source: decision.authorization_source,
+            approval_id: decision.approval_id.clone(),
+            recorded_at: Utc::now(),
+        }
+    }
+}
+
+/// The origin an action reaches, if it reaches one.
+///
+/// Built from the action's targets rather than from the arguments: a target is
+/// already the canonical shape the decision is bound to, and an argument is
+/// arbitrary text. The port is included because two ports on one host are two
+/// destinations as far as an allowlist is concerned (CONTRACT §7 #180).
+fn origin_of(action: &ActionFacts) -> Option<String> {
+    action.targets.iter().find_map(|target| match target {
+        agent_protocol::permission::ActionTarget::Network { scheme, host, port, .. } => {
+            Some(format!("{scheme}://{host}:{port}"))
+        }
+        _ => None,
+    })
+}
+
 /// The event-sourced ledger of permission decisions.
 pub struct PermissionService {
     store: Arc<dyn EventStore>,
@@ -224,21 +286,55 @@ impl PermissionService {
     ) -> Result<PermissionDecisionRecord, PermissionError> {
         let record = rule(action, baseline, classifier);
         let payload = serde_json::to_value(&record)?;
-        // The read and the append are one step, held under the store's lease:
-        // a decision written onto a log this read did not see would be a
-        // decision taken about a different session state (CONTRACT §4 C4.5).
+        self.append(session_id, EventType::PERMISSION_DECISION, payload, record.created_at).await?;
+        Ok(record)
+    }
+
+    /// Write down that a dispatch is about to use secrets, or refuse the call.
+    ///
+    /// The event carries the digest of the action the decision was made about,
+    /// the references as written, and where the call goes — never a value
+    /// (CONTRACT §7 #181). It is written before the tool runs, for the same
+    /// reason the decision is: an access recorded after the result would be a
+    /// record made with the outcome visible, and a crash between the two would
+    /// leave a secret used with nothing said about it.
+    pub async fn record_secret_access(
+        &self,
+        session_id: &SessionId,
+        action: &ActionFacts,
+        decision: &PermissionDecisionRecord,
+        references: &[String],
+    ) -> Result<SecretAccessRecord, PermissionError> {
+        let record = SecretAccessRecord::of(action, decision, references.to_vec());
+        let payload = serde_json::to_value(&record)?;
+        self.append(session_id, EventType::SECRET_ACCESSED, payload, record.recorded_at).await?;
+        Ok(record)
+    }
+
+    /// Append one ledger event at the end of the session's log.
+    ///
+    /// The read of the log's end and the append are one step, held under the
+    /// store's lease: a record written onto a log this read did not see would
+    /// be a record about a different session state (CONTRACT §4 C4.5).
+    async fn append(
+        &self,
+        session_id: &SessionId,
+        event_type: &str,
+        payload: serde_json::Value,
+        created_at: DateTime<Utc>,
+    ) -> Result<(), PermissionError> {
         let _lease = self.store.lease(session_id).await?;
         let next = self.next_seq(session_id).await?;
         let draft = EventDraft {
             event_id: EventId::new(),
-            event_type: EventType::new(EventType::PERMISSION_DECISION),
+            event_type: EventType::new(event_type),
             schema_version: SchemaVersion::current(),
             session_id: session_id.clone(),
             run_id: None,
             turn_id: None,
             step_id: None,
             actor: Actor::System,
-            created_at: record.created_at,
+            created_at,
             causation_id: None,
             correlation_id: None,
             payload,
@@ -246,7 +342,7 @@ impl PermissionService {
             ignorable: false,
         };
         self.store.append(session_id, next, vec![draft]).await?;
-        Ok(record)
+        Ok(())
     }
 
     /// The record a session's log holds for one action digest, if any.

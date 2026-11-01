@@ -246,6 +246,26 @@ fn tool_secret_refs(raw: Option<&str>) -> Vec<SecretRef> {
     names.into_iter().map(|name| SecretRef { source: "env".to_string(), name }).collect()
 }
 
+/// The host's list, narrowed by the user layer's `[secrets] allow`.
+///
+/// The user layer can only take names away (CONTRACT §7 #181). `None` there is
+/// "the person wrote no section", which leaves the host's list as it is; an
+/// empty list is a person who turned secret use off, and reads as exactly
+/// that. Both are computed here rather than at each of the two places that ask
+/// — the gateway that resolves and the prompt that tells the model what it may
+/// name — because two lists that disagree would be a model told about a secret
+/// the gateway would refuse.
+pub(crate) fn effective_tool_secrets(
+    raw: Option<&str>,
+    user_allow: Option<&[String]>,
+) -> Vec<SecretRef> {
+    let host = tool_secret_refs(raw);
+    let Some(narrow) = user_allow else {
+        return host;
+    };
+    host.into_iter().filter(|secret| narrow.contains(&secret.name)).collect()
+}
+
 /// The high-entropy layer's setting, from `AGENT_REDACT_HIGH_ENTROPY`.
 ///
 /// Host configuration, like the sandbox mode: whether to report or replace a
@@ -639,7 +659,10 @@ pub async fn assemble_over(
     let approvals = Arc::new(ApprovalService::new(store.clone()).with_session_scope(true));
     // What the gateway may resolve when a tool argument names a reference. The
     // same list is what the model is told it may name, one fact read once.
-    let tool_secrets = tool_secret_refs(std::env::var("AGENT_TOOL_SECRETS").ok().as_deref());
+    let tool_secrets = effective_tool_secrets(
+        std::env::var("AGENT_TOOL_SECRETS").ok().as_deref(),
+        resolved.secret_allow.as_deref(),
+    );
     // One redactor for the whole assembly: the loop and the tool boundary must
     // not disagree about whether a long mixed token is reported or replaced.
     let redactor = Redactor::new().with_high_entropy(high_entropy_from(
@@ -1278,6 +1301,30 @@ pub async fn assemble_over(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_user_layer_can_only_narrow_the_hosts_secrets() {
+        // Two directions the same fact can go wrong: a name the user added and
+        // the host never allowed must not become resolvable, and a section the
+        // user wrote must not be ignored.
+        let names = |secrets: Vec<SecretRef>| -> Vec<String> {
+            secrets.into_iter().map(|secret| secret.name).collect()
+        };
+
+        // No section: the host's list as it stands.
+        assert_eq!(names(effective_tool_secrets(Some("A,B"), None)), ["A", "B"]);
+
+        // A section narrows, and a name only the user wrote resolves to
+        // nothing — the host has to have allowed it too.
+        assert_eq!(names(effective_tool_secrets(Some("A,B"), Some(&["B".to_string()]))), ["B"]);
+        assert!(effective_tool_secrets(Some("A"), Some(&["C".to_string()])).is_empty());
+
+        // An explicit empty list is a person turning secret use off.
+        assert!(effective_tool_secrets(Some("A,B"), Some(&[])).is_empty());
+
+        // No host list is no secrets, whatever the user layer says.
+        assert!(effective_tool_secrets(None, Some(&["A".to_string()])).is_empty());
+    }
 
     #[test]
     fn a_reasoning_default_without_a_declared_depth_is_not_sent() {

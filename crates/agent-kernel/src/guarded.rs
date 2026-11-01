@@ -364,40 +364,62 @@ impl GuardedToolProvider {
         // The decision this call runs under, written before it runs: a resume
         // is a dispatch like any other, and a reader joining the log should see
         // the answer that permitted it by name.
-        self.record(
-            session_id,
-            &action,
-            PermissionBaseline::new(PolicyDecision::Allow)
-                .approve(true)
-                .approval(approval_id.clone()),
-            None,
-        )
-        .await?;
+        let decision = self
+            .record(
+                session_id,
+                &action,
+                PermissionBaseline::new(PolicyDecision::Allow)
+                    .approve(true)
+                    .approval(approval_id.clone()),
+                None,
+            )
+            .await?;
         let record = ToolPolicyRecord::allowed(self.capabilities_for(&invocation.tool_name))
             .about(&action.digest);
-        Ok(self.run_resolved(invocation).await?.with_policy(record))
+        Ok(self.run_resolved(session_id, &action, &decision, invocation).await?.with_policy(record))
     }
 
     /// Resolve references, run the tool, scrub what comes back.
     ///
     /// The one path both execution entry points share, so an approved call and
     /// an allowed one cannot disagree about whether a reference was resolved
-    /// or whether its value was scrubbed afterwards.
+    /// or whether its value was scrubbed afterwards. The decision is handed in
+    /// rather than asked for here: this runs only because one already exists,
+    /// and the access record names the digest it was made about.
     async fn run_resolved(
         &self,
+        session_id: &SessionId,
+        action: &ActionFacts,
+        decision: &PermissionDecisionRecord,
         invocation: &ToolInvocation,
     ) -> Result<ToolResult, ToolGatewayError> {
         let (resolved_invocation, secrets) =
             crate::secret_refs::resolve_arguments(self.secrets.as_deref(), invocation)?;
-        self.finish_resolved(&resolved_invocation, &secrets).await
+        self.finish_resolved(session_id, action, decision, &resolved_invocation, &secrets).await
     }
 
     /// Run an invocation whose references are already resolved.
+    ///
+    /// The access is written down before the tool runs, and a ledger that
+    /// cannot take the write refuses the call: a secret used with no record of
+    /// the action that permitted it is the one outcome this gate exists to
+    /// prevent.
     async fn finish_resolved(
         &self,
+        session_id: &SessionId,
+        action: &ActionFacts,
+        decision: &PermissionDecisionRecord,
         resolved_invocation: &ToolInvocation,
         secrets: &[ResolvedSecret],
     ) -> Result<ToolResult, ToolGatewayError> {
+        crate::secret_refs::record_access(
+            self.permissions.as_deref(),
+            session_id,
+            action,
+            decision,
+            secrets,
+        )
+        .await?;
         let result = self
             .inner
             .invoke(resolved_invocation)
@@ -740,22 +762,24 @@ impl ToolGateway for GuardedToolProvider {
                 // two of them carried would be worse than none.
                 let record = ToolPolicyRecord::allowed(capabilities.clone()).about(&action.digest);
                 if !crate::secret_refs::references_secret(&invocation.arguments) {
-                    self.record(
-                        session_id,
-                        &action,
-                        PermissionBaseline::new(PolicyDecision::Allow).approve(approved),
-                        classifier.clone(),
-                    )
-                    .await?;
-                    return Ok(self.finish_resolved(invocation, &[]).await?.with_policy(record));
+                    let decision = self
+                        .record(
+                            session_id,
+                            &action,
+                            PermissionBaseline::new(PolicyDecision::Allow).approve(approved),
+                            classifier.clone(),
+                        )
+                        .await?;
+                    return Ok(self
+                        .finish_resolved(session_id, &action, &decision, invocation, &[])
+                        .await?
+                        .with_policy(record));
                 }
-                // Resolve before asking: a reference this run cannot resolve is
-                // a call that could never run, and a person should not be asked
-                // to approve one. The values stay in this frame until the call
-                // actually runs (or the approval is raised and they are
-                // dropped with the frame).
-                let (resolved_invocation, secrets) =
-                    crate::secret_refs::resolve_arguments(self.secrets.as_deref(), invocation)?;
+                // Whether this run could resolve the reference at all, asked
+                // without producing a value: a call that could never run is not
+                // one a person should be asked about, and a value nobody has
+                // approved yet is not one this process should hold.
+                crate::secret_refs::check_arguments(self.secrets.as_deref(), invocation)?;
                 // A call that names a secret is a call a person should see
                 // before it runs. The reference is all the summary can show
                 // them, and the tool's own capability says whether they
@@ -772,11 +796,20 @@ impl ToolGateway for GuardedToolProvider {
                     PermissionBaseline::new(PolicyDecision::Ask)
                         .because("the call names a secret; a person sees it before it runs")
                 };
-                self.record(session_id, &action, baseline, classifier.clone()).await?;
+                let decision =
+                    self.record(session_id, &action, baseline, classifier.clone()).await?;
                 if !secret_granted {
                     return Err(self.request_approval(session_id, invocation, &action).await?);
                 }
-                Ok(self.finish_resolved(&resolved_invocation, &secrets).await?.with_policy(record))
+                // Only now is the value produced. The decision exists, the
+                // access is about to be written down, and the value lives from
+                // here to the end of the call (CONTRACT §7 #181).
+                let (resolved_invocation, secrets) =
+                    crate::secret_refs::resolve_arguments(self.secrets.as_deref(), invocation)?;
+                Ok(self
+                    .finish_resolved(session_id, &action, &decision, &resolved_invocation, &secrets)
+                    .await?
+                    .with_policy(record))
             }
         }
     }

@@ -440,9 +440,26 @@ impl DoctorCheck for ProfileHealthCheck {
                         } else {
                             format!("web.request may reach {}", origins.join(", "))
                         };
+                        // The same intersection the assembly performs, so this
+                        // line cannot promise a name the gateway would refuse
+                        // (CONTRACT §7 #181).
+                        let secrets = crate::stack::effective_tool_secrets(
+                            std::env::var("AGENT_TOOL_SECRETS").ok().as_deref(),
+                            resolved.secret_allow.as_deref(),
+                        );
+                        let names: Vec<String> =
+                            secrets.iter().map(|secret| secret.name.clone()).collect();
+                        let resolve = if names.is_empty() {
+                            "no secret reference resolves".to_string()
+                        } else {
+                            format!("secret references resolve {}", names.join(", "))
+                        };
                         (
                             HealthStatus::Passed,
-                            format!("profile '{}' resolves; {egress}", resolved.profile_id),
+                            format!(
+                                "profile '{}' resolves; {egress}; {resolve}",
+                                resolved.profile_id
+                            ),
                         )
                     }
                     Err(e) => (

@@ -81,6 +81,14 @@ pub struct ResolvedProfile {
     /// one is not an origin. Empty means no egress at all, which is the
     /// shipped posture: a run reaches the sites a person named and no others.
     pub network_allow: Vec<String>,
+    /// The secret names this run may resolve, as the user layer narrowed them.
+    ///
+    /// `None` is "the user layer said nothing", and the host's own list
+    /// (`AGENT_TOOL_SECRETS`) governs unchanged. `Some(names)` is a narrowing:
+    /// the run resolves the intersection, so a name the host does not allow is
+    /// still not resolvable. Values never appear here — this is a list of
+    /// names, and the backend is the only producer of a value.
+    pub secret_allow: Option<Vec<String>>,
     pub capability_set: CapabilitySet,
     pub plugin_versions: BTreeMap<String, String>,
     /// The MCP servers this run starts, one per enabled `mcp.<server>` plugin,
@@ -469,6 +477,7 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
             .as_ref()
             .map(|network| network.allow.clone())
             .unwrap_or_default(),
+        secret_allow: layers.user.secrets.as_ref().map(|secrets| secrets.allow.clone()),
         capability_set,
         plugin_versions,
         mcp_servers,
@@ -1762,5 +1771,27 @@ mod tests {
 
         // Nothing configured is no egress, not "any origin".
         assert!(resolve(Layers::default()).unwrap().network_allow.is_empty());
+    }
+
+    #[test]
+    fn the_user_layers_secret_names_reach_the_resolution_as_written() {
+        // `None` is not the same answer as `Some([])`: the first is "the user
+        // layer said nothing, the host's list governs", and the second is
+        // "this run resolves nothing". Collapsing them would make an absent
+        // section silently turn secrets off, or an empty one silently leave
+        // them on.
+        assert_eq!(resolve(Layers::default()).unwrap().secret_allow, None);
+
+        let layers = Layers {
+            user: UserConfig::from_toml_str("[secrets]\nallow = [\"OPENAI_API_KEY\"]\n").unwrap(),
+            ..Layers::default()
+        };
+        assert_eq!(resolve(layers).unwrap().secret_allow, Some(vec!["OPENAI_API_KEY".to_string()]));
+
+        let empty = Layers {
+            user: UserConfig::from_toml_str("[secrets]\nallow = []\n").unwrap(),
+            ..Layers::default()
+        };
+        assert_eq!(resolve(empty).unwrap().secret_allow, Some(Vec::new()));
     }
 }
