@@ -100,6 +100,19 @@ impl EventType {
     pub const INBOX_APPENDED: &'static str = "inbox/appended";
     pub const INBOX_CLAIMED: &'static str = "inbox/claimed";
     pub const INBOX_DISCARDED: &'static str = "inbox/discarded";
+    /// One direct user instruction, recorded as `agent_protocol::intent::Intent`.
+    ///
+    /// Written beside the `inbox/appended` item it asks for, in the same append
+    /// batch, so a queued turn and the request that asked for it cannot exist
+    /// apart. `intent/superseded` is the only event that changes an intent
+    /// after this one in this slice; a consuming event arrives with the answer
+    /// binding.
+    pub const INTENT_RECORDED: &'static str = "intent/recorded";
+    /// An intent was overtaken: payload names `intent_id` and `superseded_by`.
+    ///
+    /// The superseded intent keeps its text, item, and evidence — this event
+    /// records that a later request outranks it, not that it never happened.
+    pub const INTENT_SUPERSEDED: &'static str = "intent/superseded";
     pub const TURN_CANCELLED: &'static str = "turn/cancelled";
     /// The tool definitions this turn offers, frozen once before the first
     /// request. `model/request.prepared` says which manifest was sent; this
@@ -272,6 +285,8 @@ impl EventType {
         Self::INBOX_APPENDED,
         Self::INBOX_CLAIMED,
         Self::INBOX_DISCARDED,
+        Self::INTENT_RECORDED,
+        Self::INTENT_SUPERSEDED,
         Self::TURN_CANCELLED,
         Self::MODEL_TOOLS_FROZEN,
         Self::MODEL_REQUEST_PREPARED,

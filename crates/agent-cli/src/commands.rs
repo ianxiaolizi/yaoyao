@@ -15,9 +15,10 @@
 
 use agent_kernel::approval::{ApprovalError, ApprovalService};
 use agent_kernel::inbox::{Inbox, InboxError};
+use agent_kernel::intent::IntentError;
 use agent_kernel::scheduler::{RunReport, Scheduler, SchedulerError};
 use agent_protocol::events::Actor;
-use agent_protocol::ids::{ApprovalId, InboxItemId, RunId, SessionId, StepId, TurnId};
+use agent_protocol::ids::{ApprovalId, InboxItemId, IntentId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::inbox::InboxKind;
 use agent_protocol::permissions::{ApprovalReply, ApprovalScope};
 use chrono::{DateTime, Utc};
@@ -34,6 +35,8 @@ pub enum CommandError {
     Scheduler(#[from] SchedulerError),
     #[error(transparent)]
     Inbox(#[from] InboxError),
+    #[error(transparent)]
+    Intent(#[from] IntentError),
     #[error(transparent)]
     Approval(#[from] ApprovalError),
     /// The command's own argument is wrong. Nothing was written.
@@ -66,23 +69,16 @@ pub enum TurnStart {
 /// Queue text for a turn and drive it.
 ///
 /// The append is a separate fact from the run: if the run cannot start, the
-/// text is still in the inbox, exactly as `agent ask` leaves it today.
+/// text is still in the inbox, exactly as `agent ask` leaves it today. The
+/// instruction is recorded to the intent ledger beside its inbox item, so a
+/// later reader can tell which request a given answer belongs to.
 pub async fn start_turn(
     scheduler: &Scheduler,
     session_id: &SessionId,
     text: &str,
     now: DateTime<Utc>,
 ) -> Result<TurnStart, CommandError> {
-    scheduler
-        .inbox()
-        .append(
-            session_id,
-            InboxKind::NextTurn,
-            serde_json::json!({ "text": text }),
-            0,
-            Actor::User,
-        )
-        .await?;
+    scheduler.inbox().submit_user_turn(session_id, text).await?;
 
     let report = scheduler.run_pending(session_id, now).await?;
     Ok(match report {
@@ -279,6 +275,11 @@ pub struct StatusReport {
     pub open_step: Option<StepId>,
     /// Inbox items that are still pending, of any kind.
     pub pending: usize,
+    /// The most recent instruction the session recorded, if any.
+    ///
+    /// A session whose logs predate the intent ledger answers `None` — that is
+    /// "this log has no intents", not "the user asked for nothing".
+    pub latest_intent_id: Option<IntentId>,
 }
 
 /// Read a session's lifecycle from the durable log.
@@ -288,10 +289,12 @@ pub async fn status(
 ) -> Result<StatusReport, CommandError> {
     let lifecycle = scheduler.lifecycle(session_id).await?;
     let pending = scheduler.inbox().pending(session_id).await?;
+    let latest_intent_id = scheduler.intents().latest(session_id).await?.map(|i| i.intent_id);
     Ok(StatusReport {
         open_run: lifecycle.open_run,
         open_turn: lifecycle.open_turn,
         open_step: lifecycle.open_step,
         pending: pending.len(),
+        latest_intent_id,
     })
 }

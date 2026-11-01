@@ -642,6 +642,7 @@ pub async fn run_status(
     let open_run = report.open_run.as_ref().map(|id| id.as_str());
     let open_turn = report.open_turn.as_ref().map(|id| id.as_str());
     let open_step = report.open_step.as_ref().map(|id| id.as_str());
+    let latest_intent = report.latest_intent_id.as_ref().map(|id| id.as_str());
 
     if json {
         let value = serde_json::json!({
@@ -650,6 +651,7 @@ pub async fn run_status(
             "open_turn": open_turn,
             "open_step": open_step,
             "pending": report.pending,
+            "latest_intent_id": latest_intent,
         });
         Ok(CliOutput::Json(json_output(&value)?))
     } else {
@@ -658,6 +660,7 @@ pub async fn run_status(
         lines.push(format!("open turn: {}", open_turn.unwrap_or("none")));
         lines.push(format!("open step: {}", open_step.unwrap_or("none")));
         lines.push(format!("pending:   {}", report.pending));
+        lines.push(format!("intent:    {}", latest_intent.unwrap_or("none")));
         Ok(CliOutput::Text(lines.join("\n")))
     }
 }

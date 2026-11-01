@@ -15,6 +15,7 @@ use agent_protocol::ids::{
     EventId, EventSeq, InboxItemId, RunId, SchemaVersion, SessionId, TurnId,
 };
 use agent_protocol::inbox::{InboxItem, InboxItemStatus, InboxKind};
+use agent_protocol::intent::Intent;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -146,13 +147,78 @@ impl Inbox {
             created_at: Utc::now(),
             status: InboxItemStatus::Pending,
         };
+        self.append_item(session_id, item.clone(), Vec::new(), actor).await?;
+        Ok(item)
+    }
+
+    /// Record a direct user instruction and queue the turn it asks for.
+    ///
+    /// The intent and the item name each other, and both land in **one** append
+    /// batch: there is no moment where a queued turn exists without the intent
+    /// that asked for it, or the reverse. That is the whole point of the ledger
+    /// — after the 2026-11-01 incident, "which request is this answer for?"
+    /// had to become a question the log answers, not one a reader guesses from
+    /// the queue's order.
+    ///
+    /// The intent is recorded with [`IntentKind::NewTask`] because no relation
+    /// has been decided yet. Deciding it (continue / revise / supersede) is the
+    /// adjudicator's job in a later slice; asserting a relation this path
+    /// cannot know would put a guess in the log dressed as a fact.
+    pub async fn submit_user_turn(
+        &self,
+        session_id: &SessionId,
+        text: impl Into<String>,
+    ) -> Result<(Intent, InboxItem), InboxError> {
+        let text = text.into();
+        // The item is built first so its `created_at` is the one clock read
+        // that stamps both records (CONTRACT §7 裁决 #20): the intent is the
+        // request, the item is where it waits, and they happened at the same
+        // instant by construction.
+        let mut item = InboxItem {
+            item_id: InboxItemId::new(),
+            session_id: session_id.clone(),
+            kind: InboxKind::NextTurn,
+            payload: serde_json::Value::Null,
+            priority: 0,
+            created_at: Utc::now(),
+            status: InboxItemStatus::Pending,
+        };
+        let intent = Intent::user_direct(
+            session_id.clone(),
+            text.clone(),
+            item.item_id.clone(),
+            item.created_at,
+        );
+        item.payload = serde_json::json!({ "text": text, "intent_id": intent.intent_id });
+        let intent_draft = self.draft(
+            session_id,
+            EventType::INTENT_RECORDED,
+            serde_json::to_value(&intent)?,
+            Actor::User,
+        );
+        self.append_item(session_id, item.clone(), vec![intent_draft], Actor::User).await?;
+        Ok((intent, item))
+    }
+
+    /// Append one item, plus any events that must land with it, atomically.
+    ///
+    /// Order in the batch is fixed: `session/started` (when this is the
+    /// session's first event), then `leading`, then `inbox/appended`. A reader
+    /// that sees the item can therefore see everything the item depends on.
+    async fn append_item(
+        &self,
+        session_id: &SessionId,
+        item: InboxItem,
+        leading: Vec<EventDraft>,
+        actor: Actor,
+    ) -> Result<(), InboxError> {
         // Read the log's end and append at it as one step: another process on
         // this session — `agent steer` is exactly this path — can move the
         // sequence in between, and an append from a stale read is refused.
         // (YA-36)
         let _lease = self.store.lease(session_id).await?;
         let next = self.next_seq(session_id).await?;
-        let mut drafts = Vec::with_capacity(2);
+        let mut drafts = Vec::with_capacity(leading.len() + 2);
         // A session used for the first time starts here. `next == 0` means this
         // append is the first event the session will ever have, so writing
         // `session/started` beside it is what makes "a session's log says it
@@ -163,6 +229,7 @@ impl Inbox {
         if next == EventSeq::ZERO {
             drafts.push(crate::session_lifecycle::started_draft(session_id, actor.clone()));
         }
+        drafts.extend(leading);
         drafts.push(self.draft(
             session_id,
             EventType::INBOX_APPENDED,
@@ -170,7 +237,7 @@ impl Inbox {
             actor,
         ));
         self.store.append(session_id, next, drafts).await?;
-        Ok(item)
+        Ok(())
     }
 
     /// Queue text for the turn already in flight.
@@ -607,6 +674,31 @@ mod tests {
 
         inbox.claim(&sid, &claimed.item_id, &RunId::new()).await.unwrap();
         inbox.discard(&sid, &discarded.item_id, DiscardCause::Refused, None).await.unwrap();
+        inbox.submit_user_turn(&sid, "lease please").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn submitting_a_user_turn_records_the_intent_beside_the_item() {
+        let (inbox, store, sid) = inbox();
+
+        let (intent, item) = inbox.submit_user_turn(&sid, "fix the junction escape").await.unwrap();
+
+        assert_eq!(item.kind, InboxKind::NextTurn);
+        assert_eq!(item.payload["text"], "fix the junction escape");
+        assert_eq!(item.payload["intent_id"], intent.intent_id.as_str());
+        assert_eq!(intent.item_id.as_ref(), Some(&item.item_id));
+        assert_eq!(intent.text, "fix the junction escape");
+
+        // One append batch: the intent and the item it asks for cannot exist
+        // apart in the log.
+        let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.event.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![EventType::SESSION_STARTED, EventType::INTENT_RECORDED, EventType::INBOX_APPENDED]
+        );
+        assert_eq!(events[1].event.actor, Actor::User);
+        assert_eq!(events[1].event.payload["summary"], "fix the junction escape");
     }
 
     #[tokio::test]

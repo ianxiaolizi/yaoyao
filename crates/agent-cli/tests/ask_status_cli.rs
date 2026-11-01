@@ -93,6 +93,24 @@ async fn ask_json_reports_final_content() {
     }
 }
 
+#[tokio::test]
+async fn status_json_reports_the_latest_intent() {
+    let (scheduler, sid) = scheduler();
+    let _ = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+
+    let outcome = run_status(&scheduler, &sid, true).await.unwrap();
+    match outcome {
+        CliOutput::Json(j) => {
+            let value: serde_json::Value = serde_json::from_str(j.as_str()).unwrap();
+            assert!(
+                value["latest_intent_id"].is_string(),
+                "the instruction that was answered is identifiable: {value}"
+            );
+        }
+        _ => panic!("expected json output"),
+    }
+}
+
 /// A `run` asked for while a run is already active did not run.
 ///
 /// This is §3 C3.5's second case and 裁决 #6. The scheduler declines to start a

@@ -230,6 +230,14 @@ impl Scheduler {
         &self.inbox
     }
 
+    /// A read-only view of the session's intent ledger.
+    ///
+    /// Cheap to construct: it holds the store handle and every read folds the
+    /// log, so there is no second copy of the truth to keep in step.
+    pub fn intents(&self) -> crate::intent::IntentLedger {
+        crate::intent::IntentLedger::new(self.store.clone())
+    }
+
     /// The current open-entity lifecycle for this session.
     pub async fn lifecycle(
         &self,

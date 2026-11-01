@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod fork;
 pub mod guarded;
 pub mod inbox;
+pub mod intent;
 pub mod judgment;
 pub mod lifecycle;
 pub mod live_bus;

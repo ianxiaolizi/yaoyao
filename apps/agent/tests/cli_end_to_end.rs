@@ -683,16 +683,21 @@ fn a_second_process_asking_the_same_session_is_told_it_is_busy() {
         refused.err
     );
 
-    // The text was appended before the run was refused — a queued prompt and a
-    // turn are separate facts — and nothing else was: no run opened on a
-    // session another process is driving.
+    // The instruction and the text it queued were appended before the run was
+    // refused — an intent and a queued prompt are separate facts from a turn —
+    // and nothing else was: no run opened on a session another process is
+    // driving. The intent is recorded beside its item in the same append, so
+    // the log grows by two lines, in that order.
     let after = std::fs::read_to_string(session_dir.join("events.jsonl")).expect("the log");
+    let written: Vec<&str> = after.lines().skip(before.lines().count()).collect();
     assert_eq!(
-        after.lines().count(),
-        before.lines().count() + 1,
-        "only the queued text may be written: {}",
+        written.len(),
+        2,
+        "only the intent and the queued text may be written: {}",
         after
     );
+    assert!(written[0].contains("intent/recorded"), "the intent comes first: {written:?}");
+    assert!(written[1].contains("inbox/appended"), "then the item it asks for: {written:?}");
     assert_eq!(after.matches("run/started").count(), before.matches("run/started").count());
 
     // With the claim released the queued text runs, so this was a refusal and
@@ -1949,9 +1954,10 @@ fn context_inspect_after_a_turn_reports_the_last_request() {
     // The two revisions answer different questions: the top-level one names
     // what the derivation just folded, and the request's names the prefix it
     // saw. The first turn of a session saw only what was queued for it — the
-    // start at sequence 0 and its input at sequence 1 — so its request says 1
-    // even though the log has grown since.
-    assert_eq!(last["context_revision"], 1, "{doc}");
+    // start at sequence 0, the intent recorded at sequence 1 and the input it
+    // asks for at sequence 2 — so its request says 2 even though the log has
+    // grown since.
+    assert_eq!(last["context_revision"], 2, "{doc}");
 
     // The request's messages are recorded in order, as references. Their text
     // is durable where each was produced; the list and the hashes are what

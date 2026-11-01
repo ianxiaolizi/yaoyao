@@ -64,6 +64,7 @@ id_newtype!(StepId, "Unique identifier for a Step.");
 id_newtype!(EventId, "Unique identifier for an Event.");
 id_newtype!(TurnId, "Unique identifier for a Turn.");
 id_newtype!(InboxItemId, "Unique identifier for an Inbox item.");
+id_newtype!(IntentId, "Unique identifier for one recorded user intent.");
 id_newtype!(ApprovalId, "Unique identifier for an approval request.");
 id_newtype!(MessageUid, "Stable identifier for one model-visible message.");
 id_newtype!(AttemptId, "Unique identifier for one model-invocation attempt.");

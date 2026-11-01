@@ -104,6 +104,19 @@ async fn status_counts_what_is_pending() {
 }
 
 #[tokio::test]
+async fn status_reports_the_latest_intent_a_turn_was_asked_for() {
+    let (scheduler, _, sid) = harness();
+
+    commands::start_turn(&scheduler, &sid, "hi", Utc::now()).await.unwrap();
+
+    let report = commands::status(&scheduler, &sid).await.unwrap();
+    let latest = report.latest_intent_id.expect("the instruction was recorded");
+    let ledger = scheduler.intents();
+    assert_eq!(ledger.latest(&sid).await.unwrap().expect("an intent").intent_id, latest);
+    assert_eq!(ledger.all(&sid).await.unwrap().len(), 1, "one direct instruction, one intent");
+}
+
+#[tokio::test]
 async fn a_grant_reports_the_reply_and_queues_a_wakeup() {
     let (_, store, sid) = harness();
     let approvals = ApprovalService::new(store.clone());
