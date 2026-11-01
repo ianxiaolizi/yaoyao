@@ -1071,3 +1071,27 @@ async fn process_without_model(workspace: &Path, data_dir: &Path) -> Process {
 
     Process { stack, transport, session: SessionId::from_string(SESSION) }
 }
+
+#[tokio::test]
+async fn assembly_refuses_a_network_entry_that_is_not_an_origin() {
+    // A typo in `[network] allow` must stop the run at start, not leave a
+    // call refused later with the person believing the site was authorized
+    // (CONTRACT §7 #180). Nothing here reaches the model: the assembly is what
+    // refuses.
+    let (workspace, data) = dirs();
+    let transport = Arc::new(ScriptedTransport::new(Vec::new()));
+    let mut assembled =
+        inputs(SESSION, workspace.path(), data.path(), transport, SandboxMode::WorkspaceSandbox);
+    // An absent `[network]` section is the shipped posture: no origin at all.
+    assert!(assembled.resolved.network_allow.is_empty());
+    // A path, not an origin — the shape the guard cannot compare per hop.
+    assembled.resolved.network_allow = vec!["https://docs.rs/serde".to_string()];
+
+    let error = match stack::assemble(assembled).await {
+        Ok(_) => panic!("an entry the tool cannot honor must stop the run at start"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, stack::StackError::NetworkAllowlist(_)), "{error:?}");
+    assert!(error.to_string().contains("not an origin"), "{error}");
+}

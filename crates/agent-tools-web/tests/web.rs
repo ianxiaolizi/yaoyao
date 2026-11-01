@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use agent_ports::tool_provider::{ToolInvocation, ToolProvider, ToolProviderError};
 use agent_protocol::tool::ToolErrorKind;
-use agent_tools_web::{WEB_TOOL_NAME, WebToolProvider};
+use agent_tools_web::{NetworkAllowlist, WEB_TOOL_NAME, WebToolProvider};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -74,6 +74,11 @@ async fn serve() -> SocketAddr {
                         ),
                     ),
                     "/redir" => answer("302 Found", &[("location", "/ok")], ""),
+                    // A hop to an origin the list does not name: the port is
+                    // the only difference, and the allowlist compares ports.
+                    "/elsewhere" => {
+                        answer("302 Found", &[("location", "http://127.0.0.1:1/x")], "")
+                    }
                     "/outward" => answer("302 Found", &[("location", "file:///etc/passwd")], ""),
                     "/loop" => answer("302 Found", &[("location", "/loop")], ""),
                     "/slow" => {
@@ -170,19 +175,117 @@ async fn a_get_returns_the_status_the_type_and_the_body() {
 }
 
 #[tokio::test]
-async fn a_post_sends_its_body_and_headers() {
+async fn a_get_sends_the_headers_it_was_given() {
     let address = serve().await;
     let provider = local();
     let result = provider
         .invoke(&call(serde_json::json!({
             "url": format!("http://{address}/echo"),
-            "method": "post",
             "headers": { "x-test": "one" },
-            "body": "payload",
         })))
         .await
         .expect("an answer");
-    assert!(result.content.contains("POST /echo body=payload test=one"), "{}", result.content);
+    assert!(result.content.contains("GET /echo body= test=one"), "{}", result.content);
+}
+
+#[tokio::test]
+async fn a_post_request_is_rejected_in_phase_b() {
+    // The writing methods are off the surface entirely, not merely gated: a
+    // POST is refused by the tool, so nothing downstream has to decide what a
+    // write to the internet means (CONTRACT §7 #180).
+    let address = serve().await;
+    let provider = local();
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let error = provider
+            .invoke(&call(serde_json::json!({
+                "url": format!("http://{address}/echo"),
+                "method": method,
+            })))
+            .await
+            .expect_err("this tool reads only");
+        let ToolProviderError::Failed { message, .. } = &error else {
+            panic!("a refused method is the call's answer: {error}");
+        };
+        assert!(message.contains("GET, HEAD"), "{method}: {message}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_body_is_refused_rather_than_dropped() {
+    // A dropped body would make a model believe it sent something it did not.
+    let address = serve().await;
+    let provider = local();
+    let error = provider
+        .invoke(&call(serde_json::json!({
+            "url": format!("http://{address}/echo"),
+            "body": "payload",
+        })))
+        .await
+        .expect_err("a read carries no body");
+    let ToolProviderError::Failed { message, .. } = &error else {
+        panic!("an argument this tool cannot send is the call's answer: {error}");
+    };
+    assert!(message.contains("no request body"), "{message}");
+}
+
+#[tokio::test]
+async fn a_request_outside_the_allowlist_is_denied_before_dns() {
+    // `.invalid` never resolves, so a call that got as far as DNS would fail
+    // with "does not resolve" instead. The allowlist check comes first.
+    let provider = WebToolProvider::allowing_local_addresses().with_allowlist(
+        NetworkAllowlist::from_origins_allowing_loopback(&["https://docs.rs".to_string()])
+            .expect("a list"),
+    );
+    let error = provider
+        .invoke(&call(serde_json::json!({ "url": "https://unlisted.invalid/page" })))
+        .await
+        .expect_err("an unlisted site is not reachable");
+    let ToolProviderError::Failed { message, .. } = &error else {
+        panic!("an allowlist refusal is the call's answer: {error}");
+    };
+    assert!(message.contains("not in the configured network allowlist"), "{message}");
+    assert!(!message.contains("does not resolve"), "the refusal came before DNS: {message}");
+}
+
+#[tokio::test]
+async fn a_redirect_outside_the_allowlist_is_refused() {
+    let address = serve().await;
+    // Only the test server's own origin is named; the hop it redirects to is a
+    // different port, so it is a different origin.
+    let provider = WebToolProvider::allowing_local_addresses().with_allowlist(
+        NetworkAllowlist::from_origins_allowing_loopback(&[format!("http://{address}")])
+            .expect("a list"),
+    );
+    let error = provider
+        .invoke(&call(serde_json::json!({ "url": format!("http://{address}/elsewhere") })))
+        .await
+        .expect_err("a redirect cannot leave the list");
+    let ToolProviderError::Failed { message, .. } = &error else {
+        panic!("a refused hop is the call's answer: {error}");
+    };
+    assert!(message.contains("not in the configured network allowlist"), "{message}");
+}
+
+#[tokio::test]
+async fn a_web_result_is_marked_untrusted() {
+    let address = serve().await;
+    let provider = local();
+    let result = provider
+        .invoke(&call(serde_json::json!({ "url": format!("http://{address}/ok") })))
+        .await
+        .expect("an answer");
+    assert_eq!(
+        result.trust,
+        agent_protocol::tool::TrustLevel::Untrusted,
+        "a page was written outside this session"
+    );
+
+    // A failed call carries a page too — an error status still brings a body.
+    let failed = provider
+        .invoke(&call(serde_json::json!({ "url": format!("http://{address}/missing") })))
+        .await
+        .expect("an answer");
+    assert_eq!(failed.trust, agent_protocol::tool::TrustLevel::Untrusted);
 }
 
 #[tokio::test]
@@ -349,7 +452,15 @@ async fn the_definition_names_the_deadline_and_the_cap() {
     assert_eq!(definition.timeout_ms, Some(agent_tools_web::WEB_TIMEOUT_MS));
     assert!(definition.description.contains("120000"), "{}", definition.description);
     assert!(definition.description.contains("1000000"), "{}", definition.description);
-    assert!(!definition.idempotent, "a POST is not safe to repeat");
+    assert!(definition.description.contains("allowlist"), "{}", definition.description);
+    assert!(definition.description.contains("untrusted"), "{}", definition.description);
+    assert!(definition.idempotent, "both methods this tool can state are reads");
+    let schema = &definition.input_schema;
+    assert_eq!(schema["properties"]["method"]["enum"], serde_json::json!(["GET", "HEAD"]));
+    assert!(
+        schema["properties"].get("body").is_none(),
+        "a read-only tool does not offer an outbound body: {schema}"
+    );
     assert_eq!(
         definition.capability_requirements.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
         vec!["network.request"]

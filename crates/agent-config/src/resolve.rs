@@ -73,6 +73,14 @@ pub struct ResolvedProfile {
     /// only decides whether they are on the surface at all — so a run with the
     /// store off has no way to reach it even by naming a tool.
     pub memory_enabled: bool,
+    /// The remote origins this run may reach, as the user layer wrote them.
+    ///
+    /// Read from `[network] allow` in the user layer and nowhere else. The
+    /// strings are not validated here — this crate reads no URLs; assembly
+    /// canonicalizes them into the web tool's allowlist and refuses the run if
+    /// one is not an origin. Empty means no egress at all, which is the
+    /// shipped posture: a run reaches the sites a person named and no others.
+    pub network_allow: Vec<String>,
     pub capability_set: CapabilitySet,
     pub plugin_versions: BTreeMap<String, String>,
     /// The MCP servers this run starts, one per enabled `mcp.<server>` plugin,
@@ -455,6 +463,12 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
             .or_else(|| composed.model.as_ref().and_then(|model| model.main.clone())),
         model_tiers: model_tiers(&layers, composed.model.as_ref()),
         memory_enabled: layers.user.memory.as_ref().is_some_and(|memory| memory.enabled),
+        network_allow: layers
+            .user
+            .network
+            .as_ref()
+            .map(|network| network.allow.clone())
+            .unwrap_or_default(),
         capability_set,
         plugin_versions,
         mcp_servers,
@@ -1721,5 +1735,32 @@ impl From<Disposition> for PolicyDecision {
             Disposition::Ask => Self::Ask,
             Disposition::Deny => Self::Deny,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_user_layers_allowlist_reaches_the_resolution() {
+        // The resolution is the one place both the profile and the app can
+        // read, so the entries have to survive it unchanged: canonicalization
+        // belongs to the tool, and a resolution that quietly dropped one would
+        // turn a configured origin into an unlisted one.
+        let layers = Layers {
+            user: UserConfig::from_toml_str(
+                "[network]\nallow = [\"https://api.github.com\", \"https://docs.rs\"]\n",
+            )
+            .unwrap(),
+            ..Layers::default()
+        };
+        assert_eq!(
+            resolve(layers).unwrap().network_allow,
+            vec!["https://api.github.com".to_string(), "https://docs.rs".to_string()]
+        );
+
+        // Nothing configured is no egress, not "any origin".
+        assert!(resolve(Layers::default()).unwrap().network_allow.is_empty());
     }
 }

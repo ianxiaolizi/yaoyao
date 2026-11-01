@@ -425,8 +425,31 @@ impl DoctorCheck for ProfileHealthCheck {
 
     async fn run(&self) -> Vec<DiagnosticMessage> {
         let (status, message) = match config::load(&self.workspace_root, &self.args) {
+            // The egress the run would have, said beside the profile it
+            // resolved: "the tool is offered" and "the tool can reach a site"
+            // are different facts, and the second is the one a person is
+            // asking when a fetch is refused. Validated here on the same terms
+            // the assembly validates it, so the doctor cannot pass a
+            // configuration the run would refuse to start under.
             Ok(resolved) => {
-                (HealthStatus::Passed, format!("profile '{}' resolves", resolved.profile_id))
+                match agent_tools_web::NetworkAllowlist::from_origins(&resolved.network_allow) {
+                    Ok(allowlist) => {
+                        let origins = allowlist.origins();
+                        let egress = if origins.is_empty() {
+                            "web.request reaches no site (no [network] allow)".to_string()
+                        } else {
+                            format!("web.request may reach {}", origins.join(", "))
+                        };
+                        (
+                            HealthStatus::Passed,
+                            format!("profile '{}' resolves; {egress}", resolved.profile_id),
+                        )
+                    }
+                    Err(e) => (
+                        HealthStatus::Failed,
+                        format!("the network allowlist does not resolve: {e}"),
+                    ),
+                }
             }
             Err(e) => (HealthStatus::Failed, format!("the configuration does not resolve: {e}")),
         };

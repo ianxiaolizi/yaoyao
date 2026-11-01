@@ -22,8 +22,8 @@ pub use budget::{BudgetPolicy, BudgetResolution, resolve_context_budget};
 
 pub use layers::{
     BudgetSpec, DecisionsSpec, Disposition, LayaSpec, ManagedPolicy, McpServer, McpSpec,
-    MemorySpec, ModelSpec, PluginsSpec, PolicySpec, Profile, ProfileDecisions, SubagentSpec,
-    ToolsSpec, UserConfig, WorkspaceConfig, WorkspaceTools, parse_duration_ms,
+    MemorySpec, ModelSpec, NetworkSpec, PluginsSpec, PolicySpec, Profile, ProfileDecisions,
+    SubagentSpec, ToolsSpec, UserConfig, WorkspaceConfig, WorkspaceTools, parse_duration_ms,
 };
 pub use resolve::{
     Directive, Layers, McpServerConfig, McpTransport, ResolvedLaya, ResolvedPolicy,

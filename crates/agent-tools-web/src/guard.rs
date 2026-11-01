@@ -28,6 +28,8 @@ pub enum GuardError {
     Address { host: String, address: IpAddr },
     #[error("'{host}' does not resolve: {reason}")]
     Unresolved { host: String, reason: String },
+    #[error("'{0}' is not in the configured network allowlist")]
+    NotAllowed(String),
 }
 
 /// What this tool may connect to.
@@ -157,6 +159,164 @@ pub async fn resolve(target: &Target, addresses: Addresses) -> Result<Vec<IpAddr
     Ok(resolved)
 }
 
+/// One entry of a configured allowlist: a site, not a page.
+///
+/// A path in an entry would read as if one page were authorized and the rest
+/// forbidden, and nothing here can enforce that — a redirect is allowed to
+/// change the path freely, and a pattern language for paths is a language to
+/// get wrong. The origin is what both HTTP and this guard can compare exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    scheme: &'static str,
+    host: String,
+    port: u16,
+}
+
+impl Origin {
+    /// The canonical spelling: lowercased host, and the port carried only
+    /// when the scheme's default would not say the same thing.
+    pub fn as_str(&self) -> String {
+        let default = match self.scheme {
+            "http" => 80,
+            _ => 443,
+        };
+        if self.port == default {
+            format!("{}://{}", self.scheme, self.host)
+        } else {
+            format!("{}://{}:{}", self.scheme, self.host, self.port)
+        }
+    }
+
+    /// Whether `url` is this origin: same scheme, same host, same port.
+    fn matches(&self, url: &Url) -> bool {
+        url.scheme() == self.scheme
+            && url.host_str() == Some(self.host.as_str())
+            && url.port_or_known_default() == Some(self.port)
+    }
+}
+
+/// Why a configured entry is not an origin this build will reach.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OriginError {
+    #[error("'{0}' is not an absolute URL; write the origin, e.g. https://example.com")]
+    NotAUrl(String),
+    #[error("'{raw}' uses scheme '{scheme}'; only http and https are reachable")]
+    Scheme { raw: String, scheme: String },
+    #[error("'{0}' carries credentials; an allowlist entry names a site, not a user")]
+    Credentials(String),
+    #[error("'{0}' is not an origin; write scheme, host and port only, e.g. https://example.com")]
+    NotAnOrigin(String),
+    #[error("'{0}' contains a wildcard; name each origin explicitly")]
+    Wildcard(String),
+    #[error("'{0}' names no host")]
+    NoHost(String),
+    #[error("'{0}' is an address on this machine or a private network, never a remote site")]
+    NotPublic(String),
+}
+
+fn origin(raw: &str, allow_private: bool) -> Result<Origin, OriginError> {
+    // Checked before parsing so that a typo'd wildcard is named as one rather
+    // than as an unparseable URL.
+    if raw.contains('*') {
+        return Err(OriginError::Wildcard(raw.to_string()));
+    }
+    let url = Url::parse(raw).map_err(|_| OriginError::NotAUrl(raw.to_string()))?;
+    let scheme = match url.scheme() {
+        "http" => "http",
+        "https" => "https",
+        other => {
+            return Err(OriginError::Scheme { raw: raw.to_string(), scheme: other.to_string() });
+        }
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(OriginError::Credentials(raw.to_string()));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(OriginError::NotAnOrigin(raw.to_string()));
+    }
+    let host = url.host_str().ok_or_else(|| OriginError::NoHost(raw.to_string()))?.to_string();
+    let port = url.port_or_known_default().ok_or_else(|| OriginError::NoHost(raw.to_string()))?;
+    // Defense in depth: the address guard would refuse these at request time,
+    // but a configuration that names one is a mistake worth reporting when the
+    // run starts, not when the first call fails.
+    if !allow_private && literal_address(&host).is_some_and(|address| !is_public(address)) {
+        return Err(OriginError::NotPublic(raw.to_string()));
+    }
+    Ok(Origin { scheme, host, port })
+}
+
+/// The address a host names when it is written as one, IPv6 brackets included.
+fn literal_address(host: &str) -> Option<IpAddr> {
+    let bare = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+    bare.parse().ok()
+}
+
+/// The remote origins a run may reach.
+///
+/// Empty is the shipped posture: no site is reachable until a person names it
+/// in the user layer. An allowlist is checked before DNS and again on every
+/// redirect hop, so a page cannot send the request somewhere the list does not
+/// name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkAllowlist {
+    origins: Vec<Origin>,
+    /// Fixture switch: a test server's origin is not known until it binds, and
+    /// a loopback address is one an assembled run must never name. Named so a
+    /// reader of the wiring can see which one a run was given.
+    any_origin: bool,
+}
+
+impl NetworkAllowlist {
+    /// No reachable origin. The default, and what an absent section means.
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    /// Read the user layer's entries.
+    pub fn from_origins(entries: &[String]) -> Result<Self, OriginError> {
+        Self::build(entries, false)
+    }
+
+    /// The fixture variant: loopback origins are accepted so a test server can
+    /// be named. Never used by the assembled binary.
+    pub fn from_origins_allowing_loopback(entries: &[String]) -> Result<Self, OriginError> {
+        Self::build(entries, true)
+    }
+
+    /// The fixture variant that accepts any origin, for a test whose subject is
+    /// an address or a redirect rather than the list itself.
+    pub fn any() -> Self {
+        Self { origins: Vec::new(), any_origin: true }
+    }
+
+    fn build(entries: &[String], allow_private: bool) -> Result<Self, OriginError> {
+        let mut origins = Vec::with_capacity(entries.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in entries {
+            let origin = origin(entry, allow_private)?;
+            // Two spellings of one origin are one entry, so an exact-match
+            // list can never grow a second answer for the same site.
+            if seen.insert(format!("{}://{}:{}", origin.scheme, origin.host, origin.port)) {
+                origins.push(origin);
+            }
+        }
+        Ok(Self { origins, any_origin: false })
+    }
+
+    /// Whether a request to `url` is one this run authorized.
+    pub fn allows(&self, url: &Url) -> bool {
+        self.any_origin || self.origins.iter().any(|origin| origin.matches(url))
+    }
+
+    /// The entries, canonically spelled, for a report or a doctor line.
+    pub fn origins(&self) -> Vec<String> {
+        if self.any_origin {
+            return vec!["*".to_string()];
+        }
+        self.origins.iter().map(Origin::as_str).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +369,83 @@ mod tests {
         let target = parse("https://example.com/x").expect("a target");
         assert_eq!(target.port, 443, "the scheme's default port is the one checked");
         assert_eq!(parse("http://example.com/").expect("a target").port, 80);
+    }
+
+    #[test]
+    fn an_allowlist_entry_is_an_origin_and_nothing_more() {
+        let accepted = NetworkAllowlist::from_origins(&[
+            "https://api.github.com".to_string(),
+            "https://docs.rs/".to_string(),
+            "http://example.com:8080".to_string(),
+            "https://example.com:443".to_string(),
+            "HTTPS://API.GitHub.com".to_string(),
+        ])
+        .expect("origins");
+        assert_eq!(
+            accepted.origins(),
+            vec![
+                "https://api.github.com".to_string(),
+                "https://docs.rs".to_string(),
+                "http://example.com:8080".to_string(),
+                "https://example.com".to_string(),
+            ],
+            "the spelling is canonical and two spellings of one origin are one entry"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_names_more_than_an_origin_is_refused() {
+        let refused = |entry: &str| {
+            NetworkAllowlist::from_origins(&[entry.to_string()])
+                .expect_err("an entry this guard cannot compare exactly must not parse")
+                .to_string()
+        };
+        assert!(refused("api.github.com").contains("not an absolute URL"));
+        assert!(refused("ftp://example.com").contains("only http and https"));
+        assert!(refused("https://user:pw@example.com").contains("credentials"));
+        assert!(refused("https://example.com/repos").contains("not an origin"));
+        assert!(refused("https://example.com/?q=1").contains("not an origin"));
+        assert!(refused("https://*.example.com").contains("wildcard"));
+    }
+
+    #[test]
+    fn a_private_or_loopback_address_is_never_allowed_even_if_named() {
+        // Naming one is a configuration mistake, not a way to reach it: the
+        // address guard would refuse the request anyway, and a run that
+        // started with a target it can never use is a run that lied.
+        for entry in ["http://127.0.0.1:8080", "http://[::1]:8080", "http://169.254.169.254"] {
+            let error = NetworkAllowlist::from_origins(&[entry.to_string()])
+                .expect_err("a private origin is never a remote site");
+            assert!(error.to_string().contains("private network"), "{entry}: {error}");
+        }
+
+        // The fixture constructor is the one way to name a loopback origin,
+        // and it is named for that.
+        let fixture =
+            NetworkAllowlist::from_origins_allowing_loopback(
+                &["http://127.0.0.1:8080".to_string()],
+            )
+            .expect("a fixture may name its test server");
+        assert!(fixture.allows(&Url::parse("http://127.0.0.1:8080/ok").unwrap()));
+    }
+
+    #[test]
+    fn an_allowlist_matches_scheme_host_and_port_exactly() {
+        let allowlist = NetworkAllowlist::from_origins(&["https://docs.rs".to_string()]).unwrap();
+        let allows = |url: &str| allowlist.allows(&Url::parse(url).unwrap());
+
+        assert!(allows("https://docs.rs/serde/latest"), "the list is per site, not per page");
+        assert!(!allows("http://docs.rs/"), "a downgrade to cleartext is another origin");
+        assert!(!allows("https://docs.rs:8443/"), "a different port is another origin");
+        assert!(!allows("https://mirror.docs.rs/"), "a subdomain is another origin");
+        assert!(!allowlist.allows(&Url::parse("https://elsewhere.example/").unwrap()));
+    }
+
+    #[test]
+    fn an_absent_allowlist_reaches_nothing() {
+        let empty = NetworkAllowlist::deny_all();
+        assert!(!empty.allows(&Url::parse("https://docs.rs/").unwrap()));
+        assert!(empty.origins().is_empty());
     }
 
     #[test]

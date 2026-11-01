@@ -71,7 +71,7 @@ use agent_tools_fs::{
     EnvCommandVerifier, FsToolProvider, LocalExecutionEnvironment, SandboxedFileEnvironment,
 };
 use agent_tools_git::GitToolProvider;
-use agent_tools_web::WebToolProvider;
+use agent_tools_web::{NetworkAllowlist, WebToolProvider};
 
 use crate::config;
 use crate::decisions;
@@ -180,6 +180,12 @@ pub enum StackError {
         #[source]
         source: agent_config::ConfigError,
     },
+    /// The user layer's `[network] allow` names something that is not an
+    /// origin, or names one the tool would never reach (loopback, a private
+    /// address, a wildcard). Fail closed: an entry the run cannot honor must
+    /// not sit in the allowlist looking like permission.
+    #[error("network allowlist: {0}")]
+    NetworkAllowlist(String),
     /// The configuration chose a reasoning depth the route's model does not
     /// declare. Fail closed: a depth the provider never confirmed is a request
     /// it may reject mid-turn, or silently ignore while the run believes it was
@@ -846,7 +852,15 @@ pub async fn assemble_over(
     // not advertise `network.request` — a read-only run — is not refused here:
     // the gateway drops the tool from the surface it offers, which is the same
     // answer every other built-in gets.
-    let web_tools: Arc<dyn ToolProvider> = Arc::new(WebToolProvider::new());
+    //
+    // Where it may go is the user layer's alone: an absent or empty `[network]
+    // allow` reaches nothing at all. The entries are validated here, at
+    // assembly, so a typo is a refusal to start rather than a call refused
+    // mid-turn with the run believing it had egress.
+    let allowlist = NetworkAllowlist::from_origins(&resolved.network_allow)
+        .map_err(|error| StackError::NetworkAllowlist(error.to_string()))?;
+    let web_tools: Arc<dyn ToolProvider> =
+        Arc::new(WebToolProvider::new().with_allowlist(allowlist));
     // The built-in families are listed once. `reserved` is read off this list
     // and the composite is assembled from it, so a family cannot be added to
     // one and forgotten in the other.
