@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use agent_kernel::approval::PENDING_TTL;
+use agent_kernel::inbox::{Inbox, item_intent_id};
 use agent_kernel::model_selection::ModelChoice;
 use agent_ports::event_store::EventStore;
 use agent_projection::{
@@ -17,6 +19,7 @@ use agent_projection::{
 };
 use agent_protocol::events::StoredEvent;
 use agent_protocol::ids::{EventSeq, SessionId};
+use agent_protocol::intent::IntentStatus;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
@@ -331,6 +334,59 @@ pub(crate) async fn transcript(
         "session": session.as_str(),
         "head": folded.transcript.head.as_u64(),
         "items": items,
+    }))
+}
+
+/// A session's status axes, the instruction ledger behind them, and the latest
+/// adjudication.
+///
+/// The axes come from the kernel's own fold rather than a second reading of
+/// the same events: the page and `agent status` must not disagree about what
+/// "verified complete" means. The instruction and adjudication reads use the
+/// same event slice, so one request cannot report a session from two logs.
+pub(crate) async fn status(
+    store: Arc<dyn EventStore>,
+    session: &SessionId,
+) -> Result<Value, ReadError> {
+    let session_name = session.as_str().to_string();
+    let failed = |message: String| ReadError::Session { session: session_name.clone(), message };
+    let events = store
+        .read_stream(session, EventSeq::ZERO, usize::MAX)
+        .await
+        .map_err(|error| failed(error.to_string()))?;
+    let axes = agent_kernel::status::derive(&events);
+    let intents =
+        agent_kernel::intent::fold_intents(&events).map_err(|error| failed(error.to_string()))?;
+    let active = intents.iter().rev().find(|intent| intent.status == IntentStatus::Active);
+    // The instructions whose queue entries are still waiting, in queue order.
+    // A pending item with no instruction behind it contributes nothing, for
+    // the same reason `status` reports none: it is not work a person asked for.
+    let pending = Inbox::new(store.clone())
+        .pending(session)
+        .await
+        .map_err(|error| failed(error.to_string()))?;
+    let mut pending_intents: Vec<String> = Vec::new();
+    for item in &pending {
+        let Some(intent_id) = item_intent_id(item) else {
+            continue;
+        };
+        if !pending_intents.iter().any(|id| id == intent_id.as_str()) {
+            pending_intents.push(intent_id.as_str().to_string());
+        }
+    }
+    let adjudication = agent_kernel::intent_adjudication::latest(&events)
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(json!({
+        "v": 1,
+        "session": session.as_str(),
+        "run_status": axes.run_status,
+        "delivery_status": axes.delivery_status,
+        "verification_status": axes.verification_status,
+        "completion_status": axes.completion_status,
+        "active_intent_id": active.map(|intent| intent.intent_id.as_str()),
+        "active_intent_summary": active.map(|intent| intent.summary.as_str()),
+        "pending_intents": pending_intents,
+        "adjudication": adjudication,
     }))
 }
 

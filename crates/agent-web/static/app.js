@@ -68,6 +68,12 @@
     refreshTimer: null,
     whyTimer: null,
     lastError: '',
+    /// The last `/status` document, and the session it describes. Both are
+    /// reads of the log; a stale answer for another session would put its
+    /// verdict under this session's title.
+    status: null,
+    statusFor: null,
+    statusTimer: null,
   };
 
   const BUDGET_FALLBACK = 32_000;
@@ -591,6 +597,107 @@
     input.disabled = !state.token;
   }
 
+  // ─────────────────────────────────────────────────────────────── status ──
+
+  // The words are the kernel's axes, not the page's guess: `agent status` and
+  // this strip read the same fold, so "verified complete" cannot mean two
+  // things in one product.
+  const RUN_WORD = {
+    in_progress: ['进行中', 'live'],
+    completed: ['已完成', 'ok'],
+    interrupted: ['已中断', 'warn'],
+    failed: ['失败', 'bad'],
+  };
+  const DELIVERY_WORD = {
+    delivered: ['已答复', 'ok'],
+    unanswered: ['未答复', 'mut'],
+  };
+  const VERIFY_WORD = {
+    verified: ['已验证', 'ok'],
+    unverified: ['未验证', 'mut'],
+    stale: ['已过期', 'warn'],
+    not_applicable: ['无需机器验收', 'mut'],
+    blocked: ['受阻', 'bad'],
+  };
+  const COMPLETE_WORD = {
+    verified_complete: ['已验证完成', 'ok'],
+    blocked_or_parked: ['受阻或停车', 'warn'],
+  };
+
+  function renderStatus() {
+    const el = $('statusStrip');
+    if (!el) return;
+    const status = state.statusFor === state.active ? state.status : null;
+    if (!state.active || !status) {
+      el.hidden = true;
+      el.innerHTML = '';
+      return;
+    }
+    const bits = [];
+    const add = (label, value, cls = '', title = '') => {
+      const hover = title ? ` title="${esc(title)}"` : '';
+      bits.push(`<span class="kv ${cls}"${hover}>${esc(label)} <b>${esc(value)}</b></span>`);
+    };
+    const [runWord, runCls] = RUN_WORD[status.run_status] || ['未开始', 'mut'];
+    add('执行', runWord, runCls);
+    const [deliveryWord, deliveryCls] = DELIVERY_WORD[status.delivery_status] || ['—', 'mut'];
+    add('交付', deliveryWord, deliveryCls);
+    const [verifyWord, verifyCls] = VERIFY_WORD[status.verification_status] || ['—', 'mut'];
+    add('验收', verifyWord, verifyCls);
+    if (status.completion_status) {
+      const [word, cls] = COMPLETE_WORD[status.completion_status] || [status.completion_status, 'mut'];
+      add('完成', word, cls);
+    } else if (status.delivery_status === 'delivered' && status.verification_status === 'not_applicable') {
+      // Pure information: delivered, and nothing a machine criterion could
+      // have checked. This is not a completion and is not counted as one.
+      add('完成', '结果已交付，无机器验收标准', 'mut');
+    }
+    if (status.active_intent_id) {
+      const summary = status.active_intent_summary
+        ? `「${truncate(status.active_intent_summary, 28)}」`
+        : status.active_intent_id;
+      add('意图', summary, 'mut', status.active_intent_id);
+    }
+    const queued = Array.isArray(status.pending_intents) ? status.pending_intents.length : 0;
+    if (queued) add('待处理', `${queued} 条`, 'warn', status.pending_intents.join(', '));
+    const adjudication = status.adjudication;
+    if (adjudication && adjudication.decision) {
+      add(
+        '裁决',
+        adjudication.decision,
+        adjudication.event === 'unclear' ? 'warn' : 'mut',
+        adjudication.question || adjudication.cause || '',
+      );
+    }
+    el.innerHTML = bits.join('');
+    el.hidden = bits.length === 0;
+  }
+
+  async function loadStatus(session) {
+    if (!session || state.active !== session) return;
+    let payload = null;
+    try {
+      payload = await api(`/api/sessions/${encodeURIComponent(session)}/status`);
+    } catch {
+      // A read this page cannot make is not an error worth a toast: the strip
+      // is an additional truth, not the page.
+      payload = null;
+    }
+    if (state.active !== session) return;
+    state.status = payload;
+    state.statusFor = payload ? session : null;
+    renderStatus();
+  }
+
+  /// Re-read the axes after something that can move them. Debounced because a
+  /// turn writes several items at once and each would otherwise be one request.
+  function scheduleStatusRefresh(session) {
+    clearTimeout(state.statusTimer);
+    state.statusTimer = setTimeout(() => {
+      if (state.active === session) loadStatus(session);
+    }, 250);
+  }
+
   async function refreshSessions() {
     try {
       const payload = await api('/api/sessions');
@@ -775,6 +882,10 @@
         // for a list nobody is looking at.
         if (['user', 'answer', 'turn_end', 'approval'].includes(item.kind)) {
           scheduleSessionsRefresh();
+          // The same boundaries are the ones that move the status axes: a
+          // message starts a run, an answer delivers, an ending settles it, an
+          // approval parks it.
+          scheduleStatusRefresh(session);
         }
         if (item.kind === 'action' && item.tool === 'git.diff') {
           state.diff = null;
@@ -1669,6 +1780,10 @@
     state.subagentsFor = null;
     state.schedules = null;
     state.schedulesFor = null;
+    state.status = null;
+    state.statusFor = null;
+    clearTimeout(state.statusTimer);
+    renderStatus();
     localStorage.setItem(STORE.session, id);
     updateHeader();
     renderSessions();
@@ -1699,6 +1814,7 @@
     updateHeader();
     renderTimeline();
     $('empty').hidden = state.items.size > 0;
+    loadStatus(id);
     connectStream(id, 0);
     if (document.body.classList.contains('panel-open')) loadWhy();
   }

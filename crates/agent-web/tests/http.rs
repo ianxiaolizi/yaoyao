@@ -1182,6 +1182,68 @@ async fn the_plan_report_is_the_latest_plan_update() {
     handle.abort();
 }
 
+/// A settled run the operator's completion criterion passed.
+async fn seeded_status() -> (Arc<dyn EventStore>, TempDir) {
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let drafts = vec![
+        draft(&session, EventType::RUN_STARTED, None, None, json!({}), Actor::Scheduler),
+        draft(
+            &session,
+            EventType::COMPLETION_CHECKED,
+            Some(&turn),
+            None,
+            json!({ "status": "completed", "kind": "command", "steps": 2 }),
+            Actor::Agent,
+        ),
+        draft(&session, EventType::TURN_COMPLETED, Some(&turn), None, json!({}), Actor::Scheduler),
+        draft(&session, EventType::RUN_COMPLETED, None, None, json!({}), Actor::Scheduler),
+    ];
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the log");
+    (store, dir)
+}
+
+#[tokio::test]
+async fn the_status_report_carries_the_three_axes() {
+    let (store, dir) = seeded_status().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/status", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["run_status"], "completed");
+    assert_eq!(payload["delivery_status"], "unanswered");
+    assert_eq!(payload["verification_status"], "verified");
+    assert_eq!(
+        payload["completion_status"], "verified_complete",
+        "the page reads the same axes as the CLI: {payload}"
+    );
+    assert_eq!(payload["pending_intents"], json!([]));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_log_without_run_events_still_answers_status() {
+    // A session written before this slice has turns but no `run/*` events. The
+    // answer is not "no status": the axes still describe what the log says.
+    let (store, dir, _) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/status", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["run_status"], Value::Null);
+    assert_eq!(payload["delivery_status"], "delivered");
+    assert_eq!(payload["verification_status"], "not_applicable");
+    assert_eq!(
+        payload["completion_status"],
+        Value::Null,
+        "an information answer is delivered, not completed"
+    );
+    handle.abort();
+}
+
 #[tokio::test]
 async fn the_subagent_report_tracks_the_child_status() {
     let (store, dir) = seeded_subagent().await;

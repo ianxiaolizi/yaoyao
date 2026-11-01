@@ -329,6 +329,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/diff", get(diff))
         .route("/api/sessions/{id}/context", get(context))
         .route("/api/sessions/{id}/plan", get(plan))
+        .route("/api/sessions/{id}/status", get(status))
         .route("/api/sessions/{id}/subagents", get(subagents))
         .route("/api/sessions/{id}/schedules", get(schedules).post(schedule))
         .route("/api/sessions/{id}/schedules/{item_id}", axum::routing::delete(cancel_schedule))
@@ -645,6 +646,25 @@ async fn plan(
             "这个会话还没有 plan.update；计划是模型自己写的，不是页面编的",
         )),
     }
+}
+
+/// `GET /api/sessions/{id}/status`: execution, delivery and verification, the
+/// instruction still standing, and the latest adjudication.
+///
+/// A read, and the axis words are the kernel's own fold — the page must not
+/// spell "verified complete" differently from `agent status` (CONTRACT §7
+/// #166). The response carries one `v` and the session id like its neighbours,
+/// and the payload's fields are additive: a page from before this endpoint
+/// simply does not call it.
+async fn status(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiFailure> {
+    check_session(&state, &id)?;
+    let report = sessions::status(state.store.clone(), &SessionId::from_string(&id))
+        .await
+        .map_err(ApiFailure::read)?;
+    Ok(Json(report))
 }
 
 /// `GET /api/sessions/{id}/subagents`: children this session delegated to.

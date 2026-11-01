@@ -719,6 +719,8 @@ pub async fn run_status(
     let open_step = report.open_step.as_ref().map(|id| id.as_str());
     let latest_intent = report.latest_intent_id.as_ref().map(|id| id.as_str());
     let answered_intent = report.answered_intent_id.as_ref().map(|id| id.as_str());
+    let active_intent = report.active_intent_id.as_ref().map(|id| id.as_str());
+    let pending_intents: Vec<&str> = report.pending_intents.iter().map(|id| id.as_str()).collect();
 
     if json {
         let value = serde_json::json!({
@@ -732,6 +734,15 @@ pub async fn run_status(
             "stale_answer": report.stale_answer,
             "stale_items": report.stale_items.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
             "intent_adjudication": report.intent_adjudication,
+            // The three axes and the completion they derive. Fields are only
+            // added here — a consumer that predates them reads the same session
+            // it always did (CONTRACT §6 C6.2).
+            "run_status": report.run_status,
+            "delivery_status": report.delivery_status,
+            "verification_status": report.verification_status,
+            "completion_status": report.completion_status,
+            "active_intent_id": active_intent,
+            "pending_intents": pending_intents,
         });
         Ok(CliOutput::Json(json_output(&value)?))
     } else {
@@ -742,6 +753,26 @@ pub async fn run_status(
         lines.push(format!("pending:   {}", report.pending));
         lines.push(format!("intent:    {}", latest_intent.unwrap_or("none")));
         lines.push(format!("answered:  {}", answered_intent.unwrap_or("none")));
+        // Execution, delivery and verification are separate lines because they
+        // are separate facts: a run can end without an answer, and an answer
+        // can arrive without anything having checked the work (CONTRACT §7
+        // #166).
+        lines.push(format!(
+            "execution:  {}",
+            report.run_status.map(|status| status.as_str()).unwrap_or("none")
+        ));
+        lines.push(format!("delivery:   {}", report.delivery_status.as_str()));
+        lines.push(format!("verify:     {}", report.verification_status.as_str()));
+        lines.push(format!(
+            "completion: {}",
+            report.completion_status.map(|status| status.as_str()).unwrap_or("-")
+        ));
+        if let Some(active) = active_intent {
+            lines.push(format!("standing:   {active}"));
+        }
+        if !pending_intents.is_empty() {
+            lines.push(format!("queued:     {}", pending_intents.join(", ")));
+        }
         if report.stale_answer {
             // The one line a person has to read before trusting the last
             // answer: it was written for an instruction that is no longer the

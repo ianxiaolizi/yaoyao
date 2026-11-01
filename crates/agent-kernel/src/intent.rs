@@ -142,7 +142,11 @@ fn fold_answered(events: &[StoredEvent]) -> Result<Option<IntentId>, IntentError
 }
 
 /// Fold `intent/*` events into their latest intent states, in append order.
-fn fold_intents(events: &[StoredEvent]) -> Result<Vec<Intent>, IntentError> {
+///
+/// Public because the intent ledger is not the only reader: a front end that
+/// already holds a session's events (the web read model does) folds them here
+/// rather than opening the store a second time.
+pub fn fold_intents(events: &[StoredEvent]) -> Result<Vec<Intent>, IntentError> {
     let mut by_id: HashMap<String, Intent> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
 

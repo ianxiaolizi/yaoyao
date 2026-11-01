@@ -31,6 +31,7 @@ pub mod profile;
 pub mod reason;
 pub mod redactor;
 pub mod state;
+pub mod status;
 pub mod tool;
 pub mod usertext;
 pub mod versioning;

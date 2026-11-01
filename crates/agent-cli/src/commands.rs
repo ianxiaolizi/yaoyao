@@ -23,6 +23,7 @@ use agent_protocol::ids::{ApprovalId, InboxItemId, IntentId, RunId, SessionId, S
 use agent_protocol::inbox::InboxKind;
 use agent_protocol::intent::IntentStatus;
 use agent_protocol::permissions::{ApprovalReply, ApprovalScope};
+use agent_protocol::status::{CompletionStatus, DeliveryStatus, RunStatus, VerificationStatus};
 use chrono::{DateTime, Utc};
 
 /// Why a command could not be carried out.
@@ -347,6 +348,28 @@ pub struct StatusReport {
     /// route — and both mean the same thing to a reader: nothing was decided by
     /// a model here.
     pub intent_adjudication: Option<AdjudicationStatus>,
+    /// What the session's latest run is doing; `None` when it never opened one.
+    pub run_status: Option<RunStatus>,
+    /// Whether the person received an answer to the latest request.
+    pub delivery_status: DeliveryStatus,
+    /// Whether the work has been checked, and whether the check is still fresh.
+    pub verification_status: VerificationStatus,
+    /// The derived completion claim. `None` means "nothing to claim" — not
+    /// "complete": see [`agent_protocol::status::CompletionStatus`].
+    pub completion_status: Option<CompletionStatus>,
+    /// The instruction that still stands and is the newest of those.
+    ///
+    /// `None` means the session has no standing instruction: every one it
+    /// recorded was answered, superseded or withdrawn, or its log predates the
+    /// ledger. The newest instruction is [`Self::latest_intent_id`] even when
+    /// it no longer stands.
+    pub active_intent_id: Option<IntentId>,
+    /// The instructions whose queue entries are still waiting, in queue order.
+    ///
+    /// A pending item with no instruction behind it (a wakeup, a log written
+    /// before the ledger) contributes nothing: the list is about work a person
+    /// asked for and nobody has picked up.
+    pub pending_intents: Vec<IntentId>,
 }
 
 /// Read a session's lifecycle from the durable log.
@@ -357,9 +380,12 @@ pub async fn status(
     let lifecycle = scheduler.lifecycle(session_id).await?;
     let pending = scheduler.inbox().pending(session_id).await?;
     let ledger = scheduler.intents();
-    let latest = ledger.latest(session_id).await?;
+    // One read of the ledger answers every intent question below; a second read
+    // could see a state the first did not and report a session from two logs.
+    let intents = ledger.all(session_id).await?;
+    let latest = intents.last();
     let answered_intent_id = ledger.answered(session_id).await?;
-    let latest_intent_id = latest.as_ref().map(|intent| intent.intent_id.clone());
+    let latest_intent_id = latest.map(|intent| intent.intent_id.clone());
     // An instruction that is still standing and is not the one the last turn
     // answered means the answer on the table is older than the work. An
     // instruction that was superseded, withdrawn or discharged is not owed an
@@ -367,12 +393,25 @@ pub async fn status(
     let stale_answer = latest.is_some_and(|intent| intent.status == IntentStatus::Active)
         && answered_intent_id.is_some()
         && answered_intent_id != latest_intent_id;
-    let standings: std::collections::HashMap<IntentId, IntentStatus> = ledger
-        .all(session_id)
-        .await?
-        .into_iter()
-        .map(|intent| (intent.intent_id, intent.status))
-        .collect();
+    let active_intent_id = intents
+        .iter()
+        .rev()
+        .find(|intent| intent.status == IntentStatus::Active)
+        .map(|intent| intent.intent_id.clone());
+    let standings: std::collections::HashMap<IntentId, IntentStatus> =
+        intents.into_iter().map(|intent| (intent.intent_id, intent.status)).collect();
+    // The instructions behind the items still waiting, in queue order. The
+    // write path binds one instruction to one item, so this is a de-duplication
+    // for a queue that was written by two callers rather than a merge.
+    let mut pending_intents: Vec<IntentId> = Vec::new();
+    for item in &pending {
+        let Some(intent_id) = agent_kernel::inbox::item_intent_id(item) else {
+            continue;
+        };
+        if !pending_intents.contains(&intent_id) {
+            pending_intents.push(intent_id);
+        }
+    }
     let stale_items = pending
         .iter()
         .filter(|item| match agent_kernel::inbox::item_intent_id(item) {
@@ -382,6 +421,7 @@ pub async fn status(
         .map(|item| item.item_id.clone())
         .collect();
     let intent_adjudication = scheduler.intent_adjudication(session_id).await?;
+    let axes = scheduler.status_axes(session_id).await?;
     Ok(StatusReport {
         open_run: lifecycle.open_run,
         open_turn: lifecycle.open_turn,
@@ -392,5 +432,11 @@ pub async fn status(
         stale_answer,
         stale_items,
         intent_adjudication,
+        run_status: axes.run_status,
+        delivery_status: axes.delivery_status,
+        verification_status: axes.verification_status,
+        completion_status: axes.completion_status,
+        active_intent_id,
+        pending_intents,
     })
 }

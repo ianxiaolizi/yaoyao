@@ -211,9 +211,27 @@
   /* ═══ main ═══ */
   .main{
     display:grid;grid-template-columns:minmax(0,1fr);
-    grid-template-rows:46px minmax(0,1fr) auto;
+    /* header · status strip (collapses when hidden) · timeline · composer */
+    grid-template-rows:46px auto minmax(0,1fr) auto;
     min-width:0;min-height:0;background:var(--glass-main);position:relative;
   }
+  /* Execution, delivery and verification, side by side. A sentence-shaped
+     completion ("结果已交付，无机器验收标准") is one of the values, so the strip
+     wraps rather than truncating the one line a person must read. */
+  .strip{
+    display:flex;align-items:center;flex-wrap:wrap;gap:3px 14px;
+    padding:5px 18px 6px;border-bottom:1px solid var(--line);
+    font-size:10.5px;color:var(--ink-3);min-width:0;
+  }
+  .strip[hidden]{display:none}
+  .strip .kv{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}
+  .strip .kv b{font-weight:500;color:var(--ink-2)}
+  .strip .kv.ok b,.strip .kv.ok{color:#2f9e64}
+  [data-theme="dark"] .strip .kv.ok b,[data-theme="dark"] .strip .kv.ok{color:#5ec98f}
+  .strip .kv.warn b,.strip .kv.warn{color:var(--red-ink)}
+  [data-theme="dark"] .strip .kv.warn b,[data-theme="dark"] .strip .kv.warn{color:var(--red)}
+  .strip .kv.mut b,.strip .kv.mut{color:var(--ink-4)}
+  .strip .kv.live b,.strip .kv.live{color:var(--ink-2)}
   .top{
     display:flex;align-items:center;gap:10px;padding:0 14px 0 18px;
     border-bottom:1px solid var(--line);

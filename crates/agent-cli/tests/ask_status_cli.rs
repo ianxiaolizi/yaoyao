@@ -580,6 +580,138 @@ async fn an_answer_to_an_older_instruction_is_marked_stale() {
     assert!(text.contains("newest one has not run yet"), "{text}");
 }
 
+/// A `completion/checked` event, as the loop writes it at a step boundary.
+fn check_draft(sid: &SessionId, run_id: &RunId, status: &str) -> EventDraft {
+    let mut event = draft(EventType::COMPLETION_CHECKED, sid, run_id);
+    event.payload = serde_json::json!({ "status": status, "kind": "command", "steps": 1 });
+    event
+}
+
+/// A tool result, as the loop writes it after a call the gateway allowed.
+fn tool_draft(sid: &SessionId, run_id: &RunId) -> EventDraft {
+    let mut event = draft(EventType::TOOL_COMPLETED, sid, run_id);
+    event.payload = serde_json::json!({ "tool_name": "fs.write", "call_id": "call-1" });
+    event
+}
+
+/// An ordinary answer is delivered, but it is not a completion: nothing checked
+/// it, so the only honest word is "delivered, no machine criterion".
+#[tokio::test]
+async fn an_information_answer_has_three_axes_and_no_completion_claim() {
+    let (scheduler, sid) = scheduler();
+    let _ = run_ask(&scheduler, &sid, "hi", Utc::now(), false).await.unwrap();
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["run_status"], "completed");
+    assert_eq!(status["delivery_status"], "delivered");
+    assert_eq!(status["verification_status"], "not_applicable");
+    assert_eq!(status["completion_status"], serde_json::Value::Null);
+    assert!(status["active_intent_id"].is_string(), "{status}");
+    assert_eq!(status["pending_intents"], serde_json::json!([]));
+    // The fields that predate this slice are still there: `--json` only grew.
+    for key in [
+        "session",
+        "open_run",
+        "open_turn",
+        "open_step",
+        "pending",
+        "latest_intent_id",
+        "answered_intent_id",
+        "stale_answer",
+        "stale_items",
+        "intent_adjudication",
+    ] {
+        assert!(status.get(key).is_some(), "{key} disappeared from status --json: {status}");
+    }
+
+    let CliOutput::Text(text) = run_status(&scheduler, &sid, false).await.unwrap() else {
+        panic!("expected text output")
+    };
+    assert!(text.contains("execution:  completed"), "{text}");
+    assert!(text.contains("delivery:   delivered"), "{text}");
+    assert!(text.contains("verify:     not_applicable"), "{text}");
+    assert!(text.contains("completion: -"), "{text}");
+}
+
+/// A passing criterion is the one way a session may say it finished.
+#[tokio::test]
+async fn a_passing_check_makes_a_verified_complete() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+    let run_id = RunId::new();
+    let mut drafts = vec![draft(EventType::RUN_STARTED, &sid, &run_id)];
+    drafts.push(check_draft(&sid, &run_id, "completed"));
+    let mut turn = draft(EventType::TURN_COMPLETED, &sid, &run_id);
+    turn.turn_id = Some(agent_protocol::ids::TurnId::from_string("seeded-turn"));
+    drafts.push(turn);
+    drafts.push(draft(EventType::RUN_COMPLETED, &sid, &run_id));
+    for event in drafts {
+        append(store.as_ref(), &sid, event).await;
+    }
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["run_status"], "completed");
+    assert_eq!(status["verification_status"], "verified");
+    assert_eq!(
+        status["completion_status"], "verified_complete",
+        "a run the operator's criterion passed is the only verified complete: {status}"
+    );
+    assert_eq!(
+        status["delivery_status"], "unanswered",
+        "the check ended the turn with no prose answer to hand over"
+    );
+}
+
+/// Work after a passing check makes that check stale, and staleness is never
+/// reported as a completion.
+#[tokio::test]
+async fn work_after_a_passing_check_is_stale_and_parked() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+    let run_id = RunId::new();
+    let drafts = vec![
+        draft(EventType::RUN_STARTED, &sid, &run_id),
+        check_draft(&sid, &run_id, "completed"),
+        tool_draft(&sid, &run_id),
+        draft(EventType::RUN_COMPLETED, &sid, &run_id),
+    ];
+    for event in drafts {
+        append(store.as_ref(), &sid, event).await;
+    }
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["verification_status"], "stale");
+    assert_eq!(status["completion_status"], "blocked_or_parked");
+}
+
+/// A queued instruction is "pending", and the one still waiting is the one
+/// named — the status a person needs before assuming the answer on screen
+/// belongs to what they just asked.
+#[tokio::test]
+async fn a_queued_instruction_is_reported_as_pending() {
+    let (scheduler, store, sid) = scheduler_over_a_store();
+    seed_open_run(store.as_ref(), &sid).await;
+    let _ = run_ask(&scheduler, &sid, "先别动日志", Utc::now(), false).await.unwrap();
+
+    let CliOutput::Json(body) = run_status(&scheduler, &sid, true).await.unwrap() else {
+        panic!("expected json output")
+    };
+    let status: serde_json::Value = serde_json::from_str(body.as_str()).unwrap();
+    assert_eq!(status["run_status"], "in_progress");
+    assert_eq!(status["completion_status"], serde_json::Value::Null);
+    let queued = status["pending_intents"].as_array().expect("a list");
+    assert_eq!(queued.len(), 1, "{status}");
+    assert_eq!(status["active_intent_id"], queued[0]);
+    assert_eq!(status["latest_intent_id"], queued[0]);
+}
+
 /// A tool-call response that reports its own usage, so the run has a next step
 /// to reach and a number to count.
 fn priced_tool_call() -> ModelResponse {
