@@ -479,6 +479,9 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
         EventType::BUDGET_UPDATED,
         EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
+        // The answer came after a tool call and nothing checked it, so the
+        // delivery fact is written beside it (A5).
+        EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
         // The claim lands with the ending: the item is answered when the turn
         // ends, not when it opens.
         EventType::INBOX_CLAIMED,
@@ -727,6 +730,9 @@ async fn a_plan_recorded_by_the_loop_reaches_the_next_request_and_the_log() {
         EventType::BUDGET_UPDATED,
         EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,
+        // The answer came after a tool call and nothing checked it, so the
+        // delivery fact is written beside it (A5).
+        EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
         // The claim lands with the ending: the item is answered when the turn
         // ends, not when it opens.
         EventType::INBOX_CLAIMED,

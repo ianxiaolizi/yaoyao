@@ -12,10 +12,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use agent_ports::agent_loop::{
-    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, TurnCapabilityFacts, TurnContext,
-    TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
+    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, StopReason, TurnCapabilityFacts,
+    TurnContext, TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
 };
-use agent_ports::control::{ControlError, ControlHandler, ControlOutcome, ControlRequest};
+use agent_ports::control::ControlHandler;
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
 use agent_ports::instructions::{InstructionError, InstructionSource};
 use agent_ports::intent_adjudication::IntentAdjudicator;
@@ -33,6 +33,7 @@ use crate::plan;
 use crate::session_lifecycle;
 use crate::state;
 
+mod controls;
 mod draft;
 mod endings;
 mod journal;
@@ -654,6 +655,66 @@ impl Scheduler {
         // run-level audit must not have to walk back to find what it cost.
         let mut run_payload = serde_json::json!({ "stop_reason": &stop_reason });
         finished.decorate(&mut run_payload, false);
+        // What the completion gate says about the work this turn leaves behind,
+        // read once from the log as it stands now — the turn's steps are
+        // durable, and the terminal batch below is the first write after this
+        // read. Two facts are recorded rather than inferred later:
+        //
+        // * a turn that stopped because the criterion passed is a *claim*, and
+        //   the gate's refusal is written beside it, so the log says why no
+        //   completion stands;
+        // * an answer handed over after tool work with nothing current behind
+        //   it is the ordinary case the status axes exist for, and recording it
+        //   here means a reader does not have to re-fold to discover it.
+        //
+        // Neither event changes the turn's ending or the run's terminal word:
+        // the turn really ended, and the transcript must not pretend otherwise.
+        let so_far = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+        let claim = crate::completion::gate(&so_far);
+        if stop_reason == StopReason::Completed && !claim.is_accepted() {
+            let mut payload = serde_json::json!({
+                "verdict": claim.as_str(),
+                "task_revision": crate::completion::task_revision(&so_far),
+            });
+            if let Some(evidence) = claim.evidence() {
+                payload["check_id"] = serde_json::json!(evidence.check_id);
+                if let Some(operator) = match &claim {
+                    agent_protocol::evidence::ClaimVerdict::ExitMasked { operator, .. } => {
+                        Some(operator.clone())
+                    }
+                    _ => None,
+                } {
+                    payload["operator"] = serde_json::json!(operator);
+                }
+            }
+            pending.push(draft(
+                session_id,
+                EventType::COMPLETION_CLAIM_REJECTED,
+                payload,
+                Actor::Scheduler,
+                Some(&run_id),
+                Some(&turn_id),
+                None,
+            ));
+        }
+        let delivered = stop_reason == StopReason::FinalAnswer
+            && final_content.as_deref().is_some_and(|content| !content.trim().is_empty());
+        let did_work =
+            crate::completion::task_revision(&so_far) > crate::completion::task_revision(&history);
+        if delivered && did_work && !claim.is_accepted() {
+            pending.push(draft(
+                session_id,
+                EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
+                serde_json::json!({
+                    "verdict": claim.as_str(),
+                    "task_revision": crate::completion::task_revision(&so_far),
+                }),
+                Actor::Scheduler,
+                Some(&run_id),
+                Some(&turn_id),
+                None,
+            ));
+        }
         // The item is claimed only now: the claim is the fact "this input has
         // been answered", and a turn that never reached its end has not
         // answered it. Writing the claim at the opening would consume the
@@ -685,101 +746,6 @@ impl Scheduler {
         journal.commit(std::mem::take(&mut pending)).await?;
 
         Ok(finished.report(run_id, turn_id, stop_reason, final_content, answered_intent))
-    }
-
-    /// Apply the changes waiting at this boundary, one at a time, in order.
-    ///
-    /// Each item is decided before it is recorded, because the record is the
-    /// decision: a control that took effect is *claimed* — the queue's word for
-    /// "taken out, and not by a run" — and one that did not is *discarded with
-    /// the reason*. Recording first and deciding after would make a refused
-    /// control look exactly like an applied one to anyone reading the log.
-    ///
-    /// The order matters for the failure it leaves behind: the handler acts
-    /// before the claim is written, so a process that dies in between leaves the
-    /// item pending and the change already made. Applying it again is then
-    /// harmless — the second attempt refuses, because there is nothing left to
-    /// do — which is why this is safe to run on every boundary rather than
-    /// exactly once.
-    async fn apply_controls(&self, session_id: &SessionId) -> Result<(), SchedulerError> {
-        for item in self.inbox.controls(session_id).await? {
-            let control = item
-                .payload
-                .get("control")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let handler = self.controls.iter().find(|h| h.handles().contains(&control));
-
-            // The three ways a control can fail to take effect are different
-            // facts — nobody claimed it, a handler declined, a handler broke —
-            // and the port says they are recorded differently. The cause is
-            // what carries that distinction into the log; the sentence beside
-            // it is for the person reading (C-1).
-            let refusal = match handler {
-                None => Some((DiscardCause::Unhandled, self.nothing_handles(&control))),
-                Some(handler) => {
-                    let request = ControlRequest {
-                        session_id: session_id.clone(),
-                        item_id: item.item_id.clone(),
-                        control: control.clone(),
-                        payload: item.payload.clone(),
-                    };
-                    match handler.apply(request).await {
-                        Ok(ControlOutcome::Applied { .. }) => None,
-                        Ok(ControlOutcome::Refused { reason }) => Some((
-                            DiscardCause::Refused,
-                            format!("{} refused it: {reason}", handler.name()),
-                        )),
-                        Err(ControlError::Failed { message, .. }) => Some((
-                            DiscardCause::Failed,
-                            format!("{} could not apply it: {message}", handler.name()),
-                        )),
-                    }
-                }
-            };
-
-            match refusal {
-                // Applied: the change is already made and recorded by whoever
-                // made it. What is left is to take the item out of the queue.
-                None => {
-                    // Claim and append are one step, like every other writer
-                    // here: the item is re-read to build the claim, and the
-                    // append must land on the log that read saw. (YA-36)
-                    let _lease = self.store.lease(session_id).await?;
-                    let draft = self.inbox.claim_draft(session_id, &item.item_id, None).await?;
-                    let next = self.next_seq(session_id).await?;
-                    self.store.append(session_id, next, vec![draft]).await?;
-                }
-                Some((cause, reason)) => {
-                    self.inbox.discard(session_id, &item.item_id, cause, Some(&reason)).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// What to say when nobody claims a control.
-    ///
-    /// A refusal that only said "no" would send the operator to read the source;
-    /// naming the handlers is what lets them see that the control they sent is
-    /// one this build does not have — or that it has none at all.
-    fn nothing_handles(&self, control: &str) -> String {
-        let handled: Vec<String> = self
-            .controls
-            .iter()
-            .flat_map(|h| h.handles())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        if handled.is_empty() {
-            format!("no control '{control}' can be applied: this run registered no handlers")
-        } else {
-            format!(
-                "no handler claims control '{control}'; this run handles: {}",
-                handled.join(", ")
-            )
-        }
     }
 
     /// Claim what the user injected for this turn, and describe it to the loop.
@@ -861,6 +827,7 @@ mod tests {
     use crate::scheduler::snapshot::snapshot_with_budget;
     use agent_loop::DefaultAgentLoop;
     use agent_ports::agent_loop::{StepOutcome, StopReason, TurnState};
+    use agent_ports::control::{ControlError, ControlOutcome, ControlRequest};
     use agent_ports::execution_environment::SandboxMode;
     use agent_ports::instructions::{InstructionError, InstructionSource};
     use agent_ports::model_provider::{
@@ -1818,6 +1785,11 @@ mod tests {
                 EventType::BUDGET_UPDATED,
                 "reason/recorded",
                 EventType::STEP_COMPLETED,
+                // The turn answered after a tool call and nothing checked it.
+                // A5 writes the delivery fact here, before the item is claimed:
+                // the claim says the input was answered, and this says what
+                // stood behind the answer (nothing).
+                EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
                 EventType::INBOX_CLAIMED,
                 EventType::TURN_COMPLETED,
                 EventType::RUN_COMPLETED,

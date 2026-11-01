@@ -7,6 +7,7 @@
 
 pub mod adjudicate;
 pub mod approval;
+pub mod completion;
 pub mod doctor;
 pub mod fork;
 pub mod guarded;

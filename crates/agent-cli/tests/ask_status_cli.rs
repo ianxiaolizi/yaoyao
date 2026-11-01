@@ -752,3 +752,99 @@ fn snapshot_with_budget(budget: RunBudget) -> ResolvedProfileSnapshot {
     }
     .sealed()
 }
+
+/// A scheduler whose profile carries one command criterion, so a turn can end
+/// on the check rather than on a model answer.
+fn scheduler_with_criterion(command: &str) -> (Scheduler, Arc<FakeEventStore>, SessionId) {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+    let tools =
+        Arc::new(FakeToolProvider::new().with_tool("shell.run", "ok", ToolSideEffect::Pure));
+    let gateway = Arc::new(FakeToolGateway::new(tools));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    let snapshot = ResolvedProfileSnapshot {
+        completion: Some(agent_protocol::profile::CompletionSpec {
+            kind: agent_protocol::profile::CompletionKind::Command,
+            command: Some(command.to_string()),
+            url: None,
+            interval_steps: 1,
+            timeout_ms: 1_000,
+        }),
+        ..snapshot_with_budget(RunBudget::default())
+    };
+    // The struct update keeps the budget and identity, but `sealed` must be
+    // re-run: the hash has to describe the fields that are there now.
+    let scheduler =
+        Scheduler::new(store.clone(), loop_, 8).with_profile_snapshot(snapshot.sealed());
+    let sid = SessionId::from_string("criterion-session");
+    (scheduler, store, sid)
+}
+
+/// An answer after tool work is delivered, and the log says at delivery time
+/// that nothing verified it — the reader does not have to re-fold the session
+/// to learn that.
+#[tokio::test]
+async fn a_worked_answer_records_that_it_was_delivered_unverified() {
+    let store = Arc::new(FakeEventStore::new());
+    let model = Arc::new(FakeModelProvider::new(vec![
+        FakeModelProvider::tool_call("echo", serde_json::json!({ "text": "hi" })),
+        FakeModelProvider::answer("done"),
+    ]));
+    let tools = Arc::new(FakeToolProvider::new().with_tool("echo", "hi", ToolSideEffect::Pure));
+    let gateway = Arc::new(FakeToolGateway::new(tools));
+    let loop_ = Arc::new(DefaultAgentLoop::new(
+        model,
+        gateway,
+        Arc::new(NullContextEngine::new()),
+        one_model_router(),
+    ));
+    let scheduler = Scheduler::new(store.clone(), loop_, 8);
+    let sid = SessionId::from_string("unverified-session");
+
+    let _ = run_ask(&scheduler, &sid, "write it", Utc::now(), false).await.unwrap();
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let delivered = events
+        .iter()
+        .find(|stored| {
+            stored.event.event_type.as_str() == EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED
+        })
+        .expect("the delivery fact is written beside the answer");
+    assert_eq!(delivered.event.payload["verdict"], "missing");
+}
+
+/// A criterion whose command ends in a pipeline that reports the pipe's status
+/// is not a pass: the turn still ends, and the log says why the completion does
+/// not stand.
+#[tokio::test]
+async fn a_masked_criterion_pass_is_refused_and_recorded() {
+    let (scheduler, store, sid) = scheduler_with_criterion("node --test | tail -5");
+
+    let _ = run_ask(&scheduler, &sid, "run the suite", Utc::now(), false).await.unwrap();
+
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let rejection = events
+        .iter()
+        .find(|stored| stored.event.event_type.as_str() == EventType::COMPLETION_CLAIM_REJECTED)
+        .expect("a refused claim is written, not silently dropped");
+    assert_eq!(rejection.event.payload["verdict"], "exit_masked");
+    assert_eq!(rejection.event.payload["operator"], "| tail");
+    assert!(
+        events
+            .iter()
+            .any(|stored| stored.event.event_type.as_str() == EventType::COMPLETION_CHECKED),
+        "the check itself is still recorded: the refusal is about what it can support"
+    );
+
+    let axes = scheduler.status_axes(&sid).await.unwrap();
+    assert_eq!(
+        axes.verification_status,
+        agent_protocol::status::VerificationStatus::Blocked,
+        "a masked pass may not be shown as verified"
+    );
+}

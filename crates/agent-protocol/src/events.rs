@@ -220,6 +220,32 @@ impl EventType {
     /// refused it, the tool failed to start) is recorded the same way with
     /// `status: "error"`: it is not completion, and the turn continues.
     pub const COMPLETION_CHECKED: &'static str = "completion/checked";
+    /// The kernel refused to read a turn's ending as a completion claim.
+    ///
+    /// Written when a turn stops because the operator's criterion passed, but
+    /// the evidence that would make that a completion is missing, stale, came
+    /// from a check that could not run, or was produced by a pipeline that
+    /// masked the program's exit status. The turn is still over — the payload
+    /// carries the reason the claim does not stand (CONTRACT §7 #170).
+    pub const COMPLETION_CLAIM_REJECTED: &'static str = "completion/claim_rejected";
+    /// A turn handed the person an answer, did tool work, and nothing current
+    /// verified it.
+    ///
+    /// The complement of [`COMPLETION_CHECKED`](Self::COMPLETION_CHECKED): the
+    /// answer is real and delivered, and the log says at the moment of delivery
+    /// that no check stands behind it. Without this event, "delivered" and
+    /// "verified" are only distinguishable by re-folding the whole log, and a
+    /// reader who skips that fold reads every answer as checked.
+    pub const COMPLETION_UNVERIFIED_RESULT_DELIVERED: &'static str =
+        "completion/unverified_result_delivered";
+    /// One machine check's observation, in full: what ran, what it exited with,
+    /// the digests of what it printed, and the task revision it covered.
+    ///
+    /// Payload is an [`agent_protocol::evidence::Evidence`]. The completion gate
+    /// reads it in preference to `completion/checked`, whose payload cannot say
+    /// how the program ended; a check that could not start is recorded here with
+    /// `status: "error"` rather than being left out.
+    pub const VERIFICATION_RECORDED: &'static str = "verification/recorded";
     pub const TOOL_RESULT_TRUNCATED: &'static str = "tool/result.truncated";
     pub const TOOL_RESULT_REDACTED: &'static str = "tool/result.redacted";
     /// A tool result carried a token the high-entropy layer flagged but did
@@ -345,6 +371,9 @@ impl EventType {
         Self::CONTEXT_COMPACTED,
         Self::BUDGET_UPDATED,
         Self::COMPLETION_CHECKED,
+        Self::COMPLETION_CLAIM_REJECTED,
+        Self::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
+        Self::VERIFICATION_RECORDED,
         Self::TOOL_RESULT_TRUNCATED,
         Self::TOOL_RESULT_REDACTED,
         Self::TOOL_RESULT_HIGH_ENTROPY,

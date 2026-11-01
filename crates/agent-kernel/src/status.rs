@@ -18,6 +18,7 @@
 //! current is the failure this axis exists to prevent (CONTRACT §7 #167).
 
 use agent_protocol::events::{EventType, StoredEvent};
+use agent_protocol::evidence::ClaimVerdict;
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::status::{CompletionStatus, DeliveryStatus, RunStatus, VerificationStatus};
 use serde_json::Value;
@@ -146,16 +147,17 @@ fn delivery(events: &[StoredEvent]) -> DeliveryStatus {
 /// Whether the work on the table is verified, and whether the verification is
 /// still fresh.
 ///
-/// The latest check is the operator's criterion (`completion/checked`). Its
-/// payload's `status` is `completed`, `incomplete`, or `error`:
+/// The answer is the completion gate's ([`crate::completion::gate`]): the latest
+/// evidence record, compared against the revision of the work it covered.
+/// Freshness is "the task revision has not moved", which is the evidence
+/// ledger's answer to the pre-A5 approximation "no tool ran after the check"
+/// (CONTRACT §7 #170):
 ///
-/// * `completed` — the criterion passed. Fresh unless a tool ran after it.
-/// * `error` — the check itself could not run. A failed verifier is not a
-///   failed task, but nothing may be claimed either, so this is `Blocked`.
-/// * `incomplete` — the criterion exists and does not yet pass.
-///
-/// "Tool ran after" is the pre-A5 stand-in for "something persisted changed";
-/// it is conservative in the only safe direction.
+/// * accepted — the check passed and still covers the work. `Verified`.
+/// * failed — the check ran and said no. `Unverified`.
+/// * stale, or taken against a changed apparatus — `Stale`.
+/// * a check that could not run, or one whose status was a pipeline's — a
+///   refusal to claim, not a failed task. `Blocked`.
 fn verification(events: &[StoredEvent], run: Option<&RunView>) -> VerificationStatus {
     let Some(run) = run else {
         return VerificationStatus::NotApplicable;
@@ -168,43 +170,32 @@ fn verification(events: &[StoredEvent], run: Option<&RunView>) -> VerificationSt
         // A failed or interrupted run did not produce a result to verify. That
         // is a refusal to claim, not a failed check.
         RunStatus::Failed | RunStatus::Interrupted => VerificationStatus::Blocked,
-        RunStatus::Completed => {
-            let last_check = events.iter().rev().find(|stored| is_check(stored));
-            let last_pass = events
-                .iter()
-                .rev()
-                .find(|stored| is_check(stored) && check_status(stored) == Some("completed"));
-            let Some(check) = last_check else {
-                // No criterion was ever asked. A run that touched no tools is
-                // an information answer; one that did tool work is unverified.
-                return if tool_since(events, run.start_seq) {
+        RunStatus::Completed => match crate::completion::gate(events) {
+            ClaimVerdict::Accepted(_) => VerificationStatus::Verified,
+            // No criterion was ever asked. A run that touched no tools is an
+            // information answer; one that did tool work is unverified.
+            ClaimVerdict::Missing => {
+                if tool_since(events, run.start_seq) {
                     VerificationStatus::Unverified
                 } else {
                     VerificationStatus::NotApplicable
-                };
-            };
-            match check_status(check) {
-                Some("completed") => {
-                    if tool_since(events, check.seq) {
-                        VerificationStatus::Stale
-                    } else {
-                        VerificationStatus::Verified
-                    }
-                }
-                Some("error") => VerificationStatus::Blocked,
-                _ => {
-                    // Incomplete, or a status this build has no name for. An
-                    // older pass that later work has run past is stale; a pass
-                    // that nothing has followed is not a claim about this run
-                    // either, but it is not false — the check still stands.
-                    match last_pass {
-                        Some(pass) if tool_since(events, pass.seq) => VerificationStatus::Stale,
-                        Some(_) => VerificationStatus::Verified,
-                        None => VerificationStatus::Unverified,
-                    }
                 }
             }
-        }
+            // The check ran and said no. The work may still be right, but
+            // nothing on record says so.
+            ClaimVerdict::Failed { .. } => VerificationStatus::Unverified,
+            // A pass that a later change ran past, or one taken against a copy
+            // of the apparatus that has since moved.
+            ClaimVerdict::Stale { .. } | ClaimVerdict::IntegrityChanged { .. } => {
+                VerificationStatus::Stale
+            }
+            // A check that could not run, or one whose status belonged to a
+            // pipeline rather than the program: neither is a pass, and neither
+            // is a failed task. Nothing may be claimed either way.
+            ClaimVerdict::VerifierError { .. } | ClaimVerdict::ExitMasked { .. } => {
+                VerificationStatus::Blocked
+            }
+        },
     }
 }
 
@@ -234,14 +225,6 @@ fn completion(run: Option<&RunView>, verification: VerificationStatus) -> Option
             VerificationStatus::NotApplicable => None,
         },
     }
-}
-
-fn is_check(stored: &StoredEvent) -> bool {
-    stored.event.event_type.as_str() == EventType::COMPLETION_CHECKED
-}
-
-fn check_status(stored: &StoredEvent) -> Option<&str> {
-    stored.event.payload.get("status").and_then(Value::as_str)
 }
 
 /// Whether a tool call happened after `seq`.

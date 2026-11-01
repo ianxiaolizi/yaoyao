@@ -52,14 +52,21 @@ fn events_source(root: &Path) -> String {
 
 /// Every `pub const NAME: &'static str = "value";` in the events module, as
 /// `(name, value)` in declaration order.
+///
+/// Whitespace is collapsed before matching because rustfmt wraps a declaration
+/// whose line would exceed the style width, and where the line breaks is a
+/// formatting fact, not a fact about the type. Reading line by line made the
+/// guard report a name as undeclared the moment it outgrew one line
+/// (`COMPLETION_UNVERIFIED_RESULT_DELIVERED` did), which is a false negative
+/// about the *declaration*, not about the table.
 fn declared(source: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for line in source.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("pub const ") else {
+    for declaration in source.split("pub const ").skip(1) {
+        let Some(end) = declaration.find(';') else {
             continue;
         };
-        let Some((name, rest)) = rest.split_once(": &'static str = \"") else {
+        let text = declaration[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+        let Some((name, rest)) = text.split_once(": &'static str = \"") else {
             continue;
         };
         let Some((value, _)) = rest.split_once('"') else {
@@ -210,6 +217,21 @@ fn a_type_built_from_its_wire_string_counts() {
     // place the type is met with in this repository.
     let files = files_with("EventType::new(\"inbox/wakeup\")\n");
     assert!(referenced("INBOX_WAKEUP", "inbox/wakeup", &files).is_some());
+}
+
+#[test]
+fn a_declaration_rustfmt_wrapped_is_still_a_declaration() {
+    // The style width decides where this breaks; the guard must not. Both
+    // spellings below are the same declaration.
+    let source = "    pub const LONG_NAME: &'static str =\n        \"group/long_name\";\n\
+                  \x20   pub const SHORT: &'static str = \"group/short\";\n";
+    assert_eq!(
+        declared(source),
+        vec![
+            ("LONG_NAME".to_string(), "group/long_name".to_string()),
+            ("SHORT".to_string(), "group/short".to_string()),
+        ]
+    );
 }
 
 #[test]

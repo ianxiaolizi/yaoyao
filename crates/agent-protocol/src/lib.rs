@@ -15,6 +15,7 @@ pub mod decision;
 pub mod diagnostics;
 pub mod digest;
 pub mod events;
+pub mod evidence;
 pub mod failures;
 pub mod ids;
 pub mod inbox;
