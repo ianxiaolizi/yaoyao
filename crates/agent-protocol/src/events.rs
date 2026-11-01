@@ -113,6 +113,15 @@ impl EventType {
     /// The superseded intent keeps its text, item, and evidence — this event
     /// records that a later request outranks it, not that it never happened.
     pub const INTENT_SUPERSEDED: &'static str = "intent/superseded";
+    /// An intent was withdrawn before it ran: payload names `intent_id` and a
+    /// human-readable `reason`.
+    ///
+    /// Distinct from [`INTENT_SUPERSEDED`](Self::INTENT_SUPERSEDED) for the
+    /// reason `turn/cancelled` is distinct from `turn/failed`: a person taking
+    /// their request back is a decision that went exactly as asked, and folding
+    /// it into "something outranked this" would make the log unable to say
+    /// which of the two happened.
+    pub const INTENT_CANCELLED: &'static str = "intent/cancelled";
     pub const TURN_CANCELLED: &'static str = "turn/cancelled";
     /// The tool definitions this turn offers, frozen once before the first
     /// request. `model/request.prepared` says which manifest was sent; this
@@ -287,6 +296,7 @@ impl EventType {
         Self::INBOX_DISCARDED,
         Self::INTENT_RECORDED,
         Self::INTENT_SUPERSEDED,
+        Self::INTENT_CANCELLED,
         Self::TURN_CANCELLED,
         Self::MODEL_TOOLS_FROZEN,
         Self::MODEL_REQUEST_PREPARED,

@@ -71,18 +71,28 @@ pub enum IntentSource {
 
 /// Where an intent stands now.
 ///
-/// `Active` is what the write path records; the rest are applied by events
-/// (`intent/superseded` today, a consuming event in a later slice). The fold
-/// derives the latest value rather than trusting whichever write happens to be
-/// first in the log.
+/// `Active` is what the write path records for an instruction that is waiting
+/// to be worked; the rest are applied by events (`intent/superseded` and
+/// `intent/cancelled`, both written by the rule layer when a later message
+/// displaces or withdraws it). The fold derives the latest value rather than
+/// trusting whichever write happens to be first in the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentStatus {
-    /// Recorded and not yet overtaken or consumed.
+    /// Recorded and not yet overtaken, withdrawn, or discharged.
     Active,
     /// Overtaken by a later instruction; its text and evidence stay readable.
     Superseded,
-    /// The turn that answered it was claimed.
+    /// Withdrawn before it ran — a stop that emptied the queue in front of it.
+    ///
+    /// Not [`Superseded`](Self::Superseded): nothing outranks it, the person
+    /// took it back. A reader asking "what did I lose by stopping?" gets a
+    /// different answer than "what did I replace?", so the two are different
+    /// words.
+    Cancelled,
+    /// Discharged. Either the turn that answered it was claimed, or the kernel
+    /// carried the instruction out without opening one (a stop with no turn of
+    /// its own to run). Nothing further is owed for it.
     Consumed,
     /// Refused before it could be queued.
     Rejected,

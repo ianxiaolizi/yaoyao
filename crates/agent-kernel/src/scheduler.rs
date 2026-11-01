@@ -551,10 +551,15 @@ impl Scheduler {
             None,
             None,
         ));
+        // What this turn is an answer *to*, written beside what it consumed.
+        // Why the binding sits on `turn/started` rather than on the terminal
+        // payload is recorded with the payload itself.
+        let answered_intent = crate::inbox::item_intent_id(&item);
+        let turn_started_payload = report::turn_started_payload(&item, answered_intent.as_ref());
         pending.push(draft(
             session_id,
             EventType::TURN_STARTED,
-            serde_json::json!({ "inbox_item": item.item_id }),
+            turn_started_payload,
             Actor::Scheduler,
             Some(&run_id),
             Some(&turn_id),
@@ -674,7 +679,7 @@ impl Scheduler {
         // durable rather than merely accepted.
         journal.commit(std::mem::take(&mut pending)).await?;
 
-        Ok(finished.report(run_id, turn_id, stop_reason, final_content))
+        Ok(finished.report(run_id, turn_id, stop_reason, final_content, answered_intent))
     }
 
     /// Apply the changes waiting at this boundary, one at a time, in order.

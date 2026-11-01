@@ -815,6 +815,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         let outcome = ended(Ok(Some(report)), &child(), Some(Asked::Cancelled), DEFAULT_CEILING);
@@ -836,6 +837,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         assert_eq!(
@@ -873,6 +875,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         match describe_report(&report, &child()) {

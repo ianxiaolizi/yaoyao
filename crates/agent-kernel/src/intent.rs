@@ -46,6 +46,17 @@ struct SupersedePayload {
     superseded_by: Option<IntentId>,
 }
 
+/// The payload `intent/cancelled` carries.
+///
+/// Only `intent_id` is folded. The payload also carries a human-readable
+/// `reason`, which this fold deliberately does not read: the event's type is
+/// the decision and the sentence beside it is for whoever reads the log (the
+/// same split the inbox makes between a discard's `cause` and its `reason`).
+#[derive(Debug, Deserialize)]
+struct CancelPayload {
+    intent_id: IntentId,
+}
+
 /// Reads intents out of one session's event log.
 #[derive(Clone)]
 pub struct IntentLedger {
@@ -72,6 +83,62 @@ impl IntentLedger {
     pub async fn active(&self, session_id: &SessionId) -> Result<Option<Intent>, IntentError> {
         Ok(self.all(session_id).await?.into_iter().rev().find(|i| i.status == IntentStatus::Active))
     }
+
+    /// The intent the session's most recently settled turn answered.
+    ///
+    /// This is the other half of the 2026-11-01 question: the ledger says what
+    /// was asked, and this says which of those an answer belongs to. A turn
+    /// names its intent in `turn/started` and its terminal event closes the
+    /// turn by id, so the binding is two events that already exist rather than
+    /// a third that could disagree with them.
+    ///
+    /// `None` means "the last settled turn is not bound to a recorded intent" —
+    /// a turn from a log written before the ledger, or a resumed turn whose
+    /// item was a wakeup rather than a request. It does not mean "nothing was
+    /// asked"; that is [`latest`](Self::latest)'s question.
+    pub async fn answered(&self, session_id: &SessionId) -> Result<Option<IntentId>, IntentError> {
+        let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+        fold_answered(&events)
+    }
+}
+
+/// Fold `turn/started`'s intent bindings against the turns that settled.
+fn fold_answered(events: &[StoredEvent]) -> Result<Option<IntentId>, IntentError> {
+    let mut bound: HashMap<String, IntentId> = HashMap::new();
+    let mut answered: Option<IntentId> = None;
+    for event in events {
+        let e = &event.event;
+        match e.event_type.as_str() {
+            EventType::TURN_STARTED => {
+                // Absent is a legacy turn (or one that answered a wakeup) and
+                // binds nothing. Present but not an id — a wrong JSON type — is
+                // a broken record and must fail rather than quietly answer "no
+                // binding" (C2.5). (An id newtype accepts any string, so a
+                // well-typed but meaningless id is not a parse error.)
+                if let Some(raw) = e.payload.get("intent_id")
+                    && !raw.is_null()
+                {
+                    let intent_id: IntentId = serde_json::from_value(raw.clone())?;
+                    if let Some(turn_id) = &e.turn_id {
+                        bound.insert(turn_id.to_string(), intent_id);
+                    }
+                }
+            }
+            EventType::TURN_COMPLETED
+            | EventType::TURN_FAILED
+            | EventType::TURN_CANCELLED
+            | EventType::TURN_INTERRUPTED => {
+                // The latest settled turn is the answer on the table, so a turn
+                // with no binding clears the previous one: a reader asking
+                // "which request did the last answer belong to" must not be
+                // handed the request before it.
+                answered =
+                    e.turn_id.as_ref().and_then(|turn_id| bound.get(&turn_id.to_string()).cloned());
+            }
+            _ => {}
+        }
+    }
+    Ok(answered)
 }
 
 /// Fold `intent/*` events into their latest intent states, in append order.
@@ -100,6 +167,12 @@ fn fold_intents(events: &[StoredEvent]) -> Result<Vec<Intent>, IntentError> {
                     intent.superseded_by = payload.superseded_by;
                 }
             }
+            EventType::INTENT_CANCELLED => {
+                let payload: CancelPayload = serde_json::from_value(event.event.payload.clone())?;
+                if let Some(intent) = by_id.get_mut(&payload.intent_id.to_string()) {
+                    intent.status = IntentStatus::Cancelled;
+                }
+            }
             _ => {}
         }
     }
@@ -111,7 +184,7 @@ fn fold_intents(events: &[StoredEvent]) -> Result<Vec<Intent>, IntentError> {
 mod tests {
     use super::*;
     use agent_protocol::events::{Actor, EventDraft};
-    use agent_protocol::ids::{EventId, InboxItemId, SchemaVersion};
+    use agent_protocol::ids::{EventId, InboxItemId, SchemaVersion, TurnId};
     use agent_testkit::FakeEventStore;
     use chrono::{TimeZone, Utc};
 
@@ -235,5 +308,113 @@ mod tests {
 
         let ledger = IntentLedger::new(store);
         assert!(matches!(ledger.all(&sid).await, Err(IntentError::Payload(_))));
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_bound_to_the_instruction_its_turn_was_started_for() {
+        let store = Arc::new(FakeEventStore::new());
+        let sid = SessionId::from_string("s");
+        let intent = an_intent(&sid, "fix the junction escape");
+        let turn_id = TurnId::new();
+        store
+            .append(
+                &sid,
+                EventSeq::ZERO,
+                vec![
+                    draft(&sid, EventType::INTENT_RECORDED, serde_json::to_value(&intent).unwrap()),
+                    with_turn(
+                        draft(
+                            &sid,
+                            EventType::TURN_STARTED,
+                            serde_json::json!({ "intent_id": intent.intent_id }),
+                        ),
+                        &turn_id,
+                    ),
+                    with_turn(
+                        draft(&sid, EventType::TURN_COMPLETED, serde_json::json!({})),
+                        &turn_id,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let ledger = IntentLedger::new(store);
+        assert_eq!(ledger.answered(&sid).await.unwrap(), Some(intent.intent_id));
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_binding_clears_the_answer_before_it() {
+        let store = Arc::new(FakeEventStore::new());
+        let sid = SessionId::from_string("s");
+        let intent = an_intent(&sid, "fix the junction escape");
+        let bound_turn = TurnId::new();
+        let wakeup_turn = TurnId::new();
+        store
+            .append(
+                &sid,
+                EventSeq::ZERO,
+                vec![
+                    draft(&sid, EventType::INTENT_RECORDED, serde_json::to_value(&intent).unwrap()),
+                    with_turn(
+                        draft(
+                            &sid,
+                            EventType::TURN_STARTED,
+                            serde_json::json!({ "intent_id": intent.intent_id }),
+                        ),
+                        &bound_turn,
+                    ),
+                    with_turn(
+                        draft(&sid, EventType::TURN_COMPLETED, serde_json::json!({})),
+                        &bound_turn,
+                    ),
+                    // A turn that answered a wakeup, not a request: the answer
+                    // on the table is now its own, and it belongs to no intent.
+                    with_turn(
+                        draft(&sid, EventType::TURN_STARTED, serde_json::json!({})),
+                        &wakeup_turn,
+                    ),
+                    with_turn(
+                        draft(&sid, EventType::TURN_COMPLETED, serde_json::json!({})),
+                        &wakeup_turn,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let ledger = IntentLedger::new(store);
+        assert_eq!(ledger.answered(&sid).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_binding_that_cannot_be_read_is_an_error_not_a_missing_answer() {
+        let store = Arc::new(FakeEventStore::new());
+        let sid = SessionId::from_string("s");
+        store
+            .append(
+                &sid,
+                EventSeq::ZERO,
+                vec![with_turn(
+                    draft(
+                        &sid,
+                        EventType::TURN_STARTED,
+                        // Not a string at all: an id newtype accepts any string,
+                        // so only a wrong JSON type is unreadable.
+                        serde_json::json!({ "intent_id": 42 }),
+                    ),
+                    &TurnId::new(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let ledger = IntentLedger::new(store);
+        assert!(matches!(ledger.answered(&sid).await, Err(IntentError::Payload(_))));
+    }
+
+    fn with_turn(mut draft: EventDraft, turn_id: &TurnId) -> EventDraft {
+        draft.turn_id = Some(turn_id.clone());
+        draft
     }
 }

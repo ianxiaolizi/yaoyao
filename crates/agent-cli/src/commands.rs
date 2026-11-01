@@ -20,6 +20,7 @@ use agent_kernel::scheduler::{RunReport, Scheduler, SchedulerError};
 use agent_protocol::events::Actor;
 use agent_protocol::ids::{ApprovalId, InboxItemId, IntentId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::inbox::InboxKind;
+use agent_protocol::intent::IntentStatus;
 use agent_protocol::permissions::{ApprovalReply, ApprovalScope};
 use chrono::{DateTime, Utc};
 
@@ -64,21 +65,53 @@ pub enum TurnStart {
     Ran(RunReport),
     /// Nothing ran: a run is already active, or there was no pending input.
     NotStarted,
+    /// The message was a stop. Nothing new was queued to run; what was waiting
+    /// was withdrawn and, if a run was in flight, an interrupt was asked for.
+    Stopped(StopReceipt),
 }
 
-/// Queue text for a turn and drive it.
+/// What a stop withdrew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopReceipt {
+    /// Queue items taken out by the stop, in queue order.
+    pub withdrawn: Vec<InboxItemId>,
+    /// The instructions behind those items, where the log names one.
+    pub cancelled: Vec<IntentId>,
+    /// The interrupt queued for a run in flight, when there was one.
+    pub interrupt: Option<InboxItemId>,
+}
+
+impl StopReceipt {
+    /// Whether the stop actually stopped something.
+    ///
+    /// A stop with nothing queued and no run is a command that found nothing to
+    /// do — `agent interrupt` answers the same state the same way (exit `2`).
+    pub fn stopped_anything(&self) -> bool {
+        !self.withdrawn.is_empty() || self.interrupt.is_some()
+    }
+}
+
+/// Submit a direct message, then drive whatever turn it queued.
 ///
 /// The append is a separate fact from the run: if the run cannot start, the
 /// text is still in the inbox, exactly as `agent ask` leaves it today. The
 /// instruction is recorded to the intent ledger beside its inbox item, so a
-/// later reader can tell which request a given answer belongs to.
+/// later reader can tell which request a given answer belongs to — and a
+/// message the rule layer reads as a stop never becomes a turn at all.
 pub async fn start_turn(
     scheduler: &Scheduler,
     session_id: &SessionId,
     text: &str,
     now: DateTime<Utc>,
 ) -> Result<TurnStart, CommandError> {
-    scheduler.inbox().submit_user_turn(session_id, text).await?;
+    let submitted = scheduler.inbox().submit_user_message(session_id, text, now).await?;
+    if !submitted.route.queues_a_turn() {
+        return Ok(TurnStart::Stopped(StopReceipt {
+            withdrawn: submitted.displaced,
+            cancelled: submitted.cancelled,
+            interrupt: submitted.item.map(|item| item.item_id),
+        }));
+    }
 
     let report = scheduler.run_pending(session_id, now).await?;
     Ok(match report {
@@ -280,6 +313,29 @@ pub struct StatusReport {
     /// A session whose logs predate the intent ledger answers `None` — that is
     /// "this log has no intents", not "the user asked for nothing".
     pub latest_intent_id: Option<IntentId>,
+    /// The instruction the most recently settled turn answered.
+    ///
+    /// `None` when that turn is not bound to a recorded intent — it predates
+    /// the ledger, or it answered a wakeup rather than a request.
+    pub answered_intent_id: Option<IntentId>,
+    /// Whether the answer on the table predates the instruction still standing.
+    ///
+    /// True when the newest instruction is still [`Active`] and a *different*
+    /// instruction is the one the last turn answered: the session is working
+    /// through something newer than the answer a reader would otherwise take
+    /// for current. That is the 2026-11-01 shape in one boolean.
+    ///
+    /// [`Active`]: agent_protocol::intent::IntentStatus::Active
+    pub stale_answer: bool,
+    /// Queued items whose instruction no longer stands.
+    ///
+    /// A pending item bound to an intent that was superseded, withdrawn or
+    /// discharged is work nobody is waiting for any more. The write path
+    /// discards such items in the same append that displaces them, so this list
+    /// is empty on any log this version wrote — it exists for a log written
+    /// before that, where a reader has to be able to say "this queue entry is
+    /// stale" rather than run it.
+    pub stale_items: Vec<InboxItemId>,
 }
 
 /// Read a session's lifecycle from the durable log.
@@ -289,12 +345,39 @@ pub async fn status(
 ) -> Result<StatusReport, CommandError> {
     let lifecycle = scheduler.lifecycle(session_id).await?;
     let pending = scheduler.inbox().pending(session_id).await?;
-    let latest_intent_id = scheduler.intents().latest(session_id).await?.map(|i| i.intent_id);
+    let ledger = scheduler.intents();
+    let latest = ledger.latest(session_id).await?;
+    let answered_intent_id = ledger.answered(session_id).await?;
+    let latest_intent_id = latest.as_ref().map(|intent| intent.intent_id.clone());
+    // An instruction that is still standing and is not the one the last turn
+    // answered means the answer on the table is older than the work. An
+    // instruction that was superseded, withdrawn or discharged is not owed an
+    // answer, so it cannot make an older one stale.
+    let stale_answer = latest.is_some_and(|intent| intent.status == IntentStatus::Active)
+        && answered_intent_id.is_some()
+        && answered_intent_id != latest_intent_id;
+    let standings: std::collections::HashMap<IntentId, IntentStatus> = ledger
+        .all(session_id)
+        .await?
+        .into_iter()
+        .map(|intent| (intent.intent_id, intent.status))
+        .collect();
+    let stale_items = pending
+        .iter()
+        .filter(|item| match agent_kernel::inbox::item_intent_id(item) {
+            Some(intent_id) => standings.get(&intent_id) != Some(&IntentStatus::Active),
+            None => false,
+        })
+        .map(|item| item.item_id.clone())
+        .collect();
     Ok(StatusReport {
         open_run: lifecycle.open_run,
         open_turn: lifecycle.open_turn,
         open_step: lifecycle.open_step,
         pending: pending.len(),
         latest_intent_id,
+        answered_intent_id,
+        stale_answer,
+        stale_items,
     })
 }

@@ -697,8 +697,12 @@ fn a_second_process_asking_the_same_session_is_told_it_is_busy() {
 
     // With the claim released the queued text runs, so this was a refusal and
     // not a command that never works.
+    //
+    // The follow-up is a continuation, not a new instruction: since CONTRACT §7
+    // #160 a fresh instruction would displace the queued one rather than wait
+    // behind it, and this test is about the refusal leaving the queue intact.
     drop(held);
-    let later = ran(data.path(), workspace.path(), &["ask", "third", "--session", "contended"]);
+    let later = ran(data.path(), workspace.path(), &["ask", "继续", "--session", "contended"]);
     assert!(later.ok, "{}", later.err);
     assert!(
         later.out.contains("echo: and again"),

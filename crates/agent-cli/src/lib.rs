@@ -23,7 +23,7 @@ use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolInvocation;
 use agent_protocol::diagnostics::HealthStatus;
 use agent_protocol::events::{EventType, StoredEvent};
-use agent_protocol::ids::{EventSeq, SchemaVersion, SessionId, TurnId};
+use agent_protocol::ids::{EventSeq, IntentId, SchemaVersion, SessionId, TurnId};
 use agent_protocol::permissions::{ApprovalScope, ArtifactRef};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::ToolStatus;
@@ -310,21 +310,30 @@ pub async fn run_ask(
 
     match started {
         commands::TurnStart::Ran(r) => {
+            // What this answer is an answer *to*, and whether it is still the
+            // session's newest instruction. The second half is the 2026-11-01
+            // rule stated as a display decision: an answer whose request has
+            // since been overtaken is printed, with the fact that it is older
+            // stated beside it (CONTRACT §7 #160).
+            let stale = stale_note(scheduler, session_id, r.intent_id.as_ref()).await;
             let output = if json {
                 let value = serde_json::json!({
                     "run_id": r.run_id.as_str(),
                     "turn_id": r.turn_id.as_str(),
                     "stop_reason": r.stop_reason,
                     "final_content": r.final_content,
+                    "intent_id": r.intent_id.as_ref().map(|id| id.as_str()),
+                    "stale": stale.is_some(),
                 });
                 CliOutput::Json(json_output(&value)?)
             } else if halted(&r.stop_reason) {
-                CliOutput::Text(stopped_text(&r))
+                CliOutput::Text(with_note(stopped_text(&r), stale.as_deref()))
             } else {
-                match r.final_content {
-                    Some(content) => CliOutput::Text(content),
-                    None => CliOutput::Text(format!("[turn ended: {:?}]", r.stop_reason)),
-                }
+                let text = match r.final_content {
+                    Some(content) => content,
+                    None => format!("[turn ended: {:?}]", r.stop_reason),
+                };
+                CliOutput::Text(with_note(text, stale.as_deref()))
             };
             // A halted response is not an answer: the provider cut the model off
             // at the run's output limit, or withheld what it wrote. What is on
@@ -346,6 +355,72 @@ pub async fn run_ask(
                 "no run: a run is already active or there is no pending input".to_string(),
             )
         })),
+        // A stop is not a turn: nothing was asked of the model. Whether it
+        // *did* something decides the exit code, the same way `interrupt`
+        // answers a session with nothing in flight (CONTRACT §7 #6).
+        commands::TurnStart::Stopped(receipt) => {
+            let stopped = receipt.stopped_anything();
+            let output = if json {
+                let value = serde_json::json!({
+                    "outcome": "stopped",
+                    "withdrawn": receipt.withdrawn.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                    "cancelled_intents":
+                        receipt.cancelled.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+                    "interrupt": receipt.interrupt.as_ref().map(|id| id.as_str()),
+                });
+                CliOutput::Json(json_output(&value)?)
+            } else if !stopped {
+                CliOutput::Text(
+                    "nothing to stop: no run is in flight and no instruction is queued".to_string(),
+                )
+            } else {
+                let mut lines = vec![format!(
+                    "stopped: withdrew {} queued instruction(s)",
+                    receipt.withdrawn.len()
+                )];
+                if let Some(item) = &receipt.interrupt {
+                    lines.push(format!(
+                        "the run will stop at the next step boundary (item {})",
+                        item.as_str()
+                    ));
+                }
+                CliOutput::Text(lines.join("\n"))
+            };
+            Ok(if stopped { CliOutcome::ok(output) } else { CliOutcome::did_not_run(output) })
+        }
+    }
+}
+
+/// The sentence that marks an answer as older than the session's newest
+/// instruction, or `None` when the answer is the current one.
+///
+/// Only an instruction that still stands can make an answer stale: one that was
+/// superseded, withdrawn, or already discharged is not owed an answer, so an
+/// older answer is not standing in for it.
+async fn stale_note(
+    scheduler: &Scheduler,
+    session_id: &SessionId,
+    answered: Option<&IntentId>,
+) -> Option<String> {
+    let latest = scheduler.intents().latest(session_id).await.ok().flatten()?;
+    if latest.status != agent_protocol::intent::IntentStatus::Active {
+        return None;
+    }
+    if answered == Some(&latest.intent_id) {
+        return None;
+    }
+    Some(format!(
+        "[stale answer: it belongs to intent {}; the newest instruction {} has not run yet]",
+        answered.map_or("(none)".to_string(), |id| id.as_str().to_string()),
+        latest.intent_id.as_str()
+    ))
+}
+
+/// Append a note to a body of text, on its own line.
+fn with_note(text: String, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("{text}\n\n{note}"),
+        None => text,
     }
 }
 
@@ -643,6 +718,7 @@ pub async fn run_status(
     let open_turn = report.open_turn.as_ref().map(|id| id.as_str());
     let open_step = report.open_step.as_ref().map(|id| id.as_str());
     let latest_intent = report.latest_intent_id.as_ref().map(|id| id.as_str());
+    let answered_intent = report.answered_intent_id.as_ref().map(|id| id.as_str());
 
     if json {
         let value = serde_json::json!({
@@ -652,6 +728,9 @@ pub async fn run_status(
             "open_step": open_step,
             "pending": report.pending,
             "latest_intent_id": latest_intent,
+            "answered_intent_id": answered_intent,
+            "stale_answer": report.stale_answer,
+            "stale_items": report.stale_items.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
         });
         Ok(CliOutput::Json(json_output(&value)?))
     } else {
@@ -661,6 +740,26 @@ pub async fn run_status(
         lines.push(format!("open step: {}", open_step.unwrap_or("none")));
         lines.push(format!("pending:   {}", report.pending));
         lines.push(format!("intent:    {}", latest_intent.unwrap_or("none")));
+        lines.push(format!("answered:  {}", answered_intent.unwrap_or("none")));
+        if report.stale_answer {
+            // The one line a person has to read before trusting the last
+            // answer: it was written for an instruction that is no longer the
+            // newest one.
+            lines.push(
+                "note:      the last answer belongs to an older instruction; the newest one has \
+                 not run yet"
+                    .to_string(),
+            );
+        }
+        if !report.stale_items.is_empty() {
+            // Queue entries that belong to instructions which no longer stand.
+            // A session this version wrote will not have any; an older log can.
+            lines.push(format!(
+                "note:      {} queued item(s) belong to instructions that no longer stand: {}",
+                report.stale_items.len(),
+                report.stale_items.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
         Ok(CliOutput::Text(lines.join("\n")))
     }
 }

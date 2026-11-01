@@ -72,6 +72,7 @@ async fn start_turn_returns_the_run_it_drove() {
             assert_eq!(report.stop_reason, StopReason::FinalAnswer);
         }
         TurnStart::NotStarted => panic!("a free session must start the turn"),
+        TurnStart::Stopped(receipt) => panic!("\"hi\" is not a stop: {receipt:?}"),
     }
 }
 
