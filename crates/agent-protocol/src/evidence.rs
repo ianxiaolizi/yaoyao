@@ -129,6 +129,10 @@ pub struct Evidence {
     pub stdout_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_sha256: Option<String>,
+    /// The number of tests the check's own summary reported, when it carried a
+    /// readable count. Absent for a criterion, whose gateway output is prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<u64>,
     /// Artifacts the check produced or named, by their store references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_refs: Vec<String>,
@@ -175,6 +179,7 @@ impl Evidence {
             exit_code: None,
             stdout_sha256: None,
             stderr_sha256: None,
+            tests_passed: None,
             artifact_refs: Vec::new(),
             started_at: None,
             finished_at: None,
@@ -301,6 +306,7 @@ mod tests {
             exit_code: None,
             stdout_sha256: None,
             stderr_sha256: None,
+            tests_passed: None,
             artifact_refs: Vec::new(),
             started_at: None,
             finished_at: None,

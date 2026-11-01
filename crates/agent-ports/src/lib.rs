@@ -26,3 +26,4 @@ pub mod secret_provider;
 pub mod subagent;
 pub mod tool_gateway;
 pub mod tool_provider;
+pub mod verifier;

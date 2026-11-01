@@ -34,4 +34,5 @@ pub mod status;
 pub mod subagent;
 pub mod tool_schema;
 pub mod tools;
+pub mod verifier;
 pub mod workspace;

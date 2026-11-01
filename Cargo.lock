@@ -319,8 +319,10 @@ dependencies = [
  "agent-ports",
  "agent-protocol",
  "async-trait",
+ "chrono",
  "encoding_rs",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

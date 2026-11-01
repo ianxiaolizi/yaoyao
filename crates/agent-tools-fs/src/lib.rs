@@ -12,6 +12,7 @@
 mod env;
 mod provider;
 mod python_env;
+mod verifier;
 mod worker;
 
 pub use env::{
@@ -19,4 +20,5 @@ pub use env::{
     app_container_shell, app_container_shell_supports_and_and,
 };
 pub use provider::{FsToolProvider, SHELL_TIMEOUT_MS};
+pub use verifier::EnvCommandVerifier;
 pub use worker::{SandboxedFileEnvironment, WORKER_COMMAND, serve as serve_worker};

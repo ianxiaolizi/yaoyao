@@ -8,6 +8,7 @@ pub mod context;
 pub mod memory;
 pub mod reason;
 pub mod schedule;
+pub mod verify;
 
 use agent_kernel::approval::ApprovalService;
 use agent_kernel::doctor::KernelDoctor;
@@ -72,6 +73,7 @@ mod shape {
 }
 
 pub use shape::{JsonDoc, json_output};
+pub use verify::run_verify;
 
 /// Run a CLI command and return output.
 #[derive(Debug)]

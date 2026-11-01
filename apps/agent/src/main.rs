@@ -30,6 +30,7 @@ use commands::schedule::{schedule, tick};
 use commands::session::session;
 use commands::subagent::subagent;
 use commands::turn::{export, fork, interrupt, resume, run, status, steer, why};
+use commands::verify::verify;
 use commands::web::{serve, web};
 
 /// The exit status of a command whose subject answered "no".
@@ -128,6 +129,7 @@ async fn main() {
         "interrupt" => interrupt(&args).await,
         "export" => export(&args).await,
         "status" => status(&args).await,
+        "verify" => verify(&args).await,
         "why" => why(&args).await,
         "approve" => approve(&args).await,
         "deny" => deny(&args).await,
@@ -166,6 +168,7 @@ pub(crate) fn usage() {
          export --redacted          Same, with secret-shaped tokens replaced by ***\n  \
          why [--turn <id>] [--depth <n>]\n                              Explain that turn's reasoning chain, backwards\n                              (--help says what a turn's end and verdict mean)\n  \
          status                     Show session state\n  \
+         verify [flags] -- <program> [args]\n                              Run a check without a shell and record what it found\n  \
          approve <id> [scope]       Approve a pending request [once|turn|session|always]\n  \
          deny <id> [--only]         Deny a pending request (cascades to the session's pending)\n  \
          tool <name> [json-args]    Run a tool through the policy gateway\n  \

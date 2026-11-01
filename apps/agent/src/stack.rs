@@ -54,6 +54,7 @@ use agent_ports::model_router::ModelRouter;
 use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
+use agent_ports::verifier::CommandVerifier;
 use agent_protocol::ids::SessionId;
 use agent_protocol::model::{
     ModelCapabilities, ModelCapabilitySource, ModelRoute, ModelTier, ReasoningEffort,
@@ -64,7 +65,9 @@ use agent_protocol::redactor::{HighEntropy, Redactor};
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
 use agent_store_secret::EnvSecretProvider;
-use agent_tools_fs::{FsToolProvider, LocalExecutionEnvironment, SandboxedFileEnvironment};
+use agent_tools_fs::{
+    EnvCommandVerifier, FsToolProvider, LocalExecutionEnvironment, SandboxedFileEnvironment,
+};
 use agent_tools_git::GitToolProvider;
 use agent_tools_web::WebToolProvider;
 
@@ -406,6 +409,12 @@ pub struct Runtime {
     /// The run's one artifact store: the MCP adapter and the gateway's own
     /// output offload both write here.
     pub artifacts: Arc<dyn ArtifactStore>,
+    /// Structured checks, run against the same execution backend the tools
+    /// use — so a check is confined, deadline-bounded and env-scrubbed exactly
+    /// as a tool call is, and `agent verify` cannot become a way around the
+    /// sandbox. It is a separate object rather than a tool because a check is
+    /// not something the model may name or call.
+    pub verifier: Arc<dyn CommandVerifier>,
     /// The children this process started and has not collected.
     ///
     /// Held here rather than inside the delegation tool because two callers
@@ -776,6 +785,7 @@ pub async fn assemble_with_delegation(
     // is already the run's. The names are read off the providers themselves
     // rather than written down here, so the reserved list cannot drift from
     // what the built-ins actually offer.
+    let verifier: Arc<dyn CommandVerifier> = Arc::new(EnvCommandVerifier::new(env.clone()));
     let fs_tools: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::new(env));
     // The git tools read the repository in process, so they take the root
     // itself rather than the execution backend. Under the AppContainer
@@ -1179,6 +1189,7 @@ pub async fn assemble_with_delegation(
         registry,
         tools,
         artifacts,
+        verifier,
         children,
     })
 }

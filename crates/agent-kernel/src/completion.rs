@@ -112,6 +112,7 @@ fn evidence_from_check(stored: &StoredEvent, revision: u64) -> Evidence {
         exit_code: None,
         stdout_sha256: None,
         stderr_sha256: None,
+        tests_passed: None,
         artifact_refs: Vec::new(),
         started_at: None,
         finished_at: Some(stored.recorded_at),
