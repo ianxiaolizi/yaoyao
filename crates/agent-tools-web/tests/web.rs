@@ -490,6 +490,26 @@ async fn an_unknown_method_is_refused() {
     assert!(message.contains("unsupported method"), "{message}");
 }
 
+/// A live read through the assembled guard, not a loopback fixture.
+///
+/// Ignored by default: it needs the public network (STYLE §6). The B6 record
+/// left "read a real site once" to the close-out evidence; run it with
+/// `cargo test -p agent-tools-web --test web a_real_site_is_read_through_the_public_guard -- --ignored`.
+#[tokio::test]
+#[ignore = "reads a real site; needs the public network"]
+async fn a_real_site_is_read_through_the_public_guard() {
+    let provider = WebToolProvider::new().with_allowlist(
+        NetworkAllowlist::from_origins(&[String::from("https://example.com")]).expect("a list"),
+    );
+    let result = provider
+        .invoke(&call(serde_json::json!({ "url": "https://example.com/" })))
+        .await
+        .expect("a named public origin is reachable");
+    assert_eq!(result.trust, agent_protocol::tool::TrustLevel::Untrusted);
+    assert!(result.content.contains("HTTP 200"), "{}", result.content);
+    assert!(result.content.contains("Example Domain"), "{}", result.content);
+}
+
 #[tokio::test]
 async fn the_definition_names_the_deadline_and_the_cap() {
     let provider = local();

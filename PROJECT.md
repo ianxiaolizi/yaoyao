@@ -62,7 +62,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-protocol` | IDs, Event, DTO, schema 版本（零业务依赖）；请求面是 `InboxItem`；`reason` 是推理链节点与具名规则表 |
 | `agent-ports` | EventStore / ModelProvider / ToolProvider / AgentLoop / ToolGateway / ContextEngine 等 trait 缝 |
 | `agent-config` | 配置分层与解析 |
-| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded、reason 链折叠 |
+| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、PermissionService（执行前决策账本）、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded（含秘密引用、快照、安全审查门）、reason 链折叠 |
 | `agent-loop` | `DefaultAgentLoop`（model → tool → model → answer） |
 | `agent-projection` | 投影引擎 + SessionProjection + ModelContextProjection（纯 fold + checkpoint） |
 | `agent-context` | `ProjectionContextEngine`（唯一同时看见 projection 引擎与 loop 面向的端口 `agent-ports` 的 crate；运行期不依赖 `agent-loop`，那是 dev 依赖） |
@@ -74,7 +74,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-tools-fs` | `FsToolProvider`（`fs.list`/`fs.glob`/`fs.grep`/`fs.read`/`fs.write`/`fs.edit`/`shell.run`）+ `LocalExecutionEnvironment`（含 `list_dir`，符号链接只报告不跟随） |
 | `agent-tools-git` | git 工具（编码证据链）：`git.status`/`git.diff` 由进程内 libgit2 读取仓库，不 spawn `git`（AppContainer 下 git 拿不到工作目录，`CONTRACT.md` §7 #59） |
 | `agent-tools-mcp` | MCP 工具适配器（能力闸门下的注册） |
-| `agent-tools-web` | `web.request`：一次 HTTP 调用，只去公网地址（每跳重定向重新校验、DNS 钉住已校验地址）、body 截在 1 MB、per-call 超时上限 120 s（`CONTRACT.md` §7 #144） |
+| `agent-tools-web` | `web.request`：一次只读（`GET`/`HEAD`）HTTP 调用，只去公网地址与用户层 allowlist 里的 origin（每跳重定向重新校验并重新比对 allowlist、DNS 钉住已校验地址）、结果标 `Untrusted`、body 截在 1 MB、per-call 超时上限 120 s（`CONTRACT.md` §7 #144/#180） |
 | `agent-subagent-stdio` | 外部 CLI subagent 适配器（stdio 后端） |
 | `agent-sandbox-win` | Windows AppContainer 执行后端：profile/SID、ACL 授予、`STARTUPINFOEX` + Job Object 启动；唯一允许 `unsafe` 的 crate（`CONTRACT.md` §7 #38） |
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |
