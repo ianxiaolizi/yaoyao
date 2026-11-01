@@ -202,12 +202,14 @@ async fn a_truncated_answer_is_reported_as_not_answered() {
     assert!(text.starts_with("half a sen"), "the text that arrived is kept: {text}");
     assert!(text.contains("[truncated:"), "the notice says it is not whole: {text}");
 
-    // The log says the same thing, in the form `metrics` and `why` read.
+    // The log says the same thing, in the form `metrics` and `why` read. A
+    // truncated response is a limit stop, so the turn yields rather than
+    // completes (CONTRACT §7 #173).
     let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
     let end = events
         .iter()
-        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
-        .expect("the turn ended");
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_YIELDED)
+        .expect("the turn yielded");
     assert_eq!(end.event.payload["stop_reason"], "max_output_tokens");
     assert_eq!(end.event.payload["final_content"], "half a sen");
 }
@@ -319,8 +321,8 @@ async fn a_run_that_spent_its_steps_is_reported_as_not_answered() {
     let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
     let end = events
         .iter()
-        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
-        .expect("the turn ended");
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_YIELDED)
+        .expect("the turn yielded");
     assert_eq!(end.event.payload["stop_reason"], "max_steps");
     assert_eq!(end.event.payload["spent"]["steps"], 1);
     assert!(end.event.payload["spent"].get("input_tokens").is_some());
@@ -369,8 +371,8 @@ async fn a_run_that_spent_its_token_budget_is_reported_as_not_answered() {
     let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
     let end = events
         .iter()
-        .find(|event| event.event.event_type.as_str() == EventType::TURN_COMPLETED)
-        .expect("the turn ended");
+        .find(|event| event.event.event_type.as_str() == EventType::TURN_YIELDED)
+        .expect("the turn yielded");
     assert_eq!(end.event.payload["stop_reason"], "token_budget_exceeded");
     assert_eq!(end.event.payload["spent"]["input_tokens"], 100);
     assert_eq!(end.event.payload["spent"]["output_tokens"], 20);

@@ -80,6 +80,7 @@ use wording::{
 mod budget;
 mod completion;
 mod context_recovery;
+mod cycles;
 mod event_drafts;
 mod loop_call;
 mod output_recovery;
@@ -885,6 +886,11 @@ struct LoopTurn {
     identical_streak: u32,
     /// Whether the repeat gate already refused once for this streak.
     repeat_refused: bool,
+    /// The highest budget checkpoint (50, 75, 90 per cent) this turn has
+    /// recorded. A checkpoint is written once per turn, not once per step that
+    /// sits above it: the demand to write the state down is a request, and
+    /// repeating it every step would make it the loudest thing in the request.
+    checkpoint_written: u32,
     /// How many mid-turn compactions this turn has attempted. A failed attempt
     /// counts (see `MAX_IN_FLIGHT_COMPACTIONS`), so this is a record of spent
     /// attempts, not of successes.
@@ -1484,6 +1490,7 @@ impl AgentLoop for DefaultAgentLoop {
                 last_signature: None,
                 identical_streak: 0,
                 repeat_refused: false,
+                checkpoint_written: 0,
                 in_flight_compactions: 0,
                 in_flight_newest: None,
                 observed_input_tokens: None,
@@ -1725,7 +1732,15 @@ impl AgentLoop for DefaultAgentLoop {
             // more specific problem when both apply, and the budget line is the
             // last thing the request says either way.
             let stall_notice = stall::place_stall_notice(turn, &ctx.turn_id);
-            let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id);
+            // A budget checkpoint is a demand to write the state down, made at
+            // the point where there is still enough budget to act on it. The
+            // record of having made it is the log's, so a reader can tell a
+            // run that was asked from one that volunteered.
+            let checkpoint = turn.crossed_checkpoint();
+            let budget_notice = budget::place_budget_notice(turn, &ctx.turn_id, checkpoint);
+            if let Some(point) = checkpoint {
+                events.push(budget::checkpoint_event(turn, ctx, &step_id, point));
+            }
 
             let mut request = ModelRequest {
                 session_id: ctx.session_id.clone(),
@@ -2391,6 +2406,9 @@ impl AgentLoop for DefaultAgentLoop {
                     ReasonSource::Kernel,
                 );
                 events.push(reason_event(ctx, Some(&step_id), &gate));
+                // The same cycle the dispatch path records, for the case where
+                // the gate stops it before it runs (see `cycles`).
+                events.push(cycles::held(ctx, &step_id, call, turn.identical_streak + 1));
                 events.push(draft(
                     ctx,
                     &step_id,
@@ -2814,16 +2832,10 @@ impl AgentLoop for DefaultAgentLoop {
                         turn.checked_since_failure = true;
                         turn.acted_this_turn = true;
                         turn.stale = None;
-                        // The repeat gate's bookkeeping: a call that ran is
-                        // the one a third identical call would repeat. The
-                        // loop's own ledgers never reach this point.
-                        let signature = call_signature(&call.tool_name, &call.arguments);
-                        if turn.last_signature.as_deref() == Some(signature.as_str()) {
-                            turn.identical_streak += 1;
-                        } else {
-                            turn.last_signature = Some(signature);
-                            turn.identical_streak = 1;
-                            turn.repeat_refused = false;
+                        // The repeat gate's bookkeeping, and the cycle record
+                        // when this run is the third of a streak (`cycles`).
+                        if let Some(cycle) = cycles::note_run(turn, ctx, &step_id, call) {
+                            events.push(cycle);
                         }
                         // What happened to the result on its way here, recorded
                         // before the result itself. These are the facts a reader

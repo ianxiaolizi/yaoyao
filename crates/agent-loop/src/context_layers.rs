@@ -147,6 +147,7 @@ pub(crate) fn state_text(facts: &TurnStateFacts) -> String {
         Some(TurnEnding::Cancelled) => "cancelled by the user",
         Some(TurnEnding::Interrupted) => "interrupted",
         Some(TurnEnding::Yielded) => "yielded (waiting on a decision)",
+        Some(TurnEnding::Parked) => "parked (its budget ran out before it answered)",
     };
     format!(
         "State at {}.\nQueued input(s): {queued}.\nPrevious turn: {previous}.",
@@ -504,6 +505,9 @@ pub(crate) struct BudgetNotice {
     pub(crate) phase: &'static str,
     pub(crate) percent: u32,
     pub(crate) max_total_tokens: Option<u64>,
+    /// The checkpoint (50, 75, 90) this request was sent at, when it was sent
+    /// at one. Carried so the log says which request asked for the state.
+    pub(crate) checkpoint: Option<u32>,
     pub(crate) text: String,
 }
 
@@ -538,16 +542,51 @@ impl BudgetNotice {
         } else {
             text.push_str(" Phase: normal.");
         }
-        Self { phase, percent, max_total_tokens, text }
+        Self { phase, percent, max_total_tokens, checkpoint: None, text }
+    }
+
+    /// Add the demand to write the work state down, at a budget checkpoint.
+    ///
+    /// The plan's ordering is what makes this worth spending a step on: a run
+    /// that stops without an account of where it stands leaves the next turn
+    /// re-reading the transcript instead of continuing from it, which is the
+    /// cost the budget just refused to pay.
+    pub(crate) fn at_checkpoint(mut self, point: u32) -> Self {
+        self.checkpoint = Some(point);
+        self.text.push_str(&format!(
+            " Budget checkpoint {point}%: before spending more, write down where the work \
+             stands — call `state.update` (and `plan.update` if the plan changed) with what is \
+             done, what remains, and the next concrete step. A run that has to stop without \
+             that account leaves the next turn re-reading the transcript instead of \
+             continuing."
+        ));
+        self
+    }
+
+    /// Add the line about a call the turn keeps repeating.
+    pub(crate) fn after_repeat(mut self, streak: u32) -> Self {
+        self.text.push_str(&format!(
+            " Repeat notice: the last {streak} tool calls ran with byte-identical arguments. The \
+             world has already answered that call — repeating it cannot change the answer. Do \
+             something different (another tool, another argument, another reading of the \
+             problem), or write down what is blocked and answer with what you have."
+        ));
+        self
     }
 
     pub(crate) fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "phase": self.phase,
             "percent": self.percent,
             "max_total_tokens": self.max_total_tokens,
             "text": self.text,
-        })
+        });
+        // Absent, not null, when this request was not sent at a checkpoint: a
+        // request with no checkpoint keeps its exact old payload.
+        if let Some(point) = self.checkpoint {
+            json["checkpoint"] = serde_json::json!(point);
+        }
+        json
     }
 }
 

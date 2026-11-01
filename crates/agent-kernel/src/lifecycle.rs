@@ -99,7 +99,26 @@ pub fn last_turn_ending(events: &[StoredEvent]) -> Option<(TurnId, TurnEnding)> 
             EventType::TURN_FAILED => TurnEnding::Failed,
             EventType::TURN_CANCELLED => TurnEnding::Cancelled,
             EventType::TURN_INTERRUPTED => TurnEnding::Interrupted,
-            EventType::TURN_YIELDED => TurnEnding::Yielded,
+            // A yielded turn is waiting on a decision, unless it is a budget
+            // pause: `turn/yielded` is the log's word for both, and only the
+            // stop reason beside it tells them apart (CONTRACT §7 #173).
+            EventType::TURN_YIELDED => {
+                if matches!(
+                    e.payload.get("stop_reason").and_then(|value| value.as_str()),
+                    Some(
+                        "max_steps"
+                            | "max_tool_calls"
+                            | "wall_clock_exceeded"
+                            | "max_output_tokens"
+                            | "token_budget_exceeded"
+                            | "stalled"
+                    )
+                ) {
+                    TurnEnding::Parked
+                } else {
+                    TurnEnding::Yielded
+                }
+            }
             _ => continue,
         };
         if let Some(turn_id) = &e.turn_id {

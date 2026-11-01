@@ -732,15 +732,22 @@ mod tests {
             other => panic!("a child held to one step did not answer: {other:?}"),
         }
         let stored = store.read_stream(&child(), EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = stored
+        // A child held to its step budget parked, it did not complete: the
+        // parent is told the limit, and the log says the same thing
+        // (CONTRACT §7 #173).
+        let yielded = stored
             .iter()
-            .find(|event| event.event.event_type.as_str() == "turn/completed")
-            .expect("the turn ended");
+            .find(|event| event.event.event_type.as_str() == "turn/yielded")
+            .expect("the turn yielded");
         assert_eq!(
-            completed.event.payload.pointer("/budget/steps").and_then(|v| v.as_u64()),
+            yielded.event.payload.pointer("/budget/steps").and_then(|v| v.as_u64()),
             Some(1),
             "the child's terminal event says what it was held to: {}",
-            completed.event.payload
+            yielded.event.payload
+        );
+        assert!(
+            stored.iter().any(|event| event.event.event_type.as_str() == "budget/parked"),
+            "the pause is recorded for the child too"
         );
     }
 

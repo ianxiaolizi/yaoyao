@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use agent_ports::agent_loop::{
-    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, StopReason, TurnCapabilityFacts,
-    TurnContext, TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
+    AgentLoop, AgentLoopError, EventSink, Journal, SteeringInput, TurnCapabilityFacts, TurnContext,
+    TurnFailureFacts, TurnInputKind, TurnStart, TurnStateFacts,
 };
 use agent_ports::control::ControlHandler;
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
@@ -33,6 +33,7 @@ use crate::plan;
 use crate::session_lifecycle;
 use crate::state;
 
+mod completion;
 mod controls;
 mod draft;
 mod endings;
@@ -642,6 +643,15 @@ impl Scheduler {
 
         let (stop_reason, final_content, turn_terminal, run_terminal, mut turn_payload) =
             ending.settle();
+        // Read from the counters the terminal payload will carry, and before
+        // `spent` moves into `Finished`: the parked record's percentage has to
+        // describe the same run the spend does.
+        let parked_percent = crate::parking::percent_of(
+            u32::try_from(journal.steps()).unwrap_or(u32::MAX),
+            self.max_steps,
+            spent.total_tokens(),
+            self.budget.max_total_tokens,
+        );
         let finished = Finished::now(
             spent,
             journal.steps(),
@@ -658,57 +668,28 @@ impl Scheduler {
         // What the completion gate says about the work this turn leaves behind,
         // read once from the log as it stands now — the turn's steps are
         // durable, and the terminal batch below is the first write after this
-        // read. Two facts are recorded rather than inferred later:
-        //
-        // * a turn that stopped because the criterion passed is a *claim*, and
-        //   the gate's refusal is written beside it, so the log says why no
-        //   completion stands;
-        // * an answer handed over after tool work with nothing current behind
-        //   it is the ordinary case the status axes exist for, and recording it
-        //   here means a reader does not have to re-fold to discover it.
-        //
-        // Neither event changes the turn's ending or the run's terminal word:
-        // the turn really ended, and the transcript must not pretend otherwise.
+        // read. The verdicts live in `scheduler/completion.rs`; the read stays
+        // here because the parked record below folds the same snapshot.
         let so_far = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
-        let claim = crate::completion::gate(&so_far);
-        if stop_reason == StopReason::Completed && !claim.is_accepted() {
-            let mut payload = serde_json::json!({
-                "verdict": claim.as_str(),
-                "task_revision": crate::completion::task_revision(&so_far),
-            });
-            if let Some(evidence) = claim.evidence() {
-                payload["check_id"] = serde_json::json!(evidence.check_id);
-                if let Some(operator) = match &claim {
-                    agent_protocol::evidence::ClaimVerdict::ExitMasked { operator, .. } => {
-                        Some(operator.clone())
-                    }
-                    _ => None,
-                } {
-                    payload["operator"] = serde_json::json!(operator);
-                }
-            }
+        completion::note_claims(
+            &history,
+            &so_far,
+            &stop_reason,
+            final_content.as_deref(),
+            (session_id, &run_id, &turn_id),
+            &mut pending,
+        );
+        // A limit ending is a pause, and this is what it paused with. Written
+        // in the same batch as the terminal events, so a crash cannot leave a
+        // yielded turn with nothing saying where it stopped. The record is built
+        // from the log's own plan, state and ledger — not asked of the model,
+        // which is the party that just ran out of budget (CONTRACT §7 #173).
+        if endings::is_limit(&stop_reason) {
+            let parked = crate::parking::state_of(&so_far, stop_reason.as_str(), parked_percent);
             pending.push(draft(
                 session_id,
-                EventType::COMPLETION_CLAIM_REJECTED,
-                payload,
-                Actor::Scheduler,
-                Some(&run_id),
-                Some(&turn_id),
-                None,
-            ));
-        }
-        let delivered = stop_reason == StopReason::FinalAnswer
-            && final_content.as_deref().is_some_and(|content| !content.trim().is_empty());
-        let did_work =
-            crate::completion::task_revision(&so_far) > crate::completion::task_revision(&history);
-        if delivered && did_work && !claim.is_accepted() {
-            pending.push(draft(
-                session_id,
-                EventType::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
-                serde_json::json!({
-                    "verdict": claim.as_str(),
-                    "task_revision": crate::completion::task_revision(&so_far),
-                }),
+                EventType::BUDGET_PARKED,
+                serde_json::json!({ "parked": parked }),
                 Actor::Scheduler,
                 Some(&run_id),
                 Some(&turn_id),
@@ -1606,10 +1587,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_exhausted_step_budget_completes_the_turn() {
+    async fn an_exhausted_step_budget_parks_the_turn_instead_of_completing_it() {
         // The budget is the Scheduler's policy, so only the Scheduler can report
         // this ending. The model here would call tools forever: it never stops on
         // its own, which is why something outside the loop has to.
+        //
+        // A budget stop is a pause, not an answer (CONTRACT §7 #173): the turn
+        // ends `turn/yielded`, so the delivery axis cannot offer whatever text
+        // the model happened to have written as the result, and the
+        // `budget/parked` record beside it says what was left.
         let store = Arc::new(FakeEventStore::new());
         let sid = SessionId::from_string("budget-session");
         let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::tool_call(
@@ -1629,32 +1615,61 @@ mod tests {
         assert!(report.final_content.is_none());
         assert_eq!(model.requests().len(), 2, "the budget counts steps, not requests");
         let types = event_types(&store, &sid).await;
-        assert!(types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
-        assert!(types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
-        // A budget stop says so in the log, not only on stdout: without it the
-        // event is indistinguishable from a turn that ended with nothing to say.
+        assert!(types.contains(&EventType::TURN_YIELDED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::RUN_YIELDED.to_string()), "{types:?}");
+        assert!(!types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
+        assert!(!types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
+
         let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = events
+        // The pause still says why it paused and how far it got: a limit hit at
+        // once and one hit after a long run write the same stop reason, so the
+        // numbers beside it are what tell them apart.
+        let yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
-            .expect("the turn completed");
-        assert_eq!(completed.event.payload["stop_reason"], serde_json::json!("max_steps"));
-        // And how far the turn got: a limit hit at once and one hit after a long
-        // run write the same stop reason, so the numbers beside it are what tell
-        // them apart.
-        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(2));
-        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(2));
-        assert!(completed.event.payload["budget"]["elapsed_ms"].is_u64());
-        // The run's terminal event is the one an operator reads when asking
-        // what a finished run cost. It must carry the same spend as the turn.
-        let run_completed = events
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_YIELDED)
+            .expect("the turn yielded");
+        assert_eq!(yielded.event.payload["stop_reason"], serde_json::json!("max_steps"));
+        assert_eq!(yielded.event.payload["budget"]["steps"], serde_json::json!(2));
+        assert_eq!(yielded.event.payload["budget"]["tool_calls"], serde_json::json!(2));
+        assert!(yielded.event.payload["budget"]["elapsed_ms"].is_u64());
+        let run_yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::RUN_COMPLETED)
-            .expect("the run completed");
-        assert_eq!(run_completed.event.payload["stop_reason"], serde_json::json!("max_steps"));
-        assert_eq!(run_completed.event.payload["spent"]["steps"], serde_json::json!(2));
-        assert_eq!(run_completed.event.payload["spent"]["tool_calls"], serde_json::json!(2));
-        assert!(run_completed.event.payload["spent"]["input_tokens"].is_u64());
+            .find(|stored| stored.event.event_type.as_str() == EventType::RUN_YIELDED)
+            .expect("the run yielded");
+        assert_eq!(run_yielded.event.payload["stop_reason"], serde_json::json!("max_steps"));
+        assert_eq!(run_yielded.event.payload["spent"]["steps"], serde_json::json!(2));
+        assert_eq!(run_yielded.event.payload["spent"]["tool_calls"], serde_json::json!(2));
+        assert!(run_yielded.event.payload["spent"]["input_tokens"].is_u64());
+
+        // What it parked with: the reason, how much of the budget went, and —
+        // because this turn wrote no plan or state — empty goal and evidence
+        // lists rather than invented ones.
+        let parked = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::BUDGET_PARKED)
+            .expect("the pause is recorded");
+        assert_eq!(parked.event.payload["parked"]["reason"], serde_json::json!("max_steps"));
+        assert_eq!(parked.event.payload["parked"]["percent"], serde_json::json!(100));
+        assert_eq!(parked.event.payload["parked"]["remaining_goals"], serde_json::json!([]));
+        assert!(
+            parked.event.payload["parked"].get("next_step").is_none(),
+            "{:?}",
+            parked.event.payload
+        );
+
+        // The status axes read the pause as what it is: nothing delivered and no
+        // completion to claim.
+        let axes = crate::status::derive(&events);
+        assert_eq!(axes.delivery_status, agent_protocol::status::DeliveryStatus::Unanswered);
+        assert_eq!(
+            axes.completion_status,
+            Some(agent_protocol::status::CompletionStatus::BlockedOrParked)
+        );
+
+        // The item the turn used is claimed in the same batch, so a later turn
+        // does not re-claim work this one already did — which is the whole of
+        // "resume from parked does not take the old queue items again".
+        assert!(scheduler.inbox.pending(&sid).await.unwrap().is_empty());
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
     }
 
@@ -1687,18 +1702,24 @@ mod tests {
         let types = event_types(&store, &sid).await;
         assert!(types.contains(&EventType::TOOL_NOT_STARTED.to_string()), "{types:?}");
         assert!(!types.contains(&EventType::TOOL_STARTED.to_string()), "{types:?}");
-        // A limit the loop enforced ends the turn the way an exhausted step
+        // A limit the loop enforced pauses the turn the way an exhausted step
         // budget does; leaving it as `{}` would hide the reason in the log.
-        assert!(types.contains(&EventType::TURN_COMPLETED.to_string()), "{types:?}");
-        assert!(types.contains(&EventType::RUN_COMPLETED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::TURN_YIELDED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::RUN_YIELDED.to_string()), "{types:?}");
+        assert!(types.contains(&EventType::BUDGET_PARKED.to_string()), "{types:?}");
         let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = events
+        let yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
-            .expect("the turn completed");
-        assert_eq!(completed.event.payload["stop_reason"], serde_json::json!("max_tool_calls"));
-        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(1));
-        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(0));
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_YIELDED)
+            .expect("the turn yielded");
+        assert_eq!(yielded.event.payload["stop_reason"], serde_json::json!("max_tool_calls"));
+        assert_eq!(yielded.event.payload["budget"]["steps"], serde_json::json!(1));
+        assert_eq!(yielded.event.payload["budget"]["tool_calls"], serde_json::json!(0));
+        let parked = events
+            .iter()
+            .find(|stored| stored.event.event_type.as_str() == EventType::BUDGET_PARKED)
+            .expect("the pause is recorded");
+        assert_eq!(parked.event.payload["parked"]["reason"], serde_json::json!("max_tool_calls"));
         assert!(!scheduler.has_active_run(&sid).await.unwrap());
     }
 
@@ -1729,16 +1750,17 @@ mod tests {
         let types = event_types(&store, &sid).await;
         assert!(!types.contains(&EventType::STEP_STARTED.to_string()), "{types:?}");
         let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = events
+        let yielded = events
             .iter()
-            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_COMPLETED)
-            .expect("the turn completed");
-        assert_eq!(
-            completed.event.payload["stop_reason"],
-            serde_json::json!("wall_clock_exceeded")
+            .find(|stored| stored.event.event_type.as_str() == EventType::TURN_YIELDED)
+            .expect("the turn yielded");
+        assert_eq!(yielded.event.payload["stop_reason"], serde_json::json!("wall_clock_exceeded"));
+        assert_eq!(yielded.event.payload["budget"]["steps"], serde_json::json!(0));
+        assert_eq!(yielded.event.payload["budget"]["tool_calls"], serde_json::json!(0));
+        assert!(
+            types.contains(&EventType::BUDGET_PARKED.to_string()),
+            "a spent clock parks the turn like any other limit: {types:?}"
         );
-        assert_eq!(completed.event.payload["budget"]["steps"], serde_json::json!(0));
-        assert_eq!(completed.event.payload["budget"]["tool_calls"], serde_json::json!(0));
     }
 
     #[tokio::test]

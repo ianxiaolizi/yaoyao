@@ -26,6 +26,7 @@ pub mod intent_adjudication;
 pub mod judgment;
 pub mod ledger;
 pub mod model;
+pub mod parking;
 pub mod permissions;
 pub mod plan;
 pub mod plugin;

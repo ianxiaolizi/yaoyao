@@ -653,7 +653,21 @@ impl ProjectionDefinition for TranscriptProjection {
                         Some("content_filtered") => TurnEnding::ContentFiltered,
                         _ => TurnEnding::Answered,
                     },
-                    EventType::TURN_YIELDED => TurnEnding::Yielded,
+                    // A yielded turn says why it yielded when it can. A budget
+                    // pause is not a question for a person: reporting it as
+                    // `Yielded` would send a reader to answer a decision nobody
+                    // is being asked (CONTRACT §7 #173).
+                    EventType::TURN_YIELDED => match stop_reason.as_deref() {
+                        Some("max_steps") => TurnEnding::MaxSteps,
+                        Some(
+                            "max_tool_calls"
+                            | "wall_clock_exceeded"
+                            | "max_output_tokens"
+                            | "token_budget_exceeded"
+                            | "stalled",
+                        ) => TurnEnding::LimitReached,
+                        _ => TurnEnding::Yielded,
+                    },
                     EventType::TURN_FAILED => TurnEnding::Failed,
                     _ => TurnEnding::Cancelled,
                 };

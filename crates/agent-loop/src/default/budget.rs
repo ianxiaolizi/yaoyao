@@ -6,14 +6,42 @@
 //! find it. Nothing here decides to stop a turn. A spent budget is reported to
 //! the caller, whose step boundary ends the run (`default.rs`'s module doc).
 
-use agent_protocol::ids::TurnId;
+use agent_ports::agent_loop::TurnContext;
+use agent_protocol::events::{Actor, EventDraft, EventType};
+use agent_protocol::ids::{StepId, TurnId};
 use agent_protocol::model::{estimate_block, estimate_message, estimate_text};
 
 use crate::context_layers::BudgetNotice;
 
 use super::*;
 
+/// The percentages at which a run is made to stop and say where it stands.
+///
+/// Three points, not a stream of reminders: a checkpoint is a request to write
+/// the work state down, and a request repeated every step is one the model
+/// learns to read past. The first point a step has crossed is taken, so a run
+/// that jumps from 40% to 92% records 90 and not the two it skipped — the
+/// question at each point is the same one.
+pub(super) const CHECKPOINTS: [u32; 3] = [50, 75, 90];
+
 impl LoopTurn {
+    /// The budget point this step crossed, if any. Records that it was taken.
+    ///
+    /// A crossing is measured on the share the run's own budget puts it at,
+    /// before the next request is sent: the request itself will spend more, and
+    /// a checkpoint that fires only once the budget is already gone has nothing
+    /// left for the model to do with it.
+    pub(super) fn crossed_checkpoint(&mut self) -> Option<u32> {
+        let percent = self.budget_used_percent();
+        let point = CHECKPOINTS
+            .iter()
+            .copied()
+            .rev()
+            .find(|point| percent >= *point && *point > self.checkpoint_written)?;
+        self.checkpoint_written = point;
+        Some(point)
+    }
+
     /// Whether the run has spent the token budget it was configured with.
     ///
     /// Raw `input + output`, compared against `max_total_tokens`. Cache hits
@@ -154,11 +182,15 @@ pub(super) fn record_spend(
 /// uid is the turn's, so replacing it each step keeps one reminder in the
 /// request rather than a growing pile of them, and the stable prefix the
 /// provider's cache hits stays untouched.
-pub(super) fn place_budget_notice(turn: &mut LoopTurn, turn_id: &TurnId) -> Option<BudgetNotice> {
+pub(super) fn place_budget_notice(
+    turn: &mut LoopTurn,
+    turn_id: &TurnId,
+    checkpoint: Option<u32>,
+) -> Option<BudgetNotice> {
     if turn.budget.max_total_tokens.is_none() && turn.budget.wall_clock_ms.is_none() {
         return None;
     }
-    let notice = BudgetNotice::new(
+    let mut notice = BudgetNotice::new(
         turn.budget_phase(),
         turn.budget_used_percent(),
         turn.spent.total_tokens(),
@@ -167,6 +199,12 @@ pub(super) fn place_budget_notice(turn: &mut LoopTurn, turn_id: &TurnId) -> Opti
             deadline.saturating_duration_since(std::time::Instant::now()).as_millis() as u64
         }),
     );
+    if let Some(point) = checkpoint {
+        notice = notice.at_checkpoint(point);
+    }
+    if turn.identical_streak >= 3 {
+        notice = notice.after_repeat(turn.identical_streak);
+    }
     let uid = format!("msg/budget/{turn_id}");
     let message = ModelMessage::budget_notice_for_turn(turn_id, notice.text.clone());
     // Replaced and re-appended rather than overwritten in place: the reminder
@@ -176,6 +214,30 @@ pub(super) fn place_budget_notice(turn: &mut LoopTurn, turn_id: &TurnId) -> Opti
     turn.messages.retain(|message| message.message_uid.as_str() != uid);
     turn.messages.push(message);
     Some(notice)
+}
+
+/// The record that this run was asked to write its state down.
+///
+/// A checkpoint is a demand to write the work state at the point where there is
+/// still enough budget to act on it. The log keeps the fact that it was made, so
+/// a reader can tell a run that was asked from one that volunteered.
+pub(super) fn checkpoint_event(
+    turn: &LoopTurn,
+    ctx: &TurnContext,
+    step_id: &StepId,
+    point: u32,
+) -> EventDraft {
+    draft(
+        ctx,
+        step_id,
+        EventType::BUDGET_CHECKPOINT,
+        serde_json::json!({
+            "checkpoint": point,
+            "percent": turn.budget_used_percent(),
+            "phase": turn.budget_phase(),
+        }),
+        Actor::Agent,
+    )
 }
 
 /// The context budget and reasoning depth a summary request must use.

@@ -167,6 +167,14 @@ impl EventType {
     /// not a retry. Every other unsettled code says the opposite — something
     /// may have happened that the log does not know about.
     pub const TOOL_NOT_STARTED: &'static str = "tool/not_started";
+    /// The same call, with the same arguments, made often enough in one turn
+    /// that it is a loop rather than work.
+    ///
+    /// Written once per repeated signature per turn. It does not stop the
+    /// call — a read that is legitimately repeated is not refused — it is the
+    /// record that the run spent budget going in circles, and the request that
+    /// follows carries a line saying so.
+    pub const TOOL_DUPLICATE_CYCLE: &'static str = "tool/duplicate_cycle";
     /// The session's plan, replaced in full. Written by the loop's own
     /// `plan.update` tool — one event per accepted call, carrying the plan it
     /// recorded. It never reaches a provider; the next turn reads it back.
@@ -212,6 +220,21 @@ impl EventType {
     /// response, so a reader can see the spend grow without re-summing every
     /// response in the log.
     pub const BUDGET_UPDATED: &'static str = "budget/updated";
+    /// A budget point the run was told to write its state at — 50, 75, 90 per
+    /// cent — reached for the first time in that run.
+    ///
+    /// The demand travels in the request's budget notice; this event records
+    /// that the run was at the checkpoint, so a reader can tell "the model was
+    /// asked to say where it stood" from "it said so unprompted".
+    pub const BUDGET_CHECKPOINT: &'static str = "budget/checkpoint";
+    /// Where a run stopped when its budget, not its work, ended it.
+    ///
+    /// Payload is a [`agent_protocol::parking::ParkedState`]. Written in the
+    /// same batch as the turn's terminal events — a parked turn ends
+    /// `turn/yielded`, and the delivery axis already refuses to call that
+    /// delivered — because "continue" without this record means re-reading the
+    /// transcript the budget just refused to pay for.
+    pub const BUDGET_PARKED: &'static str = "budget/parked";
     /// One run of the profile's completion criterion, at a step boundary.
     ///
     /// Written whether or not the check passed, because "the world says it is
@@ -371,6 +394,7 @@ impl EventType {
         Self::TOOL_INTERRUPTED,
         Self::TOOL_OUTCOME_UNKNOWN,
         Self::TOOL_NOT_STARTED,
+        Self::TOOL_DUPLICATE_CYCLE,
         Self::PLAN_UPDATED,
         Self::STATE_UPDATED,
         Self::JUDGMENT_UPDATED,
@@ -380,6 +404,8 @@ impl EventType {
         Self::CONTEXT_COMPACTION_FAILED,
         Self::CONTEXT_COMPACTED,
         Self::BUDGET_UPDATED,
+        Self::BUDGET_CHECKPOINT,
+        Self::BUDGET_PARKED,
         Self::COMPLETION_CHECKED,
         Self::COMPLETION_CLAIM_REJECTED,
         Self::COMPLETION_UNVERIFIED_RESULT_DELIVERED,

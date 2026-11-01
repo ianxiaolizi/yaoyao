@@ -18,6 +18,7 @@ pub mod judgment;
 pub mod lifecycle;
 pub mod live_bus;
 pub mod model_selection;
+pub mod parking;
 pub mod plan;
 pub mod plugin;
 pub mod policy;

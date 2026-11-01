@@ -64,17 +64,25 @@ impl Ending {
             Ending::Loop { final_content, .. } => final_content.clone(),
             _ => None,
         };
+        // A limit ending is a *pause*, not an end: the turn did not answer, and
+        // a `turn/completed` would make the delivery axis offer whatever text
+        // the model happened to have written as the answer. `turn/yielded` is
+        // the log's word for "stopped, waiting", and the `budget/parked` record
+        // written beside it says what for (CONTRACT §7 #173).
         let (turn_event, run_event) = match &reason {
-            StopReason::FinalAnswer
-            | StopReason::MaxSteps
+            // Spelled out rather than a guard on `is_limit`: a match arm with a
+            // guard does not discharge exhaustiveness, and a new `StopReason`
+            // variant must force a decision here rather than fall into `_`.
+            StopReason::MaxSteps
             | StopReason::MaxToolCalls
             | StopReason::WallClockExceeded
             | StopReason::MaxOutputTokens
-            | StopReason::ContentFiltered
             | StopReason::TokenBudgetExceeded
             | StopReason::Stalled
-            | StopReason::Completed => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
-            StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
+            | StopReason::NeedsUserInput => (EventType::TURN_YIELDED, EventType::RUN_YIELDED),
+            StopReason::FinalAnswer | StopReason::ContentFiltered | StopReason::Completed => {
+                (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED)
+            }
             StopReason::FatalError => (EventType::TURN_FAILED, EventType::RUN_FAILED),
             StopReason::UserCancelled => (EventType::TURN_CANCELLED, EventType::RUN_CANCELLED),
         };

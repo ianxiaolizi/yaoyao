@@ -245,6 +245,11 @@ pub enum TurnEnding {
     /// turn until `resume` settles the call, but the fold still reports it
     /// rather than pretending the turn vanished.
     Yielded,
+    /// Stopped because its budget ran out, not because anything is waiting on
+    /// a decision. It is its own ending because the two asks are opposite: a
+    /// yielded turn waits for the session, a parked one waits for nothing —
+    /// the next message continues it (CONTRACT §7 #173).
+    Parked,
 }
 
 /// Text the user injected between two steps of a turn already in flight.
@@ -370,6 +375,30 @@ pub enum StopReason {
     /// other endings this one is not the model's claim: a command's exit code
     /// (or an HTTP status) decided it.
     Completed,
+}
+
+impl StopReason {
+    /// The word this reason is written as, in the log and in the parked record.
+    ///
+    /// The serde representation is the same string. It exists so a caller that
+    /// has to name a reason in a payload does not have to go through JSON to
+    /// find out what it is called.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FinalAnswer => "final_answer",
+            Self::MaxSteps => "max_steps",
+            Self::NeedsUserInput => "needs_user_input",
+            Self::FatalError => "fatal_error",
+            Self::UserCancelled => "user_cancelled",
+            Self::MaxToolCalls => "max_tool_calls",
+            Self::WallClockExceeded => "wall_clock_exceeded",
+            Self::MaxOutputTokens => "max_output_tokens",
+            Self::ContentFiltered => "content_filtered",
+            Self::TokenBudgetExceeded => "token_budget_exceeded",
+            Self::Stalled => "stalled",
+            Self::Completed => "completed",
+        }
+    }
 }
 
 /// Port for how a turn advances. Implementations are assembled at the app layer.
