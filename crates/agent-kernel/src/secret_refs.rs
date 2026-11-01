@@ -16,7 +16,7 @@ use agent_ports::secret_provider::{SecretProvider, SecretProviderError};
 use agent_ports::tool_gateway::ToolGatewayError;
 use agent_ports::tool_provider::ToolInvocation;
 use agent_protocol::ids::SessionId;
-use agent_protocol::permissions::{Capability, SecretRef};
+use agent_protocol::permissions::SecretRef;
 use agent_protocol::tool::ToolErrorKind;
 
 use crate::action::SECRET_SCHEME;
@@ -152,20 +152,20 @@ fn resolve_text(
     Ok(out)
 }
 
-/// Whether an approval already covers the capabilities a secret-using call
-/// declares.
+/// Whether an approval already covers the secret-using call in front of us.
 ///
-/// Any intersecting grant is enough: the grant was given for this tool's
-/// capability, and a secret names a value the person approving the call could
-/// not see either way.
+/// The lease has to cover *this* action, not merely one of its capabilities
+/// (B4): a grant made for reading a file says nothing about a call that would
+/// send a secret somewhere. One lease covering the whole fingerprint is what
+/// makes this call one a person already saw.
 pub(crate) async fn secret_use_granted(
     approvals: &ApprovalService,
     session_id: &SessionId,
-    capabilities: &[Capability],
+    action: &agent_protocol::permission::ActionFacts,
 ) -> Result<bool, ToolGatewayError> {
     let leases = approvals
         .leases_in_effect(session_id)
         .await
         .map_err(|e| ToolGatewayError::Approval(e.to_string()))?;
-    Ok(leases.iter().any(|lease| capabilities.contains(&lease.capability)))
+    Ok(leases.iter().any(|lease| lease.matches_action(action)))
 }

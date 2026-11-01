@@ -12,6 +12,12 @@
 //! | a dangerous call ⇒ ask | `a_dangerous_call_stops_the_turn_for_an_answer` |
 //! | a denied approval ⇒ never execute | `a_denied_call_never_touches_the_world` |
 //! | the UI/model is not the source of truth | `state_comes_from_the_log_not_from_a_claim` |
+//! | the model cannot answer its own question | `an_approval_issued_by_a_tool_child_is_refused` |
+//!
+//! The last row is B4's, and it is not one of the six: a person approves a
+//! concrete action, and a process a model can start — a tool child, which is a
+//! process with pipes and no terminal — cannot produce that answer, whatever it
+//! is handed.
 //!
 //! These tests do not replace the deeper ones. `policy.rs`, `guarded.rs`,
 //! `resource_guard.rs`, `resume.rs` and `m5_acceptance.rs` each prove one layer
@@ -55,7 +61,7 @@ use agent_ports::tool_provider::{
 use agent_protocol::events::{Actor, EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, PluginId, SessionId};
 use agent_protocol::inbox::InboxKind;
-use agent_protocol::permissions::{ApprovalStatus, Capability, CapabilitySet};
+use agent_protocol::permissions::{ApprovalScope, ApprovalStatus, Capability, CapabilitySet};
 use agent_protocol::plugin::{PluginCapabilities, PluginContributions, PluginManifest};
 use agent_testkit::FixedSecret;
 use chrono::Utc;
@@ -180,9 +186,20 @@ struct Process {
 
 /// Assemble a process the way the binary does, over a scripted model.
 async fn process(workspace: &Path, data_dir: &Path, script: Vec<String>) -> Process {
+    process_in(SESSION, workspace, data_dir, script).await
+}
+
+/// The same, in a named session — two processes over one data directory is how
+/// the test that needs a second session says so.
+async fn process_in(
+    session: &str,
+    workspace: &Path,
+    data_dir: &Path,
+    script: Vec<String>,
+) -> Process {
     let transport = Arc::new(ScriptedTransport::new(script));
     let stack = stack::assemble(stack::Inputs {
-        session: SessionId::from_string(SESSION),
+        session: SessionId::from_string(session),
         workspace_root: workspace.to_path_buf(),
         data_dir: data_dir.to_path_buf(),
         resolved: default_profile(),
@@ -202,7 +219,7 @@ async fn process(workspace: &Path, data_dir: &Path, script: Vec<String>) -> Proc
     .await
     .expect("the assembly the binary runs");
 
-    Process { stack, transport, session: SessionId::from_string(SESSION) }
+    Process { stack, transport, session: SessionId::from_string(session) }
 }
 
 impl Process {
@@ -827,6 +844,122 @@ async fn state_comes_from_the_log_not_from_a_claim() {
     assert_eq!(pending[0].status, ApprovalStatus::Pending);
     assert_eq!(rebuilt.count(EventType::APPROVAL_REQUESTED).await, 1);
     assert_eq!(rebuilt.count(EventType::APPROVAL_GRANTED).await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 7. the model cannot answer its own question
+// ---------------------------------------------------------------------------
+
+/// A child process is what a model can put on a machine, and a child process
+/// has pipes for stdio. The verb that answers a question refuses one — so a
+/// person saying yes to a *command* never becomes a model saying yes to
+/// everything else.
+///
+/// Two sessions over one data directory, which is the whole point: one holds a
+/// question nobody has answered, the other is where a command runs. The person
+/// approves that command — once — and what the command tries to do is answer the
+/// other session's question, with everything a child could need in hand: the
+/// product's own verb, the live approval id, the session it is pending in, and
+/// the data directory the answer would go into.
+///
+/// The file the child writes is its own stderr, so the assertion reads what the
+/// refused process said about itself rather than what the test believes about
+/// it. (B4, plan threshold 3.)
+#[tokio::test]
+async fn an_approval_issued_by_a_tool_child_is_refused() {
+    let (workspace, data) = dirs();
+
+    // The session with the unanswered question: a command that has not run.
+    let waiting = process(
+        workspace.path(),
+        data.path(),
+        vec![tool_call_body(
+            "call_waiting",
+            &to_wire_name("shell.run"),
+            serde_json::json!({ "command": MARKER_COMMAND }),
+        )],
+    )
+    .await;
+    let stopped = waiting.ask("run that command").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput);
+    let pending = waiting.stack.approvals.pending(&waiting.session).await.expect("pending");
+    assert_eq!(pending.len(), 1, "one call is waiting for a person");
+    let approval_id = pending[0].approval_id.clone();
+
+    // The command a person approves, in another session: the product's own verb
+    // answering that question.
+    let command = format!(
+        "set \"AGENT_DATA_DIR={}\"&& set \"AGENT_WORKSPACE_DIR={}\"&&          \"{}\" approve {approval_id} always --session {SESSION} > refusal.txt 2>&1",
+        data.path().display(),
+        workspace.path().display(),
+        env!("CARGO_BIN_EXE_agent"),
+    );
+    let spawner = process_in(
+        "security-regression-child",
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": command }),
+            ),
+            answer_body("I could not approve it myself"),
+        ],
+    )
+    .await;
+    let stopped = spawner.ask("run the command").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput, "a command asks once");
+    let own = spawner.stack.approvals.pending(&spawner.session).await.expect("pending");
+    let shell = own[0].approval_id.clone();
+
+    // The person answers the command itself, and only that.
+    spawner
+        .stack
+        .approvals
+        .grant(
+            &spawner.session,
+            &shell,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
+        .await
+        .expect("grant");
+    let ran = spawner.stack.resume.resume(&spawner.session, "go ahead").await.expect("resume");
+    assert!(
+        matches!(ran, ResumeOutcome::Settled { disposition: Disposition::Ran { .. }, .. }),
+        "the approved command ran: {ran:?}"
+    );
+
+    // It ran, was handed everything it needed except a terminal, and said so in
+    // its own words.
+    let refusal = std::fs::read_to_string(workspace.path().join("refusal.txt"))
+        .expect("the child wrote what it was told");
+    assert!(
+        refusal.contains("interactive terminal"),
+        "the child was refused for having no terminal: {refusal}"
+    );
+    assert!(
+        !refusal.contains("no such approval") && !refusal.contains("not found"),
+        "the id was real, so the refusal is not about the door it knocked on: {refusal}"
+    );
+
+    // And the other session's question is still the person's to answer: no grant
+    // names it, and it is still pending.
+    assert_eq!(
+        waiting.count(EventType::APPROVAL_GRANTED).await,
+        0,
+        "a child's answer is not a decision"
+    );
+    let still = waiting.stack.approvals.pending(&waiting.session).await.expect("pending");
+    assert_eq!(still.len(), 1, "the call is still waiting");
+    assert_eq!(still[0].approval_id, approval_id);
+    assert_eq!(still[0].status, ApprovalStatus::Pending);
+    assert!(
+        !workspace.path().join("marker.txt").exists(),
+        "and the command it was about never ran either"
+    );
 }
 
 /// A fresh assembly with no model: this test only reads and recovers.

@@ -1103,6 +1103,65 @@
     return `${hours}h ${minutes % 60}m 后过期`;
   }
 
+  const RISK_TEXT = {
+    l0: '无风险 · 只读',
+    l1: '低风险 · 可撤销',
+    l2: '中风险 · 需要补偿才能撤回',
+    l3: '高风险 · 不可撤销',
+  };
+
+  const REVERSIBILITY_TEXT = {
+    reversible: '可撤销',
+    compensatable: '需补偿才能撤回',
+    irreversible: '不可撤销',
+  };
+
+  const TARGET_KIND_TEXT = {
+    workspace_path: '路径',
+    command: '命令',
+    network: '网络',
+    secret: '密钥引用',
+    data_store: '数据',
+    other: '其他',
+  };
+
+  /// One target, as a sentence a person can check against what they meant.
+  /// The values are what the action would touch — a path, a command line, an
+  /// origin, a named store — and never a secret's value, which the log does
+  /// not carry in the first place.
+  function targetText(target) {
+    if (!target || typeof target !== 'object') return String(target);
+    const kind = TARGET_KIND_TEXT[target.kind] || target.kind;
+    const rest = Object.entries(target)
+      .filter(([key, value]) => key !== 'kind' && value !== null && value !== '')
+      .map(([key, value]) => {
+        const text = Array.isArray(value) ? value.join(' ') : String(value);
+        return `${key === 'path' ? '' : key + '='}${text}`;
+      })
+      .join(' · ');
+    return rest ? `${kind} · ${rest}` : kind;
+  }
+
+  /// What the card says about the action itself, when the request carried it.
+  /// A request written before B4 raised these shows the summary alone, which is
+  /// what it always did.
+  function approvalFacts(approval) {
+    const rows = [];
+    if (approval.risk) {
+      rows.push(`<div class="ask-fact"><span class="k">风险</span>${esc(RISK_TEXT[approval.risk] || approval.risk)}</div>`);
+    }
+    if (approval.reversibility) {
+      rows.push(
+        `<div class="ask-fact"><span class="k">可撤销性</span>${esc(REVERSIBILITY_TEXT[approval.reversibility] || approval.reversibility)}</div>`,
+      );
+    }
+    if (Array.isArray(approval.targets) && approval.targets.length) {
+      const items = approval.targets.map((target) => `<li>${esc(targetText(target))}</li>`).join('');
+      rows.push(`<div class="ask-fact"><span class="k">会动到</span><ul class="ask-targets">${items}</ul></div>`);
+    }
+    return rows.length ? `<div class="ask-facts">${rows.join('')}</div>` : '';
+  }
+
   function approvalCard(approval) {
     const key = `${state.active}:${approval.approval_id}`;
     const settling = state.settling.has(key);
@@ -1136,6 +1195,7 @@
         </div>
         <div class="ask-b">
           <div class="ask-cmd">${esc(approval.summary || '（没有提供参数摘要）')}</div>
+          ${approvalFacts(approval)}
           <div class="ask-why">策略要求这次调用逐次确认。批准后会从这一轮停下的地方继续；拒绝则把「没有派发」告诉模型。</div>
           <div class="ask-act">
             <button class="btn pri" data-decision="once" ${settling ? 'disabled' : ''}>允许一次</button>

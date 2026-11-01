@@ -10,7 +10,7 @@ pub mod reason;
 pub mod schedule;
 pub mod verify;
 
-use agent_kernel::approval::ApprovalService;
+use agent_kernel::approval::{ApprovalAuthority, ApprovalService};
 use agent_kernel::doctor::KernelDoctor;
 use agent_kernel::fork::{Fork, ForkOutcome};
 use agent_kernel::inbox::Inbox;
@@ -837,19 +837,31 @@ fn adjudication_line(status: &agent_kernel::intent_adjudication::AdjudicationSta
 /// means when they answer a question with "always". A wakeup is enqueued for
 /// each approval that was settled, not just the one that was named — each is a
 /// decision the paused turn may be waiting on.
+///
+/// `authority` is what the caller had to prove before it could answer: an
+/// interactive terminal for a person at a prompt, the loopback token for the
+/// GUI. A process that can produce neither cannot approve anything (B4).
 pub async fn run_approve(
     approvals: &ApprovalService,
     inbox: &Inbox,
     session_id: &SessionId,
     approval_id: &str,
     scope: &str,
+    authority: &ApprovalAuthority,
     json: bool,
 ) -> Result<CliOutput, String> {
     let grant = commands::Grant::from_name(scope).map_err(|e| e.to_string())?;
-    let receipt =
-        commands::grant_approval(approvals, inbox, session_id, approval_id, grant, "user")
-            .await
-            .map_err(|e| e.to_string())?;
+    let receipt = commands::grant_approval(
+        approvals,
+        inbox,
+        session_id,
+        approval_id,
+        grant,
+        "user",
+        authority,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let replies = receipt.replies;
 
     let settled = replies.iter().map(|r| r.approval_id.as_str()).collect::<Vec<_>>();

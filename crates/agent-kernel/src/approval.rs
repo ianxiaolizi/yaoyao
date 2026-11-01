@@ -43,6 +43,7 @@ use std::sync::Arc;
 use agent_ports::event_store::{EventStore, EventStoreError};
 use agent_protocol::events::{Actor, EventDraft, EventType, StoredEvent};
 use agent_protocol::ids::{ApprovalId, EventId, EventSeq, SchemaVersion, SessionId};
+use agent_protocol::permission::{ActionFacts, ActionTarget, Reversibility, RiskLevel};
 use agent_protocol::permissions::{
     ApprovalDecision, ApprovalReply, ApprovalRequest, ApprovalScope, ApprovalStatus, Capability,
     LeaseSpec,
@@ -71,6 +72,74 @@ pub struct ApprovalService {
     allow_session_scope: bool,
 }
 
+/// Where a person's answer came from, checked at the entry point and carried
+/// into the service so the decision records it (B4).
+///
+/// The type has no public constructor but the three below, and each is a check
+/// rather than a label:
+///
+/// * [`Self::interactive_tty`] refuses when stdin is not a terminal. A tool
+///   child process that runs `agent approve` inherits a pipe, so it cannot
+///   produce this value at all — which is the whole defence against the main
+///   model approving its own calls.
+/// * [`Self::local_http`] needs the loopback server's session token, which only
+///   the authenticated GUI handler holds.
+/// * [`Self::test`] exists for tests and for nothing else; a shipped build has
+///   no path that constructs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalAuthority(AuthorityKind);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthorityKind {
+    InteractiveTty,
+    LocalHttp { token: String },
+    Test,
+}
+
+/// Why an authority could not be established.
+#[derive(Debug, thiserror::Error)]
+pub enum ApprovalAuthorityError {
+    #[error(
+        "an approval must come from an interactive terminal; a process without one cannot answer \
+         for a person"
+    )]
+    NotInteractive,
+    #[error("a local HTTP approval needs the loopback session token")]
+    MissingToken,
+}
+
+impl ApprovalAuthority {
+    /// The authority a command-line answer has, when this process has a terminal.
+    pub fn interactive_tty(stdin_is_terminal: bool) -> Result<Self, ApprovalAuthorityError> {
+        if !stdin_is_terminal {
+            return Err(ApprovalAuthorityError::NotInteractive);
+        }
+        Ok(Self(AuthorityKind::InteractiveTty))
+    }
+
+    /// The authority a GUI answer has, carrying the token the request proved.
+    pub fn local_http(token: &str) -> Result<Self, ApprovalAuthorityError> {
+        if token.is_empty() {
+            return Err(ApprovalAuthorityError::MissingToken);
+        }
+        Ok(Self(AuthorityKind::LocalHttp { token: token.to_string() }))
+    }
+
+    /// An authority for tests.
+    pub fn test() -> Self {
+        Self(AuthorityKind::Test)
+    }
+
+    /// The word durable replies keep. Never the token.
+    pub fn described(&self) -> &'static str {
+        match self.0 {
+            AuthorityKind::InteractiveTty => "interactive_tty",
+            AuthorityKind::LocalHttp { .. } => "local_http",
+            AuthorityKind::Test => "test",
+        }
+    }
+}
+
 /// Errors from ApprovalService operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ApprovalError {
@@ -80,8 +149,15 @@ pub enum ApprovalError {
     NotFound(ApprovalId),
     #[error("approval is not pending: {0}")]
     NotPending(ApprovalId),
+    #[error("approval is not granted: {0}")]
+    NotGranted(ApprovalId),
     #[error("allow_for_session scope is not permitted by configuration")]
     SessionScopeNotAllowed,
+    #[error(
+        "a high-risk action needs one confirmation per action: approval {approval_id} cannot be \
+         widened beyond `once`"
+    )]
+    HighRiskNeedsPerActionConfirmation { approval_id: ApprovalId },
     #[error("payload error: {0}")]
     Payload(#[from] serde_json::Error),
 }
@@ -97,6 +173,14 @@ struct ApprovalRecord {
     granted_scope: Option<ApprovalScope>,
     created_at: DateTime<Utc>,
     granted_at: Option<DateTime<Utc>>,
+    /// The one action this question is about (B4). Absent on a request written
+    /// before the field existed, which makes the answer a capability-wide one.
+    action_digest: Option<String>,
+    risk: Option<RiskLevel>,
+    task_id: Option<String>,
+    task_revision: Option<u64>,
+    reversibility: Option<Reversibility>,
+    targets: Vec<ActionTarget>,
     /// Whether the log already says why this one ended. Set by the
     /// `approval/expired` arm, and the only thing that makes
     /// [`ApprovalService::sweep_expired`] idempotent: the derived expiry is a
@@ -128,6 +212,10 @@ impl ApprovalRecord {
             capability: self.capability.clone(),
             scope,
             expires_at: self.expires_at(),
+            action_digest: self.action_digest.clone(),
+            task_id: self.task_id.clone(),
+            task_revision: self.task_revision,
+            risk: self.risk,
         })
     }
 
@@ -173,12 +261,46 @@ impl ApprovalService {
     }
 
     /// Raise a non-blocking approval request and return the pending fact.
+    ///
+    /// The capability-wide form. The gateway uses
+    /// [`Self::request_for_action`], which binds the question to the exact
+    /// action; this one stays for callers that have no action facts (a fixture,
+    /// a session assembled by hand) and produces a question a grant cannot
+    /// widen over an `L2`/`L3` action.
     pub async fn request(
         &self,
         session_id: &SessionId,
         capability: Capability,
         tool_name: &str,
         args_summary: &str,
+    ) -> Result<ApprovalRequest, ApprovalError> {
+        self.append_request(session_id, capability, tool_name, args_summary, None).await
+    }
+
+    /// Raise the question a boundary action needs, bound to that action.
+    ///
+    /// The capability asked about is the first one the action declares, which
+    /// is the same one the policy engine evaluated first and the one a lease
+    /// will be matched against.
+    pub async fn request_for_action(
+        &self,
+        session_id: &SessionId,
+        action: &ActionFacts,
+        tool_name: &str,
+        args_summary: &str,
+    ) -> Result<ApprovalRequest, ApprovalError> {
+        let capability =
+            action.capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
+        self.append_request(session_id, capability, tool_name, args_summary, Some(action)).await
+    }
+
+    async fn append_request(
+        &self,
+        session_id: &SessionId,
+        capability: Capability,
+        tool_name: &str,
+        args_summary: &str,
+        action: Option<&ActionFacts>,
     ) -> Result<ApprovalRequest, ApprovalError> {
         let req = ApprovalRequest {
             approval_id: ApprovalId::new(),
@@ -188,6 +310,12 @@ impl ApprovalService {
             args_summary: args_summary.to_string(),
             status: ApprovalStatus::Pending,
             created_at: Utc::now(),
+            action_digest: action.map(|action| action.digest.clone()),
+            risk: action.map(|action| action.risk),
+            task_id: action.map(|action| action.task_id.clone()),
+            task_revision: action.map(|action| action.task_revision),
+            reversibility: action.map(|action| action.reversibility),
+            targets: action.map(|action| action.targets.clone()).unwrap_or_default(),
         };
         // Requesting is a read-then-append like every other writer here: the
         // sequence is computed from the log, and the append must land on the
@@ -205,13 +333,19 @@ impl ApprovalService {
         Ok(req)
     }
 
-    /// Record a grant decision, subject to the session-scope policy.
+    /// Record a grant decision, subject to the session-scope policy and to the
+    /// per-action limits a high-risk request carries (B4).
+    ///
+    /// `authority` is an attestation the entry point had to earn — see
+    /// [`ApprovalAuthority`]. The answer it produces is bound to the action the
+    /// request named, so the reply says which fingerprint a person allowed.
     pub async fn grant(
         &self,
         session_id: &SessionId,
         approval_id: &ApprovalId,
         scope: ApprovalScope,
         actor: &str,
+        authority: &ApprovalAuthority,
     ) -> Result<ApprovalReply, ApprovalError> {
         if scope == ApprovalScope::AllowForSession && !self.allow_session_scope {
             return Err(ApprovalError::SessionScopeNotAllowed);
@@ -223,12 +357,25 @@ impl ApprovalService {
         if record.status != ApprovalStatus::Pending {
             return Err(ApprovalError::NotPending(approval_id.clone()));
         }
+        // `L3` is confirmed one action at a time. A turn- or session-wide answer
+        // would authorise calls nobody saw, and the risk is precisely that the
+        // next one is different.
+        if record.risk.is_some_and(|risk| risk >= RiskLevel::L3)
+            && scope != ApprovalScope::AllowOnce
+        {
+            return Err(ApprovalError::HighRiskNeedsPerActionConfirmation {
+                approval_id: approval_id.clone(),
+            });
+        }
         let reply = ApprovalReply {
             approval_id: approval_id.clone(),
             decision: ApprovalDecision::Grant,
             scope,
             actor: actor.to_string(),
             created_at: Utc::now(),
+            action_digest: record.action_digest.clone(),
+            risk: record.risk,
+            authority: Some(authority.described().to_string()),
         };
         let next = self.next_seq(session_id).await?;
         let draft = self.draft(
@@ -261,6 +408,11 @@ impl ApprovalService {
             scope: ApprovalScope::AllowOnce,
             actor: actor.to_string(),
             created_at: Utc::now(),
+            action_digest: record.action_digest.clone(),
+            risk: record.risk,
+            // A refusal needs no authority: it cannot widen anything, and the
+            // answer that would (a grant) is the one this field is for.
+            authority: None,
         };
         let next = self.next_seq(session_id).await?;
         let draft = self.draft(
@@ -290,6 +442,7 @@ impl ApprovalService {
         session_id: &SessionId,
         approval_id: &ApprovalId,
         actor: &str,
+        authority: &ApprovalAuthority,
     ) -> Result<Vec<ApprovalReply>, ApprovalError> {
         if !self.allow_session_scope {
             return Err(ApprovalError::SessionScopeNotAllowed);
@@ -303,6 +456,14 @@ impl ApprovalService {
         if subject.status != ApprovalStatus::Pending {
             return Err(ApprovalError::NotPending(approval_id.clone()));
         }
+        // "Always" is an answer about a kind of request. A high-risk one is not
+        // a kind: the person confirmed *that* action, and the same tool with
+        // other arguments is a different risk nobody has looked at.
+        if subject.risk.is_some_and(|risk| risk >= RiskLevel::L3) {
+            return Err(ApprovalError::HighRiskNeedsPerActionConfirmation {
+                approval_id: approval_id.clone(),
+            });
+        }
         let targets = self
             .fold(session_id)
             .await?
@@ -311,12 +472,19 @@ impl ApprovalService {
                 r.status == ApprovalStatus::Pending
                     && r.capability == subject.capability
                     && r.tool_name == subject.tool_name
+                    // A high-risk request in the batch keeps its own question
+                    // rather than failing the whole command: the rest of the
+                    // answer is still what the person said.
+                    && r.risk.is_none_or(|risk| risk < RiskLevel::L3)
             })
             .map(|r| r.approval_id)
             .collect::<Vec<_>>();
         let mut replies = Vec::with_capacity(targets.len());
         for id in targets {
-            replies.push(self.grant(session_id, &id, ApprovalScope::AllowForSession, actor).await?);
+            replies.push(
+                self.grant(session_id, &id, ApprovalScope::AllowForSession, actor, authority)
+                    .await?,
+            );
         }
         Ok(replies)
     }
@@ -384,6 +552,12 @@ impl ApprovalService {
                 args_summary: r.args_summary,
                 status: r.status,
                 created_at: r.created_at,
+                action_digest: r.action_digest,
+                risk: r.risk,
+                task_id: r.task_id,
+                task_revision: r.task_revision,
+                reversibility: r.reversibility,
+                targets: r.targets,
             })
             .collect())
     }
@@ -418,7 +592,120 @@ impl ApprovalService {
             capability: record.capability,
             scope: record.granted_scope.unwrap_or(ApprovalScope::AllowOnce),
             expires_at,
+            action_digest: record.action_digest,
+            task_id: record.task_id,
+            task_revision: record.task_revision,
+            risk: record.risk,
         }))
+    }
+
+    /// Whether this approval's answer still covers `action` — the question the
+    /// resume path asks before it runs a call nobody is going to see again.
+    ///
+    /// A standing lease is matched by the policy engine through
+    /// [`LeaseSpec::matches_action`]; this is the narrower check for the one
+    /// grant that leaves no standing lease, `allow_once`. Both answer the same
+    /// question — "does the person's answer name this exact action?" — and both
+    /// say no to `L3` unless the answer was made about that action and has not
+    /// been spent on it.
+    pub async fn covers_action(
+        &self,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        action: &ActionFacts,
+    ) -> Result<bool, ApprovalError> {
+        let record = self.record(session_id, approval_id).await?;
+        if record.status != ApprovalStatus::Granted {
+            return Ok(false);
+        }
+        // A request written before the fingerprint existed has no answer bound
+        // to an action; it cannot cover one.
+        if record.action_digest.as_deref() != Some(action.digest.as_str()) {
+            return Ok(false);
+        }
+        // The digest is over the whole fact set, so these can only disagree if
+        // the request and the call came from different revisions of the work.
+        // Checked anyway: a digest is a hash, and a hash is not a proof.
+        if record.task_id.as_deref().is_some_and(|id| id != action.task_id) {
+            return Ok(false);
+        }
+        if record.task_revision.is_some_and(|revision| revision != action.task_revision) {
+            return Ok(false);
+        }
+        if record.risk.is_some_and(|risk| risk < action.risk) {
+            return Ok(false);
+        }
+        if action.risk >= RiskLevel::L3 {
+            // One confirmation, one action. A wider scope cannot cover an `L3`
+            // call at all, and an `once` grant stops covering it the moment
+            // that call has run — otherwise a retry of a *failed* action would
+            // be indistinguishable from a replay of one that succeeded.
+            if record.granted_scope != Some(ApprovalScope::AllowOnce) {
+                return Ok(false);
+            }
+            if self.completed_since_grant(session_id, approval_id, &action.digest).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the log records a successful run of `digest` after the grant of
+    /// `approval_id`.
+    ///
+    /// A tool event carries the policy record it ran under, and that record
+    /// carries the fingerprint — so a completion is the log's own word that this
+    /// exact action happened. A failure is not a completion: the action did not
+    /// happen, and a person who confirmed it was confirming a retry.
+    async fn completed_since_grant(
+        &self,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        digest: &str,
+    ) -> Result<bool, ApprovalError> {
+        let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+        let Some(granted) = events.iter().find(|stored| {
+            stored.event.event_type.as_str() == EventType::APPROVAL_GRANTED
+                && cause_approval_id(&stored.event.payload) == approval_id.as_str()
+        }) else {
+            return Ok(false);
+        };
+        Ok(events.iter().any(|stored| {
+            stored.seq > granted.seq
+                && stored.event.event_type.as_str() == EventType::TOOL_COMPLETED
+                && stored.event.payload.get("policy").and_then(|policy| policy.get("action_digest"))
+                    == Some(&serde_json::Value::String(digest.to_string()))
+        }))
+    }
+
+    /// Withdraw a grant that is still in effect.
+    ///
+    /// A grant is a durable answer, and a durable answer needs a way to stop
+    /// being one. The fold treats this as the end of the approval — the same
+    /// state as a cancellation, because the outcome for the work is the same: it
+    /// did not run and will not run under this answer — while the event keeps
+    /// the distinction for whoever reads the log: a person took it back.
+    pub async fn revoke(
+        &self,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        actor: &str,
+        authority: &ApprovalAuthority,
+    ) -> Result<(), ApprovalError> {
+        let _lease = self.store.lease(session_id).await?;
+        let record = self.record(session_id, approval_id).await?;
+        if record.status != ApprovalStatus::Granted {
+            return Err(ApprovalError::NotGranted(approval_id.clone()));
+        }
+        let next = self.next_seq(session_id).await?;
+        let payload = serde_json::json!({
+            "approval_id": approval_id,
+            "actor": actor,
+            "authority": authority.described(),
+        });
+        let draft = self.draft(session_id, EventType::APPROVAL_REVOKED, payload, Actor::User);
+        self.store.append(session_id, next, vec![draft]).await?;
+        Ok(())
     }
 
     /// Write down the expiries the fold has already derived, and return the ones
@@ -592,6 +879,12 @@ fn fold_approvals(
                         granted_scope: None,
                         created_at: req.created_at,
                         granted_at: None,
+                        action_digest: req.action_digest,
+                        risk: req.risk,
+                        task_id: req.task_id,
+                        task_revision: req.task_revision,
+                        reversibility: req.reversibility,
+                        targets: req.targets,
                         expiry_recorded: false,
                     },
                 );
@@ -620,6 +913,15 @@ fn fold_approvals(
                 }
             }
             EventType::APPROVAL_CANCELLED => {
+                if let Some(r) = by_id.get_mut(&cause_approval_id(&e.payload)) {
+                    r.status = ApprovalStatus::Cancelled;
+                }
+            }
+            // A withdrawn grant ends the answer, and the state that means "did
+            // not run and will not" is the one a cancellation already names —
+            // the work does not care which of the two happened. The event stays
+            // distinct because the person who reads the log does.
+            EventType::APPROVAL_REVOKED => {
                 if let Some(r) = by_id.get_mut(&cause_approval_id(&e.payload)) {
                     r.status = ApprovalStatus::Cancelled;
                 }
@@ -672,574 +974,7 @@ fn cause_approval_id(payload: &serde_json::Value) -> String {
     payload.get("approval_id").and_then(|v| v.as_str()).unwrap_or_default().to_string()
 }
 
+/// Out of line because `#[cfg(test)]` must be the last thing a production
+/// file says (the boundary guards in agent-testkit assert exactly that).
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use agent_testkit::FakeEventStore;
-
-    fn service() -> (ApprovalService, Arc<FakeEventStore>, SessionId) {
-        let store = Arc::new(FakeEventStore::new());
-        let service = ApprovalService::new(store.clone());
-        let sid = SessionId::from_string("approval-session");
-        (service, store, sid)
-    }
-
-    async fn event_types(store: &FakeEventStore, sid: &SessionId) -> Vec<String> {
-        store
-            .read_stream(sid, EventSeq::ZERO, usize::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|e| e.event.event_type.to_string())
-            .collect()
-    }
-
-    /// Append a bare lifecycle event, of the shape the Scheduler writes.
-    ///
-    /// The approval log and the turn log are one stream, which is the whole
-    /// reason a scope can be resolved against a turn: an event that says a turn
-    /// ended lands in the same order as the grant it ends.
-    async fn append(service: &ApprovalService, sid: &SessionId, event_type: &str) {
-        let next = service.next_seq(sid).await.unwrap();
-        let draft = service.draft(sid, event_type, serde_json::json!({}), Actor::Scheduler);
-        service.store.append(sid, next, vec![draft]).await.unwrap();
-    }
-
-    /// Ask a question `age` ago, the shape `request` writes.
-    ///
-    /// `request` stamps `Utc::now()`, and an expiry that takes a day to observe
-    /// is a test that never runs, so the two tests about the clock write the
-    /// event themselves.
-    async fn request_at(
-        service: &ApprovalService,
-        sid: &SessionId,
-        capability: Capability,
-        age: Duration,
-    ) -> ApprovalId {
-        let req = ApprovalRequest {
-            approval_id: ApprovalId::new(),
-            session_id: sid.clone(),
-            capability,
-            tool_name: "shell.run".to_string(),
-            args_summary: "ls".to_string(),
-            status: ApprovalStatus::Pending,
-            created_at: Utc::now() - age,
-        };
-        let next = service.next_seq(sid).await.unwrap();
-        let draft = service.draft(
-            sid,
-            EventType::APPROVAL_REQUESTED,
-            serde_json::to_value(&req).unwrap(),
-            Actor::Scheduler,
-        );
-        service.store.append(sid, next, vec![draft]).await.unwrap();
-        req.approval_id
-    }
-
-    /// Grant an approval `age` ago, bypassing `grant`'s pending check and the
-    /// session-scope gate — both are about *making* a decision, and this is
-    /// about one that was already made.
-    async fn grant_at(
-        service: &ApprovalService,
-        sid: &SessionId,
-        approval_id: &ApprovalId,
-        scope: ApprovalScope,
-        age: Duration,
-    ) {
-        let reply = ApprovalReply {
-            approval_id: approval_id.clone(),
-            decision: ApprovalDecision::Grant,
-            scope,
-            actor: "user".to_string(),
-            created_at: Utc::now() - age,
-        };
-        let next = service.next_seq(sid).await.unwrap();
-        let draft = service.draft(
-            sid,
-            EventType::APPROVAL_GRANTED,
-            serde_json::to_value(&reply).unwrap(),
-            Actor::User,
-        );
-        service.store.append(sid, next, vec![draft]).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn request_creates_a_pending_approval() {
-        let (service, _, sid) = service();
-        let req = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls -la")
-            .await
-            .unwrap();
-        assert_eq!(req.status, ApprovalStatus::Pending);
-
-        let pending = service.pending(&sid).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].approval_id, req.approval_id);
-        assert_eq!(pending[0].capability, Capability::new(Capability::PROCESS_SPAWN));
-    }
-
-    #[tokio::test]
-    async fn grant_sets_status_and_yields_a_lease() {
-        let (service, _, sid) = service();
-        let req = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "src/main.rs")
-            .await
-            .unwrap();
-
-        service.grant(&sid, &req.approval_id, ApprovalScope::AllowOnce, "user").await.unwrap();
-
-        assert_eq!(service.status(&sid, &req.approval_id).await.unwrap(), ApprovalStatus::Granted);
-        assert!(service.pending(&sid).await.unwrap().is_empty());
-
-        let lease = service.lease_for(&sid, &req.approval_id).await.unwrap().expect("a lease");
-        assert_eq!(lease.capability, Capability::new(Capability::FS_WRITE));
-        assert_eq!(lease.scope, ApprovalScope::AllowOnce);
-    }
-
-    #[tokio::test]
-    async fn deny_sets_status_and_yields_no_lease() {
-        let (service, _, sid) = service();
-        let req = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "rm -rf /")
-            .await
-            .unwrap();
-
-        service.deny(&sid, &req.approval_id, "user").await.unwrap();
-
-        assert_eq!(service.status(&sid, &req.approval_id).await.unwrap(), ApprovalStatus::Denied);
-        assert!(service.lease_for(&sid, &req.approval_id).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn granting_a_non_pending_approval_fails() {
-        let (service, _, sid) = service();
-        let req = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        service.grant(&sid, &req.approval_id, ApprovalScope::AllowOnce, "user").await.unwrap();
-
-        assert!(matches!(
-            service.grant(&sid, &req.approval_id, ApprovalScope::AllowOnce, "user").await,
-            Err(ApprovalError::NotPending(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn session_scope_is_rejected_by_default() {
-        let (service, _, sid) = service();
-        let req = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            service.grant(&sid, &req.approval_id, ApprovalScope::AllowForSession, "user").await,
-            Err(ApprovalError::SessionScopeNotAllowed)
-        ));
-    }
-
-    #[tokio::test]
-    async fn session_scope_allowed_when_enabled() {
-        let store = Arc::new(FakeEventStore::new());
-        let service = ApprovalService::new(store).with_session_scope(true);
-        let sid = SessionId::from_string("approval-session-scope");
-        let req = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        let reply = service
-            .grant(&sid, &req.approval_id, ApprovalScope::AllowForSession, "user")
-            .await
-            .unwrap();
-        assert_eq!(reply.scope, ApprovalScope::AllowForSession);
-        let lease = service.lease_for(&sid, &req.approval_id).await.unwrap().unwrap();
-        assert_eq!(lease.scope, ApprovalScope::AllowForSession);
-    }
-
-    #[tokio::test]
-    async fn only_a_scoped_grant_leaves_a_standing_lease() {
-        let store = Arc::new(FakeEventStore::new());
-        let service = session_scoped(store);
-        let sid = SessionId::from_string("standing-lease-session");
-
-        let once = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
-            .await
-            .unwrap();
-        service.grant(&sid, &once.approval_id, ApprovalScope::AllowOnce, "user").await.unwrap();
-
-        // `once` authorised the one call `resume` dispatches itself. Read as a
-        // standing permission it would authorise a second call, which is the
-        // opposite of what the person answered.
-        assert!(service.leases_in_effect(&sid).await.unwrap().is_empty());
-
-        let session = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        service
-            .grant(&sid, &session.approval_id, ApprovalScope::AllowForSession, "user")
-            .await
-            .unwrap();
-
-        let leases = service.leases_in_effect(&sid).await.unwrap();
-        assert_eq!(leases.len(), 1, "{leases:?}");
-        assert_eq!(leases[0].capability, Capability::new(Capability::FS_WRITE));
-        assert_eq!(leases[0].scope, ApprovalScope::AllowForSession);
-    }
-
-    #[tokio::test]
-    async fn a_turn_grant_stops_being_in_effect_when_the_turn_ends() {
-        let store = Arc::new(FakeEventStore::new());
-        let service = session_scoped(store);
-        let sid = SessionId::from_string("turn-grant-session");
-        let req = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
-            .await
-            .unwrap();
-        service.grant(&sid, &req.approval_id, ApprovalScope::AllowForTurn, "user").await.unwrap();
-
-        // Nothing has run and no turn has ended: the grant stands.
-        assert_eq!(service.leases_in_effect(&sid).await.unwrap().len(), 1);
-
-        // `turn/yielded` is where the session already was — the held turn — and
-        // it ends nothing: `resume` carries that turn forward into a *new* one,
-        // and the new one is what this grant is for. Ending the grant here
-        // would make `approve ... turn` mean "almost nothing".
-        append(&service, &sid, EventType::TURN_YIELDED).await;
-        assert_eq!(service.leases_in_effect(&sid).await.unwrap().len(), 1);
-
-        append(&service, &sid, EventType::TURN_COMPLETED).await;
-        assert!(service.leases_in_effect(&sid).await.unwrap().is_empty());
-        assert_eq!(
-            service.status(&sid, &req.approval_id).await.unwrap(),
-            ApprovalStatus::Expired,
-            "a grant that outlived its turn is no longer in effect, and `Expired` is the word for that"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_question_nobody_answers_expires_on_the_clock() {
-        let (service, store, sid) = service();
-        let old = request_at(
-            &service,
-            &sid,
-            Capability::new(Capability::PROCESS_SPAWN),
-            PENDING_TTL + Duration::minutes(1),
-        )
-        .await;
-
-        // Nobody wrote an expiry event, and the request has already stopped
-        // being one: the fold derives it from the log and the clock, so every
-        // reader agrees without having to sweep first.
-        assert_eq!(service.status(&sid, &old).await.unwrap(), ApprovalStatus::Expired);
-        assert!(
-            service.pending(&sid).await.unwrap().is_empty(),
-            "a question past its TTL is not still waiting to be answered"
-        );
-
-        // Looking at the session left the reason behind, once.
-        let written = store
-            .read_stream(&sid, EventSeq::ZERO, usize::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.event.event_type.as_str() == EventType::APPROVAL_EXPIRED)
-            .collect::<Vec<_>>();
-        assert_eq!(written.len(), 1, "{written:?}");
-        assert_eq!(
-            written[0].event.payload.get("cause").and_then(|v| v.as_str()),
-            Some("pending_ttl"),
-            "the log says which clock ran out"
-        );
-
-        // And a second look adds nothing: the event just read back is what tells
-        // the next sweep there is nothing left to say.
-        assert!(service.pending(&sid).await.unwrap().is_empty());
-        assert_eq!(
-            event_types(&store, &sid).await.len(),
-            2,
-            "a sweep that already ran wrote nothing new"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_session_grant_outlives_nothing_but_its_ttl() {
-        let store = Arc::new(FakeEventStore::new());
-        let service = session_scoped(store);
-        let sid = SessionId::from_string("session-grant-ttl");
-
-        let fresh = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        service
-            .grant(&sid, &fresh.approval_id, ApprovalScope::AllowForSession, "user")
-            .await
-            .unwrap();
-
-        // In effect, and it says until when — a session has no end written down
-        // anywhere, so the TTL is the only end a session grant can have.
-        let lease = service.lease_for(&sid, &fresh.approval_id).await.unwrap().expect("a lease");
-        let expires_at = lease.expires_at.expect("a session grant ends on the clock");
-        let drift = (expires_at - (Utc::now() + SESSION_GRANT_TTL)).num_seconds().abs();
-        assert!(drift < 60, "expiry should be a session TTL out, was {expires_at}");
-        assert_eq!(service.leases_in_effect(&sid).await.unwrap().len(), 1);
-
-        // One made more than a TTL ago is not in effect, and says so.
-        let old_sid = SessionId::from_string("session-grant-old");
-        let old = service
-            .request(&old_sid, Capability::new(Capability::NETWORK_REQUEST), "net.get", "u")
-            .await
-            .unwrap();
-        grant_at(
-            &service,
-            &old_sid,
-            &old.approval_id,
-            ApprovalScope::AllowForSession,
-            SESSION_GRANT_TTL + Duration::minutes(1),
-        )
-        .await;
-
-        assert!(
-            service.leases_in_effect(&old_sid).await.unwrap().is_empty(),
-            "a session grant a day old authorises nothing"
-        );
-        assert_eq!(
-            service.status(&old_sid, &old.approval_id).await.unwrap(),
-            ApprovalStatus::Expired
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelling_takes_back_a_question_without_answering_it() {
-        let (service, store, sid) = service();
-        let first = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
-            .await
-            .unwrap();
-        let second = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-
-        let cancelled = service.cancel_pending(&sid, "user_interrupt").await.unwrap();
-        assert_eq!(cancelled.len(), 2);
-
-        // Not an answer: nothing was granted and nothing was denied. The call
-        // did not run, which `resume` is what turns into words.
-        for id in [&first.approval_id, &second.approval_id] {
-            assert_eq!(service.status(&sid, id).await.unwrap(), ApprovalStatus::Cancelled);
-        }
-        assert!(service.leases_in_effect(&sid).await.unwrap().is_empty());
-        assert!(service.pending(&sid).await.unwrap().is_empty());
-
-        let written = store
-            .read_stream(&sid, EventSeq::ZERO, usize::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.event.event_type.as_str() == EventType::APPROVAL_CANCELLED)
-            .collect::<Vec<_>>();
-        assert_eq!(written.len(), 2);
-        assert_eq!(
-            written[0].event.payload.get("cause").and_then(|v| v.as_str()),
-            Some("user_interrupt")
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_events_are_durable_and_ordered() {
-        let (service, store, sid) = service();
-        let req = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
-            .await
-            .unwrap();
-        service.grant(&sid, &req.approval_id, ApprovalScope::AllowOnce, "user").await.unwrap();
-
-        assert_eq!(
-            event_types(&store, &sid).await,
-            vec!["approval/requested".to_string(), "approval/granted".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_fresh_service_rebuilds_state_from_the_log() {
-        let store = Arc::new(FakeEventStore::new());
-        let sid = SessionId::from_string("approval-session-rebuild");
-        let service = ApprovalService::new(store.clone());
-        let req = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        service.grant(&sid, &req.approval_id, ApprovalScope::AllowOnce, "user").await.unwrap();
-
-        let rebuilt = ApprovalService::new(store);
-        assert_eq!(rebuilt.status(&sid, &req.approval_id).await.unwrap(), ApprovalStatus::Granted);
-    }
-
-    fn session_scoped(store: Arc<FakeEventStore>) -> ApprovalService {
-        ApprovalService::new(store).with_session_scope(true)
-    }
-
-    #[tokio::test]
-    async fn grant_always_settles_every_pending_request_of_the_same_kind() {
-        let store = Arc::new(FakeEventStore::new());
-        let service = session_scoped(store);
-        let sid = SessionId::from_string("always-session");
-        let first = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "a")
-            .await
-            .unwrap();
-        let second = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "b")
-            .await
-            .unwrap();
-        // Same capability, different tool: not the same kind of request.
-        let other = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.edit", "c")
-            .await
-            .unwrap();
-
-        let replies = service.grant_always(&sid, &first.approval_id, "user").await.unwrap();
-
-        let settled: Vec<&str> = replies.iter().map(|r| r.approval_id.as_str()).collect();
-        assert_eq!(settled.len(), 2, "{settled:?}");
-        assert!(settled.contains(&first.approval_id.as_str()));
-        assert!(settled.contains(&second.approval_id.as_str()));
-        for reply in &replies {
-            assert_eq!(reply.scope, ApprovalScope::AllowForSession);
-        }
-        assert_eq!(
-            service.status(&sid, &other.approval_id).await.unwrap(),
-            ApprovalStatus::Pending
-        );
-    }
-
-    #[tokio::test]
-    async fn grant_always_needs_the_session_scope_to_be_permitted() {
-        let (service, _, sid) = service();
-        let req = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            service.grant_always(&sid, &req.approval_id, "user").await,
-            Err(ApprovalError::SessionScopeNotAllowed)
-        ));
-        // The refusal settled nothing: the request is still a question.
-        assert_eq!(service.status(&sid, &req.approval_id).await.unwrap(), ApprovalStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn grant_always_refuses_a_request_that_is_no_longer_pending() {
-        let store = Arc::new(FakeEventStore::new());
-        let service = session_scoped(store);
-        let sid = SessionId::from_string("always-settled");
-        let req = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        service.grant(&sid, &req.approval_id, ApprovalScope::AllowOnce, "user").await.unwrap();
-        let other = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "y")
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            service.grant_always(&sid, &req.approval_id, "user").await,
-            Err(ApprovalError::NotPending(_))
-        ));
-        // A cascade that could not name its subject settles nothing else.
-        assert_eq!(
-            service.status(&sid, &other.approval_id).await.unwrap(),
-            ApprovalStatus::Pending
-        );
-    }
-
-    #[tokio::test]
-    async fn deny_cascade_denies_every_pending_request() {
-        let (service, _, sid) = service();
-        let first = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
-            .await
-            .unwrap();
-        let second = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        let third = service
-            .request(&sid, Capability::new(Capability::NETWORK_REQUEST), "net.get", "u")
-            .await
-            .unwrap();
-
-        let replies = service.deny_cascade(&sid, &first.approval_id, "user").await.unwrap();
-
-        assert_eq!(replies.len(), 3);
-        assert!(replies.iter().all(|r| r.decision == ApprovalDecision::Deny));
-        assert!(service.pending(&sid).await.unwrap().is_empty());
-        for id in [&second.approval_id, &third.approval_id] {
-            assert_eq!(service.status(&sid, id).await.unwrap(), ApprovalStatus::Denied);
-        }
-    }
-
-    #[tokio::test]
-    async fn deny_cascade_leaves_an_already_settled_request_alone() {
-        let (service, _, sid) = service();
-        let settled = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .unwrap();
-        service.grant(&sid, &settled.approval_id, ApprovalScope::AllowOnce, "user").await.unwrap();
-        let pending = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            service.deny_cascade(&sid, &settled.approval_id, "user").await,
-            Err(ApprovalError::NotPending(_))
-        ));
-        // The earlier grant stands; the still-open question is untouched.
-        assert_eq!(
-            service.status(&sid, &settled.approval_id).await.unwrap(),
-            ApprovalStatus::Granted
-        );
-        assert_eq!(
-            service.status(&sid, &pending.approval_id).await.unwrap(),
-            ApprovalStatus::Pending
-        );
-    }
-
-    /// The approval writers read the log and then append to it, so each must
-    /// hold the session lease across both. A store that refuses an unleased
-    /// append turns that coupling into a failure: if any of them computes a
-    /// sequence without the lease, its append comes back `ConcurrentWriter`
-    /// instead of landing. (YA-72 / CONTRACT §4 C4.5)
-    #[tokio::test]
-    async fn every_approval_writer_holds_the_lease_across_its_read_and_append() {
-        let store = Arc::new(FakeEventStore::new().requiring_lease());
-        let service = session_scoped(store);
-        let sid = SessionId::from_string("lease-held");
-
-        let asked = service
-            .request(&sid, Capability::new(Capability::FS_WRITE), "fs.write", "x")
-            .await
-            .expect("request holds the lease across its read and append");
-        service
-            .grant(&sid, &asked.approval_id, ApprovalScope::AllowOnce, "user")
-            .await
-            .expect("grant holds the lease across its read and append");
-
-        let asked_again = service
-            .request(&sid, Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
-            .await
-            .expect("request still holds the lease with a decision already logged");
-        service
-            .deny(&sid, &asked_again.approval_id, "user")
-            .await
-            .expect("deny holds the lease across its read and append");
-    }
-}
+mod tests;

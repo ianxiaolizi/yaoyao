@@ -20,6 +20,7 @@ use agent_protocol::ids::{
 };
 use agent_protocol::inbox::{InboxItem, InboxItemStatus, InboxKind};
 use agent_protocol::model::ModelResponse;
+use agent_protocol::permission::{ActionTarget, Reversibility, RiskLevel};
 use agent_protocol::permissions::{ApprovalRequest, ApprovalStatus, Capability};
 use agent_protocol::reason::{Basis, ReasonKind, ReasonNode, ReasonSource};
 use agent_store_jsonl::JsonlEventStore;
@@ -77,6 +78,9 @@ struct FakeBackend {
     accept_delete: AtomicBool,
     forks: Mutex<Vec<(String, Option<String>, String)>>,
     hold_approval: AtomicBool,
+    /// The authority each settlement was recorded under, as the entry point
+    /// described it (B4).
+    authorities: Mutex<Vec<String>>,
     /// Whether `set_model` accepts the name it was given. `true` unless a test
     /// makes the provider unknown.
     accept_model: AtomicBool,
@@ -108,6 +112,10 @@ impl FakeBackend {
 
     fn decision_count(&self) -> usize {
         self.decisions.lock().unwrap().len()
+    }
+
+    fn authorities(&self) -> Vec<String> {
+        self.authorities.lock().unwrap().clone()
     }
 
     fn hold_approvals(&self, hold: bool) {
@@ -149,8 +157,10 @@ impl Backend for FakeBackend {
         session: &SessionId,
         approval_id: &str,
         decision: Decision,
+        authority: &agent_kernel::approval::ApprovalAuthority,
         _live: &LiveSink,
     ) -> Result<(), BackendError> {
+        self.authorities.lock().unwrap().push(authority.described().to_string());
         self.decisions.lock().unwrap().push((
             session.as_str().to_string(),
             approval_id.to_string(),
@@ -348,6 +358,30 @@ async fn seeded_approval() -> (Arc<dyn EventStore>, TempDir) {
 
 /// A session paused on one approval request made at `created_at`.
 async fn seeded_approval_at(created_at: DateTime<Utc>) -> (Arc<dyn EventStore>, TempDir) {
+    seeded_request(approval_request(created_at)).await
+}
+
+/// The request those sessions are paused on: everything a pre-B4 log carried.
+fn approval_request(created_at: DateTime<Utc>) -> ApprovalRequest {
+    ApprovalRequest {
+        approval_id: ApprovalId::from_string("ap-1"),
+        session_id: SessionId::from_string("s1"),
+        capability: Capability::new(Capability::PROCESS_SPAWN),
+        tool_name: "shell.run".to_string(),
+        args_summary: "cargo test -p agent".to_string(),
+        status: ApprovalStatus::Pending,
+        created_at,
+        action_digest: None,
+        risk: None,
+        task_id: None,
+        task_revision: None,
+        reversibility: None,
+        targets: Vec::new(),
+    }
+}
+
+/// A session paused on `request`.
+async fn seeded_request(request: ApprovalRequest) -> (Arc<dyn EventStore>, TempDir) {
     let (store, dir) = empty();
     let session = SessionId::from_string("s1");
     let turn = TurnId::from_string("t1");
@@ -360,15 +394,6 @@ async fn seeded_approval_at(created_at: DateTime<Utc>) -> (Arc<dyn EventStore>, 
         priority: 0,
         created_at: Utc::now(),
         status: InboxItemStatus::Pending,
-    };
-    let request = ApprovalRequest {
-        approval_id: ApprovalId::from_string("ap-1"),
-        session_id: session.clone(),
-        capability: Capability::new(Capability::PROCESS_SPAWN),
-        tool_name: "shell.run".to_string(),
-        args_summary: "cargo test -p agent".to_string(),
-        status: ApprovalStatus::Pending,
-        created_at,
     };
     let drafts = vec![
         draft(
@@ -1404,6 +1429,10 @@ async fn an_approval_is_settled_once() {
     assert_eq!(status, 200, "{response}");
     assert!(body(&response).contains("\"state\":\"granted\""), "{response}");
     assert!(eventually(|| backend.decision_count() == 1).await);
+    // The answer was accepted on the strength of the loopback token, and that
+    // is what the backend records it under — a GUI answer is a person's only
+    // because the request proved it came from this machine's own handler.
+    assert_eq!(backend.authorities(), vec!["local_http".to_string()]);
 
     // The fake holds the settlement open, so the first decision is still in
     // flight. A second click must not start a second resume.
@@ -1418,6 +1447,50 @@ async fn an_approval_is_settled_once() {
     assert!(body(&response).contains("\"code\":\"approval_not_pending\""), "{response}");
     assert_eq!(backend.decision_count(), 1);
     backend.release.notify_waiters();
+    handle.abort();
+}
+
+/// The card is the moment before the act, and it has to say what the act is.
+///
+/// A person agreeing to a fingerprint they cannot see is agreeing to a
+/// capability. The row carries the risk, whether the action can be taken back,
+/// and every target it would touch — including a named data store, which is the
+/// "what data is in scope" half of the question. (B4, plan threshold 7.)
+#[tokio::test]
+async fn the_approval_card_shows_target_scope_and_reversibility() {
+    let mut ask = approval_request(Utc::now());
+    ask.action_digest = Some("d1e5".to_string());
+    ask.risk = Some(RiskLevel::L3);
+    ask.reversibility = Some(Reversibility::Irreversible);
+    ask.targets = vec![
+        ActionTarget::WorkspacePath {
+            path: "src/main.rs".to_string(),
+            writable_root: Some("C:/repo".to_string()),
+        },
+        ActionTarget::DataStore { name: "memory".to_string() },
+    ];
+    let (store, dir) = seeded_request(ask).await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/transcript", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    let approval = payload["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["kind"] == "approval")
+        .expect("an approval row");
+
+    assert_eq!(approval["risk"], "l3", "{payload}");
+    assert_eq!(approval["reversibility"], "irreversible", "{payload}");
+    assert_eq!(approval["action_digest"], "d1e5", "{payload}");
+    assert_eq!(approval["targets"][0]["kind"], "workspace_path", "{payload}");
+    assert_eq!(approval["targets"][0]["path"], "src/main.rs", "{payload}");
+    assert_eq!(approval["targets"][1]["kind"], "data_store", "{payload}");
+    assert_eq!(approval["targets"][1]["name"], "memory", "the data in scope is named");
+    // The sentence the person reads is still the summary the request carried.
+    assert_eq!(approval["summary"], "cargo test -p agent", "{payload}");
     handle.abort();
 }
 

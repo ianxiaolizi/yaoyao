@@ -296,6 +296,14 @@ impl EventType {
     pub const APPROVAL_DENIED: &'static str = "approval/denied";
     pub const APPROVAL_EXPIRED: &'static str = "approval/expired";
     pub const APPROVAL_CANCELLED: &'static str = "approval/cancelled";
+    /// A grant that stood is taken back before it was used (B4).
+    ///
+    /// Separate from `approval/cancelled`, which withdraws a *question* nobody
+    /// has answered: this one withdraws an answer, and the difference is what a
+    /// reader needs to tell "the person never decided" from "the person changed
+    /// their mind". The fold treats both as "no lease here", so a revocation
+    /// stops matching the moment it is written.
+    pub const APPROVAL_REVOKED: &'static str = "approval/revoked";
     /// The one permission decision a tool call is made on.
     ///
     /// Written before the call runs and never after it: a decision appended
@@ -428,6 +436,7 @@ impl EventType {
         Self::APPROVAL_DENIED,
         Self::APPROVAL_EXPIRED,
         Self::APPROVAL_CANCELLED,
+        Self::APPROVAL_REVOKED,
         Self::PERMISSION_DECISION,
         Self::DECISION_TRACE,
         Self::PLUGIN_LOADED,

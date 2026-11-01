@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 
 use crate::ids::{ApprovalId, SessionId};
+use crate::permission::{ActionFacts, ActionTarget, Reversibility, RiskLevel};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -228,6 +229,12 @@ pub enum ApprovalStatus {
 }
 
 /// A durable pending-approval fact.
+///
+/// The fields after `args_summary` bind the request to the one action it is
+/// about (B4). A request written before they existed reads back with them all
+/// absent, and an absent digest means "the old, capability-wide question" —
+/// which no longer authorises an `L2`/`L3` call (see
+/// [`LeaseSpec::matches_action`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub approval_id: ApprovalId,
@@ -238,9 +245,33 @@ pub struct ApprovalRequest {
     pub args_summary: String,
     pub status: ApprovalStatus,
     pub created_at: DateTime<Utc>,
+    /// The exact action this question is about, by fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<String>,
+    /// The risk the action carried when the question was raised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskLevel>,
+    /// The work the action belongs to, and how many changes that work had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_revision: Option<u64>,
+    /// Whether the action can be taken back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversibility: Option<Reversibility>,
+    /// What the action would touch — paths, commands, origins, secret
+    /// references. Never values: see [`ActionTarget`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ActionTarget>,
 }
 
 /// The user's reply to a pending approval — decision, scope, actor.
+///
+/// `action_digest` and `risk` are copied from the request being answered, so a
+/// lease made from this reply is bound to the exact action a person saw.
+/// `authority` names the channel the answer came through (`interactive_tty`,
+/// `local_http`, `test`); it is an attestation written by the entry point that
+/// checked it, and its absence means a reply written before B4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalReply {
     pub approval_id: ApprovalId,
@@ -248,6 +279,12 @@ pub struct ApprovalReply {
     pub scope: ApprovalScope,
     pub actor: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
 }
 
 /// A named reference to a secret, never the secret itself.
@@ -355,11 +392,88 @@ pub struct Workspace {
 /// ends on the log instead — the turn it was for completing — which is not
 /// something a timestamp can say, so a caller that needs "is this still worth
 /// something" must ask the approval service rather than compare a time.
+///
+/// A lease is not "a capability the user allowed" any more: it is one action,
+/// by fingerprint, in one task revision (B4, CONTRACT §7 #178). A lease whose
+/// `action_digest` is absent was written before that and still reads — it just
+/// does not cover an `L2`/`L3` action, which is what
+/// [`Self::matches_action`] enforces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseSpec {
     pub capability: Capability,
     pub scope: ApprovalScope,
     pub expires_at: Option<DateTime<Utc>>,
+    /// The fingerprint of the one action this lease covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<String>,
+    /// The work the action belonged to, and its revision at grant time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_revision: Option<u64>,
+    /// The risk the action carried when the person answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskLevel>,
+}
+
+impl LeaseSpec {
+    /// A lease for one action, as a grant of `scope` should leave it.
+    ///
+    /// One constructor, so the fields a lease is bound to and the fields
+    /// [`Self::matches_action`] compares cannot be written by two call sites
+    /// that disagree about which action this is.
+    pub fn for_action(
+        capability: Capability,
+        scope: ApprovalScope,
+        expires_at: Option<DateTime<Utc>>,
+        action: &ActionFacts,
+    ) -> Self {
+        Self {
+            capability,
+            scope,
+            expires_at,
+            action_digest: Some(action.digest.clone()),
+            task_id: Some(action.task_id.clone()),
+            task_revision: Some(action.task_revision),
+            risk: Some(action.risk),
+        }
+    }
+
+    /// Whether this lease covers `action`.
+    ///
+    /// The rule, in descending order of what it protects:
+    ///
+    /// * The lease must be about a capability the action declares.
+    /// * `L3` is never covered by a standing lease. A high-risk action is
+    ///   confirmed one call at a time, so the only way for it to run is the
+    ///   `resume` path holding a granted `allow_once` for exactly that
+    ///   fingerprint — never a turn- or session-wide grant.
+    /// * A lease that names a fingerprint covers exactly that fingerprint,
+    ///   plus the task revision it was given for (the digest covers both, but
+    ///   comparing them too makes a mismatched record say *why*).
+    /// * A lease that names no fingerprint is a pre-B4 capability-wide grant.
+    ///   It still covers `L0`/`L1`, where re-asking for every read would make
+    ///   the old grants worthless — and covers nothing above that.
+    /// * A lease cannot cover an action riskier than the one it was given for.
+    pub fn matches_action(&self, action: &ActionFacts) -> bool {
+        if !action.capabilities.contains(&self.capability) {
+            return false;
+        }
+        if action.risk >= RiskLevel::L3 {
+            return false;
+        }
+        if self.risk.is_some_and(|risk| risk < action.risk) {
+            return false;
+        }
+        match &self.action_digest {
+            Some(digest) => {
+                digest == &action.digest
+                    && self.task_id.as_deref().is_none_or(|id| id == action.task_id)
+                    && self.task_revision.is_none_or(|revision| revision == action.task_revision)
+            }
+            None => action.risk <= RiskLevel::L1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -424,12 +538,45 @@ mod tests {
             args_summary: "git push origin main".to_string(),
             status: ApprovalStatus::Pending,
             created_at: Utc::now(),
+            action_digest: Some("sha256:abc".to_string()),
+            risk: Some(RiskLevel::L3),
+            task_id: Some("intent-1".to_string()),
+            task_revision: Some(2),
+            reversibility: Some(Reversibility::Irreversible),
+            targets: vec![ActionTarget::Command {
+                program: "shell".to_string(),
+                args: vec!["git push origin main".to_string()],
+                cwd: None,
+            }],
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.approval_id, req.approval_id);
         assert_eq!(decoded.capability, req.capability);
         assert_eq!(decoded.status, ApprovalStatus::Pending);
+        assert_eq!(decoded.action_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(decoded.risk, Some(RiskLevel::L3));
+        assert_eq!(decoded.targets, req.targets);
+    }
+
+    #[test]
+    fn an_approval_written_before_b4_still_reads() {
+        // The fields that bind a request to one action are absent from every
+        // log written before they existed; the question itself must still be
+        // readable, or an old session cannot show why it is waiting.
+        let old = json!({
+            "approval_id": "ap-1",
+            "session_id": "s-1",
+            "capability": "process.spawn",
+            "tool_name": "shell.run",
+            "args_summary": "ls",
+            "status": "pending",
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        let request: ApprovalRequest = serde_json::from_value(old).expect("an old request reads");
+        assert!(request.action_digest.is_none());
+        assert!(request.risk.is_none());
+        assert!(request.targets.is_empty());
     }
 
     #[test]
@@ -440,11 +587,16 @@ mod tests {
             scope: ApprovalScope::AllowOnce,
             actor: "user".to_string(),
             created_at: Utc::now(),
+            action_digest: Some("sha256:abc".to_string()),
+            risk: Some(RiskLevel::L2),
+            authority: Some("interactive_tty".to_string()),
         };
         let json = serde_json::to_string(&reply).unwrap();
         let decoded: ApprovalReply = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.decision, ApprovalDecision::Grant);
         assert_eq!(decoded.scope, ApprovalScope::AllowOnce);
+        assert_eq!(decoded.action_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(decoded.risk, Some(RiskLevel::L2));
     }
 
     #[test]
@@ -480,12 +632,108 @@ mod tests {
             capability: Capability::new(Capability::FS_WRITE),
             scope: ApprovalScope::AllowOnce,
             expires_at: None,
+            action_digest: Some("sha256:abc".to_string()),
+            task_id: Some("intent-1".to_string()),
+            task_revision: Some(1),
+            risk: Some(RiskLevel::L1),
         };
         let w: Workspace =
             serde_json::from_str(&serde_json::to_string(&workspace).unwrap()).unwrap();
         let l: LeaseSpec = serde_json::from_str(&serde_json::to_string(&lease).unwrap()).unwrap();
         assert_eq!(w, workspace);
         assert_eq!(l, lease);
+    }
+
+    fn facts(risk: RiskLevel, path: &str) -> ActionFacts {
+        facts_at(risk, path, 3)
+    }
+
+    fn facts_at(risk: RiskLevel, path: &str, task_revision: u64) -> ActionFacts {
+        ActionFacts::from_spec(crate::permission::ActionSpec {
+            task_id: "intent-1".to_string(),
+            task_revision,
+            tool_name: "fs.write".to_string(),
+            capabilities: vec![Capability::new(Capability::FS_WRITE)],
+            risk,
+            reversibility: Reversibility::for_risk(risk),
+            targets: vec![ActionTarget::WorkspacePath {
+                path: path.to_string(),
+                writable_root: None,
+            }],
+            arguments: json!({ "path": path }),
+            summary: "write".to_string(),
+        })
+    }
+
+    #[test]
+    fn a_lease_matches_only_the_action_it_was_given_for() {
+        let action = facts(RiskLevel::L2, "a.txt");
+        let lease = LeaseSpec::for_action(
+            Capability::new(Capability::FS_WRITE),
+            ApprovalScope::AllowForTurn,
+            None,
+            &action,
+        );
+        assert!(lease.matches_action(&action));
+
+        // Another path is another action, and another revision is another task.
+        assert!(!lease.matches_action(&facts(RiskLevel::L2, "b.txt")));
+        assert!(
+            !lease.matches_action(&facts_at(RiskLevel::L2, "a.txt", 4)),
+            "a newer task revision is a different action"
+        );
+    }
+
+    #[test]
+    fn a_lease_never_covers_a_higher_risk_action_than_it_was_given_for() {
+        // A classifier can raise an action after the person answered; the
+        // raised action has a new fingerprint, and the lease does not follow.
+        let action = facts(RiskLevel::L1, "a.txt");
+        let lease = LeaseSpec::for_action(
+            Capability::new(Capability::FS_WRITE),
+            ApprovalScope::AllowForSession,
+            None,
+            &action,
+        );
+        assert!(!lease.matches_action(&facts(RiskLevel::L2, "a.txt")));
+    }
+
+    #[test]
+    fn no_standing_lease_covers_an_l3_action() {
+        // Per-action confirmation is not a phrase about the CLI: it is this
+        // line. Even a lease whose fingerprint happens to match cannot authorise
+        // a high-risk call, so the only route to run one is the resume path
+        // holding a granted `allow_once`.
+        let action = facts(RiskLevel::L3, "a.txt");
+        let lease = LeaseSpec::for_action(
+            Capability::new(Capability::FS_WRITE),
+            ApprovalScope::AllowForSession,
+            None,
+            &action,
+        );
+        assert!(!lease.matches_action(&action));
+    }
+
+    #[test]
+    fn an_old_capability_only_lease_covers_low_risk_and_nothing_above_it() {
+        let old = LeaseSpec {
+            capability: Capability::new(Capability::FS_WRITE),
+            scope: ApprovalScope::AllowForSession,
+            expires_at: None,
+            action_digest: None,
+            task_id: None,
+            task_revision: None,
+            risk: None,
+        };
+        assert!(old.matches_action(&facts(RiskLevel::L0, "a.txt")));
+        assert!(old.matches_action(&facts(RiskLevel::L1, "a.txt")));
+        assert!(!old.matches_action(&facts(RiskLevel::L2, "a.txt")));
+        assert!(!old.matches_action(&facts(RiskLevel::L3, "a.txt")));
+
+        // A capability the action does not declare is never covered.
+        let mut other = facts(RiskLevel::L1, "a.txt");
+        other.capabilities = vec![Capability::new(Capability::FS_READ)];
+        assert!(!old.matches_action(&other));
     }
 
     #[test]

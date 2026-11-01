@@ -13,7 +13,7 @@
 //!
 //! [`Verdict`]: crate::Verdict
 
-use agent_kernel::approval::{ApprovalError, ApprovalService};
+use agent_kernel::approval::{ApprovalAuthority, ApprovalError, ApprovalService};
 use agent_kernel::inbox::{Inbox, InboxError};
 use agent_kernel::intent::IntentError;
 use agent_kernel::intent_adjudication::AdjudicationStatus;
@@ -238,11 +238,14 @@ pub async fn grant_approval(
     approval_id: &str,
     grant: Grant,
     actor: &str,
+    authority: &ApprovalAuthority,
 ) -> Result<ApprovalReceipt, CommandError> {
     let approval_id = ApprovalId::from_string(approval_id);
     let replies = match grant {
-        Grant::Always => approvals.grant_always(session_id, &approval_id, actor).await?,
-        scope => vec![approvals.grant(session_id, &approval_id, scope.scope(), actor).await?],
+        Grant::Always => approvals.grant_always(session_id, &approval_id, actor, authority).await?,
+        scope => {
+            vec![approvals.grant(session_id, &approval_id, scope.scope(), actor, authority).await?]
+        }
     };
 
     for reply in &replies {

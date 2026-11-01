@@ -74,11 +74,21 @@ pub struct PermissionBaseline {
     /// who already answered. The first needs an independent judgement before it
     /// runs; the second is one, and an absent classifier does not erase it.
     pub approved: bool,
+    /// The granted approval this call runs under, when the caller is a resume
+    /// path that holds one (B4). Named in the decision record, so a reader can
+    /// join the call to the person's answer without guessing.
+    pub approval_id: Option<ApprovalId>,
 }
 
 impl PermissionBaseline {
     pub fn new(decision: PolicyDecision) -> Self {
-        Self { decision, refusals: BTreeMap::new(), reason: None, approved: false }
+        Self {
+            decision,
+            refusals: BTreeMap::new(),
+            reason: None,
+            approved: false,
+            approval_id: None,
+        }
     }
 
     /// A refusal that is not a policy refusal, with the sentence to record.
@@ -88,6 +98,7 @@ impl PermissionBaseline {
             refusals: BTreeMap::new(),
             reason: Some(reason.into()),
             approved: false,
+            approval_id: None,
         }
     }
 
@@ -102,11 +113,23 @@ impl PermissionBaseline {
         self.approved = approved;
         self
     }
+
+    /// Name the granted approval this call runs under.
+    pub fn approval(mut self, approval_id: ApprovalId) -> Self {
+        self.approval_id = Some(approval_id);
+        self
+    }
 }
 
 impl From<agent_protocol::tool::ToolPolicyRecord> for PermissionBaseline {
     fn from(record: agent_protocol::tool::ToolPolicyRecord) -> Self {
-        Self { decision: record.decision, refusals: record.refusals, reason: None, approved: false }
+        Self {
+            decision: record.decision,
+            refusals: record.refusals,
+            reason: None,
+            approved: false,
+            approval_id: None,
+        }
     }
 }
 
@@ -323,7 +346,7 @@ fn resolve(
                     "the policy allows this call".to_string()
                 }
             }),
-            approval_id: None,
+            approval_id: baseline.approval_id.clone(),
         };
     };
 
@@ -365,7 +388,7 @@ fn resolve(
                 reason: "a person's standing grant covers this action; no independent classifier \
                          answered"
                     .to_string(),
-                approval_id: None,
+                approval_id: baseline.approval_id.clone(),
             }
         }
         ClassifierOutcome::Unclear | ClassifierOutcome::Unavailable => Decided {
@@ -406,7 +429,7 @@ fn resolve(
                 decision: baseline.decision,
                 source: AuthorizationSource::PermissionClassifier,
                 reason: "the permission classifier allowed the call".to_string(),
-                approval_id: None,
+                approval_id: baseline.approval_id.clone(),
             }
         }
     }
@@ -669,7 +692,7 @@ mod tests {
     // writes it: before the call runs, always, and under the same digest the
     // result is stamped with.
 
-    use crate::approval::ApprovalService;
+    use crate::approval::{ApprovalAuthority, ApprovalService};
     use crate::guarded::GuardedToolProvider;
     use crate::policy::{PolicyEngine, PolicyRule};
     use crate::resource_guard::ResourceGuard;
@@ -853,7 +876,13 @@ mod tests {
             .await
             .unwrap();
         approvals
-            .grant(&sid(), &request.approval_id, ApprovalScope::AllowForSession, "user")
+            .grant(
+                &sid(),
+                &request.approval_id,
+                ApprovalScope::AllowForSession,
+                "user",
+                &ApprovalAuthority::test(),
+            )
             .await
             .unwrap();
         assert_eq!(approvals.leases_in_effect(&sid()).await.unwrap().len(), 1);
@@ -1256,30 +1285,40 @@ mod tests {
         // this is the only source left, and it names the person.
         let store = Arc::new(FakeEventStore::new());
         let tools = Witnessed::new(
-            vec![def("shell.run", &[Capability::PROCESS_SPAWN], ToolSideEffect::Destructive)],
+            vec![def("net.get", &[Capability::NETWORK_REQUEST], ToolSideEffect::Network)],
             store.clone(),
         );
         let approvals = Arc::new(ApprovalService::new(store.clone()).with_session_scope(true));
         let gateway = GuardedToolProvider::new(
             tools.clone(),
             PolicyEngine::new()
-                .with_rules([PolicyRule::ask(Capability::new(Capability::PROCESS_SPAWN))])
-                .with_sandbox([Capability::new(Capability::PROCESS_SPAWN)]),
+                .with_rules([PolicyRule::ask(Capability::new(Capability::NETWORK_REQUEST))])
+                .with_sandbox([Capability::new(Capability::NETWORK_REQUEST)]),
             approvals.clone(),
             ResourceGuard::new(workspace()),
             Arc::new(InMemoryArtifactStore::default()),
         )
         .with_permission_service(Arc::new(PermissionService::new(store.clone())));
+        // `L2`, and bound to the call: a standing lease never covers `L3`, and
+        // one that names no fingerprint does not cover `L2` either (B4).
+        let invocation = call("net.get");
+        let action = gateway.action_facts(&format!("manual:{}", sid().as_str()), 0, &invocation);
         let request = approvals
-            .request(&sid(), Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
+            .request_for_action(&sid(), &action, "net.get", "get https://example.com")
             .await
             .unwrap();
         approvals
-            .grant(&sid(), &request.approval_id, ApprovalScope::AllowForSession, "user")
+            .grant(
+                &sid(),
+                &request.approval_id,
+                ApprovalScope::AllowForSession,
+                "user",
+                &ApprovalAuthority::test(),
+            )
             .await
             .unwrap();
 
-        let result = gateway.execute(&sid(), &call("shell.run")).await.expect("a person said yes");
+        let result = gateway.execute(&sid(), &invocation).await.expect("a person said yes");
 
         assert_eq!(result.status, agent_protocol::tool::ToolStatus::Completed);
         assert_eq!(tools.seen(), vec![true]);

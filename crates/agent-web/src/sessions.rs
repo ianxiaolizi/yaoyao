@@ -20,6 +20,7 @@ use agent_projection::{
 use agent_protocol::events::StoredEvent;
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::intent::IntentStatus;
+use agent_protocol::permission::Reversibility;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
@@ -657,12 +658,41 @@ fn wire_item_at(item: &TranscriptItem, now: DateTime<Utc>) -> Value {
                 row.insert("duration_ms".to_string(), (*duration_ms).into());
             }
         }
-        ItemBody::Approval { approval_id, tool, summary, state, created_at } => {
+        ItemBody::Approval {
+            approval_id,
+            tool,
+            summary,
+            state,
+            created_at,
+            action_digest,
+            risk,
+            reversibility,
+            targets,
+        } => {
             let expired = *state == ApprovalState::Pending && approval_expired(*created_at, now);
             row.insert("kind".to_string(), "approval".into());
             row.insert("approval_id".to_string(), approval_id.as_str().into());
             row.insert("tool".to_string(), tool.clone().into());
             row.insert("summary".to_string(), summary.clone().into());
+            // What the person is being asked to agree to, carried to the card
+            // rather than left in the log: the risk, whether it can be taken
+            // back, and everything it would touch — paths, the command line,
+            // origins, and named data stores. Absent on a request written
+            // before B4 raised them. (CONTRACT.md §7 #178)
+            if let Some(digest) = action_digest {
+                row.insert("action_digest".to_string(), digest.clone().into());
+            }
+            if let Some(risk) = risk {
+                row.insert("risk".to_string(), risk.as_str().into());
+            }
+            if let Some(reversibility) = reversibility {
+                row.insert("reversibility".to_string(), reversibility_name(*reversibility).into());
+            }
+            if !targets.is_empty()
+                && let Ok(value) = serde_json::to_value(targets)
+            {
+                row.insert("targets".to_string(), value);
+            }
             row.insert(
                 "state".to_string(),
                 if expired { "expired" } else { approval_state(*state) }.into(),
@@ -703,6 +733,19 @@ fn action_status(status: ActionStatus) -> &'static str {
         ActionStatus::Refused => "refused",
         ActionStatus::Waiting => "waiting",
         ActionStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Whether a card says the action can be taken back.
+///
+/// The risk word is the log's own ([`RiskLevel::as_str`]); this one is derived
+/// here because the vocabulary is the card's, not the ledger's — the page
+/// translates all three to a sentence either way.
+fn reversibility_name(reversibility: Reversibility) -> &'static str {
+    match reversibility {
+        Reversibility::Reversible => "reversible",
+        Reversibility::Compensatable => "compensatable",
+        Reversibility::Irreversible => "irreversible",
     }
 }
 

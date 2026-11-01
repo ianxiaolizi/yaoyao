@@ -18,7 +18,7 @@ use agent_ports::tool_gateway::{ToolGateway, ToolGatewayError};
 use agent_ports::tool_provider::{
     ToolDefinition, ToolInvocation, ToolProvider, ToolResult, ToolSideEffect,
 };
-use agent_protocol::ids::SessionId;
+use agent_protocol::ids::{ApprovalId, SessionId};
 use agent_protocol::permission::ActionFacts;
 use agent_protocol::permissions::{Capability, PolicyDecision};
 use agent_protocol::redactor::Redactor;
@@ -167,17 +167,21 @@ impl GuardedToolProvider {
         self.inner.definitions().into_iter().any(|d| d.name == tool_name)
     }
 
-    /// Raise the approval a secret-using call needs, and say it is pending.
+    /// Raise the approval a boundary call needs, and say it is pending.
+    ///
+    /// The question is bound to the action the gateway just judged, not to the
+    /// capability: what a person is asked about is the exact fingerprint they
+    /// will be answered about. (CONTRACT §7 #178)
     async fn request_approval(
         &self,
         session_id: &SessionId,
         invocation: &ToolInvocation,
-        capability: Capability,
+        action: &ActionFacts,
     ) -> Result<ToolGatewayError, ToolGatewayError> {
         let summary = crate::action::summarize_arguments(&self.redactor, invocation);
         let req = self
             .approvals
-            .request(session_id, capability, &invocation.tool_name, &summary)
+            .request_for_action(session_id, action, &invocation.tool_name, &summary)
             .await
             .map_err(|e| ToolGatewayError::Approval(e.to_string()))?;
         Ok(ToolGatewayError::ApprovalPending {
@@ -266,16 +270,66 @@ impl GuardedToolProvider {
     /// have no approval state to consult, and a trait method would make every
     /// one of them grow a knob that does nothing. `resume` is the only caller,
     /// and it holds the concrete type for exactly this reason.
+    ///
+    /// The approval is checked against the action *now*, not against the one
+    /// the approval was raised about: a fingerprint the person answered is the
+    /// only thing that lets this call through, and the check is what makes a
+    /// stale grant — a different path, a moved task revision, an `L3` answer
+    /// already spent — a refused call rather than a quiet reuse. (CONTRACT §7
+    /// #178)
     pub async fn execute_approved(
         &self,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
         invocation: &ToolInvocation,
     ) -> Result<ToolResult, ToolGatewayError> {
         if !self.is_known(&invocation.tool_name) {
             return Err(self.unknown_tool(&invocation.tool_name));
         }
         self.check_arguments(invocation)?;
-        self.check_paths(invocation, &self.policy_context(invocation))?;
-        self.run_resolved(invocation).await
+        let ctx = self.policy_context(invocation);
+        self.check_paths(invocation, &ctx)?;
+        let action = self.action_facts(&format!("manual:{}", session_id.as_str()), 0, invocation);
+
+        let covers = self
+            .approvals
+            .covers_action(session_id, approval_id, &action)
+            .await
+            .map_err(|e| ToolGatewayError::Approval(e.to_string()))?;
+        if !covers {
+            let reason = "the approval does not cover this call: the action changed since it was \
+                          answered, or the answer has already been spent"
+                .to_string();
+            let capabilities = self.capabilities_for(&invocation.tool_name);
+            self.record(session_id, &action, PermissionBaseline::refused(reason.clone()), None)
+                .await?;
+            return Err(ToolGatewayError::PolicyDenied {
+                tool: invocation.tool_name.clone(),
+                reason,
+                policy: Box::new(
+                    ToolPolicyRecord::denied(
+                        capabilities.clone(),
+                        self.policy.refusals(&capabilities, Some(&ctx), &[]),
+                    )
+                    .about(action.digest.clone()),
+                ),
+            });
+        }
+        // The decision this call runs under, written before it runs: a resume
+        // is a dispatch like any other, and a reader joining the log should see
+        // the answer that permitted it by name.
+        self.record(
+            session_id,
+            &action,
+            PermissionBaseline::new(PolicyDecision::Allow)
+                .approve(true)
+                .approval(approval_id.clone()),
+            None,
+        )
+        .await?;
+        let record = ToolPolicyRecord::allowed(self.capabilities_for(&invocation.tool_name))
+            .about(&action.digest);
+        Ok(self.run_resolved(invocation).await?.with_policy(record))
     }
 
     /// Resolve references, run the tool, scrub what comes back.
@@ -489,12 +543,16 @@ impl ToolGateway for GuardedToolProvider {
         let mut decision = self.policy.evaluate_with_ctx(&capabilities, Some(&ctx), &[]);
         let ungranted = decision;
         if decision == PolicyDecision::Ask {
+            // Only leases that cover *this* action are offered to the engine.
+            // A grant is an answer about one fingerprint, and the policy engine
+            // sees a capability list — so the narrowing has to happen here.
             let grants = self
                 .approvals
                 .leases_in_effect(session_id)
                 .await
                 .map_err(|e| ToolGatewayError::Approval(e.to_string()))?
                 .into_iter()
+                .filter(|lease| lease.matches_action(&action))
                 .map(|lease| lease.capability)
                 .collect::<Vec<_>>();
             decision = self.policy.evaluate_with_ctx(&capabilities, Some(&ctx), &grants);
@@ -588,8 +646,6 @@ impl ToolGateway for GuardedToolProvider {
                 })
             }
             PolicyDecision::Ask => {
-                let capability =
-                    capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
                 // The held call's decision is written before the question is
                 // asked: "we asked" is itself a decision about this action, and
                 // a session that crashed between raising the approval and
@@ -602,7 +658,7 @@ impl ToolGateway for GuardedToolProvider {
                     classifier.clone(),
                 )
                 .await?;
-                Err(self.request_approval(session_id, invocation, capability).await?)
+                Err(self.request_approval(session_id, invocation, &action).await?)
             }
             PolicyDecision::Allow => {
                 // Stated once and stamped on whatever this arm returns: the
@@ -631,12 +687,9 @@ impl ToolGateway for GuardedToolProvider {
                 // before it runs. The reference is all the summary can show
                 // them, and the tool's own capability says whether they
                 // already said yes to it in this scope.
-                let secret_granted = crate::secret_refs::secret_use_granted(
-                    &self.approvals,
-                    session_id,
-                    &capabilities,
-                )
-                .await?;
+                let secret_granted =
+                    crate::secret_refs::secret_use_granted(&self.approvals, session_id, &action)
+                        .await?;
                 let baseline = if secret_granted {
                     PermissionBaseline::new(PolicyDecision::Allow).approve(approved)
                 } else {
@@ -648,9 +701,7 @@ impl ToolGateway for GuardedToolProvider {
                 };
                 self.record(session_id, &action, baseline, classifier.clone()).await?;
                 if !secret_granted {
-                    let capability =
-                        capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
-                    return Err(self.request_approval(session_id, invocation, capability).await?);
+                    return Err(self.request_approval(session_id, invocation, &action).await?);
                 }
                 Ok(self.finish_resolved(&resolved_invocation, &secrets).await?.with_policy(record))
             }
@@ -708,7 +759,9 @@ fn shared_prefix_len(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use self::secrets::RecordingTools;
     use super::*;
+    use crate::approval::ApprovalAuthority;
     use crate::scrub::OFFLOAD_MAX_LINES;
     use agent_ports::artifact_store::ArtifactStoreError;
     use agent_ports::secret_provider::SecretProviderError;
@@ -933,6 +986,48 @@ mod tests {
         ToolInvocation::proposed(name, serde_json::json!({}))
     }
 
+    /// Grant the approval `execute` just raised, for one action only.
+    ///
+    /// The resume path checks the answer against the action in front of it, so
+    /// a test that dispatches an approved call has to hold a real answer for
+    /// that exact fingerprint — the same one a person would have given.
+    async fn approve_once(gateway: &GuardedToolProvider, raised: ToolGatewayError) -> ApprovalId {
+        let ToolGatewayError::ApprovalPending { approval_id, .. } = raised else {
+            panic!("expected a held call, got {raised:?}");
+        };
+        let id = ApprovalId::from_string(approval_id);
+        gateway
+            .approvals
+            .grant(&sid(), &id, ApprovalScope::AllowOnce, "user", &ApprovalAuthority::test())
+            .await
+            .unwrap();
+        id
+    }
+
+    /// An answer covering `invocation`, for a test that dispatches a call the
+    /// policy would have allowed without asking (a resume path can be reached
+    /// with a grant the gateway did not raise itself).
+    async fn granted_for(gateway: &GuardedToolProvider, invocation: &ToolInvocation) -> ApprovalId {
+        let action = gateway.action_facts(&format!("manual:{}", sid().as_str()), 0, invocation);
+        let req = gateway
+            .approvals
+            .request_for_action(&sid(), &action, &invocation.tool_name, "test")
+            .await
+            .unwrap();
+        gateway
+            .approvals
+            .grant(
+                &sid(),
+                &req.approval_id,
+                ApprovalScope::AllowOnce,
+                "user",
+                &ApprovalAuthority::test(),
+            )
+            .await
+            .unwrap();
+        req.approval_id
+    }
+
     #[tokio::test]
     async fn allow_runs_the_tool() {
         let tools = Arc::new(ScriptedTools::echo(vec![def(
@@ -1097,10 +1192,14 @@ mod tests {
         let record = result.policy.expect("the gate states its own decision");
         assert_eq!(record.capabilities, vec![Capability::new(Capability::FS_READ)]);
 
-        // Approved: the decision was made earlier and is recorded where it was
-        // made, so this path states none rather than inventing a second one.
-        let approved = gateway.execute_approved(&invocation("fs.read")).await.unwrap();
-        assert!(approved.policy.is_none(), "{:?}", approved.policy);
+        // Approved: the record is the gate's too, and it names the answer the
+        // call ran under. What the provider wrote is still overwritten (B4).
+        let approval = granted_for(&gateway, &invocation("fs.read")).await;
+        let approved =
+            gateway.execute_approved(&sid(), &approval, &invocation("fs.read")).await.unwrap();
+        let record = approved.policy.expect("an approved call states its own decision");
+        assert_eq!(record.decision, PolicyDecision::Allow);
+        assert_eq!(record.capabilities, vec![Capability::new(Capability::FS_READ)]);
     }
 
     /// What a tool returned is read by the model and by nobody else. A result
@@ -1230,15 +1329,38 @@ mod tests {
         gateway_with_session_scope(tools, policy)
     }
 
+    /// The same asking gateway, over a call whose risk is `L2` rather than
+    /// `L3`.
+    ///
+    /// A standing lease never covers an `L3` action (B4), so the tests about
+    /// what a *scope* is worth have to use a call a scope can cover at all.
+    fn asking_gateway_l2() -> (GuardedToolProvider, Arc<ApprovalService>, Arc<ScriptedTools>) {
+        let tools = Arc::new(ScriptedTools::echo(vec![def(
+            "net.get",
+            &[Capability::NETWORK_REQUEST],
+            ToolSideEffect::Network,
+        )]));
+        let policy = PolicyEngine::new()
+            .with_rules([crate::policy::PolicyRule::ask(Capability::new(
+                Capability::NETWORK_REQUEST,
+            ))])
+            .with_sandbox([Capability::new(Capability::NETWORK_REQUEST)]);
+        gateway_with_session_scope(tools, policy)
+    }
+
     /// Call the tool once, so that it stops and asks, and return the id of the
     /// request it raised.
-    async fn ask_once(gateway: &GuardedToolProvider) -> ApprovalId {
-        match gateway.execute(&sid(), &invocation("shell.run")).await {
+    async fn ask_once_for(gateway: &GuardedToolProvider, tool: &str) -> ApprovalId {
+        match gateway.execute(&sid(), &invocation(tool)).await {
             Err(ToolGatewayError::ApprovalPending { approval_id, .. }) => {
                 ApprovalId::from_string(approval_id)
             }
             other => panic!("expected an approval to be raised, got {other:?}"),
         }
+    }
+
+    async fn ask_once(gateway: &GuardedToolProvider) -> ApprovalId {
+        ask_once_for(gateway, "shell.run").await
     }
 
     #[tokio::test]
@@ -1247,14 +1369,20 @@ mod tests {
         // unconditionally, so `approve --scope session` meant exactly what
         // `once` meant: a person who said "yes, and stop asking" was asked
         // again on the next call.
-        let (gateway, approvals, tools) = asking_gateway();
+        //
+        // The call is `L2`: a standing lease is only worth something below `L3`
+        // (B4), and what this pins is the scope reaching the policy at all.
+        let (gateway, approvals, tools) = asking_gateway_l2();
         *tools.results.lock().unwrap() =
-            HashMap::from([("shell.run".to_string(), ToolResult::completed("done"))]);
+            HashMap::from([("net.get".to_string(), ToolResult::completed("done"))]);
 
-        let id = ask_once(&gateway).await;
-        approvals.grant(&sid(), &id, ApprovalScope::AllowForSession, "user").await.unwrap();
+        let id = ask_once_for(&gateway, "net.get").await;
+        approvals
+            .grant(&sid(), &id, ApprovalScope::AllowForSession, "user", &ApprovalAuthority::test())
+            .await
+            .unwrap();
 
-        let result = gateway.execute(&sid(), &invocation("shell.run")).await.unwrap();
+        let result = gateway.execute(&sid(), &invocation("net.get")).await.unwrap();
         assert_eq!(result.status, ToolStatus::Completed);
         assert!(approvals.pending(&sid()).await.unwrap().is_empty(), "no second question");
     }
@@ -1269,7 +1397,10 @@ mod tests {
             HashMap::from([("shell.run".to_string(), ToolResult::completed("done"))]);
 
         let id = ask_once(&gateway).await;
-        approvals.grant(&sid(), &id, ApprovalScope::AllowOnce, "user").await.unwrap();
+        approvals
+            .grant(&sid(), &id, ApprovalScope::AllowOnce, "user", &ApprovalAuthority::test())
+            .await
+            .unwrap();
 
         let again = gateway.execute(&sid(), &invocation("shell.run")).await;
         assert!(
@@ -1284,14 +1415,17 @@ mod tests {
         // says any turn ended — it is the *next* turn it is for, and that turn
         // has not run. What ends it is a turn event; the approval service's own
         // tests drive that.
-        let (gateway, approvals, tools) = asking_gateway();
+        let (gateway, approvals, tools) = asking_gateway_l2();
         *tools.results.lock().unwrap() =
-            HashMap::from([("shell.run".to_string(), ToolResult::completed("done"))]);
+            HashMap::from([("net.get".to_string(), ToolResult::completed("done"))]);
 
-        let id = ask_once(&gateway).await;
-        approvals.grant(&sid(), &id, ApprovalScope::AllowForTurn, "user").await.unwrap();
+        let id = ask_once_for(&gateway, "net.get").await;
+        approvals
+            .grant(&sid(), &id, ApprovalScope::AllowForTurn, "user", &ApprovalAuthority::test())
+            .await
+            .unwrap();
 
-        let result = gateway.execute(&sid(), &invocation("shell.run")).await.unwrap();
+        let result = gateway.execute(&sid(), &invocation("net.get")).await.unwrap();
         assert_eq!(result.status, ToolStatus::Completed);
     }
 
@@ -1817,8 +1951,14 @@ mod tests {
         )]));
         let gateway = gateway_any(ResourceGuard::new(workspace()), tools, PolicyEngine::new());
 
+        // The declaration is checked before the answer is, so any id will do:
+        // this call is refused for what it is, not for who approved it.
         let err = gateway
-            .execute_approved(&ToolInvocation::proposed("fs.write", serde_json::json!({})))
+            .execute_approved(
+                &sid(),
+                &ApprovalId::new(),
+                &ToolInvocation::proposed("fs.write", serde_json::json!({})),
+            )
             .await
             .expect_err("path is missing");
         assert!(matches!(err, ToolGatewayError::InvalidArguments { .. }), "unexpected: {err:?}");
@@ -1873,294 +2013,9 @@ mod tests {
         }
     }
 
-    /// A provider that records what it was handed and answers with `reply`.
-    struct RecordingTools {
-        defs: Vec<ToolDefinition>,
-        reply: ToolResult,
-        fail_with: Option<String>,
-        seen: Mutex<Vec<ToolInvocation>>,
-    }
-
-    impl RecordingTools {
-        fn new(reply: &str) -> Self {
-            Self {
-                defs: vec![def("fs.read", &[Capability::FS_READ], ToolSideEffect::Read)],
-                reply: ToolResult::completed(reply),
-                fail_with: None,
-                seen: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn failing(message: &str) -> Self {
-            let mut tools = Self::new("");
-            tools.fail_with = Some(message.to_string());
-            tools
-        }
-
-        fn seen(&self) -> Vec<ToolInvocation> {
-            self.seen.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ToolProvider for RecordingTools {
-        fn definitions(&self) -> Vec<ToolDefinition> {
-            self.defs.clone()
-        }
-
-        fn side_effect(&self, tool_name: &str) -> Option<ToolSideEffect> {
-            self.defs.iter().find(|d| d.name == tool_name).map(|d| d.side_effect)
-        }
-
-        async fn invoke(
-            &self,
-            invocation: &ToolInvocation,
-        ) -> Result<ToolResult, ToolProviderError> {
-            self.seen.lock().unwrap().push(invocation.clone());
-            match &self.fail_with {
-                Some(message) => {
-                    Err(ToolProviderError::failed(&invocation.tool_name, message.clone()))
-                }
-                None => Ok(self.reply.clone()),
-            }
-        }
-    }
-
-    /// A secret provider with one resolvable name.
-    struct OneSecret;
-
-    impl SecretProvider for OneSecret {
-        fn resolve(&self, secret: &SecretRef) -> Result<String, SecretProviderError> {
-            if secret.source == "env" && secret.name == "TOOL_TOKEN" {
-                Ok("s3cret-value-12345".to_string())
-            } else {
-                Err(SecretProviderError::NotFound {
-                    provider: secret.source.clone(),
-                    name: secret.name.clone(),
-                })
-            }
-        }
-    }
-
-    fn secret_gateway(tools: Arc<RecordingTools>) -> GuardedToolProvider {
-        let store = Arc::new(FakeEventStore::new());
-        GuardedToolProvider::new(
-            tools,
-            allowing(Capability::FS_READ),
-            Arc::new(ApprovalService::new(store)),
-            ResourceGuard::new(workspace()),
-            Arc::new(agent_testkit::InMemoryArtifactStore::default()),
-        )
-        .with_secrets(Arc::new(OneSecret))
-    }
-
-    fn secret_invocation(arguments: serde_json::Value) -> ToolInvocation {
-        ToolInvocation::proposed("fs.read", arguments)
-    }
-
-    #[tokio::test]
-    async fn a_secret_reference_is_resolved_at_the_tool_boundary_and_scrubbed_from_the_result() {
-        let tools = Arc::new(RecordingTools::new("the token is s3cret-value-12345"));
-        let gateway = secret_gateway(tools.clone());
-        let invocation = secret_invocation(serde_json::json!({
-            "path": "notes.txt",
-            "command": "echo 'Bearer secret://env/TOOL_TOKEN'",
-        }));
-
-        // The call is a secret-using one, so it stops for approval first.
-        let pending = gateway.execute(&sid(), &invocation).await.unwrap_err();
-        assert!(matches!(pending, ToolGatewayError::ApprovalPending { .. }), "{pending:?}");
-        assert!(tools.seen().is_empty(), "nothing may run before the approval");
-
-        // What the log and the summary hold is the reference, untouched.
-        assert_eq!(invocation.arguments["command"], "echo 'Bearer secret://env/TOOL_TOKEN'");
-
-        let result = gateway.execute_approved(&invocation).await.unwrap();
-        let seen = tools.seen();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].arguments["command"], "echo 'Bearer s3cret-value-12345'");
-        assert!(!result.content.contains("s3cret-value"), "secret leaked: {}", result.content);
-        assert!(result.content.contains("***"));
-        assert!(
-            result
-                .redaction_metadata
-                .patterns
-                .iter()
-                .any(|pattern| pattern == "secret://env/TOOL_TOKEN")
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unknown_secret_is_refused_before_the_tool_runs() {
-        let tools = Arc::new(RecordingTools::new("ok"));
-        let gateway = secret_gateway(tools.clone());
-
-        let error = gateway
-            .execute(
-                &sid(),
-                &secret_invocation(serde_json::json!({ "command": "echo secret://env/NOPE" })),
-            )
-            .await
-            .unwrap_err();
-        match error {
-            ToolGatewayError::SecretUnavailable { reference, kind, .. } => {
-                assert_eq!(reference, "secret://env/NOPE");
-                assert_eq!(kind, ToolErrorKind::PermissionDenied);
-            }
-            other => panic!("expected a secret refusal, got {other:?}"),
-        }
-        assert!(tools.seen().is_empty(), "an unresolvable reference must not reach the tool");
-    }
-
-    #[tokio::test]
-    async fn a_malformed_secret_reference_is_refused() {
-        let tools = Arc::new(RecordingTools::new("ok"));
-        let gateway = secret_gateway(tools.clone());
-
-        let error = gateway
-            .execute(
-                &sid(),
-                &secret_invocation(serde_json::json!({ "command": "echo secret://TOOL_TOKEN" })),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                ToolGatewayError::SecretUnavailable { kind: ToolErrorKind::InvalidArguments, .. }
-            ),
-            "{error:?}"
-        );
-        assert!(tools.seen().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_run_without_a_secret_provider_refuses_a_reference() {
-        let tools = Arc::new(RecordingTools::new("ok"));
-        let store = Arc::new(FakeEventStore::new());
-        let gateway = GuardedToolProvider::new(
-            tools.clone(),
-            allowing(Capability::FS_READ),
-            Arc::new(ApprovalService::new(store)),
-            ResourceGuard::new(workspace()),
-            Arc::new(agent_testkit::InMemoryArtifactStore::default()),
-        );
-
-        let error = gateway
-            .execute(
-                &sid(),
-                &secret_invocation(
-                    serde_json::json!({ "command": "echo secret://env/TOOL_TOKEN" }),
-                ),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                ToolGatewayError::SecretUnavailable { kind: ToolErrorKind::PermissionDenied, .. }
-            ),
-            "{error:?}"
-        );
-        assert!(tools.seen().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_provider_error_that_echoes_the_secret_is_scrubbed() {
-        let tools = Arc::new(RecordingTools::failing("rejected header: Bearer s3cret-value-12345"));
-        let gateway = secret_gateway(tools);
-
-        let error = gateway
-            .execute_approved(&secret_invocation(
-                serde_json::json!({ "command": "echo secret://env/TOOL_TOKEN" }),
-            ))
-            .await
-            .unwrap_err();
-        let text = error.to_string();
-        assert!(!text.contains("s3cret-value"), "secret leaked: {text}");
-        assert!(text.contains("***"));
-    }
-
-    /// The scrub runs before the offload, so an oversized result carries `***`
-    /// into the blob store rather than the value it replaced.
-    ///
-    /// `finalize` redacts, then offloads — and until this test nothing pinned
-    /// that order. Reverse it and the result the model sees is clean while the
-    /// artifact keeps the plaintext: the model never notices, the log never
-    /// notices, and the secret sits on disk under a content hash. The artifact
-    /// is a durable surface, so the audit's "a secret does not appear in an
-    /// artifact" is checked on the bytes, not on what the caller was handed.
-    #[tokio::test]
-    async fn a_resolved_secret_is_scrubbed_before_the_result_becomes_an_artifact() {
-        const SECRET: &str = "s3cret-value-12345";
-        // Past the offload limit, with the value the tool echoes inside it.
-        let mut reply = "echoed line\n".repeat(6_000);
-        reply.push_str("the token is s3cret-value-12345\n");
-        reply.push_str(&"trailing line\n".repeat(6_000));
-        assert!(reply.len() > OFFLOAD_MAX_BYTES, "the premise: this is offloaded");
-
-        let tools = Arc::new(RecordingTools::new(&reply));
-        let artifacts = Arc::new(agent_testkit::InMemoryArtifactStore::default());
-        let gateway = GuardedToolProvider::new(
-            tools,
-            allowing(Capability::FS_READ),
-            Arc::new(ApprovalService::new(Arc::new(FakeEventStore::new()))),
-            ResourceGuard::new(workspace()),
-            artifacts.clone(),
-        )
-        .with_secrets(Arc::new(OneSecret));
-        let invocation = secret_invocation(serde_json::json!({
-            "path": "notes.txt",
-            "command": "echo 'Bearer secret://env/TOOL_TOKEN'",
-        }));
-
-        // A secret-using call stops for approval; nothing runs before it.
-        let pending = gateway.execute(&sid(), &invocation).await.unwrap_err();
-        assert!(matches!(pending, ToolGatewayError::ApprovalPending { .. }), "{pending:?}");
-
-        let result = gateway.execute_approved(&invocation).await.unwrap();
-        assert_eq!(result.artifacts.len(), 1, "the full output was offloaded");
-        assert!(
-            !result.content.contains(SECRET),
-            "the preview the model keeps still has the value: {}",
-            result.content
-        );
-
-        let stored = artifacts.get(&result.artifacts[0]).expect("read the blob back");
-        let stored = String::from_utf8(stored).expect("the artifact is text");
-        assert!(!stored.contains(SECRET), "the resolved secret landed in the artifact store");
-        assert!(stored.contains("***"), "the blob holds the scrubbed text");
-
-        // What the metadata names is the reference, never the value, and the
-        // metadata is what a summary or an export reads.
-        assert!(
-            result
-                .redaction_metadata
-                .patterns
-                .iter()
-                .any(|pattern| pattern == "secret://env/TOOL_TOKEN")
-        );
-        let metadata = serde_json::to_string(&result.redaction_metadata).unwrap();
-        assert!(!metadata.contains(SECRET), "the value reached the metadata: {metadata}");
-    }
-
-    #[tokio::test]
-    async fn a_high_entropy_token_in_a_result_is_reported_but_not_removed() {
-        // No known prefix: the value is only recognisable by shape, which is
-        // exactly the case the prefix list cannot see.
-        const TOKEN: &str = "Zk3vQ9mR7tY1pL5nB8cF2hJ6sD4gW0xE7uI9oP1a";
-        let tools = Arc::new(RecordingTools::new(&format!("bearer {TOKEN}")));
-        let gateway =
-            gateway_any(ResourceGuard::new(workspace()), tools, allowing(Capability::FS_READ));
-
-        let result = gateway.execute(&sid(), &invocation("fs.read")).await.expect("allow runs it");
-
-        // The default layer reports; it does not edit an answer the caller
-        // did not ask to have rewritten.
-        assert_eq!(result.content, format!("bearer {TOKEN}"));
-        assert!(!result.redaction_metadata.redacted);
-        assert_eq!(result.redaction_metadata.warnings, vec!["high_entropy".to_string()]);
-        let encoded = serde_json::to_string(&result.redaction_metadata).unwrap();
-        assert!(!encoded.contains(TOKEN), "the value reached the metadata: {encoded}");
-    }
+    /// Out of line under a `tests`-named directory so the boundary guards in
+    /// agent-testkit scope it as test code.
+    #[cfg(test)]
+    #[path = "secrets.rs"]
+    mod secrets;
 }

@@ -461,7 +461,13 @@ async fn a_task_in_a_real_repository_is_done_and_the_world_says_so() {
     second
         .stack
         .approvals
-        .grant(&second.session_id, &approval_id, ApprovalScope::AllowOnce, "user")
+        .grant(
+            &second.session_id,
+            &approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
         .await
         .expect("grant");
 

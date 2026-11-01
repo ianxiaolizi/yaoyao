@@ -262,6 +262,7 @@ impl Backend for WebBackend {
         session: &SessionId,
         approval_id: &str,
         decision: Decision,
+        authority: &agent_kernel::approval::ApprovalAuthority,
         live: &LiveSink,
     ) -> Result<(), BackendError> {
         let lock = self.session_lock(session).await;
@@ -303,6 +304,7 @@ impl Backend for WebBackend {
                         approval_id,
                         grant,
                         "user",
+                        authority,
                     )
                     .await?;
                 }

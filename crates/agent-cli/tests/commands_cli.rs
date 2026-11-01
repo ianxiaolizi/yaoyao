@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use agent_cli::commands::{self, CommandError, Grant, InterruptOutcome, TurnStart};
-use agent_kernel::approval::ApprovalService;
+use agent_kernel::approval::{ApprovalAuthority, ApprovalService};
 use agent_kernel::inbox::Inbox;
 use agent_kernel::scheduler::Scheduler;
 use agent_loop::DefaultAgentLoop;
@@ -134,6 +134,7 @@ async fn a_grant_reports_the_reply_and_queues_a_wakeup() {
         request.approval_id.as_str(),
         Grant::Once,
         "user",
+        &ApprovalAuthority::test(),
     )
     .await
     .unwrap();

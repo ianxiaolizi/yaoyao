@@ -1654,17 +1654,6 @@ fn pending_approval_id(error: &str, tool: &str) -> String {
         .unwrap_or_else(|| panic!("no pending approval for {tool} in {error:?}"))
 }
 
-/// The id out of the tool's "remembered <id>  workspace/<key>" answer.
-fn tool_remembered_id(answer: &Ran) -> String {
-    answer
-        .out
-        .trim()
-        .strip_prefix("remembered ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .map(str::to_string)
-        .unwrap_or_else(|| panic!("no remembered id in {:?}", answer.out))
-}
-
 #[test]
 fn the_memory_tools_are_unknown_until_the_configuration_turns_them_on() {
     let (data, workspace) = dirs();
@@ -1684,8 +1673,12 @@ fn the_memory_tools_are_unknown_until_the_configuration_turns_them_on() {
     }
 }
 
+/// A write waits for a person — and this is what a person looks like from the
+/// outside: a terminal. The verb that answers refuses a process without one,
+/// which is every process a model can start, so the only thing that can happen
+/// to this question here is that it stays open. (B4, CONTRACT.md §7 #178)
 #[test]
-fn a_model_write_asks_once_and_then_shares_the_store_with_the_cli() {
+fn a_model_write_asks_and_a_process_without_a_terminal_cannot_answer() {
     let (data, workspace, home) = dirs_with_config();
     let config = memory_on_config(&home);
     let remember = r#"{"text":"the deploy window is Tuesday","key":"deploy-window"}"#;
@@ -1706,53 +1699,29 @@ fn a_model_write_asks_once_and_then_shares_the_store_with_the_cli() {
         "the question left no fact behind"
     );
 
-    let granted = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
-    assert!(granted.ok, "{}", granted.err);
+    // A pipe is not a person. A tool child holds exactly this — a process with
+    // pipes for stdio — and a script that could answer its own question would
+    // be a model approving itself.
+    let answered = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
+    assert_eq!(answered.code, Some(2), "{}", answered.out);
+    assert!(answered.err.contains("interactive terminal"), "{}", answered.err);
 
-    let wrote = ran_with(
+    // The refusal left the question where it was: the call is still a question
+    // and the store is still empty.
+    let again = ran_with(
         data.path(),
         workspace.path(),
         &[("AGENT_USER_CONFIG", &config)],
         &["tool", "memory.remember", remember],
     );
-    assert!(wrote.ok, "{}", wrote.err);
-    let id = tool_remembered_id(&wrote);
-    assert!(id.starts_with("mem_"), "{id}");
-
-    // The person's own verbs read the store the model wrote.
-    let listed = ran(data.path(), workspace.path(), &["memory", "list"]);
-    assert!(listed.out.contains("the deploy window is Tuesday"), "{}", listed.out);
-
-    // Reading is allowed, so a recall goes straight through.
-    let recalled = ran_with(
-        data.path(),
-        workspace.path(),
-        &[("AGENT_USER_CONFIG", &config)],
-        &["tool", "memory.recall", r#"{"query":"Tuesday"}"#],
+    assert_eq!(again.code, Some(2), "{}", again.out);
+    pending_approval_id(&again.err, "memory.remember");
+    assert!(
+        ran(data.path(), workspace.path(), &["memory", "list"])
+            .out
+            .contains("nothing is remembered"),
+        "no answer reached the log, and no fact reached the store"
     );
-    assert!(recalled.ok, "{}", recalled.err);
-    assert!(recalled.out.contains(&id), "{}", recalled.out);
-
-    // The write grant is a grant for `memory.write`, so the delete does not
-    // ask again — that is what "always" means.
-    let forgotten = ran_with(
-        data.path(),
-        workspace.path(),
-        &[("AGENT_USER_CONFIG", &config)],
-        &["tool", "memory.forget", &format!(r#"{{"id":"{id}"}}"#)],
-    );
-    assert!(forgotten.ok, "{}", forgotten.err);
-    assert!(forgotten.out.contains(&format!("forgot {id}")), "{}", forgotten.out);
-
-    let after = ran(data.path(), workspace.path(), &["memory", "list"]);
-    assert!(after.out.contains("nothing is remembered"), "{}", after.out);
-    let recalled = ran_with(
-        data.path(),
-        workspace.path(),
-        &[("AGENT_USER_CONFIG", &config)],
-        &["tool", "memory.recall", r#"{"query":"Tuesday"}"#],
-    );
-    assert!(recalled.out.contains("nothing is remembered matching 'Tuesday'"), "{}", recalled.out);
 }
 
 #[test]
@@ -1770,20 +1739,28 @@ fn a_delete_asks_before_it_happens_when_nobody_has_answered_yet() {
     assert_eq!(asked.code, Some(2), "{}", asked.out);
     let approval = pending_approval_id(&asked.err, "memory.forget");
 
-    let granted = ran(data.path(), workspace.path(), &["approve", &approval, "always"]);
-    assert!(granted.ok, "{}", granted.err);
+    // Saying no needs no terminal, and that asymmetry is the point: a refusal
+    // is always safe to accept from anywhere, an answer is the thing that has
+    // to come from somebody.
+    let refused = ran(data.path(), workspace.path(), &["deny", &approval, "--only"]);
+    assert!(refused.ok, "{}", refused.err);
 
-    let forgotten = ran_with(
+    // Putting this one question aside does not answer the next: the delete is
+    // still a question, not an act.
+    let still_asking = ran_with(
         data.path(),
         workspace.path(),
         &[("AGENT_USER_CONFIG", &config)],
         &["tool", "memory.forget", forget],
     );
-    assert!(forgotten.ok, "{}", forgotten.err);
+    assert_eq!(still_asking.code, Some(2), "{}", still_asking.out);
+    pending_approval_id(&still_asking.err, "memory.forget");
+
+    // Nothing happened to the store while nobody answered.
     assert!(
-        forgotten.out.contains("no fact with id 'mem_nothing'"),
-        "deleting what is already gone is an answer: {}",
-        forgotten.out
+        ran(data.path(), workspace.path(), &["memory", "list"])
+            .out
+            .contains("nothing is remembered")
     );
 }
 

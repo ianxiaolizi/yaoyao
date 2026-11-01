@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_cli::reason::WhyError;
+use agent_kernel::approval::ApprovalAuthority;
 use agent_kernel::inbox::{Inbox, scheduled_due_at};
 use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::event_store::EventStore;
@@ -1057,11 +1058,19 @@ async fn approve(
         }
     }
 
+    // The request already passed the gate, which is where the token was
+    // checked; carrying it here is what turns "someone on loopback" into "the
+    // authenticated GUI handler", and it is the only way an answer from this
+    // process is recorded as a person's. (B4)
+    let authority = ApprovalAuthority::local_http(&state.token)
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
     let state_for_task = state.clone();
     let sink = state.live_sink(&id);
     let approval_for_task = approval_id.clone();
     tokio::spawn(async move {
-        let result = backend.settle_approval(&session, &approval_for_task, decision, &sink).await;
+        let result = backend
+            .settle_approval(&session, &approval_for_task, decision, &authority, &sink)
+            .await;
         if let Err(error) = result {
             let _ = sink.send(LiveChunk::notice(format!(
                 "审批没有续跑（{}）：{}",

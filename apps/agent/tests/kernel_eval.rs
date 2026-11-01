@@ -1044,6 +1044,12 @@ fn run_turn(
         };
         approved.insert(id.clone());
 
+        // `deny` is answerable from anywhere — it only takes permission away.
+        // `approve` is not: since B4 it needs a terminal, because a pipe cannot
+        // prove a person is watching. A fixture that starts to raise a call
+        // needing a yes will fail here with "an approval must come from an
+        // interactive terminal"; the answer is to settle it in process
+        // (`ApprovalAuthority::test()`), not to widen the grant or the scope.
         let decision = if deny_approvals {
             run_agent(repo, &["deny", &id, "--only", "--session", SESSION, "--events"])
         } else {
