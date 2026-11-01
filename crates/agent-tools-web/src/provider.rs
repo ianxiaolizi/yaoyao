@@ -16,8 +16,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use agent_ports::tool_provider::{
-    ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
-    ToolSource,
+    RiskLevel, ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult,
+    ToolSideEffect, ToolSource,
 };
 use agent_protocol::permissions::Capability;
 use agent_protocol::tool::ToolErrorKind;
@@ -285,6 +285,26 @@ impl ToolProvider for WebToolProvider {
         (tool_name == WEB_TOOL_NAME).then_some(ToolSideEffect::Network)
     }
 
+    /// A read is a read; anything that is not `GET`/`HEAD` is treated as the
+    /// highest risk until stage B removes the writing methods from the surface
+    /// entirely (CONTRACT §7 #175). An unknown method word is not a read
+    /// either — the tool would refuse it, and the declaration must not.
+    fn risk(&self, invocation: &ToolInvocation) -> Option<RiskLevel> {
+        if invocation.tool_name != WEB_TOOL_NAME {
+            return None;
+        }
+        let method = invocation
+            .arguments
+            .get("method")
+            .and_then(|value| value.as_str())
+            .map(|method| method.to_ascii_uppercase())
+            .unwrap_or_else(|| "GET".to_string());
+        Some(match method.as_str() {
+            "GET" | "HEAD" => RiskLevel::L0,
+            _ => RiskLevel::L3,
+        })
+    }
+
     /// No argument of this tool names a workspace path: the workspace
     /// boundary has nothing to check here, and the address guard is what
     /// bounds the call instead.
@@ -463,4 +483,36 @@ fn truncate(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_read_method_is_l0_and_anything_else_is_l3() {
+        // The method is the whole difference between reading a page and
+        // posting to it, and one tool makes both calls. A declaration that
+        // said only "network" would hide that from every later decision.
+        let provider = WebToolProvider::new();
+        let risk = |arguments: serde_json::Value| {
+            provider.risk(&ToolInvocation::proposed(WEB_TOOL_NAME, arguments))
+        };
+
+        assert_eq!(risk(json!({ "url": "https://docs.rs/" })), Some(RiskLevel::L0));
+        assert_eq!(
+            risk(json!({ "url": "https://docs.rs/", "method": "head" })),
+            Some(RiskLevel::L0)
+        );
+        for method in ["POST", "put", "Patch", "DELETE", "OPTIONS"] {
+            assert_eq!(
+                risk(json!({ "url": "https://docs.rs/", "method": method })),
+                Some(RiskLevel::L3),
+                "{method}"
+            );
+        }
+        // A name this provider does not own is not this provider's to classify.
+        assert_eq!(provider.risk(&ToolInvocation::proposed("other.tool", json!({}))), None);
+    }
 }

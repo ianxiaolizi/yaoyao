@@ -5,6 +5,7 @@
 
 #![deny(unsafe_code)]
 
+mod action;
 pub mod adjudicate;
 pub mod approval;
 pub mod completion;

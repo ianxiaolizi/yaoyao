@@ -27,6 +27,7 @@ pub mod judgment;
 pub mod ledger;
 pub mod model;
 pub mod parking;
+pub mod permission;
 pub mod permissions;
 pub mod plan;
 pub mod plugin;

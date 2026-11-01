@@ -18,10 +18,12 @@ use agent_ports::tool_provider::{
     ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
 };
 use agent_protocol::ids::SessionId;
+use agent_protocol::permission::ActionFacts;
 use agent_protocol::permissions::{ArtifactRef, Capability, PolicyDecision, SecretRef};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::{ToolErrorKind, ToolPolicyRecord};
 
+use crate::action::SECRET_SCHEME;
 use crate::approval::ApprovalService;
 use crate::policy::{PolicyContext, PolicyEngine, Refusal};
 use crate::resource_guard::ResourceGuard;
@@ -45,9 +47,6 @@ const SURFACE_SAMPLE: usize = 12;
 /// what it is and where it went wrong, not enough to be the thing itself.
 const PREVIEW_HEAD_BYTES: usize = 2_048;
 const PREVIEW_TAIL_BYTES: usize = 512;
-
-/// The scheme a tool argument uses to name a secret instead of carrying one.
-const SECRET_SCHEME: &str = "secret://";
 
 /// The shortest resolved value the result scrubber replaces.
 ///
@@ -303,7 +302,7 @@ impl GuardedToolProvider {
         invocation: &ToolInvocation,
         capability: Capability,
     ) -> Result<ToolGatewayError, ToolGatewayError> {
-        let summary = self.summarize(invocation);
+        let summary = crate::action::summarize_arguments(&self.redactor, invocation);
         let req = self
             .approvals
             .request(session_id, capability, &invocation.tool_name, &summary)
@@ -382,23 +381,6 @@ impl GuardedToolProvider {
         format!("the run registers {total} tools; the nearest are: {shown}")
     }
 
-    fn summarize(&self, invocation: &ToolInvocation) -> String {
-        let raw = serde_json::to_string(&invocation.arguments).unwrap_or_default();
-        let (scrubbed, _) = self.redactor.redact(&raw);
-        if scrubbed.len() > 200 {
-            // 200 is a *size* budget, so the cut is a byte index — but the
-            // arguments are whatever the caller sent, and in this repo that is
-            // routinely not ASCII. The index has to be moved back to a
-            // character boundary or the slice panics, which would happen while
-            // asking a person to decide. `chars().take(200)` would also be safe
-            // and is the wrong fix: it counts characters, which for Chinese
-            // text is a bound three times larger.
-            format!("{}…", &scrubbed[..scrubbed.floor_char_boundary(200)])
-        } else {
-            scrubbed
-        }
-    }
-
     /// Run an invocation whose approval has already been decided.
     ///
     /// The policy question was asked and answered before this call. Asking it
@@ -471,6 +453,24 @@ impl GuardedToolProvider {
                 .find_map(|key| invocation.arguments.get(&key).and_then(|v| v.as_str())),
             command: invocation.arguments.get("command").and_then(|v| v.as_str()),
         }
+    }
+
+    /// The action one call proposes, as a permission decision will see it.
+    ///
+    /// Built in [`crate::action`] so a lease binds the fingerprint a result is under.
+    pub fn action_facts(
+        &self,
+        task_id: &str,
+        task_revision: u64,
+        invocation: &ToolInvocation,
+    ) -> ActionFacts {
+        crate::action::action_facts(
+            self.inner.as_ref(),
+            &self.capabilities_for(&invocation.tool_name),
+            task_id,
+            task_revision,
+            invocation,
+        )
     }
 
     /// Check every argument the provider declares as a path.
