@@ -33,6 +33,7 @@ use agent_kernel::approval::ApprovalService;
 use agent_kernel::fork::Fork;
 use agent_kernel::guarded::GuardedToolProvider;
 use agent_kernel::live_bus::InMemoryLiveEventBus;
+use agent_kernel::permission::PermissionService;
 use agent_kernel::plugin::{PluginRegistry, RegistryToolProvider};
 use agent_kernel::recovery::Recovery;
 use agent_kernel::resource_guard::ResourceGuard;
@@ -972,6 +973,11 @@ pub async fn assemble_with_delegation(
         ),
     };
 
+    // The decision ledger every gateway below writes to, built once: one log,
+    // one writer. A decision is written before the call runs, and a call whose
+    // decision cannot be written does not run.
+    let permissions = Arc::new(PermissionService::new(store.clone()));
+
     // One step's output is bounded by the window the run actually has: a
     // result larger than the working set cannot be compacted away afterwards,
     // because the newest group is kept whole. The gateway also decides what the
@@ -991,7 +997,8 @@ pub async fn assemble_with_delegation(
         .with_redactor(redactor.clone())
         .with_secrets(Arc::new(EnvSecretProvider::new(
             tool_secrets.iter().map(|secret| secret.name.clone()),
-        ))),
+        )))
+        .with_permission_service(permissions.clone()),
     );
 
     // Shadow decisions are assembled here, next to the provider they are built
@@ -1096,7 +1103,11 @@ pub async fn assemble_with_delegation(
                     artifacts.clone(),
                 )
                 .with_offload_limit(resolved.budget.tool_output_limit_bytes())
-                .with_redactor(redactor.clone()),
+                .with_redactor(redactor.clone())
+                // A delegated call is a tool call: it is decided and recorded
+                // in the same ledger, so an audit of the session does not stop
+                // at the thing that spawned work in it.
+                .with_permission_service(permissions.clone()),
             );
             let mut child = DefaultAgentLoop::new(
                 selected.provider.clone(),

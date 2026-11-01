@@ -15,18 +15,23 @@ use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::secret_provider::{SecretProvider, SecretProviderError};
 use agent_ports::tool_gateway::{ToolGateway, ToolGatewayError};
 use agent_ports::tool_provider::{
-    ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
+    ToolDefinition, ToolInvocation, ToolProvider, ToolResult, ToolSideEffect,
 };
 use agent_protocol::ids::SessionId;
 use agent_protocol::permission::ActionFacts;
-use agent_protocol::permissions::{ArtifactRef, Capability, PolicyDecision, SecretRef};
+use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::{ToolErrorKind, ToolPolicyRecord};
 
 use crate::action::SECRET_SCHEME;
 use crate::approval::ApprovalService;
+use crate::permission::{PermissionBaseline, PermissionDecisionRecord, PermissionService};
 use crate::policy::{PolicyContext, PolicyEngine, Refusal};
 use crate::resource_guard::ResourceGuard;
+use crate::scrub::{
+    PREVIEW_HEAD_BYTES, PREVIEW_TAIL_BYTES, ResolvedSecret, exceeds_offload_limits,
+    offload_preview, scrub_provider_error, scrub_text,
+};
 use crate::tool_schema::{SchemaCheck, SchemaGap};
 
 /// A result past either limit is offloaded to the artifact store instead of
@@ -34,7 +39,6 @@ use crate::tool_schema::{SchemaCheck, SchemaGap};
 /// catch different shapes: a minified bundle is enormous and barely long, a
 /// generated table is long and not enormous.
 const OFFLOAD_MAX_BYTES: usize = 50 * 1024;
-const OFFLOAD_MAX_LINES: usize = 2_000;
 
 /// How many registered tool names a "no such tool" message will list.
 ///
@@ -42,19 +46,6 @@ const OFFLOAD_MAX_LINES: usize = 2_000;
 /// manifest: enough names to show what the surface looks like, and a count that
 /// says how many more there are.
 const SURFACE_SAMPLE: usize = 12;
-
-/// How much of an offloaded result still reaches the model: enough to recognise
-/// what it is and where it went wrong, not enough to be the thing itself.
-const PREVIEW_HEAD_BYTES: usize = 2_048;
-const PREVIEW_TAIL_BYTES: usize = 512;
-
-/// The shortest resolved value the result scrubber replaces.
-///
-/// A backstop, not the boundary: the arguments never carried the value, and a
-/// tool that echoes it is the case this covers. Below this length a value is
-/// indistinguishable from an ordinary word, and replacing every occurrence
-/// would corrupt perfectly good output while protecting nothing.
-const MIN_SECRET_SCRUB_CHARS: usize = 8;
 
 /// Policy- and approval-guarded tool executor.
 pub struct GuardedToolProvider {
@@ -69,6 +60,13 @@ pub struct GuardedToolProvider {
     /// `None` is a run that resolves none: a reference is then refused rather
     /// than passed to the tool as if it were the value it names.
     secrets: Option<Arc<dyn SecretProvider>>,
+    /// Where the one decision behind each call is written.
+    ///
+    /// `None` is a gateway assembled without a ledger — a fixture, or a unit
+    /// test of some other layer. Such a gateway still makes the same decision
+    /// (see [`crate::permission::rule`]); it just keeps no record of it. The
+    /// assembled binary always hands one over.
+    permissions: Option<Arc<PermissionService>>,
     /// How many bytes of one result stay inline; larger results are offloaded.
     offload_max_bytes: usize,
     /// The compiled declarations calls are checked against, kept between calls
@@ -92,9 +90,20 @@ impl GuardedToolProvider {
             redactor: Redactor::new(),
             artifacts,
             secrets: None,
+            permissions: None,
             offload_max_bytes: OFFLOAD_MAX_BYTES,
             schema: SchemaCheck::new(),
         }
+    }
+
+    /// Write one `permission/decision` before each call this gateway makes.
+    ///
+    /// The service is handed over rather than built here because the event
+    /// store is assembly's decision, and a gateway that opened a second writer
+    /// to the same log could land a decision on a stream this run did not read.
+    pub fn with_permission_service(mut self, permissions: Arc<PermissionService>) -> Self {
+        self.permissions = Some(permissions);
+        self
     }
 
     /// Resolve `secret://` references in arguments through `secrets`.
@@ -473,6 +482,32 @@ impl GuardedToolProvider {
         )
     }
 
+    /// Write the decision this call is made on, or refuse to make the call.
+    ///
+    /// Every door out of `execute` comes through here — allow, ask, deny, and
+    /// the boundary refusal before the policy is even asked — which is what
+    /// makes "exactly one decision per call" a property of the code rather than
+    /// of each arm remembering to do it. A write that fails is
+    /// [`ToolGatewayError::PermissionAudit`] and the call does not run.
+    async fn record(
+        &self,
+        session_id: &SessionId,
+        action: &ActionFacts,
+        baseline: PermissionBaseline,
+    ) -> Result<PermissionDecisionRecord, ToolGatewayError> {
+        let Some(service) = &self.permissions else {
+            // A gateway assembled without a ledger still makes the same
+            // decision; it just has nowhere to put it.
+            return Ok(crate::permission::rule(action.clone(), baseline, None));
+        };
+        service.decide(session_id, action.clone(), baseline, None).await.map_err(|error| {
+            ToolGatewayError::PermissionAudit {
+                tool: action.tool_name.clone(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
     /// Check every argument the provider declares as a path.
     ///
     /// The loop is over the declaration, not over a key named `path`: a tool
@@ -528,7 +563,7 @@ impl GuardedToolProvider {
         finalized.content = content;
         finalized.redaction_metadata = redaction;
 
-        if !self.exceeds_offload_limits(&finalized.content) {
+        if !exceeds_offload_limits(&finalized.content, self.offload_max_bytes) {
             return finalized;
         }
         // The count describes the text before any preview replaced it: a
@@ -549,113 +584,6 @@ impl GuardedToolProvider {
         finalized
     }
 }
-
-impl GuardedToolProvider {
-    /// Whether content is past either offload limit.
-    fn exceeds_offload_limits(&self, content: &str) -> bool {
-        content.len() > self.offload_max_bytes || content.lines().count() > OFFLOAD_MAX_LINES
-    }
-}
-
-/// A reference resolved for one call, kept only long enough to scrub the
-/// answer and any error the provider returns.
-struct ResolvedSecret {
-    /// The reference as written, which is what the redaction metadata names.
-    reference: String,
-    /// The plaintext that was handed to the tool. Never persisted.
-    value: String,
-}
-
-/// Replace every occurrence of a resolved value with `***`.
-///
-/// Returns the scrubbed text and the references whose values were found, so
-/// the redaction metadata can say what happened without carrying the value.
-/// Longest first: when one secret contains another, replacing the shorter one
-/// first would leave a fragment of the longer one behind.
-fn scrub_text(text: &str, secrets: &[ResolvedSecret]) -> (String, Vec<String>) {
-    let mut out = text.to_string();
-    let mut patterns = Vec::new();
-    let mut ordered: Vec<&ResolvedSecret> =
-        secrets.iter().filter(|secret| secret.value.len() >= MIN_SECRET_SCRUB_CHARS).collect();
-    ordered.sort_by_key(|secret| std::cmp::Reverse(secret.value.len()));
-    for secret in ordered {
-        if out.contains(&secret.value) {
-            out = out.replace(&secret.value, "***");
-            patterns.push(secret.reference.clone());
-        }
-    }
-    (out, patterns)
-}
-
-/// Scrub resolved values out of a provider's error message.
-///
-/// A shell that echoes its command line, or a server that quotes the header it
-/// rejected, would otherwise put the value into `tool/failed` — durable, and
-/// exported with the session.
-fn scrub_provider_error(error: ToolProviderError, secrets: &[ResolvedSecret]) -> ToolProviderError {
-    match error {
-        ToolProviderError::Failed { tool, message } => {
-            let (message, _) = scrub_text(&message, secrets);
-            ToolProviderError::Failed { tool, message }
-        }
-        ToolProviderError::Classified { tool, kind, message } => {
-            let (message, _) = scrub_text(&message, secrets);
-            ToolProviderError::Classified { tool, kind, message }
-        }
-        other => other,
-    }
-}
-
-/// The head, a marker naming the full content's locator, and the tail.
-///
-/// The marker is a sentence the model can act on rather than a bare hash: it
-/// says what happened, how much there was, and what to ask for to see it.
-fn offload_preview(content: &str, artifact: &ArtifactRef) -> String {
-    // Short-but-long-by-lines content would otherwise have its head and tail
-    // overlap, printing the same text twice.
-    let (head_end, tail_start) = if content.len() <= PREVIEW_HEAD_BYTES + PREVIEW_TAIL_BYTES {
-        (content.len(), content.len())
-    } else {
-        (
-            char_boundary_at_or_before(content, PREVIEW_HEAD_BYTES),
-            char_boundary_at_or_after(content, PREVIEW_TAIL_BYTES),
-        )
-    };
-    let marker = format!(
-        "... output truncated; full content saved to {} ({} bytes, {} lines) ...",
-        artifact.locator(),
-        artifact.size,
-        content.lines().count()
-    );
-    let head = &content[..head_end];
-    let tail = &content[tail_start..];
-    if tail.is_empty() { format!("{head}\n{marker}") } else { format!("{head}\n{marker}\n{tail}") }
-}
-
-/// The largest index at or below `max` that starts a character.
-fn char_boundary_at_or_before(text: &str, max: usize) -> usize {
-    if text.len() <= max {
-        return text.len();
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
-
-/// The smallest index at or above `len - from_end` that starts a character.
-fn char_boundary_at_or_after(text: &str, from_end: usize) -> usize {
-    if text.len() <= from_end {
-        return 0;
-    }
-    let mut start = text.len() - from_end;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    start
-}
-
 #[async_trait::async_trait]
 impl ToolGateway for GuardedToolProvider {
     async fn execute(
@@ -669,6 +597,21 @@ impl ToolGateway for GuardedToolProvider {
         self.check_arguments(invocation)?;
         let capabilities = self.capabilities_for(&invocation.tool_name);
         let ctx = self.policy_context(invocation);
+        // The action, as every layer below this point will see it. Built once,
+        // before anything decides: the digest a decision is recorded under is
+        // then the one the result carries, by construction.
+        let action = self.action_facts(&format!("manual:{}", session_id.as_str()), 0, invocation);
+
+        // The workspace boundary is asked before the policy, and its refusal is
+        // recorded before it is returned. A refusal with no decision beside it
+        // is the one case an audit cannot tell from a call nobody ever made —
+        // and no grant can lift this one, so asking it early changes nothing a
+        // grant could have said.
+        if let Err(refusal) = self.check_paths(invocation, &ctx) {
+            let reason = refusal.to_string();
+            self.record(session_id, &action, PermissionBaseline::refused(reason)).await?;
+            return Err(refusal);
+        }
 
         // Ask the engine with nothing granted first. A grant can only turn an
         // `ask` into an `allow` — never a `deny` — so when the answer is not
@@ -709,15 +652,28 @@ impl ToolGateway for GuardedToolProvider {
                 } else {
                     deny_reason(&record.refusals)
                 };
+                self.record(
+                    session_id,
+                    &action,
+                    PermissionBaseline::from(record.clone()).because(reason.clone()),
+                )
+                .await?;
                 Err(ToolGatewayError::PolicyDenied {
                     tool: invocation.tool_name.clone(),
                     reason,
-                    policy: record,
+                    policy: Box::new(record.about(action.digest.clone())),
                 })
             }
             PolicyDecision::Ask => {
                 let capability =
                     capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
+                // The held call's decision is written before the question is
+                // asked: "we asked" is itself a decision about this action, and
+                // a session that crashed between raising the approval and
+                // recording it would otherwise hold a question with no reason
+                // in the log.
+                self.record(session_id, &action, PermissionBaseline::new(PolicyDecision::Ask))
+                    .await?;
                 Err(self.request_approval(session_id, invocation, capability).await?)
             }
             PolicyDecision::Allow => {
@@ -725,9 +681,14 @@ impl ToolGateway for GuardedToolProvider {
                 // arms leave by three different doors (no secret, secret
                 // already granted, secret approved), and a record that only
                 // two of them carried would be worse than none.
-                let record = ToolPolicyRecord::allowed(capabilities.clone());
-                self.check_paths(invocation, &ctx)?;
+                let record = ToolPolicyRecord::allowed(capabilities.clone()).about(&action.digest);
                 if !Self::references_secret(&invocation.arguments) {
+                    self.record(
+                        session_id,
+                        &action,
+                        PermissionBaseline::new(PolicyDecision::Allow),
+                    )
+                    .await?;
                     return Ok(self.finish_resolved(invocation, &[]).await?.with_policy(record));
                 }
                 // Resolve before asking: a reference this run cannot resolve is
@@ -740,7 +701,18 @@ impl ToolGateway for GuardedToolProvider {
                 // before it runs. The reference is all the summary can show
                 // them, and the tool's own capability says whether they
                 // already said yes to it in this scope.
-                if !self.secret_use_granted(session_id, &capabilities).await? {
+                let granted = self.secret_use_granted(session_id, &capabilities).await?;
+                let baseline = if granted {
+                    PermissionBaseline::new(PolicyDecision::Allow)
+                } else {
+                    // The policy allowed the capability; a person has not yet
+                    // seen this call name a secret. The decision states the
+                    // call as it stands: held, not allowed.
+                    PermissionBaseline::new(PolicyDecision::Ask)
+                        .because("the call names a secret; a person sees it before it runs")
+                };
+                self.record(session_id, &action, baseline).await?;
+                if !granted {
                     let capability =
                         capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
                     return Err(self.request_approval(session_id, invocation, capability).await?);
@@ -802,10 +774,11 @@ fn shared_prefix_len(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrub::OFFLOAD_MAX_LINES;
     use agent_ports::artifact_store::ArtifactStoreError;
     use agent_ports::tool_provider::{ToolProviderError, ToolSideEffect, ToolSource, ToolStatus};
     use agent_protocol::ids::ApprovalId;
-    use agent_protocol::permissions::{ApprovalScope, Workspace};
+    use agent_protocol::permissions::{ApprovalScope, ArtifactRef, Workspace};
     use agent_testkit::FakeEventStore;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1892,7 +1865,7 @@ mod tests {
                 ToolGatewayError::PolicyDenied {
                     tool: "t".into(),
                     reason: "r".into(),
-                    policy: ToolPolicyRecord::denied([], []),
+                    policy: Box::new(ToolPolicyRecord::denied([], [])),
                 },
                 Some(ToolErrorKind::PermissionDenied),
             ),

@@ -469,6 +469,9 @@ async fn a_real_adapter_drives_model_tool_model_to_an_answer() {
         EventType::BUDGET_UPDATED,
         EventType::REASON_RECORDED,
         EventType::TOOL_STARTED,
+        // The gate writes its decision before the tool runs (B2), so the
+        // record of why sits between the call opening and its result.
+        EventType::PERMISSION_DECISION,
         EventType::TOOL_COMPLETED,
         EventType::REASON_RECORDED,
         EventType::STEP_COMPLETED,

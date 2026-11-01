@@ -68,8 +68,14 @@ pub enum ToolGatewayError {
     /// is the same message for an administrator's managed deny, a rule
     /// somebody wrote, and a capability this build's sandbox does not have, and
     /// those are three different places to fix.
+    ///
+    /// The record is boxed because this enum is returned by value from every
+    /// fallible step between the caller and the tool, and the record is the
+    /// only large thing any of them carries. Boxing it keeps the refusal cheap
+    /// to pass around without taking the record apart, which `clippy` would
+    /// otherwise have this enum's every caller pay for.
     #[error("policy denied tool '{tool}': {reason}")]
-    PolicyDenied { tool: String, reason: String, policy: ToolPolicyRecord },
+    PolicyDenied { tool: String, reason: String, policy: Box<ToolPolicyRecord> },
     #[error("approval pending for tool '{tool}': {approval_id}")]
     ApprovalPending { tool: String, approval_id: String },
     #[error("resource boundary violation for tool '{tool}': {reason}")]
@@ -117,6 +123,14 @@ pub enum ToolGatewayError {
     /// is what says whether the tool ran and failed or never started — the
     /// difference between exit 1 and exit 2 (C3.1). The provider error already
     /// names the tool, so nothing is lost by not repeating it here.
+    /// The decision ledger could not be written, so the call was not made.
+    ///
+    /// Fail-closed, and deliberately a refusal rather than a warning: a chain
+    /// whose audit is "usually written" is a chain whose audit a caller can
+    /// avoid by making the write fail. The call did not run and the tool never
+    /// saw it; what is missing is the record of why.
+    #[error("tool '{tool}' was not run: its permission decision could not be recorded: {reason}")]
+    PermissionAudit { tool: String, reason: String },
     #[error("tool execution failed: {0}")]
     Tool(ToolProviderError),
     #[error("approval service failed: {0}")]
@@ -140,7 +154,11 @@ impl ToolGatewayError {
             Self::InvalidSchema { .. } => Some(ToolErrorKind::Protocol),
             Self::SecretUnavailable { kind, .. } => Some(*kind),
             Self::Tool(error) => Some(error.kind()),
-            Self::ApprovalPending { .. } | Self::Approval(_) => None,
+            // Not a class of refusal the world gave: the gate could not write
+            // its own record. `None` leaves `error_kind` off the event, which
+            // is honest — the sentence says what happened, and no word in
+            // `ToolErrorKind` claims a policy refused this call.
+            Self::PermissionAudit { .. } | Self::ApprovalPending { .. } | Self::Approval(_) => None,
         }
     }
 }

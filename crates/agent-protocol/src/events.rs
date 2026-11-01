@@ -296,6 +296,14 @@ impl EventType {
     pub const APPROVAL_DENIED: &'static str = "approval/denied";
     pub const APPROVAL_EXPIRED: &'static str = "approval/expired";
     pub const APPROVAL_CANCELLED: &'static str = "approval/cancelled";
+    /// The one permission decision a tool call is made on.
+    ///
+    /// Written before the call runs and never after it: a decision appended
+    /// once the result is in hand would be a decision taken with the answer
+    /// visible. The payload is the whole record — action digest, decision,
+    /// authorisation source, refusals, classifier trace — so a reader needs
+    /// nothing else to reconstruct why the call happened.
+    pub const PERMISSION_DECISION: &'static str = "permission/decision";
     /// One fast-decision call's trace. An observation, never an input
     /// to anything in this build: the shadow mode is what makes that true.
     pub const DECISION_TRACE: &'static str = "decision/trace";
@@ -420,6 +428,7 @@ impl EventType {
         Self::APPROVAL_DENIED,
         Self::APPROVAL_EXPIRED,
         Self::APPROVAL_CANCELLED,
+        Self::PERMISSION_DECISION,
         Self::DECISION_TRACE,
         Self::PLUGIN_LOADED,
         Self::PLUGIN_UNLOADED,

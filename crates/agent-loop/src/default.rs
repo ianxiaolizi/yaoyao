@@ -7268,7 +7268,7 @@ mod tests {
                 reason: "capability process.spawn is not provided by this build's execution \
                          sandbox"
                     .to_string(),
-                policy: self.0.clone(),
+                policy: Box::new(self.0.clone()),
             })
         }
     }

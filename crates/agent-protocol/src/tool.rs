@@ -211,6 +211,16 @@ pub struct ToolPolicyRecord {
     /// declares no capabilities has nothing to name here.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub refusals: std::collections::BTreeMap<Capability, RefusalLayer>,
+    /// The action this record was made about, by digest.
+    ///
+    /// A result and its `permission/decision` are two statements about one
+    /// call, and a reader must be able to tell they are about the *same* one
+    /// without trusting that they were written in the same step: the digest is
+    /// the join key. `None` for a record made before this field existed, and
+    /// for the paths that state a decision without an action (a resumed call
+    /// whose facts live in the approval events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<String>,
 }
 
 impl ToolPolicyRecord {
@@ -220,6 +230,7 @@ impl ToolPolicyRecord {
             decision: PolicyDecision::Allow,
             capabilities: capabilities.into_iter().collect(),
             refusals: Default::default(),
+            action_digest: None,
         }
     }
 
@@ -232,7 +243,14 @@ impl ToolPolicyRecord {
             decision: PolicyDecision::Deny,
             capabilities: capabilities.into_iter().collect(),
             refusals: refusals.into_iter().collect(),
+            action_digest: None,
         }
+    }
+
+    /// Name the action this record is about.
+    pub fn about(mut self, action_digest: impl Into<String>) -> Self {
+        self.action_digest = Some(action_digest.into());
+        self
     }
 }
 
