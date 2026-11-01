@@ -16,6 +16,7 @@
 use agent_kernel::approval::{ApprovalError, ApprovalService};
 use agent_kernel::inbox::{Inbox, InboxError};
 use agent_kernel::intent::IntentError;
+use agent_kernel::intent_adjudication::AdjudicationStatus;
 use agent_kernel::scheduler::{RunReport, Scheduler, SchedulerError};
 use agent_protocol::events::Actor;
 use agent_protocol::ids::{ApprovalId, InboxItemId, IntentId, RunId, SessionId, StepId, TurnId};
@@ -301,7 +302,10 @@ pub async fn deny_approval(
 }
 
 /// A session's lifecycle, as `agent status` reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` only: [`AdjudicationStatus`] carries the model's stated
+/// confidence, and a float has no `Eq` to derive.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StatusReport {
     pub open_run: Option<RunId>,
     pub open_turn: Option<TurnId>,
@@ -336,6 +340,13 @@ pub struct StatusReport {
     /// before that, where a reader has to be able to say "this queue entry is
     /// stale" rather than run it.
     pub stale_items: Vec<InboxItemId>,
+    /// The most recent intent adjudication, when the session has one.
+    ///
+    /// `None` covers two real states this build cannot tell apart from the log
+    /// alone — no adjudicator was configured, and every message the rules could
+    /// route — and both mean the same thing to a reader: nothing was decided by
+    /// a model here.
+    pub intent_adjudication: Option<AdjudicationStatus>,
 }
 
 /// Read a session's lifecycle from the durable log.
@@ -370,6 +381,7 @@ pub async fn status(
         })
         .map(|item| item.item_id.clone())
         .collect();
+    let intent_adjudication = scheduler.intent_adjudication(session_id).await?;
     Ok(StatusReport {
         open_run: lifecycle.open_run,
         open_turn: lifecycle.open_turn,
@@ -379,5 +391,6 @@ pub async fn status(
         answered_intent_id,
         stale_answer,
         stale_items,
+        intent_adjudication,
     })
 }

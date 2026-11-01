@@ -12,6 +12,7 @@ pub mod fork;
 pub mod guarded;
 pub mod inbox;
 pub mod intent;
+pub mod intent_adjudication;
 pub mod judgment;
 pub mod lifecycle;
 pub mod live_bus;

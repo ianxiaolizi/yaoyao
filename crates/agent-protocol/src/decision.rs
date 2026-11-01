@@ -45,6 +45,11 @@ impl DecisionFamily {
     pub const MEMORY_RELEVANCE: &'static str = "memory_relevance";
     /// Reranking of already-authorized tool candidates. Never invents arguments.
     pub const TOOL_RANKING: &'static str = "tool_ranking";
+    /// What a direct user message asks the kernel to do with the work in
+    /// flight. Unlike the families above this one is *consumed*: its answer is
+    /// a relation the kernel policy turns into queue effects, and the model
+    /// never acts itself (`intent_adjudication` module).
+    pub const INTENT_ADJUDICATION: &'static str = "intent_adjudication";
 
     /// Create a family from its wire string.
     pub fn new(s: impl Into<String>) -> Self {
@@ -72,6 +77,10 @@ pub enum DecisionKind {
     Categorical,
     Ordinal,
     Ranking,
+    /// An object, for families whose answer is a record rather than one scalar.
+    /// The pack layer checks only that it *is* a bounded JSON object; the
+    /// fields a family requires are checked by that family's own module.
+    Structured,
 }
 
 /// One choice a categorical or ranking question offers.
@@ -231,6 +240,28 @@ impl QuestionPack {
                         question.question_id
                     ));
                 }
+                DecisionValue::Structured { value } => {
+                    if !value.is_object() {
+                        return Err(format!(
+                            "question {} answered with a non-object structured value",
+                            question.question_id
+                        ));
+                    }
+                    let bytes = serde_json::to_vec(value).map_err(|err| {
+                        format!(
+                            "question {} answered with an unserializable object: {err}",
+                            question.question_id
+                        )
+                    })?;
+                    if bytes.len() > MAX_STRUCTURED_BYTES {
+                        return Err(format!(
+                            "question {} answered with {} bytes, over the {} cap",
+                            question.question_id,
+                            bytes.len(),
+                            MAX_STRUCTURED_BYTES
+                        ));
+                    }
+                }
                 _ => {}
             }
             if let Some(confidence) = answer.confidence
@@ -264,6 +295,12 @@ pub enum DecisionValue {
     Ranking {
         order: Vec<String>,
     },
+    /// A JSON object. Only families that define their own field contract use
+    /// this; everything a backend returns still has to survive that contract
+    /// before it can influence anything.
+    Structured {
+        value: serde_json::Value,
+    },
 }
 
 impl DecisionValue {
@@ -274,6 +311,7 @@ impl DecisionValue {
             Self::Categorical { .. } => DecisionKind::Categorical,
             Self::Ordinal { .. } => DecisionKind::Ordinal,
             Self::Ranking { .. } => DecisionKind::Ranking,
+            Self::Structured { .. } => DecisionKind::Structured,
         }
     }
 }
@@ -479,6 +517,13 @@ impl DecisionTrace {
 /// context dump, and dumping context into a side model is the main model's job,
 /// not a side channel's. The cap is a fail-closed guard, not a tuning knob.
 pub const MAX_FACTS_BYTES: usize = 8192;
+
+/// The largest structured answer a backend may return for one question.
+///
+/// A structured answer is a record of a handful of fields, not a document. The
+/// cap keeps a backend from turning a fast decision into a context dump, and it
+/// is a fail-closed guard rather than a tuning knob.
+pub const MAX_STRUCTURED_BYTES: usize = 4096;
 
 /// The bounded state a decision is made over.
 ///
@@ -770,5 +815,41 @@ mod tests {
             !encoded.contains("Which tier"),
             "a trace must not copy the question prose: {encoded}"
         );
+    }
+
+    #[test]
+    fn a_structured_answer_must_be_a_bounded_object() {
+        let pack = QuestionPack::new(
+            DecisionFamily::new(DecisionFamily::INTENT_ADJUDICATION),
+            "v1",
+            vec![DecisionQuestion {
+                question_id: "relation".to_string(),
+                kind: DecisionKind::Structured,
+                prompt: "name the relation".to_string(),
+                options: Vec::new(),
+            }],
+        );
+        let answered = |value: serde_json::Value| {
+            DecisionResult::answered(
+                &pack,
+                vec![DecisionAnswer::new("relation", DecisionValue::Structured { value })],
+            )
+        };
+
+        assert!(
+            pack.validate(&answered(serde_json::json!({ "relation": "continue" }))).is_ok(),
+            "an object is the contract"
+        );
+
+        // Valid JSON is not the contract: the reader that follows expects
+        // fields, and a bare scalar has none.
+        let error = pack.validate(&answered(serde_json::json!("continue"))).unwrap_err();
+        assert!(error.contains("non-object"), "{error}");
+
+        // The cap is on the wire bytes, so a backend that echoes its
+        // transcript back cannot put it in the log by way of one long field.
+        let huge = serde_json::json!({ "reason": "x".repeat(MAX_STRUCTURED_BYTES) });
+        let error = pack.validate(&answered(huge)).unwrap_err();
+        assert!(error.contains("over the"), "{error}");
     }
 }

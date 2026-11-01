@@ -9,9 +9,12 @@
 //!
 //! What it deliberately does not do:
 //!
-//! - **Act.** A decision influences nothing here. The broker hands back a trace;
-//!   a caller that wants to act on one needs a mode this build refuses to grant
-//!   (see [`DecisionBrokerError::ModeNotAvailable`]).
+//! - **Act.** The broker hands back a trace and nothing else. Exactly one
+//!   family is built in `Advisory` — intent adjudication, whose consumer is the
+//!   kernel's own policy matrix — and even that one is constructed in
+//!   [`intent_adjudication`] rather than by a caller choosing a mode. Everything
+//!   else stays in shadow; see
+//!   [`DecisionBrokerError::ModeNotAvailable`].
 //! - **Persist.** Traces become durable events where they are produced — in the
 //!   loop — because the event store is not this crate's to write.
 //! - **Own a model.** The router is built around a route the caller chose, so
@@ -26,6 +29,7 @@
 pub mod assembly;
 pub mod broker;
 pub mod deadline;
+pub mod intent_adjudication;
 pub mod model_route;
 pub mod replay;
 pub mod router;

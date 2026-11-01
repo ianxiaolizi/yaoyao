@@ -18,6 +18,7 @@ use agent_ports::agent_loop::{
 use agent_ports::control::{ControlError, ControlHandler, ControlOutcome, ControlRequest};
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
 use agent_ports::instructions::{InstructionError, InstructionSource};
+use agent_ports::intent_adjudication::IntentAdjudicator;
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{EventSeq, InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::inbox::{InboxItem, InboxKind};
@@ -47,8 +48,8 @@ pub use report::RunReport;
 
 /// Drives runs: claims input, enforces a single active run, and settles turns.
 pub struct Scheduler {
-    store: Arc<dyn EventStore>,
-    inbox: Inbox,
+    pub(crate) store: Arc<dyn EventStore>,
+    pub(crate) inbox: Inbox,
     loop_: Arc<dyn AgentLoop>,
     max_steps: u32,
     /// The rest of the run's budget. `max_steps` above is the binding step
@@ -78,6 +79,7 @@ pub struct Scheduler {
     /// no capability layer rather than describing a boundary that does not
     /// exist.
     capability: Option<TurnCapabilityFacts>,
+    pub(crate) adjudicator: Option<Arc<dyn IntentAdjudicator>>,
 }
 
 /// Errors from Scheduler operations.
@@ -134,6 +136,7 @@ impl Scheduler {
             controls: Vec::new(),
             instructions: None,
             capability: None,
+            adjudicator: None,
         }
     }
 
@@ -302,6 +305,8 @@ impl Scheduler {
         // are appended as one, and a change made *between* turns is not part of
         // one.
         self.apply_controls(session_id).await?;
+        // Once per boundary: an `unclear` message's relation to the queued work.
+        self.adjudicate_pending(session_id).await?;
 
         let Some(item) = self.inbox.next_turn(session_id).await? else {
             return Ok(None);
@@ -844,8 +849,8 @@ impl Scheduler {
         Ok(inputs)
     }
 
-    async fn next_seq(&self, session_id: &SessionId) -> Result<EventSeq, SchedulerError> {
-        let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+    pub(crate) async fn next_seq(&self, session: &SessionId) -> Result<EventSeq, SchedulerError> {
+        let events = self.store.read_stream(session, EventSeq::ZERO, usize::MAX).await?;
         Ok(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO))
     }
 }

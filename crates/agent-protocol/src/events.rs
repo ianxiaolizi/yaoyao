@@ -122,6 +122,23 @@ impl EventType {
     /// it into "something outranked this" would make the log unable to say
     /// which of the two happened.
     pub const INTENT_CANCELLED: &'static str = "intent/cancelled";
+    /// The kernel asked the independent adjudicator what one message means for
+    /// the work in flight. Payload carries the route identity, model and pack
+    /// version, prompt and input digests, and the triggering rule — the inputs
+    /// by digest, never by content.
+    pub const INTENT_ADJUDICATION_REQUESTED: &'static str = "intent/adjudication.requested";
+    /// The adjudicator answered and the kernel decided. The payload keeps the
+    /// model's suggestion and the kernel's decision in separate fields, so a
+    /// reader can tell a misclassification from a bad policy.
+    pub const INTENT_ADJUDICATION_COMPLETED: &'static str = "intent/adjudication.completed";
+    /// No usable suggestion reached the kernel: the call failed, timed out, the
+    /// answer did not parse, or the confidence was too low. The kernel produced
+    /// no side effect and queued one minimal clarification question instead.
+    ///
+    /// Separate from `completed` for the reason `turn/cancelled` is separate
+    /// from `turn/failed`: the two are different answers to "what do I do now?"
+    /// and a reader should not have to inspect a payload to tell them apart.
+    pub const INTENT_ADJUDICATION_UNCLEAR: &'static str = "intent/adjudication.unclear";
     pub const TURN_CANCELLED: &'static str = "turn/cancelled";
     /// The tool definitions this turn offers, frozen once before the first
     /// request. `model/request.prepared` says which manifest was sent; this
@@ -297,6 +314,9 @@ impl EventType {
         Self::INTENT_RECORDED,
         Self::INTENT_SUPERSEDED,
         Self::INTENT_CANCELLED,
+        Self::INTENT_ADJUDICATION_REQUESTED,
+        Self::INTENT_ADJUDICATION_COMPLETED,
+        Self::INTENT_ADJUDICATION_UNCLEAR,
         Self::TURN_CANCELLED,
         Self::MODEL_TOOLS_FROZEN,
         Self::MODEL_REQUEST_PREPARED,

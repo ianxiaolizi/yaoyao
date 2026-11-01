@@ -11,6 +11,7 @@ use std::sync::Arc;
 use agent_config::ResolvedLaya;
 use agent_decision_laya::{LayaConfig, LayaConfigError, LayaDecisionProvider};
 use agent_ports::decision::{DecisionAdvisor, FastDecisionProvider};
+use agent_ports::intent_adjudication::IntentAdjudicator;
 use agent_ports::model_router::ModelRouter;
 
 /// Why the shadow stack could not be assembled.
@@ -20,8 +21,17 @@ pub enum AssembleError {
     Laya(#[from] LayaConfigError),
 }
 
-/// The router a run executes with, and the advisor that observes its choices.
-pub type DecisionStack = (Arc<dyn ModelRouter>, Arc<dyn DecisionAdvisor>);
+/// The router a run executes with, the advisor that observes its choices, and
+/// the adjudicator that resolves messages the rules could not.
+///
+/// The adjudicator is `None` when no sidecar was configured. Every other field
+/// is always present: the loop is always given a router, and a configured run
+/// is always given an advisor.
+pub struct DecisionStack {
+    pub router: Arc<dyn ModelRouter>,
+    pub advisor: Arc<dyn DecisionAdvisor>,
+    pub adjudicator: Option<Arc<dyn IntentAdjudicator>>,
+}
 
 /// Wrap `router` with the shadow advisor.
 ///
@@ -50,7 +60,14 @@ pub fn assemble(
         backends.push(Arc::new(LayaDecisionProvider::new(config)?));
     }
 
-    Ok(agent_decision::shadow_for(router, backends))
+    // The adjudicator is built from the same backend the shadow trace is, and
+    // before `shadow_for` takes ownership of the list. It is the same sidecar,
+    // not the same call: each adjudication is a separate request with its own
+    // bounded input, and it never sees the executing session's history.
+    let adjudicator =
+        agent_decision::intent_adjudication::adjudicator_for(backends.first().cloned());
+    let (router, advisor) = agent_decision::shadow_for(router, backends);
+    Ok(DecisionStack { router, advisor, adjudicator })
 }
 
 #[cfg(test)]
@@ -70,10 +87,11 @@ mod tests {
 
     #[test]
     fn a_run_with_no_sidecar_configured_assembles_without_one() {
-        let (_, advisor) = assemble(one_route(), None).expect("no sidecar is no problem");
+        let stack = assemble(one_route(), None).expect("no sidecar is no problem");
         // Nothing to assert about the advisor's insides from here; what matters
-        // is that the call is total and needs no configuration.
-        drop(advisor);
+        // is that the call is total and needs no configuration — and that no
+        // sidecar means no adjudicator rather than a broken one.
+        assert!(stack.adjudicator.is_none());
     }
 
     #[test]
@@ -97,7 +115,7 @@ mod tests {
 
     #[test]
     fn a_configured_sidecar_assembles_with_its_parameters() {
-        let (_, advisor) = assemble(
+        let stack = assemble(
             one_route(),
             Some(ResolvedLaya {
                 url: "http://127.0.0.1:8231".to_string(),
@@ -106,6 +124,8 @@ mod tests {
             }),
         )
         .expect("a loopback endpoint is what this build dials");
-        drop(advisor);
+        // The configured sidecar is what answers unclear messages; a stack
+        // without one would leave every ambiguity to the person.
+        assert!(stack.adjudicator.is_some());
     }
 }

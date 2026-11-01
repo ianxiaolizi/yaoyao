@@ -65,6 +65,25 @@ impl DecisionBroker {
         Ok(Self { mode, backends: Vec::new(), rule, timeout: DEFAULT_TIMEOUT })
     }
 
+    /// A broker in [`DecisionMode::Advisory`], for the one family whose
+    /// consumer re-checks every answer before acting.
+    ///
+    /// Promotion out of shadow is a per-family decision, and exactly one has
+    /// been made: intent adjudication (slice A3). Its consumer is the kernel's
+    /// decision matrix, which re-checks confidence, scope, and confirmation
+    /// before turning a relation into queue effects — and fails closed to a
+    /// clarification question on anything it cannot check. The advisor that
+    /// gives a turn its model route stays in shadow, because nothing downstream
+    /// re-checks it.
+    ///
+    /// Crate-private on purpose: the only caller is
+    /// [`crate::intent_adjudication::adjudicator_for`], so "this build runs an
+    /// advisory broker" is one line in one place rather than a mode any caller
+    /// can pick up. `Bounded` remains refused everywhere.
+    pub(crate) fn advisory(rule: Arc<dyn FastDecisionProvider>) -> Self {
+        Self { mode: DecisionMode::Advisory, backends: Vec::new(), rule, timeout: DEFAULT_TIMEOUT }
+    }
+
     /// Add a backend, tried in the order added.
     pub fn with_backend(mut self, backend: Arc<dyn FastDecisionProvider>) -> Self {
         self.backends.push(backend);

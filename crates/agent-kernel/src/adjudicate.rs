@@ -55,6 +55,23 @@ pub enum Route {
 }
 
 impl Route {
+    /// The wire spelling, recorded in the queued item's payload.
+    ///
+    /// Written down rather than re-derived at read time because the rule that
+    /// produced it is a function of the queue *as it was when the message
+    /// arrived*, and a later reader looking at a different queue would answer a
+    /// different question. Slice A3 reads this to find the messages the rules
+    /// could not route; nothing else should have to guess.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::NewTask => "new_task",
+            Self::Stop => "stop",
+            Self::NoRequest => "no_request",
+            Self::Unclear => "unclear",
+        }
+    }
+
     /// The kind recorded beside the instruction this route describes.
     ///
     /// `Unclear` records [`IntentKind::NewTask`] because that is the queue item
@@ -344,5 +361,8 @@ mod tests {
         assert_eq!(Route::Continue.intent_kind(), Some(IntentKind::Continuation));
         assert_eq!(Route::Stop.intent_kind(), Some(IntentKind::Interrupt));
         assert_eq!(Route::NoRequest.intent_kind(), None);
+
+        assert_eq!(Route::Unclear.as_str(), "unclear");
+        assert_eq!(Route::NewTask.as_str(), "new_task");
     }
 }

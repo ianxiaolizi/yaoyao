@@ -27,6 +27,15 @@ pub const SCHEDULED_DUE_AT: &str = "due_at";
 pub const SCHEDULED_TEXT: &str = "text";
 /// The payload key binding an item to the intent that asked for it.
 pub const INTENT_ID: &str = "intent_id";
+/// The payload key carrying what the rule layer made of the message that queued
+/// the item ([`crate::adjudicate::Route::as_str`]).
+///
+/// Recorded at write time because the route is a function of the queue as it
+/// was when the message arrived; a later reader looking at a different queue
+/// would answer a different question. Slice A3 reads this to find exactly the
+/// messages the rules left `unclear`, instead of re-running the rules against a
+/// queue they were not written for.
+pub const ROUTE: &str = "route";
 
 /// Why a queued instruction was discarded when a newer one displaced it.
 const SUPERSEDED_REASON: &str = "a newer instruction from the same person stands in its place";
@@ -381,7 +390,11 @@ impl Inbox {
                     "reason": "user_stop",
                     "intent_id": intent.intent_id,
                 }),
-                _ => serde_json::json!({ "text": text, "intent_id": intent.intent_id }),
+                _ => serde_json::json!({
+                    "text": text,
+                    "intent_id": intent.intent_id,
+                    "route": route.as_str(),
+                }),
             };
             drafts.push(self.draft(
                 session_id,

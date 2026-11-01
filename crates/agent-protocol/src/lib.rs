@@ -20,6 +20,7 @@ pub mod ids;
 pub mod inbox;
 pub mod instructions;
 pub mod intent;
+pub mod intent_adjudication;
 pub mod judgment;
 pub mod ledger;
 pub mod model;

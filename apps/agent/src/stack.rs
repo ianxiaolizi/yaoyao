@@ -46,6 +46,7 @@ use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::control::ControlHandler;
 use agent_ports::decision::DecisionAdvisor;
 use agent_ports::execution_environment::{ExecutionEnvironment, SandboxMode};
+use agent_ports::intent_adjudication::IntentAdjudicator;
 use agent_ports::memory_index::MemoryIndex;
 use agent_ports::memory_store::MemoryStore;
 use agent_ports::model_provider::{ModelProvider, ResolvedModelCapabilities};
@@ -74,6 +75,13 @@ use crate::plugins;
 use crate::providers::{self, ProviderConfigError, SelectedProvider};
 use crate::sandbox;
 use crate::subagents;
+
+/// What assembly hands the run: the router it executes with, the advisor that
+/// observes (or `None` when the run is unobserved), and the adjudicator that
+/// resolves messages the rules could not (or `None` when no sidecar is
+/// configured).
+type DecisionParts =
+    (Arc<dyn ModelRouter>, Option<Arc<dyn DecisionAdvisor>>, Option<Arc<dyn IntentAdjudicator>>);
 
 /// What the assembly needs that it cannot decide for itself.
 ///
@@ -978,20 +986,18 @@ pub async fn assemble_with_delegation(
 
     // Shadow decisions are assembled here, next to the provider they are built
     // from, and nowhere else decides which model a run talks to.
-    let (router, advisor): (Arc<dyn ModelRouter>, Option<Arc<dyn DecisionAdvisor>>) =
-        match decisions {
-            Decisions::FromConfiguration => {
-                let router = providers::router(selected.route.clone(), &routes);
-                let (router, advisor) =
-                    decisions::assemble(Arc::new(router), resolved.laya.clone())?;
-                (router, Some(advisor))
-            }
-            // No advisor, but still a router: the loop is always given one, and a
-            // run without an observation is a run whose choices are still routed.
-            Decisions::Unobserved => {
-                (Arc::new(providers::router(selected.route.clone(), &routes)), None)
-            }
-        };
+    let (router, advisor, adjudicator): DecisionParts = match decisions {
+        Decisions::FromConfiguration => {
+            let router = providers::router(selected.route.clone(), &routes);
+            let stack = decisions::assemble(Arc::new(router), resolved.laya.clone())?;
+            (stack.router, Some(stack.advisor), stack.adjudicator)
+        }
+        // No advisor, but still a router: the loop is always given one, and a
+        // run without an observation is a run whose choices are still routed.
+        Decisions::Unobserved => {
+            (Arc::new(providers::router(selected.route.clone(), &routes)), None, None)
+        }
+    };
     // Which advisors this run has is said out loud when there is something to
     // say. The snapshot records the same list, but a run that attached a
     // sidecar that is down would otherwise only be visible in the trace of a
@@ -1132,7 +1138,7 @@ pub async fn assemble_with_delegation(
     // the next turn executes under; the root is the same one the file boundary
     // was built over, so "the workspace" is one place in both places.
     let instructions = Arc::new(WorkspaceInstructions::new(workspace_root.clone()));
-    let scheduler = Scheduler::new(store.clone(), loop_, snapshot.budget.max_steps)
+    let mut scheduler = Scheduler::new(store.clone(), loop_, snapshot.budget.max_steps)
         .with_profile_snapshot(snapshot)
         .with_control_handlers(controls)?
         .with_instructions(instructions)
@@ -1140,6 +1146,13 @@ pub async fn assemble_with_delegation(
         // These are the same two facts the environment was built over, not a
         // second reading of the environment.
         .with_capability(TurnCapabilityFacts { sandbox, network_allowed, tool_secrets });
+    // The same sidecar that observes routes is asked what an unclear message
+    // means — a second, independent call with its own bound context, never a
+    // continuation of the executing session. No sidecar means no adjudicator,
+    // and unclear messages then keep their turns unadjudicated.
+    if let Some(adjudicator) = adjudicator {
+        scheduler = scheduler.with_intent_adjudicator(adjudicator);
+    }
     // Every in-process backend is handed the run its children execute on: this
     // scheduler with the child's loop in place of the parent's, and the request's
     // own budget applied at each spawn on top of it. Done here because this run

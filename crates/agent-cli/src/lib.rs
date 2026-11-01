@@ -731,6 +731,7 @@ pub async fn run_status(
             "answered_intent_id": answered_intent,
             "stale_answer": report.stale_answer,
             "stale_items": report.stale_items.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            "intent_adjudication": report.intent_adjudication,
         });
         Ok(CliOutput::Json(json_output(&value)?))
     } else {
@@ -760,8 +761,39 @@ pub async fn run_status(
                 report.stale_items.iter().map(|id| id.as_str()).collect::<Vec<_>>().join(", ")
             ));
         }
+        if let Some(adjudication) = &report.intent_adjudication {
+            lines.push(adjudication_line(adjudication));
+            if let Some(question) = &adjudication.question {
+                // The kernel's one question for a person. It is printed here
+                // rather than asked inline: `status` is read-only, and a
+                // question a command blocks on would be a new prompt surface.
+                lines.push(format!("question:  {question}"));
+            }
+        }
         Ok(CliOutput::Text(lines.join("\n")))
     }
+}
+
+/// One line describing the latest intent adjudication.
+///
+/// The relation and the confidence are the model's; the decision and the cause
+/// are the kernel's. Both are shown because the whole point of recording them
+/// apart is that a reader can tell which one went wrong.
+fn adjudication_line(status: &agent_kernel::intent_adjudication::AdjudicationStatus) -> String {
+    let mut line = format!("adjudicated: {}", status.decision.as_deref().unwrap_or("-"));
+    if let Some(relation) = &status.relation {
+        line.push_str(&format!(" (relation {relation}"));
+        if let Some(confidence) = status.confidence {
+            line.push_str(&format!(", confidence {confidence:.2}"));
+        }
+        line.push(')');
+    }
+    if let Some(cause) = &status.cause
+        && cause != "accepted"
+    {
+        line.push_str(&format!(" cause: {cause}"));
+    }
+    line
 }
 
 /// Execute the `approve` command: record a grant decision for a pending approval

@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod event_store;
 pub mod execution_environment;
 pub mod instructions;
+pub mod intent_adjudication;
 pub mod live_event_bus;
 pub mod memory_index;
 pub mod memory_store;
