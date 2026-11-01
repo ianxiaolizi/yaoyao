@@ -70,6 +70,7 @@ id_newtype!(MessageUid, "Stable identifier for one model-visible message.");
 id_newtype!(AttemptId, "Unique identifier for one model-invocation attempt.");
 id_newtype!(SchemaVersion, "Version tag for event schema evolution.");
 id_newtype!(PluginId, "Stable identifier of a Plugin, from its manifest.");
+id_newtype!(SnapshotId, "Unique identifier for one workspace snapshot.");
 
 impl SchemaVersion {
     /// The schema version this build stamps into every event envelope and

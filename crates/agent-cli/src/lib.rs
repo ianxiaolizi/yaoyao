@@ -14,6 +14,7 @@ use agent_kernel::approval::{ApprovalAuthority, ApprovalService};
 use agent_kernel::doctor::KernelDoctor;
 use agent_kernel::fork::{Fork, ForkOutcome};
 use agent_kernel::inbox::Inbox;
+use agent_kernel::permission::{PermissionService, WorkspaceRecord};
 use agent_kernel::recovery::RecoveryReport;
 use agent_kernel::resume::{Disposition, Resume, ResumeOutcome};
 use agent_kernel::scheduler::{RunReport, Scheduler};
@@ -22,12 +23,14 @@ use agent_ports::artifact_store::{ArtifactStore, ArtifactStoreError};
 use agent_ports::event_store::EventStore;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolInvocation;
+use agent_ports::workspace_snapshot::WorkspaceSnapshotter;
 use agent_protocol::diagnostics::HealthStatus;
 use agent_protocol::events::{EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, IntentId, SchemaVersion, SessionId, TurnId};
 use agent_protocol::permissions::{ApprovalScope, ArtifactRef};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::ToolStatus;
+use agent_protocol::workspace_snapshot::RollbackReport;
 use chrono::{DateTime, Utc};
 
 /// The one shape a rendered `--json` answer has.
@@ -1485,4 +1488,101 @@ fn scope_label(scope: ApprovalScope) -> &'static str {
         ApprovalScope::AllowForTurn => "turn",
         ApprovalScope::AllowForSession => "session",
     }
+}
+
+/// Restore the workspace to `snapshot_id`, and say what it did.
+///
+/// The restore itself is the snapshotter's; what lives here is the two things a
+/// command owes around it. First, the ledger: a rollback is a fact about this
+/// session — it changed the files a call under this session had changed — so it
+/// is written to the same stream as the snapshot it undoes, and a ledger that
+/// cannot take the write is a refused command rather than a silent one. Second,
+/// the report: restored, removed, skipped and what the snapshot never covered,
+/// because "restored 12" without the skips is a number a person cannot check.
+///
+/// A snapshot that is unknown, corrupt, or whose manifest names paths that
+/// escape the workspace is `DidNotRun` with the reason as its answer: the
+/// command could not put anything back, and saying which of those it was is the
+/// only useful thing it can do.
+pub async fn run_rollback(
+    snapshots: &dyn WorkspaceSnapshotter,
+    permissions: &PermissionService,
+    session: &SessionId,
+    snapshot_id: &str,
+    json: bool,
+) -> Result<CliOutcome, String> {
+    let report: RollbackReport = match snapshots.restore(snapshot_id).await {
+        Ok(report) => report,
+        Err(error) => {
+            let text = format!("cannot roll back: {error}");
+            return Ok(CliOutcome::did_not_run(if json {
+                CliOutput::Json(json_output(&serde_json::json!({
+                    "snapshot_id": snapshot_id,
+                    "rolled_back": false,
+                    "reason": error.to_string(),
+                }))?)
+            } else {
+                CliOutput::Text(text)
+            }));
+        }
+    };
+    permissions
+        .record_workspace(
+            session,
+            WorkspaceRecord {
+                event_type: EventType::WORKSPACE_ROLLBACK_COMPLETED,
+                payload: serde_json::to_value(&report).map_err(|e| e.to_string())?,
+                recorded_at: Utc::now(),
+            },
+        )
+        .await
+        .map_err(|e| format!("the rollback happened but could not be recorded: {e}"))?;
+
+    let output = if json {
+        CliOutput::Json(json_output(&serde_json::json!({
+            "snapshot_id": report.snapshot_id.to_string(),
+            "restored": report.restored,
+            "removed": report.removed,
+            "skipped": report.skipped,
+            "unrecoverable_scope": report.unrecoverable_scope,
+            "complete": report.complete,
+        }))?)
+    } else {
+        let mut text = format!(
+            "restored {}, removed {}, skipped {}",
+            report.restored.len(),
+            report.removed.len(),
+            report.skipped.len()
+        );
+        for path in &report.restored {
+            text.push_str(&format!(
+                "
+  restored {path}"
+            ));
+        }
+        for path in &report.removed {
+            text.push_str(&format!(
+                "
+  removed {path}"
+            ));
+        }
+        for skip in &report.skipped {
+            text.push_str(&format!(
+                "
+  skipped {}: {}",
+                skip.relative_path, skip.reason
+            ));
+        }
+        // Repeated rather than referenced: a person reading this after a
+        // rollback is asking what is *not* back, and the manifest is not in
+        // front of them.
+        for scope in &report.unrecoverable_scope {
+            text.push_str(&format!(
+                "
+  not covered: {scope}"
+            ));
+        }
+        CliOutput::Text(text)
+    };
+    Ok(if report.complete { CliOutcome::ok(output) } else { CliOutcome::failed(output) })
 }

@@ -320,6 +320,25 @@ impl EventType {
     /// value: the plaintext has no field to sit in here, so no later change to
     /// a redactor can let one in (CONTRACT §7 #181).
     pub const SECRET_ACCESSED: &'static str = "secret/accessed";
+    /// A recovery point was taken before a call that may change the workspace.
+    ///
+    /// Written before the call runs, and carrying the manifest hash rather than
+    /// the manifest: the entries are content-addressed artifacts, and a reader
+    /// that wants them asks the artifact store by the hash they were recorded
+    /// under. A capture that failed writes nothing and the call does not run —
+    /// there is no "ran without a recovery point" state to record.
+    pub const WORKSPACE_SNAPSHOT_CREATED: &'static str = "workspace/snapshot.created";
+    /// What a call changed, compared against the snapshot taken before it.
+    ///
+    /// Written after the call whatever the result was: a tool that failed may
+    /// still have written half a file, and "the call failed" is not a claim
+    /// about the workspace.
+    pub const WORKSPACE_CHANGES_RECORDED: &'static str = "workspace/changes.recorded";
+    /// A rollback finished, and what it did to each path.
+    ///
+    /// Written by the command that restores, not by the crash-recovery path:
+    /// this build rolls back only what a person or a web API asks it to.
+    pub const WORKSPACE_ROLLBACK_COMPLETED: &'static str = "workspace/rollback.completed";
     /// One fast-decision call's trace. An observation, never an input
     /// to anything in this build: the shadow mode is what makes that true.
     pub const DECISION_TRACE: &'static str = "decision/trace";
@@ -447,6 +466,9 @@ impl EventType {
         Self::APPROVAL_REVOKED,
         Self::PERMISSION_DECISION,
         Self::SECRET_ACCESSED,
+        Self::WORKSPACE_SNAPSHOT_CREATED,
+        Self::WORKSPACE_CHANGES_RECORDED,
+        Self::WORKSPACE_ROLLBACK_COMPLETED,
         Self::DECISION_TRACE,
         Self::PLUGIN_LOADED,
         Self::PLUGIN_UNLOADED,

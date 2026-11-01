@@ -383,6 +383,30 @@ impl Verdict {
 /// person in the same way spawning a process does, and for the same reason: it
 /// changes something outside the run. A grant, once given, is what stops the
 /// question being asked again.
+/// Why each requested capability was refused, and by which layer.
+///
+/// The capability alone was the whole of the old message, and it said "denied by
+/// policy" for every layer there is — including the two that are not policy at
+/// all. A capability the sandbox does not provide is not a decision anyone made;
+/// it is a fact about this build, and the two are fixed in different places.
+///
+/// The list is empty exactly when the decision was not `Deny`, so this is only
+/// ever asked about a capability that really was refused.
+///
+/// Built from the record that is about to be written, not from a second walk of
+/// the engine: the sentence a person reads and the `policy.refusals` map beside
+/// it in the log are one fact, and two producers of one fact are two things
+/// that can disagree.
+pub(crate) fn deny_reason(refusals: &std::collections::BTreeMap<Capability, Refusal>) -> String {
+    refusals
+        .iter()
+        .map(|(capability, layer)| {
+            format!("capability {} {}", capability.as_str(), layer.described())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub fn default_policy() -> PolicyEngine {
     default_policy_with(&default_sandbox_capabilities())
 }

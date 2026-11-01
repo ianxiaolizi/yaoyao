@@ -34,6 +34,7 @@ mod scrub;
 mod secret_refs;
 pub mod session_archive;
 pub mod session_lifecycle;
+mod snapshot;
 pub mod state;
 pub mod status;
 pub mod subagent;

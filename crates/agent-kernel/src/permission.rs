@@ -242,6 +242,16 @@ impl SecretAccessRecord {
     }
 }
 
+/// One workspace fact, ready to be appended beside the permission decisions.
+///
+/// The timestamp is an input like everywhere else in this kernel: the caller
+/// stamps it where the fact was produced, and the append does not read a clock.
+pub struct WorkspaceRecord {
+    pub event_type: &'static str,
+    pub payload: serde_json::Value,
+    pub recorded_at: DateTime<Utc>,
+}
+
 /// The origin an action reaches, if it reaches one.
 ///
 /// Built from the action's targets rather than from the arguments: a target is
@@ -309,6 +319,22 @@ impl PermissionService {
         let payload = serde_json::to_value(&record)?;
         self.append(session_id, EventType::SECRET_ACCESSED, payload, record.recorded_at).await?;
         Ok(record)
+    }
+
+    /// Write one workspace fact to the same log the decisions live in.
+    ///
+    /// Snapshots, change lists and rollbacks belong in the session's stream:
+    /// they are facts about an action that was taken under this session, and a
+    /// reader following a turn must not have to join a second log to see what
+    /// the turn did to the files. The event type is handed in rather than
+    /// chosen here, because the writer (the gateway, or the rollback command)
+    /// is what knows which fact it is writing.
+    pub async fn record_workspace(
+        &self,
+        session_id: &SessionId,
+        record: WorkspaceRecord,
+    ) -> Result<(), PermissionError> {
+        self.append(session_id, record.event_type, record.payload, record.recorded_at).await
     }
 
     /// Append one ledger event at the end of the session's log.

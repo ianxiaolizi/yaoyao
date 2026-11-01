@@ -19,6 +19,7 @@ use agent_ports::tool_gateway::{ToolGateway, ToolGatewayError};
 use agent_ports::tool_provider::{
     ToolDefinition, ToolInvocation, ToolProvider, ToolResult, ToolSideEffect,
 };
+use agent_ports::workspace_snapshot::WorkspaceSnapshotter;
 use agent_protocol::ids::{ApprovalId, SessionId};
 use agent_protocol::permission::ActionFacts;
 use agent_protocol::permissions::{Capability, PolicyDecision};
@@ -27,7 +28,7 @@ use agent_protocol::tool::ToolPolicyRecord;
 
 use crate::approval::ApprovalService;
 use crate::permission::{PermissionBaseline, PermissionDecisionRecord, PermissionService};
-use crate::policy::{PolicyContext, PolicyEngine, Refusal};
+use crate::policy::{PolicyContext, PolicyEngine};
 use crate::resource_guard::ResourceGuard;
 use crate::scrub::{
     PREVIEW_HEAD_BYTES, PREVIEW_TAIL_BYTES, ResolvedSecret, exceeds_offload_limits,
@@ -74,6 +75,10 @@ pub struct GuardedToolProvider {
     /// and the policy's own answer stands. A judge that *is* installed and then
     /// cannot answer is the case that stops for a person (CONTRACT §7 #177).
     classifier: Option<Arc<dyn PermissionClassifier>>,
+    /// Where a recovery point is taken before a call that may change files
+    /// (B8). `None` is a gateway assembled without one — a fixture, or a unit
+    /// test of another layer. The binary always hands one over.
+    snapshot: Option<Arc<dyn WorkspaceSnapshotter>>,
     /// The backend this gateway's calls would run under (B5).
     ///
     /// The gateway is the only layer holding the action *and* the backend at
@@ -108,6 +113,7 @@ impl GuardedToolProvider {
             secrets: None,
             permissions: None,
             classifier: None,
+            snapshot: None,
             sandbox_mode: SandboxMode::LocalProcess,
             offload_max_bytes: OFFLOAD_MAX_BYTES,
             schema: SchemaCheck::new(),
@@ -152,6 +158,17 @@ impl GuardedToolProvider {
     /// provider error can be scrubbed with them.
     pub fn with_secrets(mut self, secrets: Arc<dyn SecretProvider>) -> Self {
         self.secrets = Some(secrets);
+        self
+    }
+
+    /// Take a recovery point before every call that may change files.
+    ///
+    /// The snapshot is taken before the provider runs and compared against the
+    /// workspace after it; a capture that fails stops the call (CONTRACT §7
+    /// #182). `None` — the default — is a gateway with no snapshotter: the same
+    /// decisions, no recovery points.
+    pub fn with_snapshotter(mut self, snapshot: Arc<dyn WorkspaceSnapshotter>) -> Self {
+        self.snapshot = Some(snapshot);
         self
     }
 
@@ -420,11 +437,18 @@ impl GuardedToolProvider {
             secrets,
         )
         .await?;
-        let result = self
-            .inner
-            .invoke(resolved_invocation)
-            .await
-            .map_err(|error| ToolGatewayError::Tool(scrub_provider_error(error, secrets)))?;
+        let recovery = crate::snapshot::RecoveryContext {
+            snapshotter: self.snapshot.as_deref(),
+            permissions: self.permissions.as_deref(),
+            guard: &self.guard,
+            session_id,
+        };
+        let dispatch = self.inner.side_effect(&action.tool_name);
+        let point = recovery.capture(action, resolved_invocation, dispatch).await?;
+        let result = self.inner.invoke(resolved_invocation).await;
+        recovery.settle(point, &action.tool_name).await?;
+        let result =
+            result.map_err(|error| ToolGatewayError::Tool(scrub_provider_error(error, secrets)))?;
         // The decision is the gate's to state. A provider that filled the field
         // is stating a decision it did not make, so it is cleared here and only
         // a caller that actually decided — `execute` — sets it afterwards.
@@ -714,7 +738,7 @@ impl ToolGateway for GuardedToolProvider {
                     "declares no capabilities, and an undeclared surface is not an unlimited one"
                         .to_string()
                 } else {
-                    deny_reason(&record.refusals)
+                    crate::policy::deny_reason(&record.refusals)
                 };
                 // A refusal the classifier made is recorded against the
                 // policy's own answer plus the trace, so the written decision
@@ -832,30 +856,6 @@ impl ToolGateway for GuardedToolProvider {
             .filter(|definition| self.policy.could_allow(&definition.capability_requirements))
             .collect()
     }
-}
-
-/// Why each requested capability was refused, and by which layer.
-///
-/// The capability alone was the whole of the old message, and it said "denied by
-/// policy" for every layer there is — including the two that are not policy at
-/// all. A capability the sandbox does not provide is not a decision anyone made;
-/// it is a fact about this build, and the two are fixed in different places.
-///
-/// The list is empty exactly when the decision was not `Deny`, so this is only
-/// ever asked about a capability that really was refused.
-///
-/// Built from the record that is about to be written, not from a second walk of
-/// the engine: the sentence a person reads and the `policy.refusals` map beside
-/// it in the log are one fact, and two producers of one fact are two things
-/// that can disagree.
-fn deny_reason(refusals: &std::collections::BTreeMap<Capability, Refusal>) -> String {
-    refusals
-        .iter()
-        .map(|(capability, layer)| {
-            format!("capability {} {}", capability.as_str(), layer.described())
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 /// How many leading characters two names have in common.
@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(policy.decision, PolicyDecision::Deny);
         assert_eq!(
             policy.refusals.get(&Capability::new(Capability::PROCESS_SPAWN)),
-            Some(&Refusal::Rule),
+            Some(&crate::policy::Refusal::Rule),
             "{policy:?}"
         );
         // The sentence and the record are one fact, not two that can drift.
@@ -1264,7 +1264,7 @@ mod tests {
         };
         assert_eq!(
             policy.refusals.get(&Capability::new(Capability::NETWORK_REQUEST)),
-            Some(&Refusal::SandboxUnavailable),
+            Some(&crate::policy::Refusal::SandboxUnavailable),
             "{policy:?}"
         );
         assert!(tools.calls().is_empty(), "neither refused call reached the provider");
@@ -2212,4 +2212,7 @@ mod tests {
     #[cfg(test)]
     #[path = "secrets.rs"]
     mod secrets;
+    #[cfg(test)]
+    #[path = "snapshot.rs"]
+    mod snapshot;
 }

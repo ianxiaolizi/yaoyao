@@ -9,6 +9,7 @@ license.workspace = true
 agent-protocol = { path = "../agent-protocol" }
 agent-ports = { path = "../agent-ports" }
 async-trait = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 encoding_rs = { workspace = true }
 sha2 = { workspace = true }

@@ -57,6 +57,7 @@ use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_ports::verifier::CommandVerifier;
+use agent_ports::workspace_snapshot::WorkspaceSnapshotter;
 use agent_protocol::ids::SessionId;
 use agent_protocol::model::{
     ModelCapabilities, ModelCapabilitySource, ModelRoute, ModelTier, ReasoningEffort,
@@ -68,7 +69,8 @@ use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
 use agent_store_secret::EnvSecretProvider;
 use agent_tools_fs::{
-    EnvCommandVerifier, FsToolProvider, LocalExecutionEnvironment, SandboxedFileEnvironment,
+    EnvCommandVerifier, FsToolProvider, FsWorkspaceSnapshotter, LocalExecutionEnvironment,
+    SandboxedFileEnvironment,
 };
 use agent_tools_git::GitToolProvider;
 use agent_tools_web::{NetworkAllowlist, WebToolProvider};
@@ -441,6 +443,14 @@ pub struct Runtime {
     /// The run's one artifact store: the MCP adapter and the gateway's own
     /// output offload both write here.
     pub artifacts: Arc<dyn ArtifactStore>,
+    /// The snapshotter the gateway takes recovery points with (B8), kept so
+    /// `agent rollback` restores through the same object rather than opening a
+    /// second view of the snapshot index.
+    pub snapshots: Arc<dyn WorkspaceSnapshotter>,
+    /// The decision ledger, kept for the same reason: a rollback is a fact
+    /// about this session, and it belongs in the session's stream. The gateway
+    /// holds its own clone; this is the command's way in.
+    pub permissions: Arc<PermissionService>,
     /// Structured checks, run against the same execution backend the tools
     /// use — so a check is confined, deadline-bounded and env-scrubbed exactly
     /// as a tool call is, and `agent verify` cannot become a way around the
@@ -966,6 +976,15 @@ pub async fn assemble_over(
     // not have to know which of them wrote it.
     let artifacts: Arc<dyn ArtifactStore> =
         Arc::new(FsArtifactStore::new(data_dir.join("artifacts")));
+    // The recovery point every workspace-changing call is made under (B8). One
+    // snapshotter, built here beside the store its blobs live in: the gateway
+    // takes the points and `agent rollback` restores them, and two of them
+    // built in two places would be two answers to "where is snapshot 7?".
+    let snapshots: Arc<dyn WorkspaceSnapshotter> = Arc::new(FsWorkspaceSnapshotter::new(
+        workspace_root.clone(),
+        artifacts.clone(),
+        data_dir.join("snapshots"),
+    ));
     let registry = Arc::new(PluginRegistry::new(store.clone()).with_reserved_tools(reserved));
     let servers = reachable_servers(plugins::server_specs(&resolved), &advertised);
     let suppressed = match plugins::suppressed(store.as_ref(), &session).await {
@@ -1090,7 +1109,8 @@ pub async fn assemble_over(
     .with_secrets(Arc::new(EnvSecretProvider::new(
         tool_secrets.iter().map(|secret| secret.name.clone()),
     )))
-    .with_permission_service(permissions.clone());
+    .with_permission_service(permissions.clone())
+    .with_snapshotter(snapshots.clone());
     if let Some(classifier) = &classifier {
         gateway = gateway.with_permission_classifier(classifier.clone());
     }
@@ -1293,6 +1313,8 @@ pub async fn assemble_over(
         registry,
         tools,
         artifacts,
+        snapshots,
+        permissions,
         verifier,
         children,
     })

@@ -2276,3 +2276,72 @@ fn deleting_a_session_another_process_is_driving_is_refused() {
     assert_eq!(deleted.code, Some(0), "{}", deleted.err);
     assert!(!log_file(data.path(), "held").exists());
 }
+
+/// A write is snapshotted before it runs, and `agent rollback` puts it back.
+///
+/// The whole slice through the real binary: the tool call takes a recovery
+/// point, the session log says so, and a later invocation of a *different*
+/// process restores the file from the id alone. Idempotence is checked by
+/// asking twice — a second rollback must find nothing to do, not fail and not
+/// rewrite.
+#[test]
+fn a_write_is_recoverable_and_rollback_restores_it() {
+    let (data, workspace) = dirs();
+    let file = workspace.path().join("notes.txt");
+    // A file that already exists, so the recovery point holds its *previous*
+    // bytes rather than its absence: rolling back has to bring the content
+    // back, not merely delete what the call added.
+    std::fs::write(&file, "zero").unwrap();
+
+    let write = serde_json::json!({ "path": "notes.txt", "content": "one" }).to_string();
+    let r = ran(data.path(), workspace.path(), &["tool", "fs.write", &write]);
+    assert_eq!(r.code, Some(0), "the write ran: {} {}", r.out, r.err);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one");
+
+    let log = std::fs::read_to_string(log_file(data.path(), "default")).expect("the log");
+    let snapshot = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("an event"))
+        .rfind(|line| line["event"]["event_type"] == "workspace/snapshot.created")
+        .expect("the write took a recovery point");
+    let snapshot_id =
+        snapshot["event"]["payload"]["snapshot_id"].as_str().expect("an id").to_string();
+    assert!(
+        log.contains("workspace/changes.recorded"),
+        "what the call changed is recorded too: {log}"
+    );
+
+    // Something else changes the file after the fact — the case a rollback is
+    // for: the recovery point is what the file looked like *before* the call.
+    std::fs::write(&file, "two").unwrap();
+
+    let rolled = ran(data.path(), workspace.path(), &["rollback", &snapshot_id]);
+    assert_eq!(
+        rolled.code,
+        Some(0),
+        "rollback said {:?} ({} {})",
+        rolled.code,
+        rolled.out,
+        rolled.err
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "zero");
+    assert!(rolled.out.contains("restored 1"), "{}", rolled.out);
+    assert!(rolled.out.contains("notes.txt"), "{}", rolled.out);
+
+    let after = std::fs::read_to_string(log_file(data.path(), "default")).unwrap();
+    assert!(after.contains("workspace/rollback.completed"), "the rollback is in the log");
+
+    let again = ran(data.path(), workspace.path(), &["rollback", &snapshot_id]);
+    assert_eq!(again.code, Some(0), "a second rollback is a no-op: {}", again.err);
+    assert!(again.out.contains("restored 0"), "{}", again.out);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "zero");
+}
+
+/// An unknown snapshot id is a refusal, not a panic and not a success.
+#[test]
+fn a_rollback_of_an_unknown_snapshot_does_not_run() {
+    let (data, workspace) = dirs();
+    let r = ran(data.path(), workspace.path(), &["rollback", "no-such-snapshot"]);
+    assert_eq!(r.code, Some(2), "said {:?} ({} {})", r.code, r.out, r.err);
+    assert!(r.out.contains("no-such-snapshot"), "the answer names it: {}", r.out);
+}

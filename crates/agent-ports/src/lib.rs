@@ -28,3 +28,4 @@ pub mod subagent;
 pub mod tool_gateway;
 pub mod tool_provider;
 pub mod verifier;
+pub mod workspace_snapshot;

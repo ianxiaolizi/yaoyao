@@ -131,6 +131,15 @@ pub enum ToolGatewayError {
     /// saw it; what is missing is the record of why.
     #[error("tool '{tool}' was not run: its permission decision could not be recorded: {reason}")]
     PermissionAudit { tool: String, reason: String },
+    /// The recovery point this call needed could not be taken, so the call did
+    /// not run.
+    ///
+    /// A refusal rather than a warning: the alternative — running a write with
+    /// no way back — is the state this gate exists to make unreachable. The
+    /// reason carries the snapshotter's own answer (over budget, a reparse
+    /// point, an unwritable store), which is what a caller has to change.
+    #[error("tool '{tool}' was not run: no recovery point could be taken: {reason}")]
+    SnapshotRefused { tool: String, reason: String },
     #[error("tool execution failed: {0}")]
     Tool(ToolProviderError),
     #[error("approval service failed: {0}")]
@@ -153,6 +162,10 @@ impl ToolGatewayError {
             Self::InvalidArguments { .. } => Some(ToolErrorKind::InvalidArguments),
             Self::InvalidSchema { .. } => Some(ToolErrorKind::Protocol),
             Self::SecretUnavailable { kind, .. } => Some(*kind),
+            // Nothing behind the tool was reached: the recovery point it needed
+            // could not be taken. That is an unavailable dependency, not a
+            // judgement about the call.
+            Self::SnapshotRefused { .. } => Some(ToolErrorKind::Unavailable),
             Self::Tool(error) => Some(error.kind()),
             // Not a class of refusal the world gave: the gate could not write
             // its own record. `None` leaves `error_kind` off the event, which

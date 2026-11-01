@@ -87,6 +87,22 @@ impl ResourceGuard {
         }
     }
 
+    /// The writable roots, as the guard canonicalized them.
+    ///
+    /// Handed out because a recovery point has to cover exactly what a write
+    /// is allowed to touch, and a second derivation of that list — from the
+    /// configuration, say — is a second answer to the same question. An empty
+    /// list means "the whole workspace", which the caller turns into the
+    /// workspace root.
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        &self.writable_roots
+    }
+
+    /// The workspace root the guard anchors relative paths to.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     fn reaches_an_external_directory(&self, canonical: &Path) -> bool {
         self.external_directories.iter().any(|ext| is_within(canonical, ext))
     }

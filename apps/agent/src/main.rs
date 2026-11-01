@@ -25,6 +25,7 @@ mod support;
 use commands::approval::{approve, deny, tool};
 use commands::inspect::{artifact, context, memory, metrics};
 use commands::plugin::plugin;
+use commands::rollback::rollback;
 use commands::sandbox::{doctor, sandbox_command};
 use commands::schedule::{schedule, tick};
 use commands::session::session;
@@ -144,6 +145,7 @@ async fn main() {
         "context" => context(&args).await,
         "metrics" => metrics(&args).await,
         "artifact" => artifact(&args).await,
+        "rollback" => rollback(&args).await,
         "sandbox" => sandbox_command(&args),
         "subagent" => subagent(&args).await,
         other => {
@@ -196,6 +198,7 @@ pub(crate) fn usage() {
          context inspect            Show what the next request would carry (size, kinds, budget)\n  \
          metrics [--out <path>]     Count turns, tools, approvals, tokens and time\n                              from the event log (every session unless --session names one)\n  \
          artifact get <ref> [--out] Fetch a stored blob (locator or hash). Text to stdout otherwise\n  \
+         rollback <snapshot_id>     Restore the workspace to a recovery point; --session names\n                              the log the rollback is recorded in\n  \
          sandbox setup              Create the AppContainer profile and its grants (elevated)\n  \
          sandbox status             Report whether the AppContainer setup is in place\n  \
          doctor                     Run health checks\n\n\

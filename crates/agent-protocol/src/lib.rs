@@ -41,3 +41,4 @@ pub mod tool;
 pub mod usertext;
 pub mod verification;
 pub mod versioning;
+pub mod workspace_snapshot;
