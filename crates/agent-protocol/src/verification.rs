@@ -22,6 +22,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::apparatus::ApparatusSpec;
 use crate::evidence::EvidenceStatus;
 
 /// The deadline a check gets when the caller names none.
@@ -57,6 +58,14 @@ pub struct CheckSpec {
     pub cwd: Option<String>,
     #[serde(default = "default_timeout", skip_serializing_if = "is_default_timeout")]
     pub timeout_ms: u64,
+    /// The files this check is graded against, when the check declares them.
+    ///
+    /// Empty means "the check says nothing about its apparatus": the evidence
+    /// then carries no manifest, and a session that has frozen one treats an
+    /// unstated apparatus as a pass it cannot stand behind
+    /// ([`crate::apparatus`], CONTRACT §7 #172).
+    #[serde(default, skip_serializing_if = "ApparatusSpec::is_empty")]
+    pub apparatus: ApparatusSpec,
     #[serde(default)]
     pub expect: Expectation,
 }
@@ -154,6 +163,29 @@ pub struct CheckJudgement {
 }
 
 impl CheckRun {
+    /// The shape of a check that never started.
+    ///
+    /// Used when the *setup* failed — an apparatus that could not be read, a
+    /// spec this build could not honour — so the log still carries a record of
+    /// the attempt. [`Self::judge`] reads it as `error`, which is the point:
+    /// nothing about the task follows from a check that did not run.
+    pub fn not_run(started_at: DateTime<Utc>, failure: String) -> Self {
+        Self {
+            started_at,
+            finished_at: started_at,
+            exit_code: None,
+            timed_out: false,
+            stdout_sha256: String::new(),
+            stdout_bytes: 0,
+            stderr_sha256: String::new(),
+            stderr_bytes: 0,
+            contains_expected: None,
+            tests_passed: None,
+            environment_hash: String::new(),
+            failure: Some(failure),
+        }
+    }
+
     /// Judge this run against what the operator expected.
     ///
     /// The order is the order of how much a fact can be trusted:
@@ -354,6 +386,7 @@ mod tests {
             args: vec!["test".to_string(), "--".to_string(), "a b".to_string()],
             cwd: None,
             timeout_ms: 1,
+            apparatus: ApparatusSpec::default(),
             expect: Expectation::default(),
         };
         assert_eq!(spec.command_line(), r#"cargo test -- "a b""#);

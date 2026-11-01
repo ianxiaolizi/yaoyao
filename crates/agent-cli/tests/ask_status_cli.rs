@@ -774,6 +774,7 @@ fn scheduler_with_criterion(command: &str) -> (Scheduler, Arc<FakeEventStore>, S
             url: None,
             interval_steps: 1,
             timeout_ms: 1_000,
+            apparatus: Vec::new(),
         }),
         ..snapshot_with_budget(RunBudget::default())
     };

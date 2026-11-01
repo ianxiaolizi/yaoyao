@@ -10,6 +10,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod apparatus;
 pub mod compaction;
 pub mod decision;
 pub mod diagnostics;

@@ -45,6 +45,7 @@ fn criterion(interval_steps: u32) -> CompletionSpec {
         url: None,
         interval_steps,
         timeout_ms: 1_000,
+        apparatus: Vec::new(),
     }
 }
 

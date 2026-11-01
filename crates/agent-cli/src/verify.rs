@@ -56,6 +56,11 @@ pub async fn run_verify(
             "tests_passed": evidence.tests_passed,
             "task_revision": evidence.task_revision,
             "environment_hash": evidence.environment_hash,
+            "apparatus_hash": evidence.input_manifest_hash,
+            "apparatus_files": recorded
+                .apparatus
+                .as_ref()
+                .map(|manifest| manifest.entries.len()),
             "reason": recorded.reason,
         });
         CliOutput::Json(json_output(&value)?)
@@ -81,6 +86,13 @@ fn render(recorded: &agent_kernel::verifier::RecordedCheck, spec: &CheckSpec) ->
         lines.push(format!("tests:    {tests} passed"));
     }
     lines.push(format!("revision: {}", evidence.task_revision));
+    if let Some(apparatus) = &recorded.apparatus {
+        lines.push(format!(
+            "apparatus: sha256 {} ({} files)",
+            short(&apparatus.hash),
+            apparatus.entries.len()
+        ));
+    }
     if !recorded.reason.is_empty() {
         lines.push(format!("reason:   {}", recorded.reason));
     }
@@ -99,6 +111,7 @@ fn short(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_protocol::apparatus::{ApparatusManifest, ApparatusSpec};
     use agent_protocol::evidence::EvidenceStatus;
     use agent_protocol::ids::EventSeq;
     use agent_protocol::verification::{CheckRun, Expectation};
@@ -113,6 +126,10 @@ mod tests {
         fn verify(&self, _spec: &CheckSpec, _started_at: DateTime<Utc>) -> CheckRun {
             self.0.clone()
         }
+
+        fn manifest(&self, _spec: &ApparatusSpec) -> Result<ApparatusManifest, String> {
+            Err("this test verifier reads no apparatus".to_string())
+        }
     }
 
     fn spec() -> CheckSpec {
@@ -121,6 +138,7 @@ mod tests {
             args: vec!["test".to_string()],
             cwd: None,
             timeout_ms: 1_000,
+            apparatus: ApparatusSpec::default(),
             expect: Expectation::default(),
         }
     }

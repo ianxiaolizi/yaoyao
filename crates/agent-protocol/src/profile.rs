@@ -329,6 +329,13 @@ pub struct CompletionSpec {
     pub interval_steps: u32,
     /// What one check may spend, in milliseconds.
     pub timeout_ms: u64,
+    /// The globs that name this run's verification apparatus — test files,
+    /// benchmarks, scoring rules — relative to the workspace root.
+    ///
+    /// Empty when the profile says nothing about it, and an empty list freezes
+    /// nothing (`agent_protocol::apparatus`, CONTRACT §7 #172).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apparatus: Vec<String>,
 }
 
 /// How a completion criterion is checked.

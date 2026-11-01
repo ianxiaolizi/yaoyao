@@ -11,7 +11,7 @@ agent-ports = { path = "../agent-ports" }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 encoding_rs = { workspace = true }
-sha2 = "0.10"
+sha2 = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]

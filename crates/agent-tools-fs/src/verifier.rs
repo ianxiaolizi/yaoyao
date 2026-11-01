@@ -20,8 +20,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_ports::execution_environment::{CommandSpec, ExecutionEnvironment};
+use agent_ports::execution_environment::{CommandSpec, DirEntryKind, ExecutionEnvironment};
 use agent_ports::verifier::CommandVerifier;
+use agent_protocol::apparatus::{ApparatusEntry, ApparatusManifest, ApparatusSpec};
 use agent_protocol::digest;
 use agent_protocol::verification::{CheckRun, CheckSpec};
 use chrono::{DateTime, Utc};
@@ -100,6 +101,56 @@ impl CommandVerifier for EnvCommandVerifier {
             },
         }
     }
+
+    fn manifest(&self, spec: &ApparatusSpec) -> Result<ApparatusManifest, String> {
+        let mut entries = Vec::new();
+        walk(&*self.env, "", spec, &mut entries)?;
+        Ok(ApparatusManifest::build(spec.clone(), entries))
+    }
+}
+
+/// Collect every apparatus file below `dir`, through the environment.
+///
+/// Reads and listings go through the `ExecutionEnvironment`, so the walk is
+/// confined to the workspace by the same boundary a tool call is. A directory no
+/// include pattern could match below is never listed (`may_contain`), which is
+/// what keeps `tests/**` from walking a build tree.
+///
+/// Links are reported by the listing and never followed: a link is the one entry
+/// whose target the listing does not vouch for, and following one would let a
+/// manifest be built out of files the workspace boundary never approved.
+fn walk(
+    env: &dyn ExecutionEnvironment,
+    dir: &str,
+    spec: &ApparatusSpec,
+    out: &mut Vec<ApparatusEntry>,
+) -> Result<(), String> {
+    let listing = env
+        .list_dir(dir)
+        .map_err(|e| format!("the apparatus directory {} could not be read: {e}", display(dir)))?;
+    for entry in listing {
+        let path =
+            if dir.is_empty() { entry.name.clone() } else { format!("{dir}/{}", entry.name) };
+        match entry.kind {
+            DirEntryKind::File => {
+                if spec.matches(&path) {
+                    let content = env
+                        .read_file(&path)
+                        .map_err(|e| format!("the apparatus file {path} could not be read: {e}"))?;
+                    out.push(ApparatusEntry::of(path, content.as_bytes()));
+                }
+            }
+            DirEntryKind::Directory if spec.may_contain(&path) => {
+                walk(env, &path, spec, out)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn display(dir: &str) -> &str {
+    if dir.is_empty() { "." } else { dir }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -157,6 +208,7 @@ fn tests_passed(stdout: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::env::LocalExecutionEnvironment;
+    use agent_protocol::apparatus::ApparatusSpec;
     use agent_protocol::verification::Expectation;
     use tempfile::tempdir;
 
@@ -166,6 +218,7 @@ mod tests {
             args: args.iter().map(|a| a.to_string()).collect(),
             cwd: None,
             timeout_ms: 30_000,
+            apparatus: ApparatusSpec::default(),
             expect: Expectation::default(),
         }
     }
@@ -245,6 +298,63 @@ mod tests {
 
         // No expectation, no search.
         assert_eq!(verifier(dir.path()).verify(&exiting(0), Utc::now()).contains_expected, None);
+    }
+
+    fn apparatus(include: &[&str]) -> ApparatusSpec {
+        ApparatusSpec {
+            include: include.iter().map(|glob| glob.to_string()).collect(),
+            exclude: Vec::new(),
+        }
+    }
+
+    fn write(root: &std::path::Path, path: &str, content: &str) {
+        let full = root.join(path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(full, content).unwrap();
+    }
+
+    #[test]
+    fn the_manifest_covers_exactly_the_files_the_globs_name() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "tests/a.rs", "assert!(true);");
+        write(dir.path(), "tests/nested/b.rs", "assert!(false);");
+        write(dir.path(), "src/lib.rs", "pub fn f() {}");
+
+        let manifest = verifier(dir.path()).manifest(&apparatus(&["tests/**"])).unwrap();
+        let paths: Vec<&str> = manifest.entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, ["tests/a.rs", "tests/nested/b.rs"]);
+    }
+
+    #[test]
+    fn editing_an_apparatus_file_moves_the_digest_and_editing_another_does_not() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "tests/a.rs", "assert!(true);");
+        write(dir.path(), "src/lib.rs", "pub fn f() {}");
+        let spec = apparatus(&["tests/**"]);
+
+        let before = verifier(dir.path()).manifest(&spec).unwrap();
+        write(dir.path(), "src/lib.rs", "pub fn f() { /* the work */ }");
+        let after_work = verifier(dir.path()).manifest(&spec).unwrap();
+        assert_eq!(before.hash, after_work.hash, "work is not apparatus");
+
+        write(dir.path(), "tests/a.rs", "assert!(true); // weakened");
+        let after_edit = verifier(dir.path()).manifest(&spec).unwrap();
+        assert_ne!(before.hash, after_edit.hash, "an edited test is a different apparatus");
+    }
+
+    #[test]
+    fn a_file_the_environment_will_not_read_is_an_error_not_a_gap() {
+        // A glob that names something binary: `read_file` refuses it, and a
+        // manifest that quietly skipped it would be a digest of an apparatus
+        // nobody can enumerate.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "tests/a.rs", "assert!(true);");
+        std::fs::write(dir.path().join("tests/binary.bin"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let error = verifier(dir.path()).manifest(&apparatus(&["tests/**"])).unwrap_err();
+        assert!(error.contains("tests/binary.bin"), "{error}");
     }
 
     #[test]

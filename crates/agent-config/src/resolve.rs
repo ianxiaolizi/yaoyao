@@ -915,6 +915,10 @@ fn completion(
         ));
     }
     let timeout_ms = spec.timeout_ms.unwrap_or(DEFAULT_COMPLETION_TIMEOUT_MS);
+    let apparatus = match apparatus_globs(spec.apparatus.as_deref()) {
+        Ok(globs) => globs,
+        Err(detail) => return refuse(detail),
+    };
     let (command, url) = match kind {
         CompletionKindSpec::Command => {
             let command = spec.command.as_deref().map(str::trim).unwrap_or_default();
@@ -994,7 +998,48 @@ fn completion(
         url,
         interval_steps,
         timeout_ms,
+        apparatus,
     }))
+}
+
+/// The apparatus globs, checked for the shapes a walk cannot honour.
+///
+/// A glob is a path the manifest walker will follow, so an absolute one, a
+/// `..` segment or a Windows separator is refused here — where the operator can
+/// see which line is wrong — rather than becoming a manifest that quietly
+/// covers the wrong files, or a walk that reaches outside the workspace and is
+/// refused at its first step with a message about a file nobody named.
+fn apparatus_globs(globs: Option<&[String]>) -> std::result::Result<Vec<String>, String> {
+    let Some(globs) = globs else {
+        return Ok(Vec::new());
+    };
+    let mut checked = Vec::with_capacity(globs.len());
+    for glob in globs {
+        let glob = glob.trim();
+        if glob.is_empty() {
+            return Err(String::from("`apparatus` contains an empty glob"));
+        }
+        if glob.starts_with('/') || glob.starts_with('\\') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} is absolute; globs are relative to the workspace root"
+            ));
+        }
+        if glob.contains('\\') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} uses `\\`; write workspace-relative paths with `/`"
+            ));
+        }
+        if glob.contains(':') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} names a drive or a stream; globs are workspace-relative"
+            ));
+        }
+        if glob.split('/').any(|segment| segment == "..") {
+            return Err(format!("`apparatus` glob {glob:?} reaches above the workspace root"));
+        }
+        checked.push(glob.to_string());
+    }
+    Ok(checked)
 }
 
 /// The longest a command check may run, matching `shell.run`'s own ceiling.

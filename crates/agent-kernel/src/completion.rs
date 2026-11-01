@@ -47,6 +47,34 @@ pub fn is_current(events: &[StoredEvent], evidence: &Evidence) -> bool {
     evidence.task_revision == revision_before(events, latest_evidence_seq(events))
 }
 
+/// The apparatus this session's checks are graded against, if one was frozen.
+///
+/// Only the digest is kept: the gate answers "is this the same apparatus?", and
+/// a reader that wants *which file* changed reads the freeze event itself, where
+/// the entries are. A freeze this build cannot parse is kept as `hash: None` and
+/// therefore matches nothing — a manifest this build cannot read is not a
+/// licence to accept, which is the same direction as every other unknown here.
+pub fn frozen_apparatus(events: &[StoredEvent]) -> Option<FrozenApparatus> {
+    let stored = events.iter().rfind(|stored| {
+        stored.event.event_type.as_str() == EventType::VERIFICATION_APPARATUS_FROZEN
+    })?;
+    let hash = serde_json::from_value::<agent_protocol::apparatus::ApparatusManifest>(
+        stored.event.payload.clone(),
+    )
+    .ok()
+    .map(|manifest| manifest.hash);
+    Some(FrozenApparatus { hash, seq: stored.seq })
+}
+
+/// What the gate needs to know about a frozen apparatus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenApparatus {
+    /// The digest, or `None` when the freeze event could not be read.
+    pub hash: Option<String>,
+    /// Where it was frozen, for a reader following a refusal back.
+    pub seq: EventSeq,
+}
+
 /// The latest evidence-bearing event in the session, if any.
 pub fn latest_evidence(events: &[StoredEvent]) -> Option<Evidence> {
     let (index, stored) = events.iter().enumerate().rfind(|(_, stored)| is_evidence(stored))?;
@@ -71,6 +99,22 @@ pub fn gate(events: &[StoredEvent]) -> ClaimVerdict {
         // is not a reason to claim completion, and calling it a run failure
         // would be a different lie.
         return ClaimVerdict::Failed { evidence };
+    }
+    // Integrity is asked before freshness: a session that froze its apparatus
+    // and is now being graded against a different one has a problem a revision
+    // comparison cannot see — the edit may have landed before the check ran.
+    if let Some(frozen) = frozen_apparatus(events) {
+        match frozen.hash.as_deref() {
+            Some(hash) if evidence.input_manifest_hash.as_deref() == Some(hash) => {}
+            _ => {
+                let found = evidence.input_manifest_hash.clone();
+                return ClaimVerdict::IntegrityChanged {
+                    evidence,
+                    expected: frozen.hash.unwrap_or_default(),
+                    found,
+                };
+            }
+        }
     }
     if evidence.task_revision != revision {
         return ClaimVerdict::Stale { evidence, revision };
@@ -229,19 +273,35 @@ mod tests {
     }
 
     fn recorded(seq: u64, status: &str) -> StoredEvent {
+        recorded_against(seq, status, None)
+    }
+
+    fn recorded_against(seq: u64, status: &str, apparatus: Option<&str>) -> StoredEvent {
+        let mut payload = serde_json::json!({
+            "check_id": "v1",
+            "task_revision": 0,
+            "kind": "verifier",
+            "status": status,
+            "program": "cargo",
+            "args": ["test"],
+            "exit_code": 0,
+            "verifier_identity": "verifier",
+            "authorization_source": "operator",
+        });
+        if let Some(hash) = apparatus {
+            payload["input_manifest_hash"] = serde_json::json!(hash);
+        }
+        stored(seq, EventType::VERIFICATION_RECORDED, payload)
+    }
+
+    fn frozen(seq: u64, hash: &str) -> StoredEvent {
         stored(
             seq,
-            EventType::VERIFICATION_RECORDED,
+            EventType::VERIFICATION_APPARATUS_FROZEN,
             serde_json::json!({
-                "check_id": "v1",
-                "task_revision": 0,
-                "kind": "verifier",
-                "status": status,
-                "program": "cargo",
-                "args": ["test"],
-                "exit_code": 0,
-                "verifier_identity": "verifier",
-                "authorization_source": "operator",
+                "spec": { "include": ["tests/**"] },
+                "entries": [],
+                "hash": hash,
             }),
         )
     }
@@ -303,6 +363,54 @@ mod tests {
             ClaimVerdict::ExitMasked { operator, .. } => assert_eq!(operator, "| tail"),
             other => panic!("expected exit masked, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_pass_against_the_frozen_apparatus_is_accepted() {
+        let events = [frozen(0, "aaa"), recorded_against(1, "passed", Some("aaa"))];
+        assert_eq!(gate(&events).as_str(), "accepted");
+    }
+
+    #[test]
+    fn a_pass_against_an_apparatus_that_moved_is_refused() {
+        // The check is fresh by revision and says it passed — but it was graded
+        // against different files than the session froze. That is the edit that
+        // makes a suite pass without the work being right.
+        let events = [frozen(0, "aaa"), recorded_against(1, "passed", Some("bbb"))];
+        let verdict = gate(&events);
+        assert_eq!(verdict.as_str(), "integrity_changed");
+        match verdict {
+            ClaimVerdict::IntegrityChanged { expected, found, .. } => {
+                assert_eq!(expected, "aaa");
+                assert_eq!(found.as_deref(), Some("bbb"));
+            }
+            other => panic!("expected integrity_changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_criterion_that_states_no_apparatus_cannot_stand_once_one_is_frozen() {
+        // A criterion still says "a command exited zero"; it cannot say what it
+        // was graded against. Once a session has frozen an apparatus, a pass
+        // with no manifest is a pass nobody can check.
+        let events = [frozen(0, "aaa"), recorded_against(1, "passed", None)];
+        let verdict = gate(&events);
+        assert_eq!(verdict.as_str(), "integrity_changed");
+        assert!(matches!(verdict, ClaimVerdict::IntegrityChanged { found: None, .. }));
+    }
+
+    #[test]
+    fn with_nothing_frozen_the_apparatus_is_not_asked_about() {
+        // Sessions that never declared an apparatus keep the A5 answer.
+        let events = [recorded_against(0, "passed", None)];
+        assert_eq!(gate(&events).as_str(), "accepted");
+    }
+
+    #[test]
+    fn a_freeze_this_build_cannot_read_matches_nothing() {
+        let broken = stored(0, EventType::VERIFICATION_APPARATUS_FROZEN, serde_json::json!("junk"));
+        let events = [broken, recorded_against(1, "passed", None)];
+        assert_eq!(gate(&events).as_str(), "integrity_changed");
     }
 
     #[test]

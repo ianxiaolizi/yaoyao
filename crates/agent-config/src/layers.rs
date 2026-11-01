@@ -203,6 +203,10 @@ pub struct CompletionSpecConfig {
     pub interval_steps: Option<u32>,
     /// What one check may spend, in milliseconds. Omit for 120,000.
     pub timeout_ms: Option<u64>,
+    /// Globs naming the files the check is graded against — test files,
+    /// benchmarks, scoring rules — relative to the workspace root. Omit to
+    /// freeze nothing.
+    pub apparatus: Option<Vec<String>>,
 }
 
 /// How a completion criterion is checked, as configuration spells it.

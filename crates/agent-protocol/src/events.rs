@@ -246,6 +246,16 @@ impl EventType {
     /// how the program ended; a check that could not start is recorded here with
     /// `status: "error"` rather than being left out.
     pub const VERIFICATION_RECORDED: &'static str = "verification/recorded";
+    /// The apparatus a session's checks are graded against, frozen at the first
+    /// check.
+    ///
+    /// Written once per session, in the same batch as the evidence of the check
+    /// that froze it. Later checks record the manifest they actually ran
+    /// against; the gate compares the two and refuses a pass whose apparatus
+    /// moved (CONTRACT §7 #172). The event carries the spec and every entry, so
+    /// a reader can say *which* file changed rather than only that something
+    /// did.
+    pub const VERIFICATION_APPARATUS_FROZEN: &'static str = "verification/apparatus_frozen";
     pub const TOOL_RESULT_TRUNCATED: &'static str = "tool/result.truncated";
     pub const TOOL_RESULT_REDACTED: &'static str = "tool/result.redacted";
     /// A tool result carried a token the high-entropy layer flagged but did
@@ -374,6 +384,7 @@ impl EventType {
         Self::COMPLETION_CLAIM_REJECTED,
         Self::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
         Self::VERIFICATION_RECORDED,
+        Self::VERIFICATION_APPARATUS_FROZEN,
         Self::TOOL_RESULT_TRUNCATED,
         Self::TOOL_RESULT_REDACTED,
         Self::TOOL_RESULT_HIGH_ENTROPY,

@@ -13,14 +13,23 @@
 //! next completion claim has something to stand on that a pipe cannot fake.
 
 use agent_cli::args::Args;
+use agent_protocol::apparatus::ApparatusSpec;
 use agent_protocol::verification::{CheckSpec, DEFAULT_CHECK_TIMEOUT_MS, Expectation};
 
 use crate::support::{assemble, chain_start, watch};
 use crate::{EXIT_DID_NOT_RUN, exit_on};
 
 pub(crate) async fn verify(args: &Args) {
-    let spec = parse(args);
+    let mut spec = parse(args);
     let runtime = assemble(args).await;
+    // A profile that names its apparatus is saying what every check of its runs
+    // is graded against; a check that names its own overrides that, because the
+    // operator asking for this one check is the more specific voice.
+    if spec.apparatus.is_empty()
+        && let Some(completion) = runtime.profile_snapshot().completion.as_ref()
+    {
+        spec.apparatus.include = completion.apparatus.clone();
+    }
     let from = chain_start(runtime.store.as_ref(), args).await;
 
     let outcome = watch(
@@ -55,6 +64,7 @@ fn parse(args: &Args) -> CheckSpec {
     let mut expect_tests = None;
     let mut program: Option<String> = None;
     let mut program_args: Vec<String> = Vec::new();
+    let mut apparatus = ApparatusSpec::default();
     let mut after_separator = false;
 
     let mut index = 0;
@@ -96,6 +106,10 @@ fn parse(args: &Args) -> CheckSpec {
                 let value = flag_value(words, &mut index, name, inline);
                 expect_tests = Some(parse_u64(&value, name, args));
             }
+            "--apparatus" => apparatus.include.push(flag_value(words, &mut index, name, inline)),
+            "--exclude-apparatus" => {
+                apparatus.exclude.push(flag_value(words, &mut index, name, inline));
+            }
             other => usage_failure(&format!(
                 "unknown flag '{other}'; the program and its arguments go after `--`"
             )),
@@ -118,6 +132,7 @@ fn parse(args: &Args) -> CheckSpec {
         args: program_args,
         cwd,
         timeout_ms,
+        apparatus,
         expect: Expectation {
             exit_code: expect_exit,
             stdout_contains: expect_stdout,

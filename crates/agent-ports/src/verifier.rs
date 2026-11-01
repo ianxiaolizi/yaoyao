@@ -20,6 +20,7 @@
 //!
 //! [`ExecutionEnvironment`]: crate::execution_environment::ExecutionEnvironment
 
+use agent_protocol::apparatus::{ApparatusManifest, ApparatusSpec};
 use agent_protocol::verification::{CheckRun, CheckSpec};
 use chrono::{DateTime, Utc};
 
@@ -38,4 +39,17 @@ pub trait CommandVerifier: Send + Sync {
     /// workspace's one wall-clock read at the app edge (STYLE §1). It also makes
     /// a replayed check report the same timestamps as the run it replays.
     fn verify(&self, spec: &CheckSpec, started_at: DateTime<Utc>) -> CheckRun;
+
+    /// Read the apparatus `spec` names, as it stands now.
+    ///
+    /// Reads go through the same boundary a tool's do: the implementation walks
+    /// its own execution environment, so a spec that reaches outside the
+    /// workspace is refused there rather than quietly followed. A file that
+    /// cannot be read is an **error**, not something to leave out — a manifest
+    /// that skipped what it could not open would be a digest of an apparatus
+    /// nobody can enumerate, which is the silence this exists to remove.
+    ///
+    /// The error is a sentence for the operator, like `CheckRun::failure`: this
+    /// is the same shape of "the check could not be set up" fact.
+    fn manifest(&self, spec: &ApparatusSpec) -> Result<ApparatusManifest, String>;
 }
