@@ -339,6 +339,15 @@ impl EventType {
     /// Written by the command that restores, not by the crash-recovery path:
     /// this build rolls back only what a person or a web API asks it to.
     pub const WORKSPACE_ROLLBACK_COMPLETED: &'static str = "workspace/rollback.completed";
+    /// The independent security review of a high-risk task did not pass.
+    ///
+    /// Written beside the `verification/recorded` evidence record that carries
+    /// the review's status, and only when that status is not `passed`: the
+    /// evidence says what was observed, and this says the turn may not hand its
+    /// answer over as a delivered result (CONTRACT §7 #183). A review that
+    /// passed writes no such event — a session should not have to read a
+    /// double negative to learn that nothing blocked it.
+    pub const SECURITY_REVIEW_FAILED: &'static str = "security/review.failed";
     /// One fast-decision call's trace. An observation, never an input
     /// to anything in this build: the shadow mode is what makes that true.
     pub const DECISION_TRACE: &'static str = "decision/trace";
@@ -469,6 +478,7 @@ impl EventType {
         Self::WORKSPACE_SNAPSHOT_CREATED,
         Self::WORKSPACE_CHANGES_RECORDED,
         Self::WORKSPACE_ROLLBACK_COMPLETED,
+        Self::SECURITY_REVIEW_FAILED,
         Self::DECISION_TRACE,
         Self::PLUGIN_LOADED,
         Self::PLUGIN_UNLOADED,

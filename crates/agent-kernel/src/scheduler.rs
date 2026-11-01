@@ -19,6 +19,7 @@ use agent_ports::control::ControlHandler;
 use agent_ports::event_store::{DriverRecord, EventStore, EventStoreError, SessionLease};
 use agent_ports::instructions::{InstructionError, InstructionSource};
 use agent_ports::intent_adjudication::IntentAdjudicator;
+use agent_ports::security_reviewer::SecurityReviewer;
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{EventSeq, InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::inbox::{InboxItem, InboxKind};
@@ -40,6 +41,7 @@ mod endings;
 mod journal;
 mod rebuilt;
 mod report;
+mod security;
 mod snapshot;
 
 pub(crate) use draft::draft;
@@ -82,6 +84,9 @@ pub struct Scheduler {
     /// exist.
     capability: Option<TurnCapabilityFacts>,
     pub(crate) adjudicator: Option<Arc<dyn IntentAdjudicator>>,
+    /// Who reviews the L2/L3 actions of a session before its answer is handed
+    /// over (B9). `None` is not consent: a high-risk task then cannot complete.
+    security: Option<Arc<dyn SecurityReviewer>>,
 }
 
 /// Errors from Scheduler operations.
@@ -139,6 +144,7 @@ impl Scheduler {
             instructions: None,
             capability: None,
             adjudicator: None,
+            security: None,
         }
     }
 
@@ -643,6 +649,13 @@ impl Scheduler {
 
         let (stop_reason, final_content, turn_terminal, run_terminal, mut turn_payload) =
             ending.settle();
+        // The review runs before any terminal; it returns the log as it then stands (B9).
+        let (stop_reason, so_far) = self
+            .review_before_claim(
+                (session_id, &run_id, &turn_id, stop_reason),
+                (&mut pending, &journal, &mut turn_payload),
+            )
+            .await?;
         // Read from the counters the terminal payload will carry, and before
         // `spent` moves into `Finished`: the parked record's percentage has to
         // describe the same run the spend does.
@@ -665,12 +678,6 @@ impl Scheduler {
         // run-level audit must not have to walk back to find what it cost.
         let mut run_payload = serde_json::json!({ "stop_reason": &stop_reason });
         finished.decorate(&mut run_payload, false);
-        // What the completion gate says about the work this turn leaves behind,
-        // read once from the log as it stands now — the turn's steps are
-        // durable, and the terminal batch below is the first write after this
-        // read. The verdicts live in `scheduler/completion.rs`; the read stays
-        // here because the parked record below folds the same snapshot.
-        let so_far = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
         completion::note_claims(
             &history,
             &so_far,

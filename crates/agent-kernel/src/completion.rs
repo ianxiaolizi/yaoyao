@@ -86,7 +86,24 @@ pub fn latest_evidence(events: &[StoredEvent]) -> Option<Evidence> {
 }
 
 /// The gate's verdict on this session.
+///
+/// Two questions, in order. First the ordinary check: did a check of the work
+/// pass and does it still cover what is on the table? Then, for a session that
+/// ran an L2/L3 action, the independent review: an answer from outside the agent
+/// about the actions themselves (B9, CONTRACT §7 #183). The second question is
+/// only reached when the first is satisfied — a failed check is already a
+/// refusal, and reporting it first keeps the refusal about the thing that went
+/// wrong soonest.
 pub fn gate(events: &[StoredEvent]) -> ClaimVerdict {
+    let verdict = check_verdict(events);
+    if !verdict.is_accepted() {
+        return verdict;
+    }
+    security_verdict(events, verdict)
+}
+
+/// The ordinary check's verdict: the latest evidence record against the work.
+fn check_verdict(events: &[StoredEvent]) -> ClaimVerdict {
     let Some(evidence) = latest_evidence(events) else {
         return ClaimVerdict::Missing;
     };
@@ -128,6 +145,36 @@ pub fn gate(events: &[StoredEvent]) -> ClaimVerdict {
         return ClaimVerdict::Failed { evidence };
     }
     ClaimVerdict::Accepted(evidence)
+}
+
+/// The independent review's verdict, for a session that ran an L2/L3 action.
+///
+/// A low-risk session returns the check's own verdict untouched: nothing about
+/// its work needs a second opinion, and asking for one would make every task pay
+/// for the highest risk any task reached (B9).
+///
+/// The words are the check's words, deliberately. A missing review is `Missing`,
+/// a review of older work is `Stale`, one that could not run is `VerifierError`
+/// and one that refused is `Failed` — the reader learns the same vocabulary
+/// whichever record is the one that refused, and `status` keeps its three axes.
+fn security_verdict(events: &[StoredEvent], check: ClaimVerdict) -> ClaimVerdict {
+    if !crate::security::review_required(events) {
+        return check;
+    }
+    let revision = task_revision(events);
+    let Some(review) = crate::security::latest_review(events) else {
+        return ClaimVerdict::Missing;
+    };
+    if review.status == EvidenceStatus::Error || review.status == EvidenceStatus::Unknown {
+        return ClaimVerdict::VerifierError { evidence: review };
+    }
+    if review.task_revision != revision {
+        return ClaimVerdict::Stale { evidence: review, revision };
+    }
+    if review.status != EvidenceStatus::Passed {
+        return ClaimVerdict::Failed { evidence: review };
+    }
+    check
 }
 
 /// Adapt a `completion/checked` event to an evidence record.
@@ -196,11 +243,20 @@ fn evidence_from_recorded(stored: &StoredEvent, revision: u64) -> Evidence {
     }
 }
 
+/// Whether an event is evidence *of a check* — the records the gate compares
+/// against the work.
+///
+/// A security review is `verification/recorded` too, and it is deliberately not
+/// one of these: it is a judgement about the actions rather than a check of a
+/// program, and reading it as the latest check would let a review stand in for
+/// the check it was supposed to accompany (B9, CONTRACT §7 #183). The gate asks
+/// for it separately.
 fn is_evidence(stored: &StoredEvent) -> bool {
-    matches!(
-        stored.event.event_type.as_str(),
-        EventType::COMPLETION_CHECKED | EventType::VERIFICATION_RECORDED
-    )
+    match stored.event.event_type.as_str() {
+        EventType::COMPLETION_CHECKED => true,
+        EventType::VERIFICATION_RECORDED => !crate::security::is_review_event(stored),
+        _ => false,
+    }
 }
 
 fn is_change(stored: &StoredEvent) -> bool {

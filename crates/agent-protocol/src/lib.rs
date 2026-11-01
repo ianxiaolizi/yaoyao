@@ -35,6 +35,7 @@ pub mod plugin;
 pub mod profile;
 pub mod reason;
 pub mod redactor;
+pub mod security_review;
 pub mod state;
 pub mod status;
 pub mod tool;

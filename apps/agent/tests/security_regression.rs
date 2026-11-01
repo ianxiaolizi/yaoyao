@@ -53,20 +53,23 @@ use agent_model_openai::{
     TransportResponse, to_wire_name,
 };
 use agent_ports::agent_loop::StopReason;
+use agent_ports::decision::FastDecisionProvider;
 use agent_ports::event_store::EventStore;
 use agent_ports::execution_environment::SandboxMode;
 use agent_ports::model_router::{ModelRoute, ModelTier};
+use agent_ports::security_reviewer::SecurityReviewer;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::{
     ToolDefinition, ToolInvocation, ToolProvider, ToolProviderError, ToolResult, ToolSideEffect,
     ToolSource,
 };
+use agent_protocol::decision::DecisionValue;
 use agent_protocol::events::{Actor, EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, PluginId, SessionId};
 use agent_protocol::inbox::InboxKind;
 use agent_protocol::permissions::{ApprovalScope, ApprovalStatus, Capability, CapabilitySet};
 use agent_protocol::plugin::{PluginCapabilities, PluginContributions, PluginManifest};
-use agent_testkit::FixedSecret;
+use agent_testkit::{FakeDecisionBehaviour, FakeDecisionProvider, FixedSecret};
 use chrono::Utc;
 use tempfile::TempDir;
 
@@ -1094,4 +1097,231 @@ async fn assembly_refuses_a_network_entry_that_is_not_an_origin() {
 
     assert!(matches!(error, stack::StackError::NetworkAllowlist(_)), "{error:?}");
     assert!(error.to_string().contains("not an origin"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// 7. a high-risk task is reviewed, and the assembly carries the reviewer
+// ---------------------------------------------------------------------------
+
+/// A reviewer over the real adapter, answering what `verdict` says.
+///
+/// The backend is a scripted decision provider, so the path under test is the
+/// one production takes: pack, broker, timeout, contract parse, evidence.
+fn reviewer(
+    verdict: &str,
+    confidence: f64,
+    findings: serde_json::Value,
+) -> Arc<dyn SecurityReviewer> {
+    let backend = Arc::new(
+        FakeDecisionProvider::new(
+            "stub",
+            FakeDecisionBehaviour::Answer(vec![(
+                agent_protocol::security_review::QUESTION_ID.to_string(),
+                DecisionValue::Structured {
+                    value: serde_json::json!({
+                        "verdict": verdict,
+                        "confidence": confidence,
+                        "findings": findings,
+                    }),
+                },
+            )]),
+        )
+        .with_revision("rev-1"),
+    );
+    agent_decision::security_reviewer::reviewer_for(Some(backend as Arc<dyn FastDecisionProvider>))
+        .expect("a backend was given")
+}
+
+/// The product's assembly, with a supplied reviewer in place of the sidecar
+/// one configuration would build.
+async fn reviewing_process(
+    workspace: &Path,
+    data_dir: &Path,
+    script: Vec<String>,
+    reviewer: Arc<dyn SecurityReviewer>,
+) -> Process {
+    let transport = Arc::new(ScriptedTransport::new(script));
+    let mut assembled =
+        inputs(SESSION, workspace, data_dir, transport.clone(), SandboxMode::WorkspaceSandbox);
+    assembled.decisions = Decisions::Reviewing(reviewer);
+    let stack = stack::assemble_over(
+        assembled,
+        agent::subagents::Delegation::Background,
+        claimed_isolation::isolating(workspace),
+    )
+    .await
+    .expect("the assembly the binary runs");
+    Process { stack, transport, session: SessionId::from_string(SESSION) }
+}
+
+/// A high-risk call the person approves, and the turn that follows it.
+///
+/// Returns the report of the continuation turn — the one that ends with the
+/// model's answer and is therefore the one a review is taken at the end of.
+async fn approved_dangerous_call(process: &Process, answer: &str) -> RunReport {
+    let stopped = process.ask("write the marker").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput, "the L3 call asks first");
+    let pending = process.stack.approvals.pending(&process.session).await.expect("pending");
+    assert_eq!(pending.len(), 1, "one call is waiting");
+    process
+        .stack
+        .approvals
+        .grant(
+            &process.session,
+            &pending[0].approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
+        .await
+        .expect("grant");
+    let resumed = process.stack.resume.resume(&process.session, "go ahead").await.expect("resume");
+    assert!(matches!(resumed, ResumeOutcome::Settled { .. }), "the approved call ran: {resumed:?}");
+    let report = process
+        .stack
+        .scheduler
+        .run_pending(&process.session, Utc::now())
+        .await
+        .expect("run the continuation")
+        .expect("the continuation ran");
+    assert_eq!(
+        report.stop_reason,
+        StopReason::FinalAnswer,
+        "the model answered; the review is what decides delivery: {}",
+        answer
+    );
+    report
+}
+
+/// The security-review evidence in the log, oldest first.
+async fn reviews(process: &Process) -> Vec<agent_protocol::evidence::Evidence> {
+    process
+        .log()
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.event.event_type.as_str() == EventType::VERIFICATION_RECORDED
+                && e.event.payload["kind"] == "security_review"
+        })
+        .map(|e| serde_json::from_value(e.event.payload).expect("the payload is evidence"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_security_review_pass_records_model_and_context_hash() {
+    let (workspace, data) = dirs();
+    let process = reviewing_process(
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": MARKER_COMMAND }),
+            ),
+            answer_body("the marker is written"),
+        ],
+        reviewer("pass", 0.95, serde_json::json!([])),
+    )
+    .await;
+
+    approved_dangerous_call(&process, "the marker is written").await;
+
+    let reviews = reviews(&process).await;
+    assert_eq!(reviews.len(), 1, "one review of the work the turn left behind");
+    let review = &reviews[0];
+    assert_eq!(review.status, agent_protocol::evidence::EvidenceStatus::Passed);
+    assert_eq!(review.kind, agent_protocol::evidence::EvidenceKind::SecurityReview);
+    assert_eq!(review.verifier_identity, "security_reviewer:stub");
+    assert_eq!(review.verifier_model.as_deref(), Some("stub"));
+    assert!(
+        review.verifier_context_hash.as_deref().is_some_and(|hash| !hash.is_empty()),
+        "the record says which input was reviewed: {review:?}"
+    );
+    assert_eq!(review.authorization_source, "profile.security");
+    assert_eq!(
+        process.count(EventType::SECURITY_REVIEW_FAILED).await,
+        0,
+        "a pass is not a refusal"
+    );
+    assert!(workspace.path().join("marker.txt").exists(), "the approved command ran");
+}
+
+#[tokio::test]
+async fn a_security_review_failure_blocks_delivery() {
+    let (workspace, data) = dirs();
+    let process = reviewing_process(
+        workspace.path(),
+        data.path(),
+        vec![
+            tool_call_body(
+                "call_shell",
+                &to_wire_name("shell.run"),
+                serde_json::json!({ "command": MARKER_COMMAND }),
+            ),
+            answer_body("all done"),
+        ],
+        reviewer(
+            "fail",
+            0.95,
+            serde_json::json!([{
+                "severity": "high",
+                "category": "unreviewed_change",
+                "summary": "the command wrote a file nobody asked for",
+            }]),
+        ),
+    )
+    .await;
+
+    // The turn itself ends normally — the model answered and the loop had
+    // nothing left to do. What the scheduler writes afterwards withholds it.
+    let stopped = process.ask("write the marker").await;
+    assert_eq!(stopped.stop_reason, StopReason::NeedsUserInput);
+    let pending = process.stack.approvals.pending(&process.session).await.expect("pending");
+    process
+        .stack
+        .approvals
+        .grant(
+            &process.session,
+            &pending[0].approval_id,
+            ApprovalScope::AllowOnce,
+            "user",
+            &agent_kernel::approval::ApprovalAuthority::test(),
+        )
+        .await
+        .expect("grant");
+    process.stack.resume.resume(&process.session, "go ahead").await.expect("resume");
+    let report = process
+        .stack
+        .scheduler
+        .run_pending(&process.session, Utc::now())
+        .await
+        .expect("run the continuation")
+        .expect("the continuation ran");
+
+    assert_eq!(
+        report.stop_reason,
+        StopReason::SecurityBlocked,
+        "the answer is not handed over as a delivered result"
+    );
+
+    let terminal = process
+        .log()
+        .await
+        .into_iter()
+        .rfind(|e| e.event.event_type.as_str() == EventType::TURN_COMPLETED)
+        .expect("the turn ended");
+    assert_eq!(terminal.event.payload["stop_reason"], "security_blocked");
+    assert_eq!(terminal.event.payload["incomplete"], true, "{}", terminal.event.payload);
+    assert!(
+        terminal.event.payload["security_review"]["check_id"].as_str().is_some(),
+        "the refusal names the record it came from: {}",
+        terminal.event.payload
+    );
+
+    let failed = process.count(EventType::SECURITY_REVIEW_FAILED).await;
+    assert_eq!(failed, 1, "one refusal, written once");
+    let reviews = reviews(&process).await;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, agent_protocol::evidence::EvidenceStatus::Failed);
 }

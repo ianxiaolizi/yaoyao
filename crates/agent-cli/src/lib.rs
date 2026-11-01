@@ -528,6 +528,10 @@ pub(crate) fn halted(reason: &StopReason) -> bool {
             | StopReason::WallClockExceeded
             | StopReason::TokenBudgetExceeded
             | StopReason::Stalled
+            // Not an answer either: the work was done, the review of it refused,
+            // and handing the text over as a delivered result is the one thing
+            // that review exists to prevent (B9, CONTRACT §7 #183).
+            | StopReason::SecurityBlocked
     )
 }
 
@@ -544,6 +548,20 @@ pub(crate) fn stopped_text(report: &RunReport) -> String {
     match report.stop_reason {
         StopReason::MaxOutputTokens | StopReason::ContentFiltered => {
             halted_text(&report.stop_reason, report.final_content.as_deref())
+        }
+        // Not a limit and not a cut: the run finished and the answer was
+        // withheld. The advice a limit gets ("raise the budget") would be
+        // wrong here — the same task rerun asks the same reviewer the same
+        // question — so the notice names the record instead.
+        StopReason::SecurityBlocked => {
+            let notice = "withheld: the independent security review of this task's high-risk \
+                          actions did not pass. The text above is what the model said, not a \
+                          delivered result; `security/review.failed` in the session log says \
+                          which review and why";
+            match report.final_content.as_deref() {
+                Some(text) if !text.trim().is_empty() => format!("{text}\n\n[{notice}]"),
+                _ => format!("[{notice}]"),
+            }
         }
         _ => limit_text(report),
     }

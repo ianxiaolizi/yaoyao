@@ -54,6 +54,7 @@ use agent_ports::model_provider::{ModelProvider, ResolvedModelCapabilities};
 use agent_ports::model_router::ModelRouter;
 use agent_ports::permission_classifier::PermissionClassifier;
 use agent_ports::process_launcher::ProcessLauncher;
+use agent_ports::security_reviewer::SecurityReviewer;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
 use agent_ports::verifier::CommandVerifier;
@@ -92,6 +93,7 @@ type DecisionParts = (
     Option<Arc<dyn DecisionAdvisor>>,
     Option<Arc<dyn IntentAdjudicator>>,
     Option<Arc<dyn PermissionClassifier>>,
+    Option<Arc<dyn SecurityReviewer>>,
 );
 
 /// What the assembly needs that it cannot decide for itself.
@@ -137,6 +139,13 @@ pub enum Decisions {
     /// No advisor at all: nothing observes the run's choices and no decision
     /// trace is written. The router still routes.
     Unobserved,
+    /// A supplied independent reviewer and nothing else.
+    ///
+    /// The binary never builds this: it assembles whatever the configured
+    /// sidecar gives it. It is here for the test that has to state the one fact
+    /// the gate turns on — that a high-risk task was reviewed, and what the
+    /// reviewer said (B9).
+    Reviewing(Arc<dyn SecurityReviewer>),
 }
 
 /// Why the stack could not be assembled.
@@ -1076,17 +1085,26 @@ pub async fn assemble_over(
     // before the gateway because the gateway is handed the classifier they
     // build: the judge is a property of the assembly, decided once, rather than
     // something wired into a gate that has already been built.
-    let (router, advisor, adjudicator, classifier): DecisionParts = match decisions {
+    let (router, advisor, adjudicator, classifier, reviewer): DecisionParts = match decisions {
         Decisions::FromConfiguration => {
             let router = providers::router(selected.route.clone(), &routes);
             let stack = decisions::assemble(Arc::new(router), resolved.laya.clone())?;
-            (stack.router, Some(stack.advisor), stack.adjudicator, stack.classifier)
+            (stack.router, Some(stack.advisor), stack.adjudicator, stack.classifier, stack.reviewer)
         }
         // No advisor, but still a router: the loop is always given one, and a
         // run without an observation is a run whose choices are still routed.
         Decisions::Unobserved => {
-            (Arc::new(providers::router(selected.route.clone(), &routes)), None, None, None)
+            (Arc::new(providers::router(selected.route.clone(), &routes)), None, None, None, None)
         }
+        // A reviewer and nothing else: the state a test needs to ask what the
+        // completion gate does with a high-risk task when the judge says no.
+        Decisions::Reviewing(reviewer) => (
+            Arc::new(providers::router(selected.route.clone(), &routes)),
+            None,
+            None,
+            None,
+            Some(reviewer),
+        ),
     };
 
     // One step's output is bounded by the window the run actually has: a
@@ -1286,6 +1304,12 @@ pub async fn assemble_over(
     // and unclear messages then keep their turns unadjudicated.
     if let Some(adjudicator) = adjudicator {
         scheduler = scheduler.with_intent_adjudicator(adjudicator);
+    }
+    // The independent reviewer, when this build has one. No sidecar means no
+    // reviewer, and a high-risk task then has no evidence to complete on rather
+    // than a silence read as a pass (B9, CONTRACT §7 #183).
+    if let Some(reviewer) = reviewer {
+        scheduler = scheduler.with_security_reviewer(reviewer);
     }
     // Every in-process backend is handed the run its children execute on: this
     // scheduler with the child's loop in place of the parent's, and the request's

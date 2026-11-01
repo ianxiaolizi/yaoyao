@@ -18,7 +18,7 @@
 //! current is the failure this axis exists to prevent (CONTRACT §7 #167).
 
 use agent_protocol::events::{EventType, StoredEvent};
-use agent_protocol::evidence::ClaimVerdict;
+use agent_protocol::evidence::{ClaimVerdict, EvidenceKind};
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::status::{CompletionStatus, DeliveryStatus, RunStatus, VerificationStatus};
 use serde_json::Value;
@@ -154,7 +154,9 @@ fn delivery(events: &[StoredEvent]) -> DeliveryStatus {
 /// (CONTRACT §7 #170):
 ///
 /// * accepted — the check passed and still covers the work. `Verified`.
-/// * failed — the check ran and said no. `Unverified`.
+/// * failed — the check ran and said no. `Unverified` — except for an
+///   independent security review, whose refusal holds the whole run back rather
+///   than only the criterion: `Blocked` (B9, CONTRACT §7 #183).
 /// * stale, or taken against a changed apparatus — `Stale`.
 /// * a check that could not run, or one whose status was a pipeline's — a
 ///   refusal to claim, not a failed task. `Blocked`.
@@ -182,8 +184,16 @@ fn verification(events: &[StoredEvent], run: Option<&RunView>) -> VerificationSt
                 }
             }
             // The check ran and said no. The work may still be right, but
-            // nothing on record says so.
-            ClaimVerdict::Failed { .. } => VerificationStatus::Unverified,
+            // nothing on record says so. A security review that refused is the
+            // same shape with a bigger consequence: the run itself is held
+            // back, not just the criterion, so it is `Blocked`.
+            ClaimVerdict::Failed { evidence } => {
+                if evidence.kind == EvidenceKind::SecurityReview {
+                    VerificationStatus::Blocked
+                } else {
+                    VerificationStatus::Unverified
+                }
+            }
             // A pass that a later change ran past, or one taken against a copy
             // of the apparatus that has since moved.
             ClaimVerdict::Stale { .. } | ClaimVerdict::IntegrityChanged { .. } => {
@@ -251,6 +261,7 @@ fn tool_since(events: &[StoredEvent], seq: EventSeq) -> bool {
 mod tests {
     use super::*;
     use agent_protocol::events::{Actor, EventDraft};
+    use agent_protocol::evidence::{Evidence, EvidenceKind, EvidenceStatus};
     use agent_protocol::ids::{EventId, RunId, SchemaVersion, TurnId};
     use chrono::Utc;
 
@@ -423,6 +434,113 @@ mod tests {
         let axes = derive(&events);
         assert_eq!(axes.verification_status, VerificationStatus::Stale);
         assert_eq!(axes.completion_status, Some(CompletionStatus::BlockedOrParked));
+    }
+
+    /// A permitted `L3` action, as the permission ledger writes one.
+    fn high_risk_decision(seq: u64) -> StoredEvent {
+        stored(
+            seq,
+            EventType::PERMISSION_DECISION,
+            serde_json::json!({
+                "decision": "allow",
+                "action": {
+                    "task_id": "intent-1",
+                    "task_revision": 0,
+                    "tool_name": "shell.run",
+                    "capabilities": ["proc.exec"],
+                    "risk": "l3",
+                    "reversibility": "irreversible",
+                    "targets": [{
+                        "kind": "command",
+                        "program": "cmd",
+                        "args": ["/C", "echo hi"],
+                        "cwd": null,
+                    }],
+                    "arguments_sha256": "a",
+                    "summary": "ran a command",
+                    "digest": "d",
+                },
+                "authorization_source": "policy",
+                "reason": "allowed",
+                "created_at": "2026-11-01T00:00:00Z",
+            }),
+        )
+    }
+
+    /// An independent security review, as the kernel records one.
+    fn security_review(seq: u64, status: EvidenceStatus) -> StoredEvent {
+        let evidence = Evidence {
+            check_id: format!("security/{seq}"),
+            task_revision: 0,
+            kind: EvidenceKind::SecurityReview,
+            status,
+            target: Some("security_review/route".to_string()),
+            program: None,
+            args: Vec::new(),
+            cwd: None,
+            exit_code: None,
+            stdout_sha256: None,
+            stderr_sha256: None,
+            tests_passed: None,
+            artifact_refs: Vec::new(),
+            started_at: None,
+            finished_at: None,
+            environment_hash: None,
+            verifier_identity: "security_reviewer:route".to_string(),
+            verifier_process: None,
+            verifier_model: Some("route".to_string()),
+            verifier_context_hash: Some("h".to_string()),
+            input_manifest_hash: None,
+            authorization_source: "profile.security".to_string(),
+        };
+        stored(
+            seq,
+            EventType::VERIFICATION_RECORDED,
+            serde_json::to_value(evidence).expect("evidence serialises"),
+        )
+    }
+
+    #[test]
+    fn a_refused_security_review_blocks_the_run_not_just_the_criterion() {
+        let events = vec![
+            run_event(0, EventType::RUN_STARTED),
+            high_risk_decision(1),
+            check(2, "completed"),
+            security_review(3, EvidenceStatus::Failed),
+            stored(
+                4,
+                EventType::TURN_COMPLETED,
+                serde_json::json!({
+                    "stop_reason": "security_blocked",
+                    "incomplete": true,
+                    "final_content": "all done",
+                }),
+            ),
+            run_event(5, EventType::RUN_COMPLETED),
+        ];
+        let axes = derive(&events);
+        // The text exists and is not a delivery: the same `incomplete` marker
+        // a cut-off turn carries keeps it off the delivery axis.
+        assert_eq!(axes.delivery_status, DeliveryStatus::Unanswered);
+        // And the refusal is a block, not a criterion that failed: the run
+        // itself may not be claimed. A failed ordinary check stays `Unverified`.
+        assert_eq!(axes.verification_status, VerificationStatus::Blocked);
+        assert_eq!(axes.completion_status, Some(CompletionStatus::BlockedOrParked));
+    }
+
+    #[test]
+    fn a_passing_security_review_leaves_the_check_standing() {
+        let events = vec![
+            run_event(0, EventType::RUN_STARTED),
+            high_risk_decision(1),
+            check(2, "completed"),
+            security_review(3, EvidenceStatus::Passed),
+            answered(4, "all done"),
+            run_event(5, EventType::RUN_COMPLETED),
+        ];
+        let axes = derive(&events);
+        assert_eq!(axes.verification_status, VerificationStatus::Verified);
+        assert_eq!(axes.completion_status, Some(CompletionStatus::VerifiedComplete));
     }
 
     #[test]

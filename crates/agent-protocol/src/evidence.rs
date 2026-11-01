@@ -44,6 +44,11 @@ pub enum EvidenceKind {
     /// A structured check re-run from the frozen copy of the verification
     /// apparatus, after the working copy changed.
     Reviewer,
+    /// An independent reviewer's verdict on a task that ran an L2/L3 action
+    /// (CONTRACT §7 #183). Not a check of a program's output: a judgement about
+    /// the actions and the changes they made, recorded so the completion gate
+    /// can require it without reading prose.
+    SecurityReview,
     /// A kind this build has no name for. Read, recorded, never accepted: an
     /// evidence record whose meaning is unknown is not a reason to claim
     /// anything.
@@ -57,6 +62,7 @@ impl EvidenceKind {
             Self::CompletionCriterion => "completion_criterion",
             Self::Verifier => "verifier",
             Self::Reviewer => "reviewer",
+            Self::SecurityReview => "security_review",
             Self::Unknown => "unknown",
         }
     }

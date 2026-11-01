@@ -375,6 +375,16 @@ pub enum StopReason {
     /// other endings this one is not the model's claim: a command's exit code
     /// (or an HTTP status) decided it.
     Completed,
+    /// The turn's answer was withheld because the independent security review
+    /// of a high-risk task did not pass (B9, CONTRACT §7 #183).
+    ///
+    /// The model did its work and the loop ended normally; what failed is the
+    /// claim that the result may be handed over. Written by the scheduler after
+    /// the review, so it is never a reason the loop itself returns. The text the
+    /// model produced stays in the log and is shown with this reason attached —
+    /// the same shape a truncated answer has, because it is the same situation:
+    /// something that reads like an answer and is not one.
+    SecurityBlocked,
 }
 
 impl StopReason {
@@ -397,6 +407,7 @@ impl StopReason {
             Self::TokenBudgetExceeded => "token_budget_exceeded",
             Self::Stalled => "stalled",
             Self::Completed => "completed",
+            Self::SecurityBlocked => "security_blocked",
         }
     }
 }

@@ -55,6 +55,10 @@ impl DecisionFamily {
     /// can only tighten what policy and the workspace boundary already said
     /// (`permission_classifier` module).
     pub const PERMISSION_CLASSIFIER: &'static str = "permission_classifier";
+    /// Whether finished high-risk work may be called done. *Consumed* like the
+    /// two above: its answer is an evidence record the completion gate reads,
+    /// and it can only block (`security_review` module, CONTRACT §7 #183).
+    pub const SECURITY_REVIEW: &'static str = "security_review";
 
     /// Create a family from its wire string.
     pub fn new(s: impl Into<String>) -> Self {

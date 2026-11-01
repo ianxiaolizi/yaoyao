@@ -24,6 +24,7 @@ pub mod permission_classifier;
 pub mod process_env;
 pub mod process_launcher;
 pub mod secret_provider;
+pub mod security_reviewer;
 pub mod subagent;
 pub mod tool_gateway;
 pub mod tool_provider;

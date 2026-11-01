@@ -14,6 +14,7 @@ use agent_ports::decision::{DecisionAdvisor, FastDecisionProvider};
 use agent_ports::intent_adjudication::IntentAdjudicator;
 use agent_ports::model_router::ModelRouter;
 use agent_ports::permission_classifier::PermissionClassifier;
+use agent_ports::security_reviewer::SecurityReviewer;
 
 /// Why the shadow stack could not be assembled.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -38,6 +39,13 @@ pub struct DecisionStack {
     /// record says so by naming no trace. Only a judge that is installed and
     /// fails to answer stops the call for a person (B3, CONTRACT §7 #177).
     pub classifier: Option<Arc<dyn PermissionClassifier>>,
+    /// Who reviews the L2/L3 actions a task ran, before its answer may be
+    /// delivered (B9).
+    ///
+    /// `None` when no sidecar is configured, and then a high-risk task simply
+    /// cannot complete: the gate finds no review evidence and refuses, rather
+    /// than reading the absence as approval.
+    pub reviewer: Option<Arc<dyn SecurityReviewer>>,
 }
 
 /// Wrap `router` with the shadow advisor.
@@ -78,8 +86,13 @@ pub fn assemble(
     // gate then asks a person instead of assuming silence is consent.
     let classifier =
         agent_decision::permission_classifier::classifier_for(backends.first().cloned());
+    // The reviewer is built from the same backend by the same rule, and for a
+    // stronger version of the same reason: a classifier that cannot answer asks
+    // a person, while a reviewer that cannot answer blocks the delivery. Both
+    // need to know whether a judge exists at all (B9).
+    let reviewer = agent_decision::security_reviewer::reviewer_for(backends.first().cloned());
     let (router, advisor) = agent_decision::shadow_for(router, backends);
-    Ok(DecisionStack { router, advisor, adjudicator, classifier })
+    Ok(DecisionStack { router, advisor, adjudicator, classifier, reviewer })
 }
 
 #[cfg(test)]

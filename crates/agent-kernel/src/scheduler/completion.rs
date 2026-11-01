@@ -31,7 +31,13 @@ pub(crate) fn note_claims(
     pending: &mut Vec<EventDraft>,
 ) {
     let claim = crate::completion::gate(so_far);
-    if *reason == StopReason::Completed && !claim.is_accepted() {
+    // Two endings make a claim about the world: the operator's check said the
+    // task was done, or the turn is ending with an answer and the work behind it
+    // is on the table. A turn whose security review refused it is the second
+    // kind still — the answer exists and the log has to say why it was withheld
+    // (B9).
+    let claiming = matches!(reason, StopReason::Completed | StopReason::SecurityBlocked);
+    if claiming && !claim.is_accepted() {
         let mut payload = serde_json::json!({
             "verdict": claim.as_str(),
             "task_revision": crate::completion::task_revision(so_far),

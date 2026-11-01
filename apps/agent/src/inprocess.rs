@@ -483,6 +483,17 @@ pub(crate) fn describe_report(
             ),
             side_effects: Vec::new(),
         },
+        // A child turn runs read-only (CONTRACT §7 #133), so it cannot run the
+        // L2/L3 action a review is about and has nothing that reaches this arm.
+        // If a child ever did, the answer would still not be one this parent may
+        // pass on: an unaccepted review is a withheld result, in a child exactly
+        // as in a turn.
+        StopReason::SecurityBlocked => SubagentOutcome::Failed {
+            message: "the child's answer was withheld: the independent security review of its \
+                      actions did not pass"
+                .to_string(),
+            side_effects: Vec::new(),
+        },
         StopReason::UserCancelled => SubagentOutcome::Cancelled,
         StopReason::FatalError => {
             let mut message = "the child's attempt failed".to_string();

@@ -32,6 +32,7 @@ pub mod schedule;
 pub mod scheduler;
 mod scrub;
 mod secret_refs;
+pub mod security;
 pub mod session_archive;
 pub mod session_lifecycle;
 mod snapshot;

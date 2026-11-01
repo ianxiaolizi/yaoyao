@@ -36,6 +36,7 @@ pub mod permission_classifier;
 pub mod replay;
 pub mod router;
 pub mod rule;
+pub mod security_reviewer;
 
 pub use assembly::shadow_for;
 pub use broker::{DEFAULT_TIMEOUT, DecisionBroker, DecisionBrokerError};

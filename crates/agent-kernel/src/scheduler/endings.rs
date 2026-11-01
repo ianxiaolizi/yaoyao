@@ -83,6 +83,13 @@ impl Ending {
             StopReason::FinalAnswer | StopReason::ContentFiltered | StopReason::Completed => {
                 (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED)
             }
+            // The turn ended normally and the review afterwards withheld the
+            // answer (B9). Named here so a loop that ever returned this reason
+            // would be a decision rather than a fall into `_`; it is not a
+            // reason the loop produces, and the scheduler, which writes it after
+            // this method has run, rewrites the payload's `stop_reason` and sets
+            // `incomplete` itself.
+            StopReason::SecurityBlocked => (EventType::TURN_COMPLETED, EventType::RUN_COMPLETED),
             StopReason::FatalError => (EventType::TURN_FAILED, EventType::RUN_FAILED),
             StopReason::UserCancelled => (EventType::TURN_CANCELLED, EventType::RUN_CANCELLED),
         };
@@ -117,6 +124,17 @@ impl Ending {
                 reason: reason @ (StopReason::TokenBudgetExceeded | StopReason::Stalled),
                 final_content,
             } => {
+                let mut payload = serde_json::json!({ "stop_reason": reason, "incomplete": true });
+                if let Some(content) = final_content {
+                    payload["final_content"] = serde_json::json!(content);
+                }
+                payload
+            }
+            // Same shape as a stall: text the model produced that is not a
+            // delivered answer. Unreachable through `settle` for the reason the
+            // terminal-event arm gives, and kept so the payload never falls
+            // through to a shape that would read as an ordinary ending.
+            Ending::Loop { reason: StopReason::SecurityBlocked, final_content } => {
                 let mut payload = serde_json::json!({ "stop_reason": reason, "incomplete": true });
                 if let Some(content) = final_content {
                     payload["final_content"] = serde_json::json!(content);
