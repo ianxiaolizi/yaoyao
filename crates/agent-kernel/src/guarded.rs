@@ -12,18 +12,18 @@
 use std::sync::Arc;
 
 use agent_ports::artifact_store::ArtifactStore;
-use agent_ports::secret_provider::{SecretProvider, SecretProviderError};
+use agent_ports::permission_classifier::PermissionClassifier;
+use agent_ports::secret_provider::SecretProvider;
 use agent_ports::tool_gateway::{ToolGateway, ToolGatewayError};
 use agent_ports::tool_provider::{
     ToolDefinition, ToolInvocation, ToolProvider, ToolResult, ToolSideEffect,
 };
 use agent_protocol::ids::SessionId;
 use agent_protocol::permission::ActionFacts;
-use agent_protocol::permissions::{Capability, PolicyDecision, SecretRef};
+use agent_protocol::permissions::{Capability, PolicyDecision};
 use agent_protocol::redactor::Redactor;
-use agent_protocol::tool::{ToolErrorKind, ToolPolicyRecord};
+use agent_protocol::tool::ToolPolicyRecord;
 
-use crate::action::SECRET_SCHEME;
 use crate::approval::ApprovalService;
 use crate::permission::{PermissionBaseline, PermissionDecisionRecord, PermissionService};
 use crate::policy::{PolicyContext, PolicyEngine, Refusal};
@@ -67,6 +67,12 @@ pub struct GuardedToolProvider {
     /// (see [`crate::permission::rule`]); it just keeps no record of it. The
     /// assembled binary always hands one over.
     permissions: Option<Arc<PermissionService>>,
+    /// Who is asked about a boundary action, when the policy does not refuse it.
+    ///
+    /// `None` is a build with no independent judge: the decision names no trace
+    /// and the policy's own answer stands. A judge that *is* installed and then
+    /// cannot answer is the case that stops for a person (CONTRACT §7 #177).
+    classifier: Option<Arc<dyn PermissionClassifier>>,
     /// How many bytes of one result stay inline; larger results are offloaded.
     offload_max_bytes: usize,
     /// The compiled declarations calls are checked against, kept between calls
@@ -91,6 +97,7 @@ impl GuardedToolProvider {
             artifacts,
             secrets: None,
             permissions: None,
+            classifier: None,
             offload_max_bytes: OFFLOAD_MAX_BYTES,
             schema: SchemaCheck::new(),
         }
@@ -103,6 +110,12 @@ impl GuardedToolProvider {
     /// to the same log could land a decision on a stream this run did not read.
     pub fn with_permission_service(mut self, permissions: Arc<PermissionService>) -> Self {
         self.permissions = Some(permissions);
+        self
+    }
+
+    /// Ask an independent classifier about every boundary action (B3).
+    pub fn with_permission_classifier(mut self, classifier: Arc<dyn PermissionClassifier>) -> Self {
+        self.classifier = Some(classifier);
         self
     }
 
@@ -152,156 +165,6 @@ impl GuardedToolProvider {
 
     fn is_known(&self, tool_name: &str) -> bool {
         self.inner.definitions().into_iter().any(|d| d.name == tool_name)
-    }
-
-    /// Whether any string in `value` names a secret.
-    fn references_secret(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::String(text) => text.contains(SECRET_SCHEME),
-            serde_json::Value::Array(items) => items.iter().any(Self::references_secret),
-            serde_json::Value::Object(map) => map.values().any(Self::references_secret),
-            _ => false,
-        }
-    }
-
-    /// Resolve every reference in the arguments, refusing the whole call if one
-    /// cannot be resolved.
-    ///
-    /// All-or-nothing: a call that half-resolved would hand the tool a mix of
-    /// values and reference strings, and the tool would act on the mix. The
-    /// returned invocation is a copy — the caller's own value, and the event
-    /// already written from it, keep the references.
-    fn resolve_arguments(
-        &self,
-        invocation: &ToolInvocation,
-    ) -> Result<(ToolInvocation, Vec<ResolvedSecret>), ToolGatewayError> {
-        if !Self::references_secret(&invocation.arguments) {
-            return Ok((invocation.clone(), Vec::new()));
-        }
-        let mut resolved = Vec::new();
-        let arguments =
-            self.resolve_value(&invocation.tool_name, &invocation.arguments, &mut resolved)?;
-        let mut resolved_invocation = invocation.clone();
-        resolved_invocation.arguments = arguments;
-        Ok((resolved_invocation, resolved))
-    }
-
-    fn resolve_value(
-        &self,
-        tool: &str,
-        value: &serde_json::Value,
-        resolved: &mut Vec<ResolvedSecret>,
-    ) -> Result<serde_json::Value, ToolGatewayError> {
-        match value {
-            serde_json::Value::String(text) => {
-                self.resolve_text(tool, text, resolved).map(serde_json::Value::String)
-            }
-            serde_json::Value::Array(items) => items
-                .iter()
-                .map(|item| self.resolve_value(tool, item, resolved))
-                .collect::<Result<Vec<_>, _>>()
-                .map(serde_json::Value::Array),
-            serde_json::Value::Object(map) => map
-                .iter()
-                .map(|(key, item)| {
-                    self.resolve_value(tool, item, resolved).map(|value| (key.clone(), value))
-                })
-                .collect::<Result<serde_json::Map<_, _>, _>>()
-                .map(serde_json::Value::Object),
-            other => Ok(other.clone()),
-        }
-    }
-
-    /// Substitute every `secret://<source>/<name>` in one string.
-    ///
-    /// A reference is parsed only at the scheme's start and ends at the first
-    /// character that cannot appear in a name, so `Bearer secret://env/TOKEN`
-    /// inside a shell command substitutes exactly the token and leaves the
-    /// rest of the command alone. A malformed reference is refused rather than
-    /// passed through as text: a tool handed the literal reference would do
-    /// something with it, and the caller would have meant a value.
-    fn resolve_text(
-        &self,
-        tool: &str,
-        text: &str,
-        resolved: &mut Vec<ResolvedSecret>,
-    ) -> Result<String, ToolGatewayError> {
-        let Some(first) = text.find(SECRET_SCHEME) else {
-            return Ok(text.to_string());
-        };
-        let mut out = String::with_capacity(text.len());
-        out.push_str(&text[..first]);
-        let mut rest = &text[first..];
-        while let Some(start) = rest.find(SECRET_SCHEME) {
-            out.push_str(&rest[..start]);
-            let after = &rest[start + SECRET_SCHEME.len()..];
-            let end = after
-                .find(|ch: char| {
-                    !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
-                })
-                .unwrap_or(after.len());
-            let body = &after[..end];
-            let reference = format!("{SECRET_SCHEME}{body}");
-            let malformed = || ToolGatewayError::SecretUnavailable {
-                tool: tool.to_string(),
-                reference: reference.clone(),
-                reason: "a secret reference is written secret://<source>/<name>".to_string(),
-                kind: ToolErrorKind::InvalidArguments,
-            };
-            let Some((source, name)) = body.split_once('/') else {
-                return Err(malformed());
-            };
-            if source.is_empty() || name.is_empty() || name.contains('/') {
-                return Err(malformed());
-            }
-            let secret = SecretRef { source: source.to_string(), name: name.to_string() };
-            let Some(provider) = self.secrets.as_deref() else {
-                return Err(ToolGatewayError::SecretUnavailable {
-                    tool: tool.to_string(),
-                    reference: secret.reference(),
-                    reason: "this run has no secret provider configured".to_string(),
-                    kind: ToolErrorKind::PermissionDenied,
-                });
-            };
-            let value = provider.resolve(&secret).map_err(|error| match error {
-                SecretProviderError::NotFound { .. } => ToolGatewayError::SecretUnavailable {
-                    tool: tool.to_string(),
-                    reference: secret.reference(),
-                    reason: "is not available to this run".to_string(),
-                    kind: ToolErrorKind::PermissionDenied,
-                },
-                SecretProviderError::Failed(message) => ToolGatewayError::SecretUnavailable {
-                    tool: tool.to_string(),
-                    reference: secret.reference(),
-                    reason: format!("the secret provider failed: {message}"),
-                    kind: ToolErrorKind::Unavailable,
-                },
-            })?;
-            resolved.push(ResolvedSecret { reference: secret.reference(), value: value.clone() });
-            out.push_str(&value);
-            rest = &after[end..];
-        }
-        out.push_str(rest);
-        Ok(out)
-    }
-
-    /// Whether an approval already covers the capabilities a secret-using call
-    /// declares.
-    ///
-    /// Any intersecting grant is enough: the grant was given for this tool's
-    /// capability, and a secret names a value the person approving the call
-    /// could not see either way.
-    async fn secret_use_granted(
-        &self,
-        session_id: &SessionId,
-        capabilities: &[Capability],
-    ) -> Result<bool, ToolGatewayError> {
-        let leases = self
-            .approvals
-            .leases_in_effect(session_id)
-            .await
-            .map_err(|e| ToolGatewayError::Approval(e.to_string()))?;
-        Ok(leases.iter().any(|lease| capabilities.contains(&lease.capability)))
     }
 
     /// Raise the approval a secret-using call needs, and say it is pending.
@@ -424,7 +287,8 @@ impl GuardedToolProvider {
         &self,
         invocation: &ToolInvocation,
     ) -> Result<ToolResult, ToolGatewayError> {
-        let (resolved_invocation, secrets) = self.resolve_arguments(invocation)?;
+        let (resolved_invocation, secrets) =
+            crate::secret_refs::resolve_arguments(self.secrets.as_deref(), invocation)?;
         self.finish_resolved(&resolved_invocation, &secrets).await
     }
 
@@ -494,13 +358,14 @@ impl GuardedToolProvider {
         session_id: &SessionId,
         action: &ActionFacts,
         baseline: PermissionBaseline,
+        classifier: Option<crate::permission::ClassifierTrace>,
     ) -> Result<PermissionDecisionRecord, ToolGatewayError> {
         let Some(service) = &self.permissions else {
             // A gateway assembled without a ledger still makes the same
             // decision; it just has nowhere to put it.
-            return Ok(crate::permission::rule(action.clone(), baseline, None));
+            return Ok(crate::permission::rule(action.clone(), baseline, classifier));
         };
-        service.decide(session_id, action.clone(), baseline, None).await.map_err(|error| {
+        service.decide(session_id, action.clone(), baseline, classifier).await.map_err(|error| {
             ToolGatewayError::PermissionAudit {
                 tool: action.tool_name.clone(),
                 reason: error.to_string(),
@@ -600,7 +465,8 @@ impl ToolGateway for GuardedToolProvider {
         // The action, as every layer below this point will see it. Built once,
         // before anything decides: the digest a decision is recorded under is
         // then the one the result carries, by construction.
-        let action = self.action_facts(&format!("manual:{}", session_id.as_str()), 0, invocation);
+        let mut action =
+            self.action_facts(&format!("manual:{}", session_id.as_str()), 0, invocation);
 
         // The workspace boundary is asked before the policy, and its refusal is
         // recorded before it is returned. A refusal with no decision beside it
@@ -609,7 +475,7 @@ impl ToolGateway for GuardedToolProvider {
         // grant could have said.
         if let Err(refusal) = self.check_paths(invocation, &ctx) {
             let reason = refusal.to_string();
-            self.record(session_id, &action, PermissionBaseline::refused(reason)).await?;
+            self.record(session_id, &action, PermissionBaseline::refused(reason), None).await?;
             return Err(refusal);
         }
 
@@ -621,6 +487,7 @@ impl ToolGateway for GuardedToolProvider {
         // call. The second evaluation is the one that costs, and it happens
         // only for the calls that were going to stop and ask anyway.
         let mut decision = self.policy.evaluate_with_ctx(&capabilities, Some(&ctx), &[]);
+        let ungranted = decision;
         if decision == PolicyDecision::Ask {
             let grants = self
                 .approvals
@@ -632,6 +499,38 @@ impl ToolGateway for GuardedToolProvider {
                 .collect::<Vec<_>>();
             decision = self.policy.evaluate_with_ctx(&capabilities, Some(&ctx), &grants);
         }
+        // Whether a person's grant is what allowed this call, as opposed to a
+        // rule that allows the capability outright. The difference decides what
+        // an absent classifier means: a grant is an answer, a rule is not.
+        let approved = ungranted != PolicyDecision::Allow && decision == PolicyDecision::Allow;
+
+        // The independent judgement of a boundary action, taken before anything
+        // is written or run (B3). A policy deny never reaches it: a refusal is
+        // final, and an estimate about a call nobody may make is work done to
+        // learn nothing. The risk a classifier states can only raise the action
+        // it is judging — and raising it re-computes the digest, so the record
+        // names the action that was actually judged.
+        let classifier = crate::permission::judge(
+            self.classifier.as_ref(),
+            session_id,
+            &action,
+            decision,
+            &capabilities,
+        )
+        .await;
+        if let Some(risk) =
+            classifier.as_ref().and_then(|trace| trace.suggestion.as_ref()).and_then(|s| s.risk)
+        {
+            action = action.raised_to(risk);
+        }
+        // The door this call leaves by is the matrix's answer, not the
+        // policy's: a classifier's `deny` stops a call the policy allowed, and
+        // its `ask` holds one. The baseline each arm records is still the
+        // policy's own answer, so the written decision re-derives to the same
+        // verdict it was acted on.
+        let policy_answer = decision;
+        let decision =
+            crate::permission::verdict(&action, policy_answer, approved, classifier.as_ref());
 
         match decision {
             PolicyDecision::Deny => {
@@ -646,16 +545,40 @@ impl ToolGateway for GuardedToolProvider {
                     capabilities.clone(),
                     self.policy.refusals(&capabilities, Some(&ctx), &[]),
                 );
-                let reason = if capabilities.is_empty() {
+                let denied_by_classifier = classifier.as_ref().is_some_and(|trace| {
+                    trace.outcome == crate::permission::ClassifierOutcome::Deny
+                });
+                let reason = if denied_by_classifier {
+                    // The policy allowed this call; the refusal is the
+                    // classifier's, and the record says so with its own words.
+                    classifier
+                        .as_ref()
+                        .and_then(|trace| trace.suggestion.as_ref())
+                        .filter(|suggestion| !suggestion.reason.is_empty())
+                        .map(|suggestion| {
+                            format!("the permission classifier refused: {}", suggestion.reason)
+                        })
+                        .unwrap_or_else(|| "the permission classifier refused the call".to_string())
+                } else if capabilities.is_empty() {
                     "declares no capabilities, and an undeclared surface is not an unlimited one"
                         .to_string()
                 } else {
                     deny_reason(&record.refusals)
                 };
+                // A refusal the classifier made is recorded against the
+                // policy's own answer plus the trace, so the written decision
+                // re-derives to "the classifier refused" rather than to a
+                // policy deny nobody wrote.
+                let baseline = if denied_by_classifier {
+                    PermissionBaseline::new(policy_answer)
+                } else {
+                    PermissionBaseline::from(record.clone())
+                };
                 self.record(
                     session_id,
                     &action,
-                    PermissionBaseline::from(record.clone()).because(reason.clone()),
+                    baseline.because(reason.clone()),
+                    classifier.clone(),
                 )
                 .await?;
                 Err(ToolGatewayError::PolicyDenied {
@@ -672,8 +595,13 @@ impl ToolGateway for GuardedToolProvider {
                 // a session that crashed between raising the approval and
                 // recording it would otherwise hold a question with no reason
                 // in the log.
-                self.record(session_id, &action, PermissionBaseline::new(PolicyDecision::Ask))
-                    .await?;
+                self.record(
+                    session_id,
+                    &action,
+                    PermissionBaseline::new(PolicyDecision::Ask),
+                    classifier.clone(),
+                )
+                .await?;
                 Err(self.request_approval(session_id, invocation, capability).await?)
             }
             PolicyDecision::Allow => {
@@ -682,11 +610,12 @@ impl ToolGateway for GuardedToolProvider {
                 // already granted, secret approved), and a record that only
                 // two of them carried would be worse than none.
                 let record = ToolPolicyRecord::allowed(capabilities.clone()).about(&action.digest);
-                if !Self::references_secret(&invocation.arguments) {
+                if !crate::secret_refs::references_secret(&invocation.arguments) {
                     self.record(
                         session_id,
                         &action,
-                        PermissionBaseline::new(PolicyDecision::Allow),
+                        PermissionBaseline::new(PolicyDecision::Allow).approve(approved),
+                        classifier.clone(),
                     )
                     .await?;
                     return Ok(self.finish_resolved(invocation, &[]).await?.with_policy(record));
@@ -696,14 +625,20 @@ impl ToolGateway for GuardedToolProvider {
                 // to approve one. The values stay in this frame until the call
                 // actually runs (or the approval is raised and they are
                 // dropped with the frame).
-                let (resolved_invocation, secrets) = self.resolve_arguments(invocation)?;
+                let (resolved_invocation, secrets) =
+                    crate::secret_refs::resolve_arguments(self.secrets.as_deref(), invocation)?;
                 // A call that names a secret is a call a person should see
                 // before it runs. The reference is all the summary can show
                 // them, and the tool's own capability says whether they
                 // already said yes to it in this scope.
-                let granted = self.secret_use_granted(session_id, &capabilities).await?;
-                let baseline = if granted {
-                    PermissionBaseline::new(PolicyDecision::Allow)
+                let secret_granted = crate::secret_refs::secret_use_granted(
+                    &self.approvals,
+                    session_id,
+                    &capabilities,
+                )
+                .await?;
+                let baseline = if secret_granted {
+                    PermissionBaseline::new(PolicyDecision::Allow).approve(approved)
                 } else {
                     // The policy allowed the capability; a person has not yet
                     // seen this call name a secret. The decision states the
@@ -711,8 +646,8 @@ impl ToolGateway for GuardedToolProvider {
                     PermissionBaseline::new(PolicyDecision::Ask)
                         .because("the call names a secret; a person sees it before it runs")
                 };
-                self.record(session_id, &action, baseline).await?;
-                if !granted {
+                self.record(session_id, &action, baseline, classifier.clone()).await?;
+                if !secret_granted {
                     let capability =
                         capabilities.first().cloned().unwrap_or_else(|| Capability::new("unknown"));
                     return Err(self.request_approval(session_id, invocation, capability).await?);
@@ -776,9 +711,12 @@ mod tests {
     use super::*;
     use crate::scrub::OFFLOAD_MAX_LINES;
     use agent_ports::artifact_store::ArtifactStoreError;
+    use agent_ports::secret_provider::SecretProviderError;
     use agent_ports::tool_provider::{ToolProviderError, ToolSideEffect, ToolSource, ToolStatus};
     use agent_protocol::ids::ApprovalId;
+    use agent_protocol::permissions::SecretRef;
     use agent_protocol::permissions::{ApprovalScope, ArtifactRef, Workspace};
+    use agent_protocol::tool::ToolErrorKind;
     use agent_testkit::FakeEventStore;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1227,6 +1165,34 @@ mod tests {
         assert_eq!(pending[0].capability, Capability::new(Capability::PROCESS_SPAWN));
     }
 
+    /// A classifier that allows whatever it is asked about (B3).
+    ///
+    /// Used by the tests that are about *other* wiring (grants, approvals):
+    /// since no `L2`/`L3` call runs without an independent judgement, they need
+    /// a judge that gets out of the way.
+    struct Allows;
+
+    #[async_trait::async_trait]
+    impl agent_ports::permission_classifier::PermissionClassifier for Allows {
+        async fn classify(
+            &self,
+            _: &agent_ports::permission_classifier::PermissionClassifierInput,
+        ) -> crate::permission::ClassifierTrace {
+            use agent_protocol::permission_classifier::{PermissionSuggestion, SuggestionDecision};
+            let mut trace = crate::permission::ClassifierTrace::unavailable("test");
+            trace.outcome = crate::permission::ClassifierOutcome::Allow;
+            trace.suggestion = Some(PermissionSuggestion {
+                decision: SuggestionDecision::Allow,
+                confidence: 1.0,
+                risk: None,
+                reversible: None,
+                requires_confirmation: false,
+                reason: "allowed by the test".to_string(),
+            });
+            trace
+        }
+    }
+
     /// As [`gateway`], but the approval service permits session-scoped grants.
     /// Those are off by default — a session-wide grant must be opted into — so
     /// a test that grants one has to say so here.
@@ -1243,7 +1209,8 @@ mod tests {
             approvals.clone(),
             ResourceGuard::new(workspace()),
             artifacts,
-        );
+        )
+        .with_permission_classifier(Arc::new(Allows));
         (gateway, approvals, tools)
     }
 

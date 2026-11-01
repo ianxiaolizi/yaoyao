@@ -13,6 +13,7 @@ use agent_decision_laya::{LayaConfig, LayaConfigError, LayaDecisionProvider};
 use agent_ports::decision::{DecisionAdvisor, FastDecisionProvider};
 use agent_ports::intent_adjudication::IntentAdjudicator;
 use agent_ports::model_router::ModelRouter;
+use agent_ports::permission_classifier::PermissionClassifier;
 
 /// Why the shadow stack could not be assembled.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -31,6 +32,12 @@ pub struct DecisionStack {
     pub router: Arc<dyn ModelRouter>,
     pub advisor: Arc<dyn DecisionAdvisor>,
     pub adjudicator: Option<Arc<dyn IntentAdjudicator>>,
+    /// Who judges a boundary action when the policy does not refuse it.
+    ///
+    /// `None` when no sidecar is configured: the build has no judge, and the
+    /// record says so by naming no trace. Only a judge that is installed and
+    /// fails to answer stops the call for a person (B3, CONTRACT §7 #177).
+    pub classifier: Option<Arc<dyn PermissionClassifier>>,
 }
 
 /// Wrap `router` with the shadow advisor.
@@ -66,8 +73,13 @@ pub fn assemble(
     // bounded input, and it never sees the executing session's history.
     let adjudicator =
         agent_decision::intent_adjudication::adjudicator_for(backends.first().cloned());
+    // The classifier is built from the same backend list and by the same rule:
+    // a build with no independent judge says so by leaving this `None`, and the
+    // gate then asks a person instead of assuming silence is consent.
+    let classifier =
+        agent_decision::permission_classifier::classifier_for(backends.first().cloned());
     let (router, advisor) = agent_decision::shadow_for(router, backends);
-    Ok(DecisionStack { router, advisor, adjudicator })
+    Ok(DecisionStack { router, advisor, adjudicator, classifier })
 }
 
 #[cfg(test)]

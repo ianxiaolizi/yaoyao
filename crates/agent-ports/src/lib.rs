@@ -20,6 +20,7 @@ pub mod memory_index;
 pub mod memory_store;
 pub mod model_provider;
 pub mod model_router;
+pub mod permission_classifier;
 pub mod process_env;
 pub mod process_launcher;
 pub mod secret_provider;

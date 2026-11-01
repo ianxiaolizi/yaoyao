@@ -22,9 +22,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agent_ports::event_store::{EventStore, EventStoreError};
+use agent_ports::permission_classifier::{PermissionClassifier, PermissionClassifierInput};
 use agent_protocol::events::{Actor, EventDraft, EventType};
 use agent_protocol::ids::{ApprovalId, EventId, EventSeq, SchemaVersion, SessionId};
 use agent_protocol::permission::{ActionFacts, RiskLevel};
+pub use agent_protocol::permission_classifier::{ClassifierOutcome, ClassifierTrace};
 use agent_protocol::permissions::{Capability, PolicyDecision, RefusalLayer};
 use chrono::{DateTime, Utc};
 
@@ -42,54 +44,14 @@ pub enum AuthorizationSource {
     UserApproval,
 }
 
-/// What a classifier concluded, as the decision that used it records it.
+/// How sure a classifier has to be before an `allow` is acted on.
 ///
-/// Defined here rather than beside the classifier because the record is the
-/// thing that has to be storable: a classifier is replaced, rescheduled or
-/// absent, and the log outlives every one of them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClassifierOutcome {
-    Allow,
-    Ask,
-    Deny,
-    /// No classifier was reachable for this call.
-    Unavailable,
-    /// The classifier answered something this build cannot act on — a timeout,
-    /// a protocol error, a low-confidence answer.
-    Unclear,
-}
-
-/// One classifier call, as it is remembered.
-///
-/// The hashes are what make a classifier's advice reviewable without keeping
-/// its input: the pack, the prompt and the input are reproducible from these
-/// three values plus the classifier's own version.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ClassifierTrace {
-    pub route_id: String,
-    pub revision: String,
-    pub pack_version: String,
-    pub prompt_hash: String,
-    pub input_hash: String,
-    pub latency_ms: u64,
-    pub outcome: ClassifierOutcome,
-}
-
-impl ClassifierTrace {
-    /// The trace for a call no classifier answered.
-    pub fn unavailable(route_id: &str) -> Self {
-        Self {
-            route_id: route_id.to_string(),
-            revision: String::new(),
-            pack_version: String::new(),
-            prompt_hash: String::new(),
-            input_hash: String::new(),
-            latency_ms: 0,
-            outcome: ClassifierOutcome::Unavailable,
-        }
-    }
-}
+/// Below this the answer is not evidence: a backend that says "allow" at 0.3 is
+/// guessing, and a guess that lets a boundary action run is the failure this
+/// family exists to prevent. The number is policy, so it lives beside the
+/// matrix rather than inside the adapter — a reader looking for "what can
+/// tighten a call" finds one function, not one function and an adapter.
+pub const MIN_CLASSIFIER_CONFIDENCE: f64 = 0.7;
 
 /// What the deterministic layers said, before anything estimates.
 ///
@@ -104,11 +66,19 @@ pub struct PermissionBaseline {
     pub decision: PolicyDecision,
     pub refusals: BTreeMap<Capability, RefusalLayer>,
     pub reason: Option<String>,
+    /// Whether a person's standing grant is what turned the policy's `ask`
+    /// into this `allow`.
+    ///
+    /// The distinction the matrix turns on: a rule that allows a boundary action
+    /// outright is the machine deciding by itself, while a grant is a person
+    /// who already answered. The first needs an independent judgement before it
+    /// runs; the second is one, and an absent classifier does not erase it.
+    pub approved: bool,
 }
 
 impl PermissionBaseline {
     pub fn new(decision: PolicyDecision) -> Self {
-        Self { decision, refusals: BTreeMap::new(), reason: None }
+        Self { decision, refusals: BTreeMap::new(), reason: None, approved: false }
     }
 
     /// A refusal that is not a policy refusal, with the sentence to record.
@@ -117,6 +87,7 @@ impl PermissionBaseline {
             decision: PolicyDecision::Deny,
             refusals: BTreeMap::new(),
             reason: Some(reason.into()),
+            approved: false,
         }
     }
 
@@ -125,11 +96,17 @@ impl PermissionBaseline {
         self.reason = Some(reason.into());
         self
     }
+
+    /// Say whether a person's grant is what allowed this call.
+    pub fn approve(mut self, approved: bool) -> Self {
+        self.approved = approved;
+        self
+    }
 }
 
 impl From<agent_protocol::tool::ToolPolicyRecord> for PermissionBaseline {
     fn from(record: agent_protocol::tool::ToolPolicyRecord) -> Self {
-        Self { decision: record.decision, refusals: record.refusals, reason: None }
+        Self { decision: record.decision, refusals: record.refusals, reason: None, approved: false }
     }
 }
 
@@ -272,7 +249,7 @@ pub fn rule(
     baseline: PermissionBaseline,
     classifier: Option<ClassifierTrace>,
 ) -> PermissionDecisionRecord {
-    let decided = resolve(&baseline, classifier.as_ref());
+    let decided = resolve(&action, &baseline, classifier.as_ref());
     PermissionDecisionRecord {
         decision: decided.decision,
         action,
@@ -298,7 +275,24 @@ struct Decided {
 /// A function rather than a method because the matrix is the rule a reader has
 /// to be able to check against the contract — it is the same rule whether the
 /// caller is the gateway, a test, or a future second entry point.
-fn resolve(baseline: &PermissionBaseline, classifier: Option<&ClassifierTrace>) -> Decided {
+///
+/// The order is the whole point, and each step can only tighten:
+///
+/// 1. A deterministic refusal is final. No classifier answer, however sure,
+///    turns a denied call into a running one.
+/// 2. With no classifier configured, the policy's answer stands, and the
+///    record names no judgement: a build that never had a judge is not a build
+///    whose judge abstained. (An *announced* judge that then fails does stop
+///    the call — see the `unavailable` arm below.)
+/// 3. `deny` refuses, `ask` asks, and an unreachable or unreadable backend asks.
+/// 4. An `allow` is acted on only above [`MIN_CLASSIFIER_CONFIDENCE`], and only
+///    as far as the baseline already went: the classifier never raises an
+///    `ask` into an `allow`.
+fn resolve(
+    action: &ActionFacts,
+    baseline: &PermissionBaseline,
+    classifier: Option<&ClassifierTrace>,
+) -> Decided {
     // The floor first, and before any estimate: a managed deny, a rule that
     // refuses this invocation, or a capability this build's sandbox does not
     // have is a fact, and no classifier's opinion about a call changes a fact.
@@ -313,43 +307,166 @@ fn resolve(baseline: &PermissionBaseline, classifier: Option<&ClassifierTrace>) 
             approval_id: None,
         };
     }
+
     let Some(trace) = classifier else {
         return Decided {
             decision: baseline.decision,
-            source: AuthorizationSource::Policy,
-            reason: baseline
-                .reason
-                .clone()
-                .unwrap_or_else(|| "the policy allows this call".to_string()),
+            source: if baseline.approved {
+                AuthorizationSource::UserApproval
+            } else {
+                AuthorizationSource::Policy
+            },
+            reason: baseline.reason.clone().unwrap_or_else(|| {
+                if baseline.approved && action.requires_high_risk_isolation() {
+                    "a person's standing grant covers this action".to_string()
+                } else {
+                    "the policy allows this call".to_string()
+                }
+            }),
             approval_id: None,
         };
     };
+
     match trace.outcome {
         ClassifierOutcome::Deny => Decided {
             decision: PolicyDecision::Deny,
             source: AuthorizationSource::PermissionClassifier,
-            reason: "the permission classifier refused the call".to_string(),
+            reason: trace
+                .suggestion
+                .as_ref()
+                .filter(|suggestion| !suggestion.reason.is_empty())
+                .map(|suggestion| {
+                    format!("the permission classifier refused: {}", suggestion.reason)
+                })
+                .unwrap_or_else(|| "the permission classifier refused the call".to_string()),
             approval_id: None,
         },
-        // Abstention, a timeout, a protocol error and a low-confidence answer
-        // are one case: none of them is evidence that the call is fine, so the
-        // call stops and asks. A classifier that cannot answer does not inherit
-        // the baseline's allow.
-        ClassifierOutcome::Ask | ClassifierOutcome::Unclear | ClassifierOutcome::Unavailable => {
+        ClassifierOutcome::Ask => Decided {
+            decision: PolicyDecision::Ask,
+            source: AuthorizationSource::PermissionClassifier,
+            reason: "the permission classifier asked for a person".to_string(),
+            approval_id: None,
+        },
+        // Abstention, a timeout, a protocol error and an unreachable backend are
+        // one case: none of them is evidence that the call is fine, so the call
+        // stops and asks. A classifier that cannot answer does not inherit the
+        // baseline's allow.
+        //
+        // The one exception is a call a person already granted: nothing was
+        // learned by not asking the classifier, so the standing answer stands.
+        // The call is not running *automatically* — a person decided about this
+        // capability — and B4 ties that grant to the exact action it covered.
+        ClassifierOutcome::Unclear | ClassifierOutcome::Unavailable
+            if baseline.approved && baseline.decision == PolicyDecision::Allow =>
+        {
             Decided {
-                decision: PolicyDecision::Ask,
-                source: AuthorizationSource::PermissionClassifier,
-                reason: format!("the permission classifier asked: {:?}", trace.outcome),
+                decision: PolicyDecision::Allow,
+                source: AuthorizationSource::UserApproval,
+                reason: "a person's standing grant covers this action; no independent classifier \
+                         answered"
+                    .to_string(),
                 approval_id: None,
             }
         }
-        ClassifierOutcome::Allow => Decided {
-            decision: baseline.decision,
+        ClassifierOutcome::Unclear | ClassifierOutcome::Unavailable => Decided {
+            decision: PolicyDecision::Ask,
             source: AuthorizationSource::PermissionClassifier,
-            reason: "the permission classifier allowed the call".to_string(),
+            reason: match trace.outcome {
+                ClassifierOutcome::Unavailable => {
+                    "no independent classifier was reachable for this call".to_string()
+                }
+                _ => "the permission classifier's answer could not be read".to_string(),
+            },
             approval_id: None,
         },
+        ClassifierOutcome::Allow => {
+            let suggestion = trace.suggestion.as_ref();
+            let confidence = suggestion.map(|s| s.confidence).unwrap_or(0.0);
+            if confidence < MIN_CLASSIFIER_CONFIDENCE {
+                return Decided {
+                    decision: PolicyDecision::Ask,
+                    source: AuthorizationSource::PermissionClassifier,
+                    reason: format!(
+                        "the permission classifier was not sure ({confidence:.2} < \
+                         {MIN_CLASSIFIER_CONFIDENCE}); a person sees it"
+                    ),
+                    approval_id: None,
+                };
+            }
+            if suggestion.is_some_and(|s| s.requires_confirmation) {
+                return Decided {
+                    decision: PolicyDecision::Ask,
+                    source: AuthorizationSource::PermissionClassifier,
+                    reason: "the permission classifier asked that a person see this action"
+                        .to_string(),
+                    approval_id: None,
+                };
+            }
+            Decided {
+                decision: baseline.decision,
+                source: AuthorizationSource::PermissionClassifier,
+                reason: "the permission classifier allowed the call".to_string(),
+                approval_id: None,
+            }
+        }
     }
+}
+
+/// What the policy's answer and a classifier's advice come to, without a record.
+///
+/// The gateway branches on this rather than on the policy's own answer, so the
+/// door a call leaves by is the one the matrix chose: a classifier's `deny`
+/// stops an otherwise-allowed call, and its `ask` holds one.
+pub fn verdict(
+    action: &ActionFacts,
+    decision: PolicyDecision,
+    approved: bool,
+    classifier: Option<&ClassifierTrace>,
+) -> PolicyDecision {
+    resolve(action, &PermissionBaseline::new(decision).approve(approved), classifier).decision
+}
+
+/// Ask the classifier about one call, when there is anything to ask.
+///
+/// `None` means "this question does not apply": the policy already refused (a
+/// deny is final before any estimate), the action is below the boundary the
+/// classifier exists for, or **this build has no judge at all**. The last is a
+/// configuration fact, not an abstention: a build without an independent backend
+/// was never promised one, and the record says so by naming no trace rather than
+/// by inventing an `unavailable` one. An abstention is what a *configured*
+/// classifier produces when it cannot answer, and that does read as "ask".
+///
+/// The input is built from the action facts and nothing else: no conversation,
+/// no file contents, no environment, and no resolved secret — a `secret://`
+/// reference stays the reference it was written as.
+pub async fn judge(
+    classifier: Option<&Arc<dyn PermissionClassifier>>,
+    session_id: &SessionId,
+    action: &ActionFacts,
+    decision: PolicyDecision,
+    capabilities: &[Capability],
+) -> Option<ClassifierTrace> {
+    if decision == PolicyDecision::Deny || !action.requires_high_risk_isolation() {
+        return None;
+    }
+    let classifier = classifier?;
+    let input = PermissionClassifierInput {
+        // The id the action itself was built under, so the record and the
+        // judgement name the same work.
+        session_id: session_id.clone(),
+        task_id: action.task_id.clone(),
+        task_revision: action.task_revision,
+        // The gateway holds no view of the work in progress: these three are
+        // the caller's to fill in when one exists, and their absence is stated
+        // rather than papered over with an empty string.
+        task_summary: None,
+        action: action.clone(),
+        policy_baseline: decision,
+        allowed_capabilities: capabilities.to_vec(),
+        recent_actions: Vec::new(),
+        untrusted_context_summary: None,
+    };
+    Some(classifier.classify(&input).await)
 }
 
 fn refusals_sentence(refusals: &BTreeMap<Capability, RefusalLayer>) -> String {
@@ -369,6 +486,7 @@ fn refusals_sentence(refusals: &BTreeMap<Capability, RefusalLayer>) -> String {
 mod tests {
     use super::*;
     use agent_protocol::permission::{ActionSpec, Reversibility, RiskLevel};
+    use agent_protocol::permission_classifier::{PermissionSuggestion, SuggestionDecision};
     use agent_testkit::FakeEventStore;
 
     fn sid() -> SessionId {
@@ -498,6 +616,14 @@ mod tests {
                     prompt_hash: String::new(),
                     input_hash: String::new(),
                     latency_ms: 3,
+                    suggestion: Some(PermissionSuggestion {
+                        decision: SuggestionDecision::Allow,
+                        confidence: 1.0,
+                        risk: None,
+                        reversible: None,
+                        requires_confirmation: false,
+                        reason: "test".to_string(),
+                    }),
                 }),
             )
             .await
@@ -800,6 +926,370 @@ mod tests {
         // unreadable, which is the opposite of what the log is for.
         let (service, _) = service();
         assert!(service.recorded(&sid(), "sha256:absent").await.unwrap().is_none());
+    }
+
+    // ---- The classifier (B3) ----
+    //
+    // The matrix above is checked here against a gateway: the answer the
+    // classifier gives is advice the gate acts on, it can only tighten, and it
+    // is taken before anything is written or run.
+
+    use agent_ports::permission_classifier::{PermissionClassifier, PermissionClassifierInput};
+
+    /// A classifier that answers one scripted verdict and remembers what it was
+    /// asked.
+    struct Scripted {
+        outcome: ClassifierOutcome,
+        suggestion: Option<(SuggestionDecision, f64, Option<RiskLevel>)>,
+        seen: Mutex<Vec<PermissionClassifierInput>>,
+    }
+
+    impl Scripted {
+        fn allowing(confidence: f64) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: ClassifierOutcome::Allow,
+                suggestion: Some((SuggestionDecision::Allow, confidence, None)),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn denying() -> Arc<Self> {
+            Arc::new(Self {
+                outcome: ClassifierOutcome::Deny,
+                suggestion: Some((SuggestionDecision::Deny, 0.95, None)),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn judging(risk: RiskLevel) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: ClassifierOutcome::Allow,
+                suggestion: Some((SuggestionDecision::Allow, 0.99, Some(risk))),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<PermissionClassifierInput> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionClassifier for Scripted {
+        async fn classify(&self, input: &PermissionClassifierInput) -> ClassifierTrace {
+            self.seen.lock().unwrap().push(input.clone());
+            let suggestion =
+                self.suggestion.as_ref().map(|(decision, confidence, risk)| PermissionSuggestion {
+                    decision: *decision,
+                    confidence: *confidence,
+                    risk: *risk,
+                    reversible: None,
+                    requires_confirmation: false,
+                    reason: "scripted".to_string(),
+                });
+            ClassifierTrace {
+                route_id: "scripted".to_string(),
+                revision: "rev-1".to_string(),
+                pack_version: "permission/1".to_string(),
+                prompt_hash: "prompt".to_string(),
+                input_hash: "input".to_string(),
+                latency_ms: 4,
+                outcome: self.outcome,
+                suggestion,
+            }
+        }
+    }
+
+    /// A gateway over `policy` with `classifier` installed and its ledger kept.
+    fn judged_gateway(
+        tools: Arc<Witnessed>,
+        policy: PolicyEngine,
+        store: Arc<FakeEventStore>,
+        classifier: Arc<Scripted>,
+    ) -> GuardedToolProvider {
+        GuardedToolProvider::new(
+            tools,
+            policy,
+            Arc::new(ApprovalService::new(store.clone())),
+            ResourceGuard::new(workspace()),
+            Arc::new(InMemoryArtifactStore::default()),
+        )
+        .with_permission_service(Arc::new(PermissionService::new(store)))
+        .with_permission_classifier(classifier)
+    }
+
+    fn network_call() -> ToolInvocation {
+        ToolInvocation::proposed(
+            "web.request",
+            serde_json::json!({ "url": "https://docs.rs/index.html" }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_classifier_allow_still_obeys_the_hard_deny_floor() {
+        // The policy refuses `process.spawn` outright and a classifier is sure
+        // the call is fine. The call is refused, and the classifier is not even
+        // asked: an estimate about an impossible call is work done to learn
+        // nothing, and a record that asked anyway invites "it agreed" to be read
+        // as the reason the call ran.
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("shell.run", &[Capability::PROCESS_SPAWN], ToolSideEffect::Destructive)],
+            store.clone(),
+        );
+        let classifier = Scripted::allowing(1.0);
+        let gateway = judged_gateway(
+            tools.clone(),
+            PolicyEngine::new()
+                .with_managed_deny([Capability::new(Capability::PROCESS_SPAWN)])
+                .with_sandbox([Capability::new(Capability::PROCESS_SPAWN)]),
+            store.clone(),
+            classifier.clone(),
+        );
+
+        let error = gateway.execute(&sid(), &call("shell.run")).await.unwrap_err();
+
+        assert!(matches!(error, ToolGatewayError::PolicyDenied { .. }), "{error:?}");
+        assert!(tools.seen().is_empty(), "the tool never ran");
+        assert!(classifier.seen().is_empty(), "the classifier was never asked");
+        let recorded = decisions(&store).await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, PolicyDecision::Deny);
+        assert_eq!(recorded[0].authorization_source, AuthorizationSource::Policy);
+    }
+
+    #[tokio::test]
+    async fn a_classifier_deny_stops_an_otherwise_allowed_l2_call() {
+        // The policy allows `network.request` and nothing else objects. The
+        // classifier does — and a call the policy permitted does not run.
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("web.request", &[Capability::NETWORK_REQUEST], ToolSideEffect::Network)],
+            store.clone(),
+        );
+        let classifier = Scripted::denying();
+        let gateway = judged_gateway(
+            tools.clone(),
+            allowing(Capability::NETWORK_REQUEST),
+            store.clone(),
+            classifier.clone(),
+        );
+
+        let error = gateway.execute(&sid(), &network_call()).await.unwrap_err();
+
+        assert!(matches!(error, ToolGatewayError::PolicyDenied { .. }), "denied: {error:?}");
+        assert!(tools.seen().is_empty(), "the tool never ran");
+        assert_eq!(classifier.seen().len(), 1, "the classifier was asked exactly once");
+        let recorded = decisions(&store).await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, PolicyDecision::Deny);
+        assert_eq!(recorded[0].authorization_source, AuthorizationSource::PermissionClassifier);
+        assert!(
+            recorded[0].reason.contains("permission classifier"),
+            "the record names who refused: {}",
+            recorded[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn a_low_confidence_answer_asks_instead_of_allowing() {
+        // The backend said allow — at 0.2. That is not evidence, and the call
+        // stops for a person instead of running on a guess.
+        let action = facts("web.request");
+        let trace = ClassifierTrace {
+            outcome: ClassifierOutcome::Allow,
+            suggestion: Some(PermissionSuggestion {
+                decision: SuggestionDecision::Allow,
+                confidence: 0.2,
+                risk: None,
+                reversible: None,
+                requires_confirmation: false,
+                reason: "maybe".to_string(),
+            }),
+            ..ClassifierTrace::unavailable("scripted")
+        };
+
+        let record = rule(action, PermissionBaseline::new(PolicyDecision::Allow), Some(trace));
+
+        assert_eq!(record.decision, PolicyDecision::Ask);
+        assert!(record.reason.contains("not sure"), "{}", record.reason);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_abstention_or_protocol_error_never_allows() {
+        for outcome in [ClassifierOutcome::Unclear, ClassifierOutcome::Unavailable] {
+            let trace = ClassifierTrace { outcome, ..ClassifierTrace::unavailable("scripted") };
+            let record = rule(
+                facts("web.request"),
+                PermissionBaseline::new(PolicyDecision::Allow),
+                Some(trace),
+            );
+            assert_eq!(record.decision, PolicyDecision::Ask, "{outcome:?} must ask");
+            assert_ne!(record.decision, PolicyDecision::Allow);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_classifier_cannot_lower_the_computed_risk() {
+        // An `L3` action judged `L0`: it stays `L3`, and its digest — the
+        // identity a lease is bound to — does not move.
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("shell.run", &[Capability::PROCESS_SPAWN], ToolSideEffect::Destructive)],
+            store.clone(),
+        );
+        let gateway = judged_gateway(
+            tools,
+            allowing(Capability::PROCESS_SPAWN),
+            store.clone(),
+            Scripted::judging(RiskLevel::L0),
+        );
+        let before = gateway.action_facts("manual:permission-session", 0, &call("shell.run"));
+
+        let result = gateway.execute(&sid(), &call("shell.run")).await.unwrap();
+
+        let recorded = decisions(&store).await;
+        let record = recorded.first().expect("a decision is recorded");
+        assert_eq!(record.risk(), RiskLevel::L3, "an estimate can only raise");
+        assert_eq!(record.action.digest, before.digest);
+        assert_eq!(result.status, agent_protocol::tool::ToolStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_classifier_that_raises_the_risk_changes_the_action_it_names() {
+        // An `L2` request judged `L3`: the record says `L3`, and its digest is
+        // the digest of the raised action — the one that was actually judged.
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("web.request", &[Capability::NETWORK_REQUEST], ToolSideEffect::Network)],
+            store.clone(),
+        );
+        let gateway = judged_gateway(
+            tools,
+            allowing(Capability::NETWORK_REQUEST),
+            store.clone(),
+            Scripted::judging(RiskLevel::L3),
+        );
+        let before = gateway.action_facts("manual:permission-session", 0, &network_call());
+
+        gateway.execute(&sid(), &network_call()).await.unwrap();
+
+        let recorded = decisions(&store).await;
+        let record = recorded.first().expect("a decision is recorded");
+        assert_eq!(record.risk(), RiskLevel::L3);
+        assert_ne!(record.action.digest, before.digest);
+    }
+
+    #[tokio::test]
+    async fn a_classifier_sees_no_secret_plaintext_or_whole_conversation() {
+        // What the classifier is handed is the action, not the session: no
+        // argument object, no conversation, and the secret only as the
+        // reference the caller wrote.
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("shell.run", &[Capability::PROCESS_SPAWN], ToolSideEffect::Destructive)],
+            store.clone(),
+        );
+        let classifier = Scripted::allowing(1.0);
+        let gateway = judged_gateway(
+            tools,
+            allowing(Capability::PROCESS_SPAWN),
+            store.clone(),
+            classifier.clone(),
+        );
+
+        gateway
+            .execute(
+                &sid(),
+                &ToolInvocation::proposed(
+                    "shell.run",
+                    serde_json::json!({
+                        "command": "curl -H 'Authorization: $TOKEN' https://x",
+                        "note": "s3cr3t-plaintext",
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let seen = classifier.seen();
+        assert_eq!(seen.len(), 1);
+        let input = &seen[0];
+        assert!(input.task_summary.is_none(), "no conversation is handed over");
+        assert!(input.recent_actions.is_empty());
+        assert!(input.untrusted_context_summary.is_none());
+        let rendered = serde_json::to_string(&input.action).unwrap();
+        assert!(!rendered.contains("s3cr3t-plaintext"), "{rendered}");
+        assert!(!rendered.contains("\"arguments\""), "only the action facts are handed over");
+    }
+
+    #[tokio::test]
+    async fn a_boundary_call_without_a_classifier_keeps_the_policy_answer() {
+        // A build with no judge is not a build whose judge abstained. The
+        // matrix leaves the policy's answer alone and the record says, by
+        // naming no trace, that nothing independent was asked — which is the
+        // truth a reader needs and the one an empty `unavailable` would hide.
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("web.request", &[Capability::NETWORK_REQUEST], ToolSideEffect::Network)],
+            store.clone(),
+        );
+        let (gateway, _, _) =
+            gateway_over(tools.clone(), allowing(Capability::NETWORK_REQUEST), store.clone());
+
+        let result = gateway.execute(&sid(), &network_call()).await.expect("the policy allows it");
+
+        assert_eq!(result.status, agent_protocol::tool::ToolStatus::Completed);
+        assert_eq!(tools.seen(), vec![true]);
+        let recorded = decisions(&store).await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].decision, PolicyDecision::Allow);
+        assert_eq!(recorded[0].authorization_source, AuthorizationSource::Policy);
+        assert!(recorded[0].classifier.is_none(), "no judge was configured, and none is named");
+    }
+
+    #[tokio::test]
+    async fn a_persons_grant_stands_when_no_classifier_answers() {
+        // A grant is a person's answer, and the record has to say so: the
+        // policy's `ask`, lifted by the session's lease, is not the same
+        // authorization as a rule that never asked. With no judge in the build
+        // this is the only source left, and it names the person.
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("shell.run", &[Capability::PROCESS_SPAWN], ToolSideEffect::Destructive)],
+            store.clone(),
+        );
+        let approvals = Arc::new(ApprovalService::new(store.clone()).with_session_scope(true));
+        let gateway = GuardedToolProvider::new(
+            tools.clone(),
+            PolicyEngine::new()
+                .with_rules([PolicyRule::ask(Capability::new(Capability::PROCESS_SPAWN))])
+                .with_sandbox([Capability::new(Capability::PROCESS_SPAWN)]),
+            approvals.clone(),
+            ResourceGuard::new(workspace()),
+            Arc::new(InMemoryArtifactStore::default()),
+        )
+        .with_permission_service(Arc::new(PermissionService::new(store.clone())));
+        let request = approvals
+            .request(&sid(), Capability::new(Capability::PROCESS_SPAWN), "shell.run", "ls")
+            .await
+            .unwrap();
+        approvals
+            .grant(&sid(), &request.approval_id, ApprovalScope::AllowForSession, "user")
+            .await
+            .unwrap();
+
+        let result = gateway.execute(&sid(), &call("shell.run")).await.expect("a person said yes");
+
+        assert_eq!(result.status, agent_protocol::tool::ToolStatus::Completed);
+        assert_eq!(tools.seen(), vec![true]);
+        let recorded = decisions(&store).await;
+        assert_eq!(recorded[0].decision, PolicyDecision::Allow);
+        assert_eq!(recorded[0].authorization_source, AuthorizationSource::UserApproval);
+        assert!(
+            recorded[0].classifier.is_none(),
+            "no judge was configured, so the record names none"
+        );
     }
 
     #[test]

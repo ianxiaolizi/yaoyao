@@ -50,6 +50,11 @@ impl DecisionFamily {
     /// a relation the kernel policy turns into queue effects, and the model
     /// never acts itself (`intent_adjudication` module).
     pub const INTENT_ADJUDICATION: &'static str = "intent_adjudication";
+    /// Whether one boundary action should run. *Consumed* like adjudication and
+    /// never widening: its answer is folded into the permission matrix, which
+    /// can only tighten what policy and the workspace boundary already said
+    /// (`permission_classifier` module).
+    pub const PERMISSION_CLASSIFIER: &'static str = "permission_classifier";
 
     /// Create a family from its wire string.
     pub fn new(s: impl Into<String>) -> Self {

@@ -28,6 +28,7 @@ pub mod ledger;
 pub mod model;
 pub mod parking;
 pub mod permission;
+pub mod permission_classifier;
 pub mod permissions;
 pub mod plan;
 pub mod plugin;

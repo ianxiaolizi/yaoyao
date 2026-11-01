@@ -52,6 +52,7 @@ use agent_ports::memory_index::MemoryIndex;
 use agent_ports::memory_store::MemoryStore;
 use agent_ports::model_provider::{ModelProvider, ResolvedModelCapabilities};
 use agent_ports::model_router::ModelRouter;
+use agent_ports::permission_classifier::PermissionClassifier;
 use agent_ports::process_launcher::ProcessLauncher;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
@@ -84,8 +85,12 @@ use crate::subagents;
 /// observes (or `None` when the run is unobserved), and the adjudicator that
 /// resolves messages the rules could not (or `None` when no sidecar is
 /// configured).
-type DecisionParts =
-    (Arc<dyn ModelRouter>, Option<Arc<dyn DecisionAdvisor>>, Option<Arc<dyn IntentAdjudicator>>);
+type DecisionParts = (
+    Arc<dyn ModelRouter>,
+    Option<Arc<dyn DecisionAdvisor>>,
+    Option<Arc<dyn IntentAdjudicator>>,
+    Option<Arc<dyn PermissionClassifier>>,
+);
 
 /// What the assembly needs that it cannot decide for itself.
 ///
@@ -978,43 +983,48 @@ pub async fn assemble_with_delegation(
     // decision cannot be written does not run.
     let permissions = Arc::new(PermissionService::new(store.clone()));
 
+    // Shadow decisions are assembled here, next to the provider they are built
+    // from, and nowhere else decides which model a run talks to. They come
+    // before the gateway because the gateway is handed the classifier they
+    // build: the judge is a property of the assembly, decided once, rather than
+    // something wired into a gate that has already been built.
+    let (router, advisor, adjudicator, classifier): DecisionParts = match decisions {
+        Decisions::FromConfiguration => {
+            let router = providers::router(selected.route.clone(), &routes);
+            let stack = decisions::assemble(Arc::new(router), resolved.laya.clone())?;
+            (stack.router, Some(stack.advisor), stack.adjudicator, stack.classifier)
+        }
+        // No advisor, but still a router: the loop is always given one, and a
+        // run without an observation is a run whose choices are still routed.
+        Decisions::Unobserved => {
+            (Arc::new(providers::router(selected.route.clone(), &routes)), None, None, None)
+        }
+    };
+
     // One step's output is bounded by the window the run actually has: a
     // result larger than the working set cannot be compacted away afterwards,
     // because the newest group is kept whole. The gateway also decides what the
     // model is offered (`model_definitions`): the surface minus every tool this
     // policy could refuse for every possible call.
-    let gateway = Arc::new(
-        GuardedToolProvider::new(
-            tools.clone(),
-            // Kept as well as handed over: an in-process child's policy is
-            // derived from this one, by narrowing it (CONTRACT §7 #133).
-            policy.clone(),
-            approvals.clone(),
-            guard.clone(),
-            artifacts.clone(),
-        )
-        .with_offload_limit(resolved.budget.tool_output_limit_bytes())
-        .with_redactor(redactor.clone())
-        .with_secrets(Arc::new(EnvSecretProvider::new(
-            tool_secrets.iter().map(|secret| secret.name.clone()),
-        )))
-        .with_permission_service(permissions.clone()),
-    );
-
-    // Shadow decisions are assembled here, next to the provider they are built
-    // from, and nowhere else decides which model a run talks to.
-    let (router, advisor, adjudicator): DecisionParts = match decisions {
-        Decisions::FromConfiguration => {
-            let router = providers::router(selected.route.clone(), &routes);
-            let stack = decisions::assemble(Arc::new(router), resolved.laya.clone())?;
-            (stack.router, Some(stack.advisor), stack.adjudicator)
-        }
-        // No advisor, but still a router: the loop is always given one, and a
-        // run without an observation is a run whose choices are still routed.
-        Decisions::Unobserved => {
-            (Arc::new(providers::router(selected.route.clone(), &routes)), None, None)
-        }
-    };
+    let mut gateway = GuardedToolProvider::new(
+        tools.clone(),
+        // Kept as well as handed over: an in-process child's policy is
+        // derived from this one, by narrowing it (CONTRACT §7 #133).
+        policy.clone(),
+        approvals.clone(),
+        guard.clone(),
+        artifacts.clone(),
+    )
+    .with_offload_limit(resolved.budget.tool_output_limit_bytes())
+    .with_redactor(redactor.clone())
+    .with_secrets(Arc::new(EnvSecretProvider::new(
+        tool_secrets.iter().map(|secret| secret.name.clone()),
+    )))
+    .with_permission_service(permissions.clone());
+    if let Some(classifier) = &classifier {
+        gateway = gateway.with_permission_classifier(classifier.clone());
+    }
+    let gateway = Arc::new(gateway);
     // Which advisors this run has is said out loud when there is something to
     // say. The snapshot records the same list, but a run that attached a
     // sidecar that is down would otherwise only be visible in the trace of a
@@ -1094,21 +1104,27 @@ pub async fn assemble_with_delegation(
                 Arc::new(crate::inprocess::ReadOnlySurface::new(builtins.clone()));
             let child_policy =
                 crate::inprocess::never_asking(&policy, surface.as_ref(), &advertised);
-            let child_gateway: Arc<dyn ToolGateway> = Arc::new(
-                GuardedToolProvider::new(
-                    surface,
-                    child_policy,
-                    approvals.clone(),
-                    guard.clone(),
-                    artifacts.clone(),
-                )
-                .with_offload_limit(resolved.budget.tool_output_limit_bytes())
-                .with_redactor(redactor.clone())
-                // A delegated call is a tool call: it is decided and recorded
-                // in the same ledger, so an audit of the session does not stop
-                // at the thing that spawned work in it.
-                .with_permission_service(permissions.clone()),
-            );
+            let mut child_gate = GuardedToolProvider::new(
+                surface,
+                child_policy,
+                approvals.clone(),
+                guard.clone(),
+                artifacts.clone(),
+            )
+            .with_offload_limit(resolved.budget.tool_output_limit_bytes())
+            .with_redactor(redactor.clone())
+            // A delegated call is a tool call: it is decided and recorded
+            // in the same ledger, so an audit of the session does not stop
+            // at the thing that spawned work in it.
+            .with_permission_service(permissions.clone());
+            // A child's surface is read-only, but "read-only" is a claim about
+            // the tools, not about the risk: a child that reached a boundary
+            // action gets the same independent judgement the parent's gate
+            // gives it.
+            if let Some(classifier) = &classifier {
+                child_gate = child_gate.with_permission_classifier(classifier.clone());
+            }
+            let child_gateway: Arc<dyn ToolGateway> = Arc::new(child_gate);
             let mut child = DefaultAgentLoop::new(
                 selected.provider.clone(),
                 child_gateway,

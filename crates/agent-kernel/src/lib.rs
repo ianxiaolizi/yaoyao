@@ -31,6 +31,7 @@ pub mod resume;
 pub mod schedule;
 pub mod scheduler;
 mod scrub;
+mod secret_refs;
 pub mod session_archive;
 pub mod session_lifecycle;
 pub mod state;

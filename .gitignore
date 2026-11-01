@@ -44,6 +44,11 @@ credentials.*
 # is missing from every fresh clone.
 !crates/agent-ports/src/secret_provider.rs
 
+# The same hazard again for the argument-resolution module split out of
+# `guarded.rs` when the permission gate pushed it past its ratchet: it reads
+# references, it holds no credential.
+!crates/agent-kernel/src/secret_refs.rs
+
 # Local kernel-eval output (reports and transcripts from live runs)
 /apps/agent/kernel-eval-*.json
 /apps/agent/target/
