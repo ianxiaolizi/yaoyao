@@ -30,6 +30,7 @@ fn ctx() -> TurnContext {
         session_id: agent_protocol::ids::SessionId::from_string("s"),
         turn_id: agent_protocol::ids::TurnId::new(),
         run_id: agent_protocol::ids::RunId::new(),
+        authorization_subject: agent_protocol::permission::AuthorizationSubject::manual("s"),
         user_input: serde_json::json!({"text": "hi"}),
         journal: Journal::new(Arc::new(RecordingJournal::new())),
         instructions: None,
@@ -184,7 +185,7 @@ async fn run_with_budget(
         input_kind: TurnInputKind::User,
         previous_turn: None,
         resumed: None,
-        max_steps: 8,
+        max_steps: Some(8),
         budget,
         completion: None,
     });

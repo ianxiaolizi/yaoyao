@@ -11,6 +11,7 @@
 //! field on the request would be one the caller could fill with a decision
 //! nobody made.
 
+use crate::permission::AuthorizationSubject;
 use crate::permissions::{
     ArtifactRef, Capability, PolicyDecision, RedactionMetadata, RefusalLayer,
 };
@@ -159,12 +160,22 @@ pub struct ToolInvocation {
     /// The model's `ToolUse` id this invocation came from. `None` for
     /// invocations started outside a model response, such as `agent tool`.
     pub provider_tool_call_id: Option<String>,
+    /// The intent and revision this call belongs to. The loop fills this from
+    /// the turn context; a manual CLI call leaves it absent and the gateway
+    /// names the call `manual:<session>` at revision zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_subject: Option<AuthorizationSubject>,
 }
 
 impl ToolInvocation {
     /// An invocation proposed without a model-originated call id.
     pub fn proposed(tool_name: impl Into<String>, arguments: serde_json::Value) -> Self {
-        Self { tool_name: tool_name.into(), arguments, provider_tool_call_id: None }
+        Self {
+            tool_name: tool_name.into(),
+            arguments,
+            provider_tool_call_id: None,
+            authorization_subject: None,
+        }
     }
 
     /// An invocation derived from a model's `ToolUse` block. Keeping the call id
@@ -178,7 +189,14 @@ impl ToolInvocation {
             tool_name: tool_name.into(),
             arguments,
             provider_tool_call_id: Some(tool_call_id.into()),
+            authorization_subject: None,
         }
+    }
+
+    /// Attach the task identity the turn was opened for.
+    pub fn with_authorization_subject(mut self, subject: AuthorizationSubject) -> Self {
+        self.authorization_subject = Some(subject);
+        self
     }
 }
 

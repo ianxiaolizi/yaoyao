@@ -23,6 +23,7 @@
 //! resume and fork.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -161,6 +162,9 @@ pub enum StackError {
     /// No provider could be built for the configured model.
     #[error("model provider: {0}")]
     Model(#[from] ProviderConfigError),
+    /// The session's own state sits inside a path its tools can write.
+    #[error("unsafe agent data directory: {0}")]
+    UnsafeDataDir(String),
     /// The configured decision backend this build will not honor.
     #[error("decision backend: {0}")]
     DecisionBackend(#[from] decisions::AssembleError),
@@ -491,6 +495,54 @@ impl Runtime {
     }
 }
 
+/// Whether `child` is the same path as `parent` or below it.
+///
+/// Existing ancestors are canonicalized so a missing data directory and a
+/// symlinked workspace still compare as the paths they will be.
+fn path_is_within(child: &Path, parent: &Path) -> bool {
+    let child = canonicalize_with_missing(child);
+    let parent = canonicalize_with_missing(parent);
+    if cfg!(windows) {
+        let child = child.to_string_lossy().to_lowercase();
+        let parent = parent.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+        child == parent
+            || child.starts_with(&format!("{parent}\\"))
+            || child.starts_with(&format!("{parent}/"))
+    } else {
+        child.starts_with(parent)
+    }
+}
+
+fn canonicalize_with_missing(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut missing: Vec<OsString> = Vec::new();
+    let mut current = absolute.clone();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(&current) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = current.file_name().map(ToOwned::to_owned) else {
+            break;
+        };
+        missing.push(name);
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    absolute
+}
+
 /// The execution backend the selected mode names, or a refusal.
 ///
 /// Fail closed: a mode this build has no backend for stops assembly. Falling
@@ -672,6 +724,17 @@ pub async fn assemble_over(
         network_allowed,
         judgment,
     } = inputs;
+
+    // The ledger, snapshots and artifact store are evidence about the run.
+    // If any of them sits inside the model-writable workspace, the model can
+    // rewrite the evidence, so assembly refuses before opening a store.
+    if path_is_within(&data_dir, &workspace_root) {
+        return Err(StackError::UnsafeDataDir(format!(
+            "{} is inside the model-writable workspace {}",
+            data_dir.display(),
+            workspace_root.display()
+        )));
+    }
 
     let store = Arc::new(JsonlEventStore::new(&data_dir));
 
@@ -1495,6 +1558,31 @@ mod tests {
             }
             other => panic!("expected a docker refusal, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn assembly_refuses_agent_state_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join(".agent-data");
+        let error = match assemble(Inputs {
+            session: agent_protocol::ids::SessionId::from_string("s"),
+            workspace_root: dir.path().to_path_buf(),
+            data_dir: data.clone(),
+            resolved: agent_config::resolve(agent_config::Layers::default())
+                .expect("the defaults resolve"),
+            model: None,
+            decisions: Decisions::Unobserved,
+            sandbox: SandboxMode::LocalProcess,
+            network_allowed: false,
+            judgment: false,
+        })
+        .await
+        {
+            Ok(_) => panic!("the ledger cannot be inside the model-writable workspace"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StackError::UnsafeDataDir(_)), "{error:?}");
+        assert!(!data.exists(), "the refused state directory was created");
     }
 
     #[tokio::test]

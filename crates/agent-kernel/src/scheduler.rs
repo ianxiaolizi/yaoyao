@@ -34,6 +34,7 @@ use crate::plan;
 use crate::session_lifecycle;
 use crate::state;
 
+mod accessors;
 mod completion;
 mod controls;
 mod draft;
@@ -42,7 +43,9 @@ mod journal;
 mod rebuilt;
 mod report;
 mod security;
+mod seq;
 mod snapshot;
+mod subject;
 
 pub(crate) use draft::draft;
 use endings::{Ending, Gate};
@@ -55,10 +58,10 @@ pub struct Scheduler {
     pub(crate) store: Arc<dyn EventStore>,
     pub(crate) inbox: Inbox,
     loop_: Arc<dyn AgentLoop>,
-    max_steps: u32,
-    /// The rest of the run's budget. `max_steps` above is the binding step
-    /// limit (a harness supplies it directly); this carries the limits the
-    /// loop enforces inside a step and the ones recorded in a budget stop.
+    max_steps: Option<u32>,
+    /// The rest of the run's budget. `max_steps` above is the optional binding
+    /// step limit; this carries the limits the loop enforces inside a step and
+    /// the ones recorded in a budget stop.
     budget: RunBudget,
     /// The profile's completion criterion, when it named one. The loop runs it
     /// at step boundaries; the scheduler only carries it from the resolved
@@ -96,6 +99,8 @@ pub enum SchedulerError {
     Store(#[from] EventStoreError),
     #[error("inbox error: {0}")]
     Inbox(#[from] InboxError),
+    #[error("intent error: {0}")]
+    Intent(#[from] crate::intent::IntentError),
     #[error("agent loop error: {0}")]
     Loop(#[from] AgentLoopError),
     /// The run's instructions could not be assembled. Nothing has been written
@@ -130,24 +135,6 @@ pub enum SchedulerError {
 }
 
 impl Scheduler {
-    pub fn new(store: Arc<dyn EventStore>, loop_: Arc<dyn AgentLoop>, max_steps: u32) -> Self {
-        let inbox = Inbox::new(store.clone());
-        Self {
-            store,
-            inbox,
-            loop_,
-            max_steps,
-            budget: RunBudget::default(),
-            completion: None,
-            profile: None,
-            controls: Vec::new(),
-            instructions: None,
-            capability: None,
-            adjudicator: None,
-            security: None,
-        }
-    }
-
     /// Tell the scheduler what the run's execution boundary can do.
     ///
     /// Set by the app layer, which chose the sandbox and the network policy.
@@ -217,9 +204,11 @@ impl Scheduler {
     /// files. A scheduler without one still runs; what it cannot do is tell a
     /// later reader what configuration it was running under.
     pub fn with_profile_snapshot(mut self, snapshot: ResolvedProfileSnapshot) -> Self {
-        // The profile's budget is what the run executes under; the step limit
-        // stays the one `new` was given, which is how a harness states it.
+        // The profile's budget is what the run executes under, including its
+        // optional step ceiling. Keeping a separately supplied limit here would
+        // let the recorded profile and the scheduler enforce different numbers.
         self.budget = snapshot.budget.clone();
+        self.max_steps = self.budget.max_steps;
         self.completion = snapshot.completion.clone();
         self.profile = Some(snapshot);
         self
@@ -234,19 +223,6 @@ impl Scheduler {
     pub fn with_instructions(mut self, source: Arc<dyn InstructionSource>) -> Self {
         self.instructions = Some(source);
         self
-    }
-
-    /// The scheduler's Inbox, for submitting inputs to this session.
-    pub fn inbox(&self) -> &Inbox {
-        &self.inbox
-    }
-
-    /// A read-only view of the session's intent ledger.
-    ///
-    /// Cheap to construct: it holds the store handle and every read folds the
-    /// log, so there is no second copy of the truth to keep in step.
-    pub fn intents(&self) -> crate::intent::IntentLedger {
-        crate::intent::IntentLedger::new(self.store.clone())
     }
 
     /// The current open-entity lifecycle for this session.
@@ -493,6 +469,11 @@ impl Scheduler {
             .then(|| item.payload.get("decision").and_then(|value| value.as_str()))
             .flatten()
             .map(str::to_string);
+        // The permission subject is the intent this turn answers. A resumed
+        // continuation inherits the active intent, so the held call and the
+        // following work keep one identity.
+        let authorization_subject = subject::for_turn(session_id, &item, resumed, &history)?;
+
         let state = TurnStateFacts {
             started_at: now,
             queued_inputs,
@@ -513,6 +494,7 @@ impl Scheduler {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             run_id: run_id.clone(),
+            authorization_subject,
             user_input: item.payload.clone(),
             journal: Journal::new(journal.clone()),
             instructions: instructions.clone(),
@@ -593,7 +575,7 @@ impl Scheduler {
         // each boundary now writes what it produced.
         let mut consumed: HashSet<InboxItemId> = HashSet::new();
         let ending = loop {
-            if steps >= self.max_steps {
+            if self.max_steps.is_some_and(|max_steps| steps >= max_steps) {
                 break Ending::Budget;
             }
             // An interrupt ends the turn at the boundary rather than inside a
@@ -801,11 +783,6 @@ impl Scheduler {
             inputs.push(SteeringInput { item_id: item.item_id, text: text.to_string() });
         }
         Ok(inputs)
-    }
-
-    pub(crate) async fn next_seq(&self, session: &SessionId) -> Result<EventSeq, SchedulerError> {
-        let events = self.store.read_stream(session, EventSeq::ZERO, usize::MAX).await?;
-        Ok(events.last().map(|e| e.seq.next()).unwrap_or(EventSeq::ZERO))
     }
 }
 
@@ -2560,7 +2537,7 @@ mod tests {
         assert_eq!(first.queued_inputs, 2);
         assert_eq!(first.input_kind, TurnInputKind::User);
         assert_eq!(first.previous_turn, None, "no turn has ended yet");
-        assert_eq!(first.max_steps, 8);
+        assert_eq!(first.max_steps, Some(8));
         assert_eq!(first.started_at, now, "the turn reports the instant it was handed");
 
         scheduler.run_pending(&sid, Utc::now()).await.unwrap().expect("a run");
@@ -2925,4 +2902,7 @@ mod tests {
         let claim = store.driver_lease(&sid).await.expect("the claim is free between turns");
         drop(claim);
     }
+
+    mod step_budget_tests;
+    mod subject_tests;
 }

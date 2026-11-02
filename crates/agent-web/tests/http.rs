@@ -2052,3 +2052,56 @@ async fn a_request_the_surface_cannot_answer_is_refused_by_name() {
     assert!(body(&response).contains("ghost"), "{response}");
     handle.abort();
 }
+#[tokio::test]
+async fn no_synthetic_step_parking_after_three_hundred_steps() {
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let mut drafts = vec![draft(
+        &session,
+        EventType::TURN_STARTED,
+        Some(&turn),
+        None,
+        json!({ "inbox_item": "i1" }),
+        Actor::Scheduler,
+    )];
+    for n in 0..301 {
+        let step = StepId::from_string(format!("step-{n}"));
+        drafts.push(draft(
+            &session,
+            EventType::STEP_STARTED,
+            Some(&turn),
+            Some(&step),
+            json!({}),
+            Actor::Scheduler,
+        ));
+    }
+    drafts.push(draft(
+        &session,
+        EventType::TURN_COMPLETED,
+        Some(&turn),
+        None,
+        json!({ "final_content": "finished after the old backstop" }),
+        Actor::Scheduler,
+    ));
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the log");
+    let events =
+        store.read_stream(&session, EventSeq::ZERO, usize::MAX).await.expect("read the log");
+    assert!(
+        events.iter().all(|event| event.event.event_type.as_str() != "budget/parked"),
+        "no step ceiling was configured, so there is nothing to park"
+    );
+
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+    let (status, response) = request(addr, "/api/sessions/s1/transcript", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let transcript: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    let ending = transcript["items"]
+        .as_array()
+        .expect("a list of rows")
+        .iter()
+        .find(|item| item["kind"] == "turn_end")
+        .expect("a turn ending row");
+    assert_eq!(ending["ending"], "answered", "{transcript}");
+    handle.abort();
+}

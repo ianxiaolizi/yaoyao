@@ -255,7 +255,7 @@ pub(crate) fn positionals(args: &Args) -> Vec<&String> {
 mod tests {
     use super::*;
     use crate::support::{
-        DEFAULT_DATA_DIR, WatchSink, resolve_data_dir, resolve_workspace_root, watch_with,
+        STATE_DIR_NAME, WatchSink, resolve_data_dir_with_state, resolve_workspace_root, watch_with,
     };
     use agent_cli::CliOutput;
     use agent_kernel::live_bus::InMemoryLiveEventBus;
@@ -290,41 +290,57 @@ mod tests {
         );
     }
 
-    /// The data directory follows the workspace root, not the process.
+    /// The data directory is outside the workspace, keyed by the workspace.
     ///
-    /// `AGENT_DATA_DIR` is the one path a run cannot do without when nobody
-    /// named one, and where "nowhere named" points has to be decided by the
-    /// rule every other relative path follows. Otherwise the event log of a run
-    /// against a workspace goes to whatever directory the command was invoked
-    /// from: a different place per invocation, and none of them the workspace.
+    /// The ledger, snapshots and artifacts are evidence about the run; placing
+    /// them where tools can write would let the model rewrite its own evidence.
+    /// An explicit `AGENT_DATA_DIR` is absolute and outside the workspace; with
+    /// no explicit path, the platform user state root keeps workspaces separate.
     #[test]
-    fn an_unnamed_data_directory_is_resolved_inside_the_workspace() {
-        let root = if cfg!(windows) { "C:\\ws" } else { "/ws" };
+    fn an_unnamed_data_directory_is_resolved_outside_the_workspace() {
+        let root = tempfile::TempDir::new().unwrap();
+        let state_root = tempfile::TempDir::new().unwrap();
+        let root_text = root.path().display().to_string();
 
-        // Unset and empty are the same request: a name inside the workspace.
+        // Unset and empty are the same request: the workspace-keyed state
+        // directory under the platform state root.
         for configured in [None, Some("")] {
-            let resolved = resolve_data_dir(root, configured);
-            assert_eq!(resolved, Path::new(root).join(DEFAULT_DATA_DIR).display().to_string());
-            assert!(
-                Path::new(&resolved).starts_with(root),
-                "{resolved:?} is outside the workspace"
-            );
+            let resolved =
+                resolve_data_dir_with_state(&root_text, configured, state_root.path()).unwrap();
+            let resolved = PathBuf::from(resolved);
+            assert!(resolved.starts_with(state_root.path()), "{resolved:?}");
+            assert!(resolved.to_string_lossy().contains(STATE_DIR_NAME), "{resolved:?}");
+            assert!(!resolved.starts_with(root.path()), "state is inside the workspace");
         }
 
-        // A relative value is relative to the workspace root, which is the whole
-        // point — it is not relative to whatever cwd the process has.
-        assert_eq!(
-            resolve_data_dir(root, Some("state")),
-            Path::new(root).join("state").display().to_string()
-        );
-        assert_eq!(
-            resolve_data_dir(root, Some(Path::new("nested").join("state").to_str().unwrap())),
-            Path::new(root).join("nested").join("state").display().to_string()
-        );
+        // A relative explicit value has no safe base: it could put the ledger
+        // inside the workspace or make it depend on cwd. It is refused.
+        let relative = resolve_data_dir_with_state(&root_text, Some("state"), state_root.path())
+            .expect_err("a relative data directory is unsafe");
+        assert!(relative.contains("absolute path"), "{relative}");
 
-        // An absolute value is already unambiguous and is taken as given.
-        let absolute = if cfg!(windows) { "C:\\agent-state" } else { "/var/agent-state" };
-        assert_eq!(resolve_data_dir(root, Some(absolute)), absolute);
+        // An absolute path outside the workspace is taken as given.
+        let outside = state_root.path().join("explicit");
+        let resolved = resolve_data_dir_with_state(
+            &root_text,
+            Some(outside.to_str().unwrap()),
+            state_root.path(),
+        )
+        .unwrap();
+        assert_eq!(PathBuf::from(resolved), outside);
+    }
+
+    #[test]
+    fn a_data_directory_inside_the_workspace_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let inside = root.path().join(".agent-data");
+        let error = resolve_data_dir_with_state(
+            root.path().to_str().unwrap(),
+            Some(inside.to_str().unwrap()),
+            root.path(),
+        )
+        .expect_err("the decision ledger cannot live inside the workspace");
+        assert!(error.contains("inside the model-writable workspace"), "{error}");
     }
 
     /// A run's base is the configured root, or the cwd — and never a panic.

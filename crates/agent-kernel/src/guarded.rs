@@ -21,12 +21,14 @@ use agent_ports::tool_provider::{
 };
 use agent_ports::workspace_snapshot::WorkspaceSnapshotter;
 use agent_protocol::ids::{ApprovalId, SessionId};
-use agent_protocol::permission::ActionFacts;
+use agent_protocol::permission::{ActionFacts, AuthorizationSubject};
 use agent_protocol::permissions::{Capability, PolicyDecision};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::ToolPolicyRecord;
 
 use crate::approval::ApprovalService;
+
+mod approved;
 use crate::permission::{PermissionBaseline, PermissionDecisionRecord, PermissionService};
 use crate::policy::{PolicyContext, PolicyEngine};
 use crate::resource_guard::ResourceGuard;
@@ -329,7 +331,7 @@ impl GuardedToolProvider {
         self.check_arguments(invocation)?;
         let ctx = self.policy_context(invocation);
         self.check_paths(invocation, &ctx)?;
-        let action = self.action_facts(&format!("manual:{}", session_id.as_str()), 0, invocation);
+        let action = self.approved_action(session_id, approval_id, invocation).await?;
 
         // The isolation floor holds on the resume path too: a standing answer
         // about a call is an answer about the call, and it cannot confine it.
@@ -611,8 +613,11 @@ impl ToolGateway for GuardedToolProvider {
         // The action, as every layer below this point will see it. Built once,
         // before anything decides: the digest a decision is recorded under is
         // then the one the result carries, by construction.
-        let mut action =
-            self.action_facts(&format!("manual:{}", session_id.as_str()), 0, invocation);
+        let subject = invocation
+            .authorization_subject
+            .clone()
+            .unwrap_or_else(|| AuthorizationSubject::manual(session_id.as_str()));
+        let mut action = self.action_facts(&subject.task_id, subject.task_revision, invocation);
 
         // The workspace boundary is asked before the policy, and its refusal is
         // recorded before it is returned. A refusal with no decision beside it

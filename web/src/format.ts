@@ -245,7 +245,7 @@ export function turnStatus(item: { ending?: string; stop_reason?: string } | und
     case 'answered':
       return { label: '完成', className: 'done' };
     case 'max_steps':
-      return { label: '步数用尽', className: 'fail' };
+      return { label: '达到步数上限', className: 'fail' };
     case 'limit_reached':
       return { label: '达到上限', className: 'fail' };
     case 'content_filtered':

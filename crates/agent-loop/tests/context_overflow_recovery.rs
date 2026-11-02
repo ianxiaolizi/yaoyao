@@ -27,6 +27,7 @@ fn ctx() -> TurnContext {
         session_id: agent_protocol::ids::SessionId::from_string("s"),
         turn_id: TurnId::new(),
         run_id: agent_protocol::ids::RunId::new(),
+        authorization_subject: agent_protocol::permission::AuthorizationSubject::manual("s"),
         user_input: serde_json::json!({"text": "continue"}),
         journal: Journal::new(Arc::new(agent_testkit::RecordingJournal::new())),
         instructions: None,
@@ -61,7 +62,7 @@ fn facts(target: u32) -> TurnStateFacts {
         input_kind: TurnInputKind::User,
         previous_turn: None,
         resumed: None,
-        max_steps: 8,
+        max_steps: Some(8),
         budget: RunBudget { context: Some(budget(target)), ..RunBudget::default() },
         completion: None,
     }

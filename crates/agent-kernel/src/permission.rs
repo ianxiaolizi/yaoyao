@@ -371,6 +371,49 @@ impl PermissionService {
         Ok(())
     }
 
+    /// The exact action a person was shown for one approval.
+    ///
+    /// The approval request names its digest; the decision ledger carries the
+    /// full `ActionFacts` under that digest. A resume reads this instead of
+    /// rebuilding from provider defaults, because a classifier may have raised
+    /// the risk after those defaults were read and the person approved the
+    /// raised action.
+    pub async fn action_for_approval(
+        &self,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+    ) -> Result<Option<ActionFacts>, PermissionError> {
+        let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+        let Some(action_digest) = events.iter().rev().find_map(|stored| {
+            (stored.event.event_type.as_str() == EventType::APPROVAL_REQUESTED
+                && stored.event.payload.get("approval_id").and_then(|value| value.as_str())
+                    == Some(approval_id.as_str()))
+            .then(|| {
+                stored
+                    .event
+                    .payload
+                    .get("action_digest")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .flatten()
+        }) else {
+            return Ok(None);
+        };
+
+        for stored in events.iter().rev() {
+            if stored.event.event_type.as_str() != EventType::PERMISSION_DECISION {
+                continue;
+            }
+            let record: PermissionDecisionRecord =
+                serde_json::from_value(stored.event.payload.clone())?;
+            if record.action.digest == action_digest {
+                return Ok(Some(record.action));
+            }
+        }
+        Ok(None)
+    }
+
     /// The record a session's log holds for one action digest, if any.
     ///
     /// A reader's entry point, and the one tests use: the claim this service
@@ -520,8 +563,8 @@ fn resolve(
         //
         // The one exception is a call a person already granted: nothing was
         // learned by not asking the classifier, so the standing answer stands.
-        // The call is not running *automatically* — a person decided about this
-        // capability — and B4 ties that grant to the exact action it covered.
+        // The call is not running *automatically* ? a person decided about this
+        // capability ? and B4 ties that grant to the exact action it covered.
         ClassifierOutcome::Unclear | ClassifierOutcome::Unavailable
             if baseline.approved && baseline.decision == PolicyDecision::Allow =>
         {
@@ -1387,6 +1430,59 @@ mod tests {
         let record = recorded.first().expect("a decision is recorded");
         assert_eq!(record.risk(), RiskLevel::L3);
         assert_ne!(record.action.digest, before.digest);
+    }
+
+    #[tokio::test]
+    async fn an_approved_classifier_raised_action_resumes_on_its_recorded_fingerprint() {
+        use crate::approval::{ApprovalAuthority, ApprovalService};
+        use agent_protocol::permissions::ApprovalScope;
+
+        let store = Arc::new(FakeEventStore::new());
+        let tools = Witnessed::new(
+            vec![def("web.request", &[Capability::NETWORK_REQUEST], ToolSideEffect::Network)],
+            store.clone(),
+        );
+        let approvals = Arc::new(ApprovalService::new(store.clone()));
+        let gateway = GuardedToolProvider::new(
+            tools.clone(),
+            PolicyEngine::new()
+                .with_rules([PolicyRule::ask(Capability::new(Capability::NETWORK_REQUEST))])
+                .with_sandbox([Capability::new(Capability::NETWORK_REQUEST)]),
+            approvals.clone(),
+            ResourceGuard::new(workspace()),
+            Arc::new(InMemoryArtifactStore::default()),
+        )
+        .with_permission_service(Arc::new(PermissionService::new(store.clone())))
+        .with_permission_classifier(Scripted::judging(RiskLevel::L3))
+        .with_sandbox_mode(SandboxMode::WorkspaceSandbox);
+
+        let held = gateway.execute(&sid(), &network_call()).await.expect_err("a person is asked");
+        let agent_ports::tool_gateway::ToolGatewayError::ApprovalPending { approval_id, .. } = held
+        else {
+            panic!("expected an approval, got {held:?}");
+        };
+        let approval_id = ApprovalId::from_string(approval_id);
+        let pending = approvals.pending(&sid()).await.unwrap();
+        assert_eq!(pending[0].risk, Some(RiskLevel::L3), "the raised action is what was shown");
+        approvals
+            .grant(
+                &sid(),
+                &approval_id,
+                ApprovalScope::AllowOnce,
+                "user",
+                &ApprovalAuthority::test(),
+            )
+            .await
+            .unwrap();
+
+        let result = gateway
+            .execute_approved(&sid(), &approval_id, &network_call())
+            .await
+            .expect("the approved action runs with the fingerprint the person saw");
+
+        assert_eq!(result.status, agent_protocol::tool::ToolStatus::Completed);
+        let recorded = decisions(&store).await;
+        assert_eq!(recorded.last().unwrap().risk(), RiskLevel::L3);
     }
 
     #[tokio::test]

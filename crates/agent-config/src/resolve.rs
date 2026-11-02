@@ -764,7 +764,6 @@ fn with_rules(
     policy
 }
 
-
 /// When a run with a primary limit is told to finalize.
 const DEFAULT_FINALIZE_AT_PERCENT: u32 = 85;
 

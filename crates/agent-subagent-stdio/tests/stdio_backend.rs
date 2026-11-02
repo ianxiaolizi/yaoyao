@@ -294,7 +294,10 @@ async fn a_request_the_backend_cannot_honour_never_starts_a_process() {
     let provider = StdioSubagentProvider::new("fake", "definitely-not-a-real-program-xyz")
         .with_ceiling(Duration::from_secs(30));
     let request = SubagentRequest {
-        budget: Some(agent_protocol::profile::RunBudget { max_steps: 3, ..Default::default() }),
+        budget: Some(agent_protocol::profile::RunBudget {
+            max_steps: Some(3),
+            ..Default::default()
+        }),
         ..SubagentRequest::new("anything")
     };
 

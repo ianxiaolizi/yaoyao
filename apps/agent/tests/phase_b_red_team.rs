@@ -120,6 +120,10 @@ impl ToolProvider for CountingProvider {
         self.inner.definitions()
     }
 
+    fn risk(&self, invocation: &ToolInvocation) -> Option<agent_protocol::permission::RiskLevel> {
+        self.inner.risk(invocation)
+    }
+
     fn side_effect(&self, tool_name: &str) -> Option<ToolSideEffect> {
         self.inner.side_effect(tool_name)
     }
@@ -383,6 +387,10 @@ impl ToolProvider for WebAndFiles {
             input_schema: json!({}),
         });
         definitions
+    }
+
+    fn risk(&self, invocation: &ToolInvocation) -> Option<agent_protocol::permission::RiskLevel> {
+        if invocation.tool_name == WEB_TOOL_NAME { self.web.risk(invocation) } else { None }
     }
 
     fn side_effect(&self, tool_name: &str) -> Option<ToolSideEffect> {

@@ -70,8 +70,10 @@ pub fn state_of(events: &[StoredEvent], reason: &str, percent: u32) -> ParkedSta
 /// that was actually reached. The wall clock is not counted here — the loop
 /// measured it against its own monotonic deadline, and the elapsed time is
 /// already in the terminal payload's `spent`.
-pub fn percent_of(steps: u32, max_steps: u32, tokens: u64, max_tokens: Option<u64>) -> u32 {
-    let steps_percent = steps.saturating_mul(100).checked_div(max_steps).unwrap_or(100);
+pub fn percent_of(steps: u32, max_steps: Option<u32>, tokens: u64, max_tokens: Option<u64>) -> u32 {
+    let steps_percent = max_steps
+        .and_then(|max_steps| steps.saturating_mul(100).checked_div(max_steps))
+        .unwrap_or(0);
     let tokens_percent = max_tokens
         .filter(|max| *max > 0)
         .map_or(0, |max| u32::try_from(tokens.saturating_mul(100) / max).unwrap_or(100));
@@ -81,6 +83,13 @@ pub fn percent_of(steps: u32, max_steps: u32, tokens: u64, max_tokens: Option<u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_step_ceiling_contributes_no_percentage() {
+        assert_eq!(percent_of(12, None, 0, None), 0);
+        assert_eq!(percent_of(12, None, 50, Some(100)), 50);
+        assert_eq!(percent_of(2, Some(4), 0, None), 50);
+    }
     use agent_protocol::events::{Actor, EventDraft};
     use agent_protocol::ids::{EventSeq, SchemaVersion, SessionId};
     use chrono::Utc;
@@ -214,12 +223,12 @@ mod tests {
     #[test]
     fn the_percent_describes_the_limit_that_was_reached() {
         // Steps at 2 of 2 is 100% even with no token budget configured.
-        assert_eq!(percent_of(2, 2, 0, None), 100);
+        assert_eq!(percent_of(2, Some(2), 0, None), 100);
         // Halfway through the steps is 50%.
-        assert_eq!(percent_of(4, 8, 0, None), 50);
+        assert_eq!(percent_of(4, Some(8), 0, None), 50);
         // A token-heavy turn reports the larger of the two.
-        assert_eq!(percent_of(1, 100, 900, Some(1_000)), 90);
+        assert_eq!(percent_of(1, Some(100), 900, Some(1_000)), 90);
         // Overshoot is still 100%: a percent above it is noise.
-        assert_eq!(percent_of(9, 8, 0, None), 100);
+        assert_eq!(percent_of(9, Some(8), 0, None), 100);
     }
 }

@@ -365,8 +365,9 @@ impl EventType {
     /// says what the child did, while this says that the parent asked.
     pub const SUBAGENT_SPAWNED: &'static str = "subagent/spawned";
     /// A child agent ended with an answer, or with less than it was asked for
-    /// (`status: "partial"` in the payload — a child's own report, never this
-    /// build's guess at how far it got).
+    /// (`status: "partial"` in the payload). Partial may be the child's own
+    /// report, or a parent-side result produced only for an explicit step
+    /// ceiling with a known child session.
     ///
     /// The type is the family and the payload's `status` is the precise word, so
     /// that a reader asking the coarse question ("did it come back?") does not

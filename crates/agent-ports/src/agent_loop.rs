@@ -19,6 +19,7 @@ use std::sync::Arc;
 use agent_protocol::events::EventDraft;
 use agent_protocol::ids::{InboxItemId, RunId, SessionId, StepId, TurnId};
 use agent_protocol::instructions::RunInstructions;
+use agent_protocol::permission::AuthorizationSubject;
 use agent_protocol::permissions::SecretRef;
 use agent_protocol::profile::{RunBudget, Spent};
 use chrono::{DateTime, Utc};
@@ -81,6 +82,9 @@ pub struct TurnContext {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub run_id: RunId,
+    /// The intent and revision this turn is authorized to act for. Every tool
+    /// invocation the loop makes carries it into the permission ledger.
+    pub authorization_subject: AuthorizationSubject,
     /// The inbox item payload that started this turn, e.g. `{"text": "..."}`.
     pub user_input: serde_json::Value,
     /// Where the loop makes durable the facts that must precede a side effect.
@@ -186,7 +190,8 @@ pub struct TurnStateFacts {
     /// settlement.
     pub resumed: Option<String>,
     /// The most steps this run may take, from the run's configuration.
-    pub max_steps: u32,
+    /// `None` means no fixed step ceiling; the Scheduler still counts steps.
+    pub max_steps: Option<u32>,
     /// The run's configured budget, as the caller resolved it.
     ///
     /// `max_steps` above stays the binding step limit (the Scheduler owns it);

@@ -505,7 +505,7 @@ pub struct Situation {
     /// decision is what the posture has to come from.
     pub resumed: Option<String>,
     pub queued_inputs: usize,
-    pub max_steps: u32,
+    pub max_steps: Option<u32>,
     pub plan_done: usize,
     pub plan_total: usize,
     pub pending_failure: Option<String>,
@@ -1177,7 +1177,7 @@ mod tests {
             previous_turn: None,
             resumed: None,
             queued_inputs: 0,
-            max_steps: 12,
+            max_steps: Some(12),
             plan_done: 0,
             plan_total: 0,
             pending_failure: None,

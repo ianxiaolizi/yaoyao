@@ -286,13 +286,15 @@ pub(crate) fn task_text(
         TurnInputKind::User => "user turn",
         TurnInputKind::Scheduled => "scheduled turn",
     };
-    let steps = match facts.max_steps {
-        1 => String::from("1 model step"),
-        count => format!("{count} model steps"),
+    let step_sentence = match facts.max_steps {
+        Some(1) => String::from("This run allows at most 1 model step."),
+        Some(count) => format!("This run allows at most {count} model steps."),
+        None => String::from(
+            "This run has no fixed model-step ceiling; finish when the task is done or \
+             another stated limit or stop condition applies.",
+        ),
     };
-    let mut text = format!(
-        "Task for this turn: \"{task}\"\nInput: {input_kind}. This run allows at most {steps}."
-    );
+    let mut text = format!("Task for this turn: \"{task}\"\nInput: {input_kind}. {step_sentence}");
     // Time, stated where the model reads its task: an earlier turn's answer
     // is a fact about when it was read, not about now. When the kernel can
     // name the read this turn's words point at, it says that instead of the
@@ -824,6 +826,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unbounded_task_layer_does_not_claim_a_step_ceiling() {
+        let facts = TurnStateFacts { max_steps: None, ..facts() };
+        let text = task_text(
+            &serde_json::json!({ "text": "finish the migration" }),
+            &facts,
+            TaskLedger::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(text.contains("no fixed model-step ceiling"), "{text}");
+        assert!(!text.contains("at most"), "{text}");
+    }
+
+    #[test]
+    fn a_bounded_task_layer_still_names_its_step_ceiling() {
+        let facts = TurnStateFacts { max_steps: Some(4), ..facts() };
+        let text = task_text(
+            &serde_json::json!({ "text": "finish the migration" }),
+            &facts,
+            TaskLedger::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(text.contains("at most 4 model steps"), "{text}");
+    }
+
     fn facts() -> TurnStateFacts {
         TurnStateFacts {
             started_at: chrono::Utc::now(),
@@ -831,7 +864,7 @@ mod tests {
             input_kind: TurnInputKind::User,
             previous_turn: None,
             resumed: None,
-            max_steps: 4,
+            max_steps: Some(4),
             budget: Default::default(),
             completion: None,
         }

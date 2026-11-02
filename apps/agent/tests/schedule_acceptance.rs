@@ -42,11 +42,12 @@ const SESSION: &str = "schedule-acceptance";
 /// same value `select` would have built for it. Its answer begins `echo: ` and
 /// quotes the text it was given, which is how the test knows the projection
 /// carried the scheduled payload to the model.
-async fn assembled(data: &Path) -> stack::Runtime {
-    stack::assemble(stack::Inputs {
+async fn assembled(data: &Path) -> (stack::Runtime, TempDir) {
+    let state = TempDir::new().unwrap();
+    let runtime = stack::assemble(stack::Inputs {
         session: SessionId::from_string(SESSION),
         workspace_root: data.to_path_buf(),
-        data_dir: data.to_path_buf(),
+        data_dir: state.path().to_path_buf(),
         resolved: default_profile(),
         model: Some(SelectedProvider {
             provider: Arc::new(EchoModelProvider),
@@ -58,7 +59,8 @@ async fn assembled(data: &Path) -> stack::Runtime {
         judgment: true,
     })
     .await
-    .expect("the assembly the binary runs")
+    .expect("the assembly the binary runs");
+    (runtime, state)
 }
 
 /// The configuration a run in a directory with no configuration has.
@@ -73,7 +75,7 @@ async fn log(runtime: &stack::Runtime, session: &SessionId) -> Vec<StoredEvent> 
 #[tokio::test]
 async fn a_due_item_becomes_a_turn_the_model_sees_and_is_claimed_in_its_batch() {
     let data = TempDir::new().unwrap();
-    let runtime = assembled(data.path()).await;
+    let (runtime, _state) = assembled(data.path()).await;
     let session = SessionId::from_string(SESSION);
 
     let due = Utc::now() - Duration::seconds(1);
@@ -172,7 +174,7 @@ async fn a_due_item_becomes_a_turn_the_model_sees_and_is_claimed_in_its_batch() 
 #[tokio::test]
 async fn an_item_not_yet_due_is_left_completely_alone() {
     let data = TempDir::new().unwrap();
-    let runtime = assembled(data.path()).await;
+    let (runtime, _state) = assembled(data.path()).await;
     let session = SessionId::from_string(SESSION);
 
     runtime

@@ -294,11 +294,15 @@ struct Harness {
     stack: stack::Runtime,
     transport: Arc<ScriptedTransport>,
     session: SessionId,
+    /// Session state is kept outside the workspace even in this in-process
+    /// harness: the same invariant the binary enforces.
+    _data: TempDir,
 }
 
 impl Harness {
     async fn new(data: &Path, script: Vec<String>) -> Self {
         let transport = Arc::new(ScriptedTransport::new(script));
+        let data_state = TempDir::new().unwrap();
         let stack = stack::assemble_over(
             stack::Inputs {
                 session: SessionId::from_string(SESSION),
@@ -306,7 +310,7 @@ impl Harness {
                 // tests turn on the plugin surface, not on where the boundary sits
                 // relative to the log.
                 workspace_root: data.to_path_buf(),
-                data_dir: data.to_path_buf(),
+                data_dir: data_state.path().to_path_buf(),
                 resolved: default_profile(),
                 model: Some(SelectedProvider {
                     provider: scripted_provider(transport.clone()),
@@ -327,7 +331,7 @@ impl Harness {
         .await
         .expect("the assembly the binary runs");
 
-        Self { stack, transport, session: SessionId::from_string(SESSION) }
+        Self { stack, transport, session: SessionId::from_string(SESSION), _data: data_state }
     }
 
     /// Queue `text` as the next turn's input and run it.

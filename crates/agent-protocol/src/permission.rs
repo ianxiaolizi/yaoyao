@@ -38,6 +38,29 @@ use crate::tool::ToolSideEffect;
 /// same thing.
 pub const ACTION_DIGEST_VERSION: &str = "action/1";
 
+/// The work one authorization decision belongs to.
+///
+/// `task_id` is the intent that asked for the work, or `manual:<session>` for a
+/// call made outside a turn. `task_revision` is stable for the same intent and
+/// changes when the work behind it changes; a lease bound to one revision never
+/// covers another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationSubject {
+    pub task_id: String,
+    pub task_revision: u64,
+}
+
+impl AuthorizationSubject {
+    pub fn new(task_id: impl Into<String>, task_revision: u64) -> Self {
+        Self { task_id: task_id.into(), task_revision }
+    }
+
+    /// The subject for a call made outside a task turn.
+    pub fn manual(session_id: &str) -> Self {
+        Self::new(format!("manual:{session_id}"), 0)
+    }
+}
+
 /// How much risk one action carries. Internal to the kernel and recorded in the
 /// log; it is not a permission the user is asked to understand.
 ///

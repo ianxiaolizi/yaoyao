@@ -303,7 +303,7 @@ fn fold_events(
     // A payload that will not read back is a log anomaly, not "no choice": the
     // page would label the session with the default and hide the damage.
     let model =
-        agent_kernel::model_selection::current(&events).map_err(|error| ReadError::Session {
+        agent_kernel::model_selection::current(events).map_err(|error| ReadError::Session {
             session: session.as_str().to_string(),
             message: format!("model selection: {error}"),
         })?;
@@ -319,7 +319,7 @@ fn fold_events(
         last_plan,
         subagents,
         model,
-        archived: agent_kernel::session_archive::current(&events),
+        archived: agent_kernel::session_archive::current(events),
     })
 }
 

@@ -53,6 +53,15 @@ notepad scripts\gui\start.local.ps1
 `start.local.ps1` 已在 `.gitignore` 里，可以放模型 key，不要提交。示例里给了
 DeepSeek / OpenAI-compatible 的四个环境变量。
 
+步数预算默认不设固定上限。`[budget] max_steps` 省略时，主循环会继续到正常完成或其他显式停止条件；需要严格上限时再写正整数：
+
+```toml
+[budget]
+# max_steps = 20
+```
+
+已有配置中的 `max_steps` 行必须删除，才会得到无固定步数上限的行为。`0` 不是“无限”，会被拒绝；`max_tool_calls`、`max_total_tokens`、`wall_clock_timeout` 和停滞检测仍是独立的安全阀。
+
 启动器参数（直接跑 PowerShell 脚本时）：
 
 ```powershell

@@ -141,6 +141,22 @@ fn fold_answered(events: &[StoredEvent]) -> Result<Option<IntentId>, IntentError
     Ok(answered)
 }
 
+/// The stable revision number of one recorded intent.
+///
+/// The sequence of the `intent/recorded` event, made one-based, is a revision
+/// the log already fixes: it does not move when the same intent is resumed and
+/// it cannot collide with another intent in the session.
+pub fn recorded_revision(events: &[StoredEvent], intent_id: &IntentId) -> Option<u64> {
+    events
+        .iter()
+        .find(|stored| {
+            stored.event.event_type.as_str() == EventType::INTENT_RECORDED
+                && stored.event.payload.get("intent_id").and_then(|value| value.as_str())
+                    == Some(intent_id.as_str())
+        })
+        .map(|stored| stored.seq.as_u64() + 1)
+}
+
 /// Fold `intent/*` events into their latest intent states, in append order.
 ///
 /// Public because the intent ledger is not the only reader: a front end that

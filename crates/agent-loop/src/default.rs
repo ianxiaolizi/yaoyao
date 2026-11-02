@@ -1230,7 +1230,7 @@ impl AgentLoop for DefaultAgentLoop {
             previous_turn: turn_facts.and_then(|facts| facts.previous_turn).map(ending_word),
             resumed: turn_facts.and_then(|facts| facts.resumed.clone()),
             queued_inputs: turn_facts.map(|facts| facts.queued_inputs).unwrap_or(0),
-            max_steps: turn_facts.map(|facts| facts.max_steps).unwrap_or(0),
+            max_steps: turn_facts.and_then(|facts| facts.max_steps),
             plan_done: ctx.plan.as_ref().map_or(0, |plan| {
                 plan.items.iter().filter(|item| item.status == PlanItemStatus::Done).count()
             }),
@@ -2780,7 +2780,8 @@ impl AgentLoop for DefaultAgentLoop {
                     call.tool_call_id.clone(),
                     call.tool_name.clone(),
                     call.arguments.clone(),
-                );
+                )
+                .with_authorization_subject(ctx.authorization_subject.clone());
                 match self.gateway.execute(&ctx.session_id, &invocation).await {
                     Ok(result) => {
                         // The call ran. It is the retry a reconcile promised,
@@ -3449,6 +3450,7 @@ mod tests {
             session_id: agent_protocol::ids::SessionId::from_string("s"),
             turn_id: agent_protocol::ids::TurnId::new(),
             run_id: agent_protocol::ids::RunId::new(),
+            authorization_subject: agent_protocol::permission::AuthorizationSubject::manual("s"),
             user_input: serde_json::json!({"text": "hi"}),
             journal: Journal::new(Arc::new(RecordingJournal::new())),
             instructions: None,
@@ -3495,7 +3497,6 @@ mod tests {
             FakeModelProvider::answer("done"),
         ]));
         let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
-
         let mut ctx = ctx();
         ctx.journal = Journal::new(journal.clone());
         let TurnStart { mut state, .. } = loop_.begin_turn(&ctx).await.unwrap();
@@ -3517,6 +3518,38 @@ mod tests {
                 .any(|event| event.event_type.as_str() == EventType::TOOL_STARTED),
             "a committed draft must not also be returned"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_carries_the_turn_authorization_subject() {
+        let seen: Arc<Mutex<Vec<agent_protocol::permission::AuthorizationSubject>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let seen = seen.clone();
+            Arc::new(move |invocation: &ToolInvocation| {
+                if let Some(subject) = invocation.authorization_subject.clone() {
+                    seen.lock().unwrap().push(subject);
+                }
+            })
+        };
+        let tools = Arc::new(
+            FakeToolProvider::new()
+                .with_tool("echo", "hello", ToolSideEffect::Pure)
+                .with_observer(observer),
+        );
+        let gateway = Arc::new(FakeToolGateway::new(tools));
+        let model = Arc::new(FakeModelProvider::new(vec![
+            FakeModelProvider::tool_call("echo", serde_json::json!({"s": "hi"})),
+            FakeModelProvider::answer("done"),
+        ]));
+        let loop_ = DefaultAgentLoop::new(model, gateway, no_context(), one_model_router());
+
+        let mut ctx = ctx();
+        let subject = agent_protocol::permission::AuthorizationSubject::new("intent-42", 9);
+        ctx.authorization_subject = subject.clone();
+        let outcome = run_turn(&loop_, &ctx).await;
+        assert_eq!(outcome.stop_reason, StopReason::FinalAnswer);
+        assert_eq!(seen.lock().unwrap().as_slice(), std::slice::from_ref(&subject));
     }
 
     #[tokio::test]
@@ -6969,7 +7002,7 @@ mod tests {
             input_kind: TurnInputKind::User,
             previous_turn: Some(TurnEnding::Cancelled),
             resumed: None,
-            max_steps: 16,
+            max_steps: Some(16),
             budget: RunBudget::default(),
             completion: None,
         }
@@ -7418,7 +7451,7 @@ mod tests {
     #[test]
     fn the_task_layer_bounds_a_long_input_and_names_the_input_kind() {
         let facts =
-            TurnStateFacts { input_kind: TurnInputKind::Scheduled, max_steps: 1, ..facts() };
+            TurnStateFacts { input_kind: TurnInputKind::Scheduled, max_steps: Some(1), ..facts() };
         let long = "x".repeat(MAX_TASK_CHARS + 10);
         let text = task_text(
             &serde_json::json!({ "text": long }),

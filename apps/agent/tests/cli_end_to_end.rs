@@ -118,13 +118,16 @@ fn write_config(home: &TempDir, name: &str, text: &str) -> String {
 }
 
 #[test]
-fn an_unnamed_data_directory_lands_in_the_workspace_not_the_callers_cwd() {
-    // Two throwaway directories and no `AGENT_DATA_DIR` between them: which one
-    // the run's own state appears in is the whole question.
-    let (workspace, elsewhere) = dirs();
+fn an_unnamed_data_directory_lands_outside_the_workspace() {
+    // The state directory must be outside every path a tool can write. The
+    // platform state root is redirected to a throwaway directory here so the
+    // test can see where the default landed without touching the real profile.
+    let (workspace, elsewhere, state_home) = dirs_with_config();
+    let state_var = if cfg!(windows) { "LOCALAPPDATA" } else { "XDG_STATE_HOME" };
     let output = Command::new(env!("CARGO_BIN_EXE_agent"))
         .env("AGENT_WORKSPACE_DIR", workspace.path())
         .env("AGENT_MODEL_PROVIDER", "echo")
+        .env(state_var, state_home.path())
         .env_remove("AGENT_DATA_DIR")
         .env_remove(ENV_USER_CONFIG)
         .env_remove(ENV_MANAGED_POLICY)
@@ -134,16 +137,30 @@ fn an_unnamed_data_directory_lands_in_the_workspace_not_the_callers_cwd() {
         .expect("the binary starts");
     assert!(output.status.success(), "the run failed: {}", String::from_utf8_lossy(&output.stderr));
 
-    // The log is where the workspace says, under the default session.
-    let log = workspace.path().join(".agent-data").join("default").join("events.jsonl");
-    assert!(log.exists(), "no event log at {log:?}");
-
-    // And nowhere else: the directory the command was invoked from is untouched,
-    // which is what makes a run's state findable rather than cwd-shaped.
+    assert!(
+        state_home.path().join("yaoyao-agent").exists(),
+        "the default state directory did not appear under the platform state root"
+    );
+    assert!(
+        !workspace.path().join(".agent-data").exists(),
+        "agent state is still inside the model-writable workspace"
+    );
     assert!(
         !elsewhere.path().join(".agent-data").exists(),
         "the run's state landed in the caller's cwd"
     );
+}
+
+#[test]
+fn an_agent_data_directory_inside_the_workspace_is_refused() {
+    let workspace = TempDir::new().unwrap();
+    let inside = workspace.path().join(".agent-data");
+
+    let r = ran(&inside, workspace.path(), &["session", "new"]);
+
+    assert_eq!(r.code, Some(2), "an unsafe data directory was accepted: {} {}", r.out, r.err);
+    assert!(r.err.contains("outside it"), "the refusal did not explain the boundary: {}", r.err);
+    assert!(!inside.exists(), "the refused directory was created anyway");
 }
 
 #[test]
