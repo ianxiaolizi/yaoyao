@@ -169,7 +169,7 @@ mod tests {
         assert!(resolved.capability_set.is_empty(), "no layer authorized anything");
         assert!(!resolved.policy.replaces_defaults, "the built-in rules still apply");
         assert!(resolved.policy.rules.is_empty());
-        assert_eq!(resolved.budget.max_steps, 8);
+        assert_eq!(resolved.budget.max_steps, None);
         assert!(!resolved.policy_version.is_empty(), "the policy is identifiable either way");
     }
 
@@ -239,7 +239,7 @@ budget = { max_steps = 4, max_tool_calls = 6 }
         .unwrap();
         layers.profile_override = Some("p".to_string());
         let budget = resolve(layers).unwrap().budget;
-        assert_eq!(budget.max_steps, 4);
+        assert_eq!(budget.max_steps, Some(4));
         assert_eq!(budget.max_tool_calls, Some(6));
         assert_eq!(budget.max_input_tokens, None);
         assert_eq!(budget.preset, agent_protocol::model::BudgetPreset::Balanced);
@@ -299,7 +299,7 @@ policy = { shell = "ask" }
         let resolved = resolve(layers).unwrap();
         assert_eq!(resolved.profile_id, "coding");
         assert_eq!(resolved.model.as_deref(), Some("big"), "the child names the model");
-        assert_eq!(resolved.budget.max_steps, 4, "and inherits what it does not name");
+        assert_eq!(resolved.budget.max_steps, Some(4), "and inherits what it does not name");
         assert_eq!(resolved.capability_set, caps(&["fs.read"]).into_iter().collect());
         assert!(resolved.policy.replaces_defaults);
         assert!(resolved.policy.overrides.contains(&Directive {
@@ -1203,7 +1203,7 @@ plugins = { enable = ["mcp.foo"] }
         assert_eq!(snapshot.profile_id, "coding");
         assert_eq!(snapshot.plugin_versions["mcp.foo"], "1.0.0");
         assert_eq!(snapshot.policy_version, policy_version);
-        assert_eq!(snapshot.budget.max_steps, 8);
+        assert_eq!(snapshot.budget.max_steps, None);
         assert!(!snapshot.config_hash.is_empty());
     }
 
@@ -1346,12 +1346,12 @@ plugins = { enable = ["mcp.foo"] }
         };
 
         let lowered = load("[budget]\nmax_steps = 2\n", "");
-        assert_eq!(lowered.max_steps, 2);
+        assert_eq!(lowered.max_steps, Some(2));
 
         // A budget is a normal setting, so the closer layer wins — the
         // project is not a ceiling on it the way it is on a permission.
         let overridden = load("[budget]\nmax_steps = 2\n", "budget = { max_steps = 12 }\n");
-        assert_eq!(overridden.max_steps, 12);
+        assert_eq!(overridden.max_steps, Some(12));
     }
 
     #[test]
@@ -1529,7 +1529,7 @@ decisions = { laya = true }
         .unwrap();
         ok.profile_override = Some("p".to_string());
         let resolved = resolve(ok).unwrap().budget;
-        assert_eq!(resolved.max_steps, 1);
+        assert_eq!(resolved.max_steps, Some(1));
         assert_eq!(resolved.max_tool_calls, Some(1));
         assert_eq!(resolved.wall_clock_ms, Some(1_000));
     }
@@ -1686,7 +1686,7 @@ decisions = { laya = true }
     }
 
     #[test]
-    fn a_token_budget_raises_the_step_ceiling_and_fills_the_phase_defaults() {
+    fn a_token_budget_fills_phase_defaults_without_inventing_a_step_ceiling() {
         // A run with a primary limit is meant to last; the step count becomes a
         // backstop rather than the plan, and the phases that only make sense
         // against a primary limit are filled in.
@@ -1697,7 +1697,7 @@ decisions = { laya = true }
         layers.profile_override = Some("p".to_string());
         let budget = resolve(layers).unwrap().budget;
         assert_eq!(budget.max_total_tokens, Some(45_000_000));
-        assert_eq!(budget.max_steps, 300, "a primary limit raises the step backstop");
+        assert_eq!(budget.max_steps, None, "a primary limit does not invent a step ceiling");
         assert_eq!(budget.finalize_at_percent, Some(85));
         assert_eq!(budget.stall_steps, Some(8));
         assert_eq!(budget.cache_hit_weight_percent, Some(10));
@@ -1709,7 +1709,7 @@ decisions = { laya = true }
         )
         .unwrap();
         named.profile_override = Some("p".to_string());
-        assert_eq!(resolve(named).unwrap().budget.max_steps, 40);
+        assert_eq!(resolve(named).unwrap().budget.max_steps, Some(40));
     }
 
     #[test]
@@ -1943,7 +1943,7 @@ max_output_tokens = 8000
             serde_json::from_value(old).expect("an old budget reads back");
         assert_eq!(budget.max_input_tokens, None);
         assert_eq!(budget.reserved_output_tokens, None);
-        assert_eq!(budget, agent_protocol::profile::RunBudget::default());
+        assert_eq!(budget.max_steps, Some(8));
     }
 
     #[test]
@@ -1956,7 +1956,7 @@ max_output_tokens = 8000
         assert_eq!(
             default,
             serde_json::json!({
-                "max_steps": 8,
+                "max_steps": null,
                 "max_tool_calls": null,
                 "wall_clock_ms": null,
                 "preset": "balanced",

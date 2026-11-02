@@ -764,10 +764,6 @@ fn with_rules(
     policy
 }
 
-/// The step ceiling a profile gets when it configured a primary limit but no
-/// step count. The limit is the plan; this is the backstop that stops a loop
-/// whose other limits never fire.
-const DEFAULT_BACKSTOP_STEPS: u32 = 300;
 
 /// When a run with a primary limit is told to finalize.
 const DEFAULT_FINALIZE_AT_PERCENT: u32 = 85;
@@ -792,16 +788,11 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
     let mut budget = RunBudget::default();
     apply_budget(&mut budget, workspace.budget.as_ref())?;
     apply_budget(&mut budget, composed.budget.as_ref())?;
-    // A primary limit (token budget or wall clock) is what makes the step
-    // ceiling a backstop rather than the plan: a run meant to last an hour
-    // must not die at the eighth step because nobody raised it. Only a profile
-    // that configured no `max_steps` of its own gets the raised value.
+    // A primary limit is what a run with a token or wall-clock budget is
+    // measured against. It does not invent a step ceiling: a run that names no
+    // `max_steps` is unbounded by step count and stops only on another stated
+    // condition.
     let primary_limit = budget.max_total_tokens.is_some() || budget.wall_clock_ms.is_some();
-    let named_steps = workspace.budget.as_ref().and_then(|spec| spec.max_steps).is_some()
-        || composed.budget.as_ref().and_then(|spec| spec.max_steps).is_some();
-    if primary_limit && !named_steps {
-        budget.max_steps = DEFAULT_BACKSTOP_STEPS;
-    }
     if primary_limit && budget.finalize_at_percent.is_none() {
         budget.finalize_at_percent = Some(DEFAULT_FINALIZE_AT_PERCENT);
     }
@@ -1090,7 +1081,7 @@ fn apply_budget(budget: &mut RunBudget, spec: Option<&BudgetSpec>) -> Result<()>
                     .to_string(),
             });
         }
-        budget.max_steps = steps;
+        budget.max_steps = Some(steps);
     }
     if let Some(calls) = spec.max_tool_calls {
         if calls == 0 {

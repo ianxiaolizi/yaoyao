@@ -69,7 +69,16 @@ impl Spent {
 #[serde(default)]
 pub struct RunBudget {
     /// How many steps a turn may take before it stops as `MaxSteps`.
-    pub max_steps: u32,
+    ///
+    /// `None` means the run has no fixed step ceiling. `Some(0)` is never a
+    /// valid configured value; zero is refused at configuration resolution.
+    ///
+    /// The field-level default preserves the historical eight-step ceiling for
+    /// snapshots written before this field became optional. A new unbounded
+    /// budget always serializes `null`, so it is distinguishable from an old
+    /// snapshot whose field is absent.
+    #[serde(default = "legacy_max_steps")]
+    pub max_steps: Option<u32>,
     /// How many tool calls the whole run may make. `None` means unbounded.
     ///
     /// Enforced by the loop, which is what sees a call before dispatching it: a
@@ -225,17 +234,21 @@ impl RunBudget {
     }
 }
 
+/// The historical step ceiling used when an old snapshot omitted the field.
+fn legacy_max_steps() -> Option<u32> {
+    Some(8)
+}
+
 impl Default for RunBudget {
     /// What a run has when no configuration says otherwise.
     ///
-    /// The step limit is the one the assembled binary has always used, so a
-    /// run with no config files behaves exactly as it did before profiles
-    /// existed. `max_steps` is enforced by the Scheduler, which owns when a
-    /// turn advances; `max_tool_calls` and `wall_clock_ms` are enforced by the
-    /// loop, which is what sees each call before dispatching it.
+    /// A run has no fixed step ceiling unless configuration names one.
+    /// `max_steps` is enforced by the Scheduler when present;
+    /// `max_tool_calls` and `wall_clock_ms` are enforced by the loop, which is
+    /// what sees each call before dispatching it.
     fn default() -> Self {
         Self {
-            max_steps: 8,
+            max_steps: None,
             max_tool_calls: None,
             wall_clock_ms: None,
             max_total_tokens: None,
@@ -492,11 +505,25 @@ mod tests {
     }
 
     #[test]
-    fn the_default_budget_is_the_step_limit_the_binary_already_used() {
-        // A run with no config must not change shape because profiles now
-        // exist, so the fallback is the number that was hard-coded before.
-        assert_eq!(RunBudget::default().max_steps, 8);
+    fn the_default_budget_has_no_fixed_step_ceiling() {
+        let encoded = serde_json::to_value(RunBudget::default()).unwrap();
+        assert_eq!(encoded["max_steps"], serde_json::Value::Null);
         assert_eq!(RunBudget::default().max_tool_calls, None);
+    }
+
+    #[test]
+    fn an_omitted_step_ceiling_decodes_as_the_legacy_eight() {
+        let budget: RunBudget = serde_json::from_value(serde_json::json!({})).unwrap();
+        let encoded = serde_json::to_value(budget).unwrap();
+        assert_eq!(encoded["max_steps"], serde_json::json!(8));
+    }
+
+    #[test]
+    fn an_explicit_null_step_ceiling_is_unbounded() {
+        let budget: RunBudget =
+            serde_json::from_value(serde_json::json!({ "max_steps": null })).unwrap();
+        let encoded = serde_json::to_value(budget).unwrap();
+        assert_eq!(encoded["max_steps"], serde_json::Value::Null);
     }
 
     #[test]
