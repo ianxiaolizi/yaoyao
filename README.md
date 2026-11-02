@@ -30,10 +30,13 @@
 
 ## 双击启动
 
-双击仓库根目录的 `启动爻爻.cmd`（它只负责调 `scripts\gui\start.ps1`，真正的逻辑在那一个脚本里）：
+双击仓库根目录的 `启动爻爻.cmd`（或 ASCII 名 `start-yaoyao.cmd`；两者都只调
+`scripts\gui\start.ps1`，真正的逻辑在那一个脚本里）：
 
+- 在 `web/src` 或前端入口比 `web/dist` 新时先 `pnpm build`，再把 `web/dist` 编进二进制；
 - 自动构建 `target\debug\agent.exe`；
-- 使用 `G:\yaoyao-work` 作为工作区（存在时），数据目录用 `G:\yaoyao-work\.agent`；
+- 使用 `G:\yaoyao-work` 作为工作区（存在时）；
+- 数据目录默认不设置，由二进制决定（显式设置时必须是工作区之外的绝对路径）；
 - 在 `7441` 起服务；
 - 读到带一次性令牌的 URL 后自动打开默认浏览器；
 - 控制台保留服务日志，Ctrl+C 停止。
