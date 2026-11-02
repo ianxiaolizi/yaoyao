@@ -37,7 +37,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -314,13 +314,31 @@ impl Server {
     }
 }
 
+/// The page's assets, compiled in by `build.rs` from `web/dist`.
+///
+/// The generated table names every file with its content type, so the binary
+/// needs nothing beside it and a request cannot reach outside the build.
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
+}
+
+/// The policy the page is served under. Only this origin, and inline styles
+/// because the glass and the drag handles are computed at runtime. The bundle's
+/// script is an external file under `/assets/`, so `script-src 'self'` still
+/// forbids inline script; `object-src` names `blob:` because a PDF artifact is
+/// handed to the browser's viewer as a blob URL, never as a network fetch, and
+/// `frame-src` names it too because the viewer frames its own document.
+const PAGE_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; \
+                        object-src 'self' blob:; frame-src 'self' blob:; \
+                        style-src 'self' 'unsafe-inline'; connect-src 'self' blob:; \
+                        script-src 'self'";
+
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/favicon.ico", get(favicon))
-        .route("/app.css", get(app_css))
-        .route("/app.js", get(app_js))
+        .route("/assets/{*path}", get(asset))
         .route("/api/meta", get(meta))
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{id}", get(session).delete(delete_session))
@@ -350,35 +368,59 @@ fn router(state: Arc<AppState>) -> Router {
 
 /// The page shell.
 ///
-/// The page is public because it holds no data; every `/api/` call is gated. The
-/// CSP is the same one the contract promises: only this origin, and inline
-/// styles because the glass and the drag handles are computed at runtime.
-async fn index() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_SECURITY_POLICY,
-            "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' blob:; script-src 'self'",
-        )],
-        Html(include_str!("../static/index.html")),
-    )
+/// The page is public because it holds no data; every `/api/` call is gated. It
+/// is compiled in (`embedded::INDEX`), so the binary serves the exact bundle it
+/// was built with.
+async fn index() -> Response {
+    page(embedded::INDEX)
+}
+
+/// Answer with the page, under the policy the contract promises.
+fn page(bytes: &'static [u8]) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_SECURITY_POLICY, PAGE_CSP)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        // The document names hashed assets; a cached copy would pin an old
+        // bundle across a restart. The assets themselves are immutable.
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(bytes))
+        .expect("static headers are valid")
+}
+
+/// One asset from the built bundle.
+///
+/// A miss is a 404, not the page: an unknown asset means the binary and the
+/// document disagree, and answering HTML would hide that as a parse error.
+async fn asset(AxumPath(path): AxumPath<String>) -> Response {
+    let key = format!("assets/{path}");
+    let Some(asset) = embedded::ASSETS.iter().find(|asset| asset.path == key) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "v": PROTOCOL,
+                "ok": false,
+                "kind": "not_found",
+                "code": "asset_not_found",
+                "message": "这个构建里没有这个资源",
+            })),
+        )
+            .into_response();
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, asset.content_type)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        // Vite names each bundle after its content, so a URL is immutable and a
+        // new build cannot overwrite one a page still points at.
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(Body::from(asset.bytes))
+        .expect("static headers are valid")
 }
 
 /// No icon is served; the page uses the inline mark. Answering 204 rather than
 /// letting the browser log a 404 keeps the console useful for real failures.
 async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
-}
-
-/// The stylesheet, embedded like the page so production runs no separate web
-/// server.
-async fn app_css() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../static/app.css"))
-}
-
-/// The page's script, embedded for the same reason.
-async fn app_js() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../static/app.js"))
 }
 
 async fn meta(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -857,6 +899,11 @@ async fn artifact(
         "image/gif"
     } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         "image/webp"
+    } else if bytes.starts_with(b"%PDF-") {
+        // A PDF is a document the page can put in a viewer, not an opaque
+        // download; its signature is the only type a content-addressed store
+        // can honestly offer.
+        "application/pdf"
     } else if is_plain_text(&bytes) {
         // A tab pointed at `application/octet-stream` stays blank: the browser
         // has nothing it can render. Text is common here (the model's own

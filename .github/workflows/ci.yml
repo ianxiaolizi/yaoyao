@@ -79,9 +79,51 @@ jobs:
         # passed".
         run: pwsh -File scripts/test.ps1 -SkipFormat -SkipClippy
 
+  web:
+    # The page is compiled into the binary (`crates/agent-web/build.rs`), so
+    # `web/dist` is source, not a build artifact to ignore. This job typechecks
+    # the shell and rebuilds it, then fails when the committed directory no
+    # longer matches `web/src` — otherwise a page change would only reach the
+    # machines that remembered to run `pnpm build` by hand.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --dir web check
+
+      - name: Build
+        run: pnpm --dir web build
+
+      - name: The committed bundle must match its sources
+        shell: pwsh
+        run: |
+          $drift = git status --porcelain -- web/dist
+          if ($drift) {
+            Write-Host $drift
+            throw 'web/dist is stale: run `pnpm --dir web build` and commit the result.'
+          }
+
   gui-smoke:
-    # The page is a real projection of a real server, so its smoke test builds
-    # the binary and drives Edge over a throwaway data directory. It is separate
+    # The page is a real projection of a real server, and since M7 it is part of
+    # the binary, so this job builds the binary and drives Edge against a
+    # throwaway data directory — no Node dev server in the path. It is separate
     # from `check` because Playwright and a browser are not needed for the Rust
     # gate, and a GUI failure should name itself.
     runs-on: windows-latest

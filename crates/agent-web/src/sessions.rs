@@ -86,7 +86,7 @@ impl LiveTranscript {
         let projection = TranscriptProjection::new();
         let mut state = projection.init();
         for event in events {
-            state = projection.apply(&state, event).map_err(|error| ReadError::Session {
+            projection.apply_in_place(&mut state, event).map_err(|error| ReadError::Session {
                 session: event.event.session_id.as_str().to_string(),
                 message: error.to_string(),
             })?;
@@ -117,11 +117,14 @@ impl LiveTranscript {
 
     /// Apply one durable event and return the rows whose wire shape changed.
     pub(crate) fn apply(&mut self, event: &StoredEvent) -> Result<Vec<Value>, ReadError> {
-        self.state =
-            self.projection.apply(&self.state, event).map_err(|error| ReadError::Session {
+        // In place, for the same reason the read fold is: an SSE client on a
+        // long session applies every event to one growing state.
+        self.projection.apply_in_place(&mut self.state, event).map_err(|error| {
+            ReadError::Session {
                 session: event.event.session_id.as_str().to_string(),
                 message: error.to_string(),
-            })?;
+            }
+        })?;
 
         let mut changed = Vec::new();
         // Only rows this event touched can have a new wire shape. The filter
@@ -263,7 +266,10 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
         session_state = session_projection.apply(&session_state, event).map_err(|error| {
             ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
         })?;
-        transcript = transcript_projection.apply(&transcript, event).map_err(|error| {
+        // In place: the trait's `apply` clones every item it has folded so far,
+        // which turns one 10k-event log into a quadratic fold. This is the same
+        // projection without that clone (see `TranscriptProjection`).
+        transcript_projection.apply_in_place(&mut transcript, event).map_err(|error| {
             ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
         })?;
     }

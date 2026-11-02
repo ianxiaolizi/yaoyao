@@ -1,8 +1,9 @@
 # GUI smoke
 
-This is the browser half of `agent web`'s acceptance: it starts the real binary,
-seeds a throwaway data directory with a session that has thinking, a `git.diff`
-observation, and a pending approval, then drives the page in Edge.
+The browser half of `agent web`'s acceptance. Since M7 the page is compiled into
+the binary (`web/dist` → `crates/agent-web/build.rs`), so the test starts the
+real `agent.exe web`, not a Vite server, and drives exactly the bytes a user
+gets.
 
 ```powershell
 cargo build -p agent
@@ -10,26 +11,61 @@ npm ci --prefix scripts/gui
 node scripts/gui/smoke.mjs
 ```
 
-Screenshots land in `target/gui-smoke-*.png`.
+It seeds a throwaway data directory with eight sessions — a four-turn session with
+thinking, a `git.diff` observation, a plan, context layers and a two-level
+subagent tree; an artifact session with an image / HTML / Markdown / PDF / docx /
+xlsx; a session replayed from a real captured run (`fixtures/real-chain`); pending
+and expired approvals; a scratch session for archive/delete; a 1,000-item
+session — then checks:
 
-- `AGENT_BIN` overrides `target/debug/agent.exe`.
-- `EDGE_PATH` overrides the default Edge path.
-- The script owns the server and its temporary workspace; it never touches your
-  `.agent-data`.
-- CI runs the same command in the `gui-smoke` job.
+- the session list, title, current turn, thinking fold, action rows;
+- the evidence sheet's plan / diff / why / context / subagents / schedules tabs;
+- 排定 and 取消 against the real Inbox;
+- export downloads `${id}.md` with the session's own text;
+- fork opens a real child session, rename/archive/delete go through the menu;
+- ⌘K / Ctrl K filtering and Enter;
+- image / HTML / Markdown / PDF / docx / xlsx artifact previews, the result dock
+  and full screen;
+- the real chain's plan, diff, answer and reasoning nodes;
+- approval decisions, a ticking TTL and the settled record;
+- model switch writes a choice and says when it applies;
+- a new turn against the echo provider;
+- one deliberately dropped SSE connection, after which the next turn still lands
+  and no item is duplicated;
+- 1,000 items: first render, unfolding every past turn, scrolling;
+- `prefers-reduced-motion: reduce` leaves no transitions on the moving surfaces;
+- 900px drawer and 390px single column;
+- no console error, page error or 4xx along the way.
+
+Screenshots land in `web/shots/m7-*.png`, `m8-*.png` and `m9-*.png`. `AGENT_BIN`
+overrides `target/debug/agent.exe`; `EDGE_PATH` overrides the default Edge path.
+The script owns the server and its temporary workspace; it never touches your
+`.agent-data`. CI runs the same command in the `gui-smoke` job.
+
+## Capturing a real chain
+
+`capture-real-chain.mjs` runs the real binary — scheduler, tool gateway,
+filesystem, `git diff` — against a scripted loopback model, because a machine
+without `AGENT_MODEL_API_KEY` cannot call a vendor. Add `--live` on a machine
+that has one and the same flow is captured from the real endpoint.
+
+```powershell
+node scripts/gui/capture-real-chain.mjs         # writes fixtures/real-chain/
+node scripts/gui/capture-real-chain.mjs --live  # same flow, vendor model
+```
+
+The fixture keeps the run's bytes, timestamps and ids; only the throwaway
+workspace path is rewritten to `<workspace>`.
 
 ## Timeline performance (local only)
 
 `perf.mjs` seeds sessions of 2,000 / 5,000 / 10,000 events and measures what a
-reader feels: time to open the session, scroll frames per second, the worst
-frame while a real reply streams, and how many finished turns were rebuilt
-during that reply. It is not part of CI — the numbers are only comparable on the
-machine that recorded `perf-baseline.json`, and a runner is a different machine.
+reader feels: time to open the session, time to unfold every earlier turn, scroll
+frames per second, and the worst frame while a real reply streams. It is not part
+of CI — the numbers are only comparable on the machine that recorded
+`perf-baseline.json`, and a runner is a different machine.
 
 ```powershell
 node scripts/gui/perf.mjs            # compare against the baseline
 node scripts/gui/perf.mjs --record   # rewrite it
 ```
-
-It fails when a time is more than twice the baseline, the scroll rate drops
-below half of it, or a finished turn is rebuilt while the next one streams.

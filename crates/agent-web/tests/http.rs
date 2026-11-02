@@ -922,20 +922,47 @@ async fn the_page_is_public_and_names_the_product() {
     let (addr, _, handle, _dir) = serve().await;
     let (status, response) = request(addr, "/", None, None).await;
     assert_eq!(status, 200, "{response}");
+    assert!(
+        response.to_ascii_lowercase().contains("content-security-policy"),
+        "the page is served under the contract's policy: {response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("object-src 'self' blob:; frame-src 'self' blob:"),
+        "a PDF artifact is handed to the viewer as a blob: {response}"
+    );
     let page = body(&response);
     assert!(page.contains("爻爻"), "the page names the product");
+    assert!(page.contains("./assets/"), "the page names its bundle: {page}");
     handle.abort();
 }
 
 #[tokio::test]
-async fn the_page_assets_are_embedded_and_served() {
+async fn the_bundle_is_embedded_and_served() {
     let (addr, _, handle, _dir) = serve().await;
-    let (status, script) = request(addr, "/app.js", None, None).await;
+    let (_, page) = request(addr, "/", None, None).await;
+    let html = body(&page);
+    let asset = html
+        .split("src=\"./")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the page names its script");
+    let (status, script) = request(addr, &format!("/{asset}"), None, None).await;
     assert_eq!(status, 200, "{script}");
-    assert!(body(&script).contains("renderTimeline"), "the page script is embedded");
-    let (status, style) = request(addr, "/app.css", None, None).await;
-    assert_eq!(status, 200, "{style}");
-    assert!(body(&style).contains(".window"), "the page stylesheet is embedded");
+    assert!(
+        script.to_ascii_lowercase().contains("content-type: text/javascript"),
+        "the script is typed: {script}"
+    );
+    assert!(body(&script).contains("y-sheet"), "the bundle carries the shell");
+    for line in ["cache-control: public, max-age=31536000, immutable", "nosniff"] {
+        assert!(
+            script.to_ascii_lowercase().contains(line),
+            "the hashed asset is cached as immutable: {script}"
+        );
+    }
+
+    let (status, missing) = request(addr, "/assets/does-not-exist.js", None, None).await;
+    assert_eq!(status, 404, "{missing}");
+    assert!(body(&missing).contains("asset_not_found"), "{missing}");
     handle.abort();
 }
 
@@ -1097,6 +1124,16 @@ async fn an_artifact_is_served_only_by_its_content_hash() {
         request(addr, &format!("/api/artifacts/{binary_hash}"), Some(&token), None).await;
     assert_eq!(status, 200, "{response}");
     assert!(response.contains("content-type: application/octet-stream"), "{response}");
+
+    // A PDF is served as one so the page can embed a viewer: the signature is
+    // the only type the store has.
+    let pdf_hash = "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad";
+    std::fs::write(artifacts.join(format!("{pdf_hash}.blob")), b"%PDF-1.4\n%%EOF\n")
+        .expect("pdf blob");
+    let (status, response) =
+        request(addr, &format!("/api/artifacts/{pdf_hash}"), Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    assert!(response.contains("content-type: application/pdf"), "{response}");
     handle.abort();
 }
 

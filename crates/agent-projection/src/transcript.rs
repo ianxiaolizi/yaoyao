@@ -297,31 +297,20 @@ fn turn_end_id(turn: &TurnId) -> String {
     format!("end:{}", turn.as_str())
 }
 
-impl ProjectionDefinition for TranscriptProjection {
-    type State = TranscriptState;
-    type View = TranscriptView;
-
-    fn key(&self) -> &str {
-        "transcript"
-    }
-
-    fn state_schema(&self) -> &str {
-        "transcript/0.1.0"
-    }
-
-    fn state_version(&self) -> u64 {
-        // 2: items carry `updated_seq`, so an incremental reader can tell a
-        // changed row from an old one without refolding the log.
-        2
-    }
-
-    fn init(&self) -> Self::State {
-        TranscriptState::default()
-    }
-
-    fn apply(&self, state: &Self::State, event: &StoredEvent) -> Result<Self::State, ApplyError> {
-        let mut next = state.clone();
-        next.head = event.seq;
+impl TranscriptProjection {
+    /// Apply one event to `state` in place.
+    ///
+    /// `ProjectionDefinition::apply` must return a new state, which costs a
+    /// clone of every item it holds. The web fold and the SSE loop apply
+    /// thousands of events to one state and cannot pay that per event; this is
+    /// the same fold without the clone, and `apply` is this function with one
+    /// clone at the front, so the two cannot drift apart.
+    pub fn apply_in_place(
+        &self,
+        state: &mut TranscriptState,
+        event: &StoredEvent,
+    ) -> Result<(), ApplyError> {
+        state.head = event.seq;
 
         match event.event.event_type.as_str() {
             EventType::INBOX_APPENDED => {
@@ -341,7 +330,7 @@ impl ProjectionDefinition for TranscriptProjection {
                             .and_then(|value| value.as_bool())
                             .unwrap_or(false);
                         upsert(
-                            &mut next,
+                            state,
                             user_id(event.seq),
                             event.seq,
                             None,
@@ -358,7 +347,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     // addressed to is not known until `turn/steered`.
                     InboxKind::NextStep if !text.trim().is_empty() => {
                         upsert(
-                            &mut next,
+                            state,
                             format!("note:{}", event.seq.as_u64()),
                             event.seq,
                             None,
@@ -376,7 +365,7 @@ impl ProjectionDefinition for TranscriptProjection {
                 let inbox_id = event.event.payload.get("inbox_item").and_then(|v| v.as_str());
                 if let Some(inbox_id) = inbox_id {
                     let turn = event.event.turn_id.clone();
-                    if let Some(message) = next.items.iter_mut().find(|item| {
+                    if let Some(message) = state.items.iter_mut().find(|item| {
                         matches!(&item.body, ItemBody::User { inbox_item: Some(id), .. } if id == inbox_id)
                     }) {
                         message.turn_id = turn;
@@ -398,7 +387,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     .unwrap_or_default();
                 if !text.trim().is_empty() {
                     upsert(
-                        &mut next,
+                        state,
                         format!("steer:{}", event.seq.as_u64()),
                         event.seq,
                         event.event.turn_id.clone(),
@@ -426,17 +415,17 @@ impl ProjectionDefinition for TranscriptProjection {
                     "reading" => "读法",
                     "stance" => "立场",
                     "gate" => "闸门",
-                    _ => return Ok(next),
+                    _ => return Ok(()),
                 };
                 let Some(turn) = event.event.turn_id.clone().or_else(|| {
                     (!node.turn_id.is_empty()).then(|| TurnId::from_string(&node.turn_id))
                 }) else {
-                    return Ok(next);
+                    return Ok(());
                 };
                 let id = format!("think:{}", turn.as_str());
                 let line = format!("{label}：{}", node.claim);
                 let steps = node.step + 1;
-                if let Some(existing) = next.items.iter_mut().find(|item| item.id == id) {
+                if let Some(existing) = state.items.iter_mut().find(|item| item.id == id) {
                     if let ItemBody::Thinking { text, steps: current } = &mut existing.body {
                         text.push_str("\n\n");
                         text.push_str(&line);
@@ -445,7 +434,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     }
                 } else {
                     upsert(
-                        &mut next,
+                        state,
                         id,
                         event.seq,
                         Some(turn),
@@ -466,14 +455,14 @@ impl ProjectionDefinition for TranscriptProjection {
                         serde_json::from_value(value).map_err(|e| ApplyError::malformed(event, e))
                     })?;
                 if let Some(usage) = response.usage {
-                    next.last_usage = Some(usage);
+                    state.last_usage = Some(usage);
                 }
                 let text = response_text(&response);
                 if !text.trim().is_empty()
                     && let Some(turn) = event.event.turn_id.clone()
                 {
                     let id = answer_id(&turn);
-                    let combined = match next.items.iter().find(|item| item.id == id) {
+                    let combined = match state.items.iter().find(|item| item.id == id) {
                         Some(TranscriptItem {
                             body: ItemBody::Answer { text: previous }, ..
                         }) if !previous.is_empty() => {
@@ -482,7 +471,7 @@ impl ProjectionDefinition for TranscriptProjection {
                         _ => text,
                     };
                     upsert(
-                        &mut next,
+                        state,
                         id,
                         event.seq,
                         Some(turn),
@@ -502,7 +491,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
                 upsert(
-                    &mut next,
+                    state,
                     format!("a:{call_id}"),
                     event.seq,
                     event.event.turn_id.clone(),
@@ -544,7 +533,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     },
                 };
                 let id = format!("a:{call_id}");
-                let started_at = next
+                let started_at = state
                     .items
                     .iter()
                     .find(|item| item.id == id)
@@ -554,7 +543,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     })
                     .unwrap_or(event.recorded_at);
                 let duration_ms = (event.recorded_at - started_at).num_milliseconds().max(0) as u64;
-                let arguments = next
+                let arguments = state
                     .items
                     .iter()
                     .find(|item| item.id == id)
@@ -570,7 +559,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     .and_then(|value| value.as_str())
                     .map(|text| text.to_string());
                 upsert(
-                    &mut next,
+                    state,
                     id,
                     event.seq,
                     event.event.turn_id.clone(),
@@ -591,7 +580,7 @@ impl ProjectionDefinition for TranscriptProjection {
                     serde_json::from_value(event.event.payload.clone())
                         .map_err(|e| ApplyError::malformed(event, e))?;
                 upsert(
-                    &mut next,
+                    state,
                     format!("ap:{}", request.approval_id.as_str()),
                     event.seq,
                     event.event.turn_id.clone(),
@@ -625,17 +614,17 @@ impl ProjectionDefinition for TranscriptProjection {
                     .get("approval_id")
                     .and_then(|value| value.as_str())
                     .ok_or_else(|| ApplyError::malformed(event, "no approval_id"))?;
-                let state = match event.event.event_type.as_str() {
+                let decided = match event.event.event_type.as_str() {
                     EventType::APPROVAL_GRANTED => ApprovalState::Granted,
                     EventType::APPROVAL_DENIED => ApprovalState::Denied,
                     EventType::APPROVAL_EXPIRED => ApprovalState::Expired,
                     _ => ApprovalState::Cancelled,
                 };
                 let id = format!("ap:{approval_id}");
-                if let Some(existing) = next.items.iter_mut().find(|item| item.id == id)
+                if let Some(existing) = state.items.iter_mut().find(|item| item.id == id)
                     && let ItemBody::Approval { state: current, .. } = &mut existing.body
                 {
-                    *current = state;
+                    *current = decided;
                     // A decision is news. Without this the approval row would
                     // keep its pending sequence forever, and `?since=` would
                     // never deliver the answer that a pending card needs to
@@ -650,7 +639,7 @@ impl ProjectionDefinition for TranscriptProjection {
             | EventType::TURN_CANCELLED
             | EventType::TURN_INTERRUPTED => {
                 let Some(turn) = event.event.turn_id.clone() else {
-                    return Ok(next);
+                    return Ok(());
                 };
                 let stop_reason = event
                     .event
@@ -700,7 +689,7 @@ impl ProjectionDefinition for TranscriptProjection {
                 // Without this the page has no group to put the card in and the
                 // person sees "等待批准" with no button to press.
                 if event.event.event_type.as_str() == EventType::TURN_YIELDED {
-                    for item in next.items.iter_mut() {
+                    for item in state.items.iter_mut() {
                         if item.turn_id.is_none()
                             && matches!(
                                 item.body,
@@ -726,7 +715,7 @@ impl ProjectionDefinition for TranscriptProjection {
                         event.event.payload.get("final_content").and_then(|value| value.as_str())
                 {
                     upsert(
-                        &mut next,
+                        state,
                         answer_id(&turn),
                         event.seq,
                         Some(turn.clone()),
@@ -735,9 +724,9 @@ impl ProjectionDefinition for TranscriptProjection {
                     );
                 }
 
-                let usage = next.last_usage;
+                let usage = state.last_usage;
                 upsert(
-                    &mut next,
+                    state,
                     turn_end_id(&turn),
                     event.seq,
                     Some(turn),
@@ -756,6 +745,35 @@ impl ProjectionDefinition for TranscriptProjection {
             _ => return Err(ApplyError::UnknownEventType(event.event.event_type.clone())),
         }
 
+        Ok(())
+    }
+}
+
+impl ProjectionDefinition for TranscriptProjection {
+    type State = TranscriptState;
+    type View = TranscriptView;
+
+    fn key(&self) -> &str {
+        "transcript"
+    }
+
+    fn state_schema(&self) -> &str {
+        "transcript/0.1.0"
+    }
+
+    fn state_version(&self) -> u64 {
+        // 2: items carry `updated_seq`, so an incremental reader can tell a
+        // changed row from an old one without refolding the log.
+        2
+    }
+
+    fn init(&self) -> Self::State {
+        TranscriptState::default()
+    }
+
+    fn apply(&self, state: &Self::State, event: &StoredEvent) -> Result<Self::State, ApplyError> {
+        let mut next = state.clone();
+        self.apply_in_place(&mut next, event)?;
         Ok(next)
     }
 
@@ -826,6 +844,67 @@ mod tests {
             ItemBody::User { text, .. } => Some(text),
             _ => None,
         }
+    }
+
+    #[test]
+    fn folding_in_place_matches_the_pure_apply() {
+        // The web fold and the SSE loop use `apply_in_place`; the trait's
+        // `apply` is the same fold with one clone. If they ever disagree, one
+        // of the two readers is wrong and the log alone cannot say which.
+        let turn = TurnId::from_string("t1");
+        let step = StepId::from_string("s1");
+        let item = InboxItem {
+            item_id: agent_protocol::ids::InboxItemId::from_string("i1"),
+            session_id: SessionId::from_string("transcript-test"),
+            kind: InboxKind::NextTurn,
+            payload: json!({ "text": "先看一下 agent-cli" }),
+            priority: 0,
+            created_at: Utc::now(),
+            status: InboxItemStatus::Pending,
+        };
+        let events = [
+            stored(0, EventType::INBOX_APPENDED, None, None, serde_json::to_value(&item).unwrap()),
+            stored(
+                1,
+                EventType::TURN_STARTED,
+                Some(turn.clone()),
+                None,
+                json!({ "inbox_item": item.item_id }),
+            ),
+            stored(2, EventType::STEP_STARTED, Some(turn.clone()), Some(step.clone()), json!({})),
+            stored(
+                3,
+                EventType::REASON_RECORDED,
+                Some(turn.clone()),
+                Some(step),
+                json!({
+                    "node": ReasonNode {
+                        id: "r/1".to_string(),
+                        turn_id: turn.as_str().to_string(),
+                        step: 0,
+                        kind: ReasonKind::Situation,
+                        claim: "the person asked for a read".to_string(),
+                        basis: vec![Basis::fact("the log")],
+                        rule: "situation/derive".to_string(),
+                        source: ReasonSource::Kernel,
+                    }
+                }),
+            ),
+        ];
+
+        let projection = TranscriptProjection::new();
+        let mut in_place = projection.init();
+        for event in &events {
+            projection.apply_in_place(&mut in_place, event).expect("in-place fold");
+        }
+
+        let mut pure = projection.init();
+        for event in &events {
+            pure = projection.apply(&pure, event).expect("pure fold");
+        }
+
+        assert_eq!(in_place, pure);
+        assert_eq!(in_place.head, EventSeq::new(3));
     }
 
     #[test]
