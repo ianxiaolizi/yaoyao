@@ -28,6 +28,14 @@ const binary = process.env.AGENT_BIN || join(root, 'target', 'debug', 'agent.exe
 const live = process.argv.includes('--live');
 const fixtureDir = join(here, 'fixtures', 'real-chain');
 
+if (live && !process.env.AGENT_MODEL_API_KEY) {
+  throw new Error(
+    '--live needs AGENT_MODEL_API_KEY. Copy scripts/gui/start.local.ps1.example to ' +
+      'scripts/gui/start.local.ps1 (gitignored), fill it in, then dot-source it in the same ' +
+      'shell before running: `. .\\scripts\\gui\\start.local.ps1`',
+  );
+}
+
 if (!existsSync(binary)) {
   throw new Error(`agent binary not found at ${binary}; run cargo build -p agent first`);
 }

@@ -55,7 +55,14 @@ without `AGENT_MODEL_API_KEY` cannot call a vendor. Add `--live` on a machine
 that has one and the same flow is captured from the real endpoint.
 
 ```powershell
-node scripts/gui/capture-real-chain.mjs         # writes fixtures/real-chain/
+# one-time: the gitignored local config used by both the launcher and this shell
+Copy-Item scripts\gui\start.local.ps1.example scripts\gui\start.local.ps1
+notepad scripts\gui\start.local.ps1
+
+# the capture script inherits the current process environment, so load it first
+. .\scripts\gui\start.local.ps1
+
+node scripts/gui/capture-real-chain.mjs         # writes fixtures/real-chain/ (scripted stub)
 node scripts/gui/capture-real-chain.mjs --live  # same flow, vendor model
 ```
 
