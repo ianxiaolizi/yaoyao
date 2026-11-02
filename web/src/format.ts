@@ -6,13 +6,185 @@ export function esc(value: unknown): string {
     .replaceAll('"', '&quot;');
 }
 
-/** Enough Markdown for a transcript: bold, code spans, paragraphs, line breaks. */
+/**
+ * One URL policy for Markdown: links may leave the page, images may only be
+ * bytes the page already holds. Artifact text is untrusted, so a Markdown image
+ * must never make the page fetch a third-party URL; external images stay links.
+ */
+function linkUrl(raw: string): string | null {
+  const url = raw.trim();
+  if (/^(https?:|mailto:)/i.test(url)) return url;
+  // A document-relative link cannot reach another origin and is useful in
+  // transcripts; a protocol-relative `//host` could, so it is excluded.
+  if (/^(\.{0,2}\/|\/)(?!\/)/.test(url)) return url;
+  return null;
+}
+
+function imageUrl(raw: string): string | null {
+  const url = raw.trim();
+  if (/^blob:/i.test(url)) return url;
+  // SVG can carry script; the `<img>` context does not run it, but the store
+  // has no reason to accept an active format when the raster ones cover it.
+  if (/^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/i.test(url)) return url;
+  return null;
+}
+
+const CODE_MARK = '\uE000';
+
+/** Inline Markdown on already-escaped text: code, images, links, bold. */
+function inlineMd(text: string): string {
+  const code: string[] = [];
+  let out = esc(text).replace(/`([^`]+)`/g, (_match, body: string) => {
+    code.push(body);
+    return `${CODE_MARK}${code.length - 1}${CODE_MARK}`;
+  });
+
+  out = out.replace(
+    /!\[([^\]]*)\]\(([^)\s]+)\)/g,
+    (match, alt: string, href: string) => {
+      const src = imageUrl(href);
+      if (src) return `<img src="${src}" alt="${alt}" loading="lazy" />`;
+      const link = linkUrl(href);
+      return link
+        ? `<a href="${link}" target="_blank" rel="noreferrer noopener">图片：${alt || '外链'}</a>`
+        : alt || match;
+    },
+  );
+
+  out = out.replace(
+    /\[([^\]]+)\]\(([^)\s]+)\)/g,
+    (match, label: string, href: string) => {
+      const url = linkUrl(href);
+      return url
+        ? `<a href="${url}" target="_blank" rel="noreferrer noopener">${label}</a>`
+        : match;
+    },
+  );
+
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  out = out.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+
+  return out.replace(new RegExp(`${CODE_MARK}(\\d+)${CODE_MARK}`, 'g'), (_match, index: string) => `<code>${code[Number(index)]}</code>`);
+}
+
+/**
+ * Enough Markdown for a transcript and an artifact: headings, paragraphs,
+ * fenced code, unordered/ordered lists, tables, code spans, bold/italic, links
+ * and images. It is deliberately a renderer, not an HTML passthrough.
+ */
+export function mdDoc(text: string): string {
+  const lines = String(text ?? '').split(/\r?\n/);
+  const out: string[] = [];
+  let paragraph: string[] = [];
+  let list: 'ul' | 'ol' | null = null;
+  let fence = false;
+  let code: string[] = [];
+
+  const closeList = (): void => {
+    if (list) {
+      out.push(`</${list}>`);
+      list = null;
+    }
+  };
+  const closeParagraph = (): void => {
+    if (paragraph.length) {
+      out.push(`<p>${paragraph.join('<br>')}</p>`);
+      paragraph = [];
+    }
+  };
+  const closeBlocks = (): void => {
+    closeParagraph();
+    closeList();
+  };
+
+  const cells = (line: string): string[] =>
+    line
+      .trim()
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .split('|')
+      .map((cell) => cell.trim());
+  const separator = (line: string): boolean => {
+    const row = cells(line);
+    return row.length > 0 && row.every((cell) => /^:?-{3,}:?$/.test(cell));
+  };
+  const tableStart = (line: string, next: string | undefined): boolean =>
+    line.includes('|') && next !== undefined && separator(next);
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+
+    if (fence) {
+      if (/^```/.test(line.trim())) {
+        out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);
+        code = [];
+        fence = false;
+      } else {
+        code.push(line);
+      }
+      continue;
+    }
+    if (/^```/.test(line.trim())) {
+      closeBlocks();
+      fence = true;
+      continue;
+    }
+
+    if (tableStart(line, lines[i + 1])) {
+      closeBlocks();
+      const head = cells(line);
+      i += 2;
+      const body: string[][] = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        body.push(cells(lines[i]));
+        i += 1;
+      }
+      i -= 1;
+      out.push(
+        `<table><thead><tr>${head.map((cell) => `<th>${inlineMd(cell)}</th>`).join('')}</tr></thead><tbody>${body
+          .map((row) => `<tr>${row.map((cell) => `<td>${inlineMd(cell)}</td>`).join('')}</tr>`)
+          .join('')}</tbody></table>`,
+      );
+      continue;
+    }
+
+    if (/^#{1,6}\s+/.test(line)) {
+      closeBlocks();
+      const body = line.replace(/^#{1,6}\s+/, '');
+      out.push(`<h3>${inlineMd(body)}</h3>`);
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+\.\s+(.*)$/);
+    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+    if (ordered || bullet) {
+      closeParagraph();
+      const kind = ordered ? 'ol' : 'ul';
+      if (list !== kind) {
+        closeList();
+        out.push(`<${kind}>`);
+        list = kind;
+      }
+      out.push(`<li>${inlineMd((ordered ?? bullet)?.[1] ?? '')}</li>`);
+      continue;
+    }
+
+    if (!line.trim()) {
+      closeBlocks();
+      continue;
+    }
+
+    paragraph.push(inlineMd(line));
+  }
+
+  if (fence) out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);
+  closeBlocks();
+  return out.join('');
+}
+
+/** A single transcript answer; kept as the old name for call sites. */
 export function mdText(text: string): string {
-  return `<p>${esc(text)
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\n\n/g, '</p><p>')
-    .replace(/\n/g, '<br>')}</p>`;
+  return mdDoc(text);
 }
 
 export function argsSummary(value: unknown): string {

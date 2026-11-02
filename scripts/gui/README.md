@@ -18,27 +18,32 @@ xlsx; a session replayed from a real captured run (`fixtures/real-chain`); pendi
 and expired approvals; a scratch session for archive/delete; a 1,000-item
 session — then checks:
 
-- the session list, title, current turn, thinking fold, action rows;
-- the evidence sheet's plan / diff / why / context / subagents / schedules tabs;
+- the session list (6 recent rows + 「全部会话」), title, current turn, thinking fold, action rows;
+- the turn rail: hover / focus summary, `Alt ↑/↓`, click to jump;
+- the evidence sheet's plan / diff / why / context / subagents / schedules tabs；
 - 排定 and 取消 against the real Inbox;
 - export downloads `${id}.md` with the session's own text;
 - fork opens a real child session, rename/archive/delete go through the menu;
 - ⌘K / Ctrl K filtering and Enter;
 - image / HTML / Markdown / PDF / docx / xlsx artifact previews, the result dock
   and full screen;
+- Markdown tables, ordered lists, links, embedded data images and the external-image
+  fallback; docx headings; xlsx merged cells and date formats;
 - the real chain's plan, diff, answer and reasoning nodes;
+- the real-subagent fixture's delegated + settled shapes;
 - approval decisions, a ticking TTL and the settled record;
-- model switch writes a choice and says when it applies;
+- model switch writes a choice and says when it applies; the approval-policy chip
+  states that auto-approval is not offered; `+` is disabled;
 - a new turn against the echo provider;
 - one deliberately dropped SSE connection, after which the next turn still lands
   and no item is duplicated;
 - 1,000 items: first render, unfolding every past turn, scrolling;
 - `prefers-reduced-motion: reduce` leaves no transitions on the moving surfaces;
-- 900px drawer and 390px single column;
+- 1024 / 900 drawer and 390px single column;
 - no console error, page error or 4xx along the way.
 
-Screenshots land in `web/shots/m7-*.png`, `m8-*.png` and `m9-*.png`. `AGENT_BIN`
-overrides `target/debug/agent.exe`; `EDGE_PATH` overrides the default Edge path.
+Screenshots land in `web/shots/m7-*.png`, `m8-*.png`, `m9-*.png` and `m10-*.png`.
+`AGENT_BIN` overrides `target/debug/agent.exe`; `EDGE_PATH` overrides the default Edge path.
 The script owns the server and its temporary workspace; it never touches your
 `.agent-data`. CI runs the same command in the `gui-smoke` job.
 
@@ -56,6 +61,17 @@ node scripts/gui/capture-real-chain.mjs --live  # same flow, vendor model
 
 The fixture keeps the run's bytes, timestamps and ids; only the throwaway
 workspace path is rewritten to `<workspace>`.
+
+## Capturing a real subagent
+
+`capture-real-subagent.mjs` runs the real binary, policy gate and in-process
+subagent provider: a parent turn closes, then `subagent.run` delegates
+`check the notes`. Only the model is the echo provider. The fixture keeps the
+parent log's real `subagent/spawned` + `subagent/completed`.
+
+```powershell
+node scripts/gui/capture-real-subagent.mjs    # writes fixtures/real-subagent/
+```
 
 ## Timeline performance (local only)
 

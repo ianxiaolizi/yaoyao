@@ -14,8 +14,8 @@ use agent_kernel::inbox::{Inbox, item_intent_id};
 use agent_kernel::model_selection::ModelChoice;
 use agent_ports::event_store::EventStore;
 use agent_projection::{
-    ActionStatus, ApprovalState, ItemBody, ProjectionDefinition, SessionProjection, TranscriptItem,
-    TranscriptProjection, TranscriptState, TurnEnding,
+    ActionStatus, ApprovalState, ItemBody, Projection, ProjectionDefinition, SessionProjection,
+    TranscriptItem, TranscriptProjection, TranscriptState, TurnEnding,
 };
 use agent_protocol::events::StoredEvent;
 use agent_protocol::ids::{EventSeq, SessionId};
@@ -142,6 +142,11 @@ impl LiveTranscript {
     }
 }
 
+/// The event count above which a fold leaves a checkpoint behind. Normal
+/// sessions stay memory-only; a long one pays one write so the next process
+/// start folds only the tail.
+const CHECKPOINT_MIN_EVENTS: usize = 1_000;
+
 /// A small cache of folded logs, keyed by the file signature they were read at.
 ///
 /// Listing ten sessions on every sidebar refresh means folding ten logs; most
@@ -150,9 +155,11 @@ impl LiveTranscript {
 /// this process or another one invalidates the entry by touching the file. A
 /// fold whose read spans a write is not cached, because the file's signature
 /// changed underneath it and the entry would be stale before it was stored.
-#[derive(Default)]
 pub(crate) struct ReadModel {
     cache: std::sync::Mutex<HashMap<String, Cached>>,
+    /// The transcript projection writes checkpoints under the data directory;
+    /// the store is held here so a cache miss does not need a second read.
+    store: Arc<dyn EventStore>,
 }
 
 #[derive(Clone)]
@@ -162,8 +169,8 @@ struct Cached {
 }
 
 impl ReadModel {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(store: Arc<dyn EventStore>) -> Self {
+        Self { cache: std::sync::Mutex::new(HashMap::new()), store }
     }
 
     fn signature(
@@ -175,10 +182,10 @@ impl ReadModel {
         Some((metadata.len(), metadata.modified().ok()))
     }
 
-    /// The folded session, from the cache when the log has not moved.
+    /// The folded session, from the cache when the log has not moved, from a
+    /// transcript checkpoint when one is grounded, and otherwise from the log.
     pub(crate) async fn fold(
         &self,
-        store: &dyn EventStore,
         data_dir: &Path,
         session: &SessionId,
     ) -> Result<Folded, ReadError> {
@@ -191,7 +198,34 @@ impl ReadModel {
             return Ok(cached.folded.clone());
         }
 
-        let folded = fold(store, session).await?;
+        let events =
+            self.store.read_stream(session, EventSeq::ZERO, usize::MAX).await.map_err(|error| {
+                ReadError::Session {
+                    session: session.as_str().to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+        let projection = Projection::new(
+            TranscriptProjection::new(),
+            self.store.clone(),
+            data_dir.to_path_buf(),
+        );
+        let projected = projection.build_from_events(session, &events).await.map_err(|error| {
+            ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
+        })?;
+        if events.len() >= CHECKPOINT_MIN_EVENTS {
+            let session = session.clone();
+            let checkpoint = projected.clone();
+            // A checkpoint is a cache: a write failure costs the next read a
+            // full fold, not this response. Wait out the first paint and the
+            // reader's first scroll — serializing 6k items competes with the
+            // frames a person is actually watching.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let _ = projection.checkpoint(&session, &checkpoint).await;
+            });
+        }
+        let folded = fold_events(session, &events, projected.state)?;
         let after = Self::signature(data_dir, session);
         if before.is_some() && before == after {
             let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -207,20 +241,18 @@ impl ReadModel {
     }
 }
 
-/// Fold one session's log through both projections.
-pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<Folded, ReadError> {
-    let events = store.read_stream(session, EventSeq::ZERO, usize::MAX).await.map_err(|error| {
-        ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
-    })?;
-
+/// Fold one session's metadata and a transcript already built by the caller.
+fn fold_events(
+    session: &SessionId,
+    events: &[StoredEvent],
+    transcript: TranscriptState,
+) -> Result<Folded, ReadError> {
     let session_projection = SessionProjection::new();
     let mut session_state = session_projection.init();
-    let transcript_projection = TranscriptProjection::new();
-    let mut transcript = transcript_projection.init();
     let mut last_request = None;
     let mut last_plan = None;
     let mut subagents: Vec<Value> = Vec::new();
-    for event in &events {
+    for event in events {
         let event_type = event.event.event_type.as_str();
         if event_type == agent_protocol::events::EventType::MODEL_REQUEST_PREPARED {
             last_request = Some(event.event.payload.clone());
@@ -266,12 +298,6 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
         session_state = session_projection.apply(&session_state, event).map_err(|error| {
             ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
         })?;
-        // In place: the trait's `apply` clones every item it has folded so far,
-        // which turns one 10k-event log into a quadratic fold. This is the same
-        // projection without that clone (see `TranscriptProjection`).
-        transcript_projection.apply_in_place(&mut transcript, event).map_err(|error| {
-            ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
-        })?;
     }
 
     // A payload that will not read back is a log anomaly, not "no choice": the
@@ -299,14 +325,13 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
 
 /// Every session under the data directory, newest activity first.
 pub(crate) async fn list(
-    store: &dyn EventStore,
     data_dir: &Path,
     reads: &ReadModel,
     now: DateTime<Utc>,
 ) -> Result<Vec<Value>, ReadError> {
     let mut sessions: Vec<(Option<DateTime<Utc>>, String, Value)> = Vec::new();
     for id in session_ids(data_dir)? {
-        let folded = reads.fold(store, data_dir, &id).await?;
+        let folded = reads.fold(data_dir, &id).await?;
         let summary = summary(&id, &folded, now);
         sessions.push((folded.last_activity_at, id.as_str().to_string(), summary));
     }
@@ -318,14 +343,13 @@ pub(crate) async fn list(
 
 /// One session's transcript, with items changed after `since`.
 pub(crate) async fn transcript(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     since: Option<u64>,
     reads: &ReadModel,
     now: DateTime<Utc>,
 ) -> Result<Value, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     let items: Vec<Value> = folded
         .transcript
         .items
@@ -405,12 +429,11 @@ pub(crate) async fn status(
 /// no report — that is a `404`, not an empty diff (which would claim the tree
 /// was clean).
 pub(crate) async fn diff(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     for item in folded.transcript.items.iter().rev() {
         let ItemBody::Action {
             tool,
@@ -448,12 +471,11 @@ pub(crate) async fn diff(
 /// input). A category is omitted when the request did not record its number,
 /// rather than shown as zero.
 pub(crate) async fn context(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     let Some(request) = folded.last_request.as_ref() else {
         return Ok(None);
     };
@@ -514,12 +536,11 @@ pub(crate) async fn context(
 
 /// The session's latest plan ledger, if the loop recorded one.
 pub(crate) async fn plan(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     Ok(folded.last_plan.map(|plan| {
         json!({
             "v": 1,
@@ -532,12 +553,11 @@ pub(crate) async fn plan(
 
 /// The children this session delegated to, with their last known status.
 pub(crate) async fn subagents(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     if folded.subagents.is_empty() {
         return Ok(None);
     }
@@ -636,11 +656,14 @@ fn wire_item_at(item: &TranscriptItem, now: DateTime<Utc>) -> Value {
     }
 
     match &item.body {
-        ItemBody::User { text, resumed, .. } => {
+        ItemBody::User { text, resumed, at, .. } => {
             row.insert("kind".to_string(), "user".into());
             row.insert("text".to_string(), text.clone().into());
             if *resumed {
                 row.insert("resumed".to_string(), true.into());
+            }
+            if let Some(at) = at {
+                row.insert("at".to_string(), at.to_rfc3339().into());
             }
         }
         ItemBody::Note { text } => {
@@ -863,6 +886,7 @@ mod tests {
                 text: "The approval ended the wait".to_string(),
                 inbox_item: None,
                 resumed: true,
+                at: None,
             },
         };
         let wire = wire_item_at(&item, Utc::now());
@@ -874,6 +898,7 @@ mod tests {
                 text: "what I typed".to_string(),
                 inbox_item: None,
                 resumed: false,
+                at: None,
             },
             ..item
         };

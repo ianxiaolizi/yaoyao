@@ -34,14 +34,10 @@ if (-not $env:AGENT_WORKSPACE_DIR) {
         $env:AGENT_WORKSPACE_DIR = $repo
     }
 }
-if (-not $env:AGENT_DATA_DIR) {
-    $legacy = Join-Path $env:AGENT_WORKSPACE_DIR '.agent'
-    if (Test-Path $legacy) {
-        $env:AGENT_DATA_DIR = $legacy
-    } else {
-        $env:AGENT_DATA_DIR = Join-Path $env:AGENT_WORKSPACE_DIR '.agent-data'
-    }
-}
+# AGENT_DATA_DIR is intentionally left unset by default. The binary places
+# logs, snapshots and artifacts under the platform's per-user state root, outside
+# the model-writable workspace. Set it explicitly only to an absolute path
+# outside the workspace.
 
 # 可选的机器本地设置：不要把它提交进仓库。
 $local = Join-Path $PSScriptRoot 'start.local.ps1'
@@ -65,6 +61,47 @@ if ($listener) {
 }
 
 if (-not $SkipBuild) {
+    # The page is compiled into the binary (crates/agent-web/build.rs), so the
+    # bundle has to be current before cargo runs. Rebuild it only when web/src is
+    # newer than web/dist; a machine without Node keeps the bundle it has.
+    $web = Join-Path $repo 'web'
+    $index = Join-Path $web 'dist\index.html'
+    $stale = -not (Test-Path $index)
+    if (-not $stale) {
+        $builtAt = (Get-Item $index).LastWriteTime
+        $newestSource = Get-ChildItem (Join-Path $web 'src') -Recurse -File |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($newestSource -and $newestSource.LastWriteTime -gt $builtAt) { $stale = $true }
+        # The entry, the Vite config and the lockfile also decide the bundle;
+        # editing them without rebuilding would leave the old page in the exe.
+        foreach ($name in 'index.html', 'package.json', 'pnpm-lock.yaml', 'vite.config.ts', 'tsconfig.json') {
+            $candidate = Join-Path $web $name
+            if ((Test-Path $candidate) -and (Get-Item $candidate).LastWriteTime -gt $builtAt) { $stale = $true }
+        }
+    }
+    if ($stale -and $DryRun) {
+        Write-Host '  前端产物已过期（或缺失），正式启动会先构建。' -ForegroundColor Yellow
+    }
+    if ($stale) {
+        $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue
+        if (-not $pnpm) {
+            Stop-WithMessage "前端产物缺失或已过期，且找不到 pnpm。`n先在 web\ 里运行 pnpm install 和 pnpm build，或删掉 -SkipBuild 改用已提交的 dist。"
+        }
+        Push-Location $web
+        try {
+            if (-not (Test-Path (Join-Path $web 'node_modules'))) {
+                Write-Host '  正在安装前端依赖…' -ForegroundColor DarkGray
+                & $pnpm.Source install
+                if ($LASTEXITCODE -ne 0) { Stop-WithMessage 'pnpm install 失败。上面的输出就是原因。' }
+            }
+            Write-Host '  正在构建页面…' -ForegroundColor DarkGray
+            & $pnpm.Source build
+            if ($LASTEXITCODE -ne 0) { Stop-WithMessage '页面构建失败。上面的输出就是原因。' }
+        } finally {
+            Pop-Location
+        }
+    }
+
     $cargo = Get-Command cargo -ErrorAction SilentlyContinue
     if (-not $cargo) {
         Stop-WithMessage '找不到 cargo。请先安装 Rust，或用已经构建好的 target\debug\agent.exe。'

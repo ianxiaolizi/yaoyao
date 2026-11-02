@@ -281,11 +281,11 @@ impl Server {
         let app = router(Arc::new(AppState {
             token: token.clone(),
             meta,
-            store,
+            store: store.clone(),
             data_dir,
             backend,
             now,
-            reads: sessions::ReadModel::new(),
+            reads: sessions::ReadModel::new(store),
             live: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
             settling: Mutex::new(HashSet::new()),
@@ -444,9 +444,8 @@ async fn sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiFailure> {
     let now = state.now();
-    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads, now)
-        .await
-        .map_err(ApiFailure::read)?;
+    let list =
+        sessions::list(&state.data_dir, &state.reads, now).await.map_err(ApiFailure::read)?;
     Ok(Json(serde_json::json!({ "v": PROTOCOL, "sessions": list })))
 }
 
@@ -457,9 +456,8 @@ async fn session(
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
     let now = state.now();
-    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads, now)
-        .await
-        .map_err(ApiFailure::read)?;
+    let list =
+        sessions::list(&state.data_dir, &state.reads, now).await.map_err(ApiFailure::read)?;
     let found = list
         .into_iter()
         .find(|row| row["id"].as_str() == Some(id.as_str()))
@@ -556,7 +554,6 @@ async fn transcript(
         return Err(ApiFailure::not_found(format!("no session '{id}'")));
     }
     let payload = sessions::transcript(
-        state.store.as_ref(),
         &state.data_dir,
         &SessionId::from_string(&id),
         since,
@@ -627,14 +624,9 @@ async fn diff(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::diff(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::diff(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::diff_unavailable(
@@ -653,14 +645,9 @@ async fn context(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::context(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::context(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::context_unavailable(
@@ -675,14 +662,9 @@ async fn plan(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::plan(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::plan(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::plan_unavailable(
@@ -716,14 +698,9 @@ async fn subagents(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::subagents(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::subagents(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::subagents_unavailable(
@@ -993,11 +970,7 @@ async fn turn(
     // missing one: the turn's own inbox append creates its log. Only the checks
     // that need a history are skipped.
     if state.data_dir.join(&id).join("events.jsonl").is_file() {
-        let folded = state
-            .reads
-            .fold(state.store.as_ref(), &state.data_dir, &session)
-            .await
-            .map_err(ApiFailure::read)?;
+        let folded = state.reads.fold(&state.data_dir, &session).await.map_err(ApiFailure::read)?;
         if folded.yielded {
             return Err(ApiFailure::conflict(
                 "awaiting_decision",
@@ -1069,11 +1042,7 @@ async fn approve(
     };
 
     let session = SessionId::from_string(&id);
-    let folded = state
-        .reads
-        .fold(state.store.as_ref(), &state.data_dir, &session)
-        .await
-        .map_err(ApiFailure::read)?;
+    let folded = state.reads.fold(&state.data_dir, &session).await.map_err(ApiFailure::read)?;
     let now = state.now();
     let pending = folded.transcript.items.iter().any(|item| {
         matches!(

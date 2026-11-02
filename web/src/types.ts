@@ -65,6 +65,8 @@ export interface Item {
   usage?: Usage;
   resumed?: boolean;
   steps?: number;
+  /** When a prompt was queued; the turn rail uses it as the turn's time. */
+  at?: string;
 }
 
 export interface Transcript {
@@ -119,7 +121,11 @@ export interface ArtifactView {
   contentType?: string;
   /** docx: one entry per paragraph. */
   paragraphs?: string[];
+  /** docx: the same paragraphs with Word heading levels kept. */
+  blocks?: { text: string; heading?: number }[];
   /** xlsx: cells of the first sheet, gaps padded so columns line up. */
   rows?: string[][];
+  /** xlsx: merged ranges, 0-based and inclusive. */
+  merges?: { r1: number; c1: number; r2: number; c2: number }[];
   sheet?: string;
 }

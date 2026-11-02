@@ -51,6 +51,10 @@ pub enum ItemBody {
         /// message.
         #[serde(default, skip_serializing_if = "is_false")]
         resumed: bool,
+        /// When the prompt was queued. The turn rail shows it as the turn's
+        /// time; older logs have no field and simply show no time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<DateTime<Utc>>,
     },
     /// A steering note injected at a step boundary.
     Note { text: String },
@@ -339,6 +343,7 @@ impl TranscriptProjection {
                                 text,
                                 inbox_item: Some(item.item_id.as_str().to_string()),
                                 resumed,
+                                at: Some(item.created_at),
                             },
                         );
                     }
@@ -764,7 +769,8 @@ impl ProjectionDefinition for TranscriptProjection {
     fn state_version(&self) -> u64 {
         // 2: items carry `updated_seq`, so an incremental reader can tell a
         // changed row from an old one without refolding the log.
-        2
+        // 3: a prompt carries `at`, so the turn rail can show when it started.
+        3
     }
 
     fn init(&self) -> Self::State {

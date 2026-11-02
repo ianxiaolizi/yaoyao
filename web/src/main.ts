@@ -156,7 +156,9 @@ async function showArtifact(locator: string): Promise<void> {
         kind: office.kind,
         name,
         paragraphs: office.paragraphs,
+        blocks: office.blocks,
         rows: office.rows,
+        merges: office.merges,
         sheet: office.sheet,
         contentType: blob.type,
       };

@@ -90,6 +90,22 @@ body {
   font-family: var(--font-mono);
   font-size: 10px;
 }
+.y-sec-more {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  font-size: 12px;
+  color: var(--ink-3);
+  text-align: left;
+  cursor: pointer;
+}
+.y-sec-more:hover {
+  background: var(--surface-2);
+  color: var(--ink-2);
+}
 .y-session {
   position: relative;
   display: block;
@@ -203,11 +219,25 @@ body {
   padding-right: 64px;
 }
 .y-trace {
+  position: relative;
   display: flex;
   width: 30px;
   flex: none;
   align-items: center;
   justify-content: center;
+}
+/* The rail's preview: three lines, beside the rail, never reflowing the column. */
+.y-trace .trace-pop {
+  z-index: var(--z-pop);
+  width: 236px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow-pop);
+}
+.y-trace .trace-pop .t1 b.run {
+  color: var(--accent);
 }
 .y-ticks {
   display: flex;
@@ -227,6 +257,10 @@ body {
 }
 .y-tick:hover {
   background: var(--ink-3);
+}
+.y-tick:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 .y-tick.now {
   width: 13px;
@@ -950,6 +984,67 @@ body {
   font-family: var(--font-mono);
   font-size: 11px;
 }
+/* Markdown that both an answer and an artifact can produce. */
+.y-answer table,
+.y-art-md table {
+  margin: 0 0 10px;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.y-answer th,
+.y-art-md th,
+.y-answer td,
+.y-art-md td {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+.y-answer th,
+.y-art-md th {
+  background: var(--surface-2);
+  color: var(--ink);
+  font-weight: 600;
+}
+.y-answer a,
+.y-art-md a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.y-answer img,
+.y-art-md img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+.y-answer ol,
+.y-art-md ol {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+.y-answer h3,
+.y-art-md h3 {
+  margin: 12px 0 8px;
+  font-size: 15px;
+  color: var(--ink);
+}
+.y-answer pre,
+.y-art-md pre {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.65;
+}
+.y-answer pre code,
+.y-art-md pre code {
+  padding: 0;
+  border: 0;
+  background: none;
+}
 
 /* ── menu / hover preview / palette ── */
 .y-menu,
@@ -1302,6 +1397,19 @@ body.y-resizing embed {
 .y-model-menu .pop-item {
   width: 100%;
 }
+.y-model-menu .pop-item:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.y-model-menu .pop-item:disabled:hover {
+  background: none;
+}
+.pop-note {
+  padding: 6px 8px 3px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--ink-3);
+}
 
 /* ── M8 · menu extras ─────────────────────────────────────────────────── */
 .pop-sep {
@@ -1449,6 +1557,15 @@ body.y-resizing embed {
 }
 .y-art-docx p.gap {
   margin: 0 0 4px;
+}
+.y-art-docx h3 {
+  margin: 16px 0 10px;
+  font-size: 16px;
+  line-height: 1.45;
+  color: var(--ink);
+}
+.y-art-docx h3:first-child {
+  margin-top: 0;
 }
 .y-art-sheet {
   flex: 1;

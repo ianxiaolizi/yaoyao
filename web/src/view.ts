@@ -1,5 +1,5 @@
 import type { ArtifactView, Item, ModelOption, PanelKey, SessionSummary } from './types';
-import { argsSummary, dueTime, duration, esc, fmtTokens, mdText, relativeTime, turnStatus } from './format';
+import { argsSummary, dueTime, duration, esc, fmtTokens, mdDoc, mdText, relativeTime, turnStatus } from './format';
 import { artifactLabel, artifactRefs } from './artifacts';
 import type { PanelState, State, Store } from './state';
 
@@ -48,6 +48,9 @@ const approvalLabel: Record<string, string> = {
   expired: '已过期',
   cancelled: '已取消',
 };
+
+/** The sidebar's default row count; the rest sit behind "全部会话". */
+const SESSION_RECENT = 6;
 
 const PANEL_TABS: { key: PanelKey; label: string }[] = [
   { key: 'plan', label: '计划' },
@@ -119,6 +122,45 @@ function turnTitle(group: Group): string {
     return group.user.text.replace(/\s+/g, ' ').trim();
   }
   return '继续上一轮';
+}
+
+/** The prompt's clock, for the turn rail; empty on logs written before `at`. */
+function clockAt(iso: string | undefined): string {
+  if (!iso) return '';
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return '';
+  return new Date(at).toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+/** What a turn touched, counted from its own action rows. */
+function turnFacts(group: Group): { steps: number; files: number } {
+  const files = new Set<string>();
+  let steps = 0;
+  for (const item of group.items) {
+    if (item.kind !== 'action') continue;
+    steps += 1;
+    const args = item.arguments;
+    if (args && typeof args === 'object') {
+      const path = (args as Record<string, unknown>).path;
+      if (typeof path === 'string' && path) files.add(path);
+    }
+  }
+  return { steps, files: files.size };
+}
+
+/** The three lines the rail shows on hover / focus / Alt↑↓. */
+function tracePopHtml(group: Group): string {
+  const status = turnStatus(group.end);
+  const at = clockAt(group.user?.at);
+  const { steps, files } = turnFacts(group);
+  const tone = status.className === 'done' ? '' : status.className === 'run' ? 'run' : 'warn';
+  return `<div class="t1"><span>第 ${group.index} 轮</span><b class="${tone}">${status.label}</b>${at ? `<span>${at}</span>` : ''}</div>
+    <div class="t2">${esc(shortTitle(turnTitle(group), 160))}</div>
+    <div class="t3">${steps} 步${files ? ` · ${files} 个文件` : ''}</div>`;
 }
 
 function shortTitle(title: string, max = 90): string {
@@ -385,38 +427,40 @@ function subagentNodes(children: Record<string, unknown>[], depth: number): stri
     .join('');
 }
 
-function mdDoc(text: string): string {
-  const inline = (line: string): string =>
-    esc(line)
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/`([^`]+)`/g, '<code>$1</code>');
-  let html = '';
-  let list = false;
-  const close = (): void => {
-    if (list) {
-      html += '</ul>';
-      list = false;
-    }
-  };
-  for (const line of text.split(/\r?\n/)) {
-    if (/^#\s+/.test(line)) {
-      close();
-      html += `<h3>${inline(line.replace(/^#\s+/, ''))}</h3>`;
-    } else if (/^-\s+/.test(line)) {
-      if (!list) {
-        html += '<ul>';
-        list = true;
+/** A worksheet as a table, with merged ranges turned into colspan/rowspan. */
+function sheetTable(rows: string[][], merges: ArtifactView['merges']): string {
+  const spans = new Map<string, { colspan: number; rowspan: number }>();
+  const covered = new Set<string>();
+  for (const merge of merges ?? []) {
+    if (merge.r1 === merge.r2 && merge.c1 === merge.c2) continue;
+    spans.set(`${merge.r1}:${merge.c1}`, {
+      colspan: merge.c2 - merge.c1 + 1,
+      rowspan: merge.r2 - merge.r1 + 1,
+    });
+    for (let row = merge.r1; row <= merge.r2; row += 1) {
+      for (let column = merge.c1; column <= merge.c2; column += 1) {
+        if (row !== merge.r1 || column !== merge.c1) covered.add(`${row}:${column}`);
       }
-      html += `<li>${inline(line.replace(/^-\s+/, ''))}</li>`;
-    } else if (!line.trim()) {
-      close();
-    } else {
-      close();
-      html += `<p>${inline(line)}</p>`;
     }
   }
-  close();
-  return html;
+  const columns = Math.max(
+    1,
+    ...rows.map((row) => row.length),
+    ...(merges ?? []).map((merge) => merge.c2 + 1),
+  );
+  const body = rows
+    .map((row, rowIndex) => {
+      let cells = '';
+      for (let column = 0; column < columns; column += 1) {
+        if (covered.has(`${rowIndex}:${column}`)) continue;
+        const span = spans.get(`${rowIndex}:${column}`);
+        const size = span ? ` colspan="${span.colspan}" rowspan="${span.rowspan}"` : '';
+        cells += `<td${size}>${esc(row[column] ?? '')}</td>`;
+      }
+      return `<tr>${cells}</tr>`;
+    })
+    .join('');
+  return body || '<tr><td>这张表是空的。</td></tr>';
 }
 
 function previewHtml(view: ArtifactView | null): string {
@@ -427,19 +471,23 @@ function previewHtml(view: ArtifactView | null): string {
   if (view.kind === 'markdown') return `${bar}<div class="y-art-md">${mdDoc(view.text ?? '')}</div>`;
   if (view.kind === 'pdf') return `${bar}<div class="y-art-image"><embed class="y-art-pdf" type="application/pdf" src="${esc(view.url)}" title="${esc(view.name)}" /></div>`;
   if (view.kind === 'docx') {
-    const paragraphs = view.paragraphs ?? [];
+    const blocks: { text: string; heading?: number }[] =
+      view.blocks?.length ? view.blocks : (view.paragraphs ?? []).map((text) => ({ text }));
     return `${bar}<div class="y-art-docx">${
-      paragraphs.map((line) => (line.trim() ? `<p>${esc(line)}</p>` : '<p class="gap"></p>')).join('') ||
-      '<div class="y-panel-empty">这个文档没有可读的段落。</div>'
+      blocks
+        .map((block) =>
+          !block.text.trim()
+            ? '<p class="gap"></p>'
+            : block.heading
+              ? `<h3 class="y-art-docx-h">${esc(block.text)}</h3>`
+              : `<p>${esc(block.text)}</p>`,
+        )
+        .join('') || '<div class="y-panel-empty">这个文档没有可读的段落。</div>'
     }</div>`;
   }
   if (view.kind === 'xlsx') {
     const rows = view.rows ?? [];
-    return `${bar}<div class="y-art-sheet"><div class="y-art-sheet-name">${esc(view.sheet ?? '')}</div><table>${
-      rows
-        .map((row) => `<tr>${row.map((cell) => `<td>${esc(cell)}</td>`).join('')}</tr>`)
-        .join('') || '<tr><td>这张表是空的。</td></tr>'
-    }</table></div>`;
+    return `${bar}<div class="y-art-sheet"><div class="y-art-sheet-name">${esc(view.sheet ?? '')}</div><table>${sheetTable(rows, view.merges)}</table></div>`;
   }
   return `${bar}<pre class="y-art-text">${esc(view.text ?? '')}</pre>`;
 }
@@ -479,7 +527,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
         <button class="pop-item danger" type="button" data-menu="remove">删除此会话</button>
       </div>
       <div class="y-stage">
-        <div class="y-trace"><div class="y-ticks" id="trace"></div></div>
+        <div class="y-trace"><div class="y-ticks" id="trace"></div><div class="trace-pop" id="tracePop" role="tooltip" aria-hidden="true"></div></div>
         <div class="y-scroll" id="scroll"><div class="y-col" id="transcript"></div></div>
       </div>
       <aside class="y-sheet" id="sheet" aria-hidden="true" aria-label="本轮详情">
@@ -507,11 +555,12 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
         <div class="y-gate" id="gate"></div>
         <div class="y-composer">
           <div class="y-model-menu" id="modelMenu" role="menu" aria-label="选择模型" hidden></div>
+          <div class="y-model-menu" id="policyMenu" role="menu" aria-label="审批策略" hidden></div>
           <textarea id="input" rows="1" placeholder="继续补充要求，或输入 / 命令…"></textarea>
           <div class="y-comp-row">
-            <button class="y-chip" type="button">${svg(ICON.plus, 13)}</button>
+            <button class="y-chip" type="button" id="attach" aria-label="附件上传（v1.1）" title="附件上传留在 v1.1" disabled>${svg(ICON.plus, 13)}</button>
             <button class="y-chip" type="button" id="modelChip" aria-haspopup="menu" aria-expanded="false">模型</button>
-            <button class="y-chip" type="button">审批：逐次</button>
+            <button class="y-chip" type="button" id="policyChip" aria-haspopup="menu" aria-expanded="false" title="审批是逐个动作的门">审批：逐次</button>
             <span class="sp"></span>
             <button class="y-stop" id="stop" type="button" aria-label="停止" hidden>${svg(ICON.stop, 12)}</button>
             <button class="y-send" id="send" type="button" aria-label="发送">${svg(ICON.arrow, 14)}</button>
@@ -545,8 +594,11 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   const sessionList = $('#sessionList');
   const sessionCount = $('#sessionCount');
   const trace = $('#trace');
+  const tracePop = $('#tracePop');
   const modelChip = $('#modelChip');
   const modelMenu = $('#modelMenu');
+  const policyChip = $('#policyChip');
+  const policyMenu = $('#policyMenu');
   const rzSide = $('#rzSide');
   const rzSheet = $('#rzSheet');
   const details = $('#details');
@@ -700,6 +752,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
 
   modelChip.addEventListener('click', (event) => {
     event.stopPropagation();
+    closePolicyMenu();
     if (!modelMenu.hidden) return closeModelMenu();
     renderModelMenu(store.get());
     modelMenu.hidden = false;
@@ -710,6 +763,28 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     if (!button?.dataset.provider) return;
     closeModelMenu();
     void actions.chooseModel(button.dataset.provider, button.dataset.model || null);
+  });
+
+  // ── the approval policy chip ───────────────────────────────────────────
+  // This is deliberately a statement, not a switch. Approving is the moment a
+  // person vouches for one exact action; an "auto approve" mode would remove
+  // the person from that moment, which the permission work forbids.
+  function closePolicyMenu(): void {
+    policyMenu.hidden = true;
+    policyChip.setAttribute('aria-expanded', 'false');
+  }
+
+  policyChip.addEventListener('click', (event) => {
+    event.stopPropagation();
+    closeModelMenu();
+    if (!policyMenu.hidden) return closePolicyMenu();
+    policyMenu.innerHTML =
+      '<div class="pop-h">审批策略</div>' +
+      '<button class="pop-item" type="button" role="menuitem" disabled>✓ 逐次确认</button>' +
+      '<button class="pop-item" type="button" role="menuitem" disabled>自动批准（本版不提供）</button>' +
+      '<div class="pop-note">审批是门：每个动作单独确认，高风险动作只允许一次。自动批准会绕过「有人在看」，所以不提供。</div>';
+    policyMenu.hidden = false;
+    policyChip.setAttribute('aria-expanded', 'true');
   });
 
   // ── the two-step delete ────────────────────────────────────────────────
@@ -847,6 +922,9 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     if (!modelMenu.hidden && !modelMenu.contains(event.target as Node) && !modelChip.contains(event.target as Node)) {
       closeModelMenu();
     }
+    if (!policyMenu.hidden && !policyMenu.contains(event.target as Node) && !policyChip.contains(event.target as Node)) {
+      closePolicyMenu();
+    }
   });
   menu.addEventListener('click', (event) => {
     const button = (event.target as HTMLElement).closest<HTMLElement>('[data-menu]');
@@ -891,6 +969,11 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   });
 
   sessionList.addEventListener('click', (event) => {
+    const all = (event.target as HTMLElement).closest<HTMLElement>('[data-session-all]');
+    if (all) {
+      store.dispatch({ type: 'sessions/all' });
+      return;
+    }
     const button = (event.target as HTMLElement).closest<HTMLElement>('[data-session]');
     if (button?.dataset.session) actions.selectSession(button.dataset.session);
   });
@@ -936,6 +1019,67 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     target?.scrollIntoView({ block: 'start', behavior: 'smooth' });
   });
 
+  // The rail is a scrubber: hover/focus previews one turn in place, Alt↑↓
+  // moves the preview, Enter (a click) jumps. Nothing here changes layout.
+  function showTracePop(tick: HTMLElement, group: Group): void {
+    tracePop.innerHTML = tracePopHtml(group);
+    tracePop.classList.add('is-on');
+    tracePop.setAttribute('aria-hidden', 'false');
+    tracePop.dataset.turn = group.turn;
+    const height = tracePop.offsetHeight;
+    const room = trace.parentElement?.clientHeight ?? 0;
+    const top = Math.max(4, Math.min(tick.offsetTop - 10, room - height - 8));
+    tracePop.style.top = `${top}px`;
+  }
+
+  function hideTracePop(): void {
+    tracePop.classList.remove('is-on');
+    tracePop.setAttribute('aria-hidden', 'true');
+    delete tracePop.dataset.turn;
+  }
+
+  function traceTickAt(node: EventTarget | null): HTMLElement | null {
+    return node instanceof HTMLElement ? node.closest<HTMLElement>('[data-jump]') : null;
+  }
+
+  function traceGroup(turn: string): Group | undefined {
+    return groupsFor(store.get().items).find((group) => group.turn === turn);
+  }
+
+  trace.addEventListener('mouseover', (event) => {
+    const tick = traceTickAt(event.target);
+    const jump = tick?.dataset.jump;
+    const group = jump ? traceGroup(jump) : undefined;
+    if (tick && group) showTracePop(tick, group);
+  });
+  trace.addEventListener('mouseleave', hideTracePop);
+  trace.addEventListener('focusin', (event) => {
+    const tick = traceTickAt(event.target);
+    const jump = tick?.dataset.jump;
+    const group = jump ? traceGroup(jump) : undefined;
+    if (tick && group) showTracePop(tick, group);
+  });
+  trace.addEventListener('focusout', (event) => {
+    if (!trace.contains(event.relatedTarget as Node | null)) hideTracePop();
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (!event.altKey || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
+    const ticks = [...trace.querySelectorAll<HTMLElement>('.y-tick')];
+    if (!ticks.length) return;
+    event.preventDefault();
+    const focused = document.activeElement instanceof HTMLElement ? ticks.indexOf(document.activeElement as HTMLElement) : -1;
+    const previewed = tracePop.dataset.turn ? ticks.findIndex((tick) => tick.dataset.jump === tracePop.dataset.turn) : -1;
+    let index = focused >= 0 ? focused : previewed >= 0 ? previewed : ticks.length - 1;
+    index = Math.max(0, Math.min(ticks.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)));
+    const tick = ticks[index];
+    tick.focus({ preventScroll: true });
+    const group = traceGroup(tick.dataset.jump ?? '');
+    if (group) showTracePop(tick, group);
+  });
+
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (!palette.hidden) {
@@ -947,6 +1091,9 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     } else if (!modelMenu.hidden) {
       event.preventDefault();
       closeModelMenu();
+    } else if (!policyMenu.hidden) {
+      event.preventDefault();
+      closePolicyMenu();
     } else if (!evpop.hidden) {
       event.preventDefault();
       evpop.hidden = true;
@@ -1084,23 +1231,39 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   });
 
   function renderSidebar(state: State): void {
-    const signature = `${state.active}|${state.sessions.map((row) => `${row.id}:${row.title}:${row.pending_approvals}:${row.archived ? 1 : 0}`).join('|')}`;
+    const signature = `${state.active}|${state.sessionAll}|${state.sessions.map((row) => `${row.id}:${row.title}:${row.pending_approvals}:${row.archived ? 1 : 0}`).join('|')}`;
     if (signature === sidebarSignature) return;
     sidebarSignature = signature;
     sessionCount.textContent = String(state.sessions.length);
     const live = state.sessions.filter((row) => !row.archived);
+    // One workspace per process today, so this is a recency fold rather than a
+    // per-workspace tree: six rows, the active one always kept in view, and the
+    // rest one click away. See plan/06 §4 for the deferred grouping decision.
+    const folded = !state.sessionAll && live.length > SESSION_RECENT;
+    let visible = live;
+    if (folded) {
+      visible = live.slice(0, SESSION_RECENT);
+      const active = live.find((row) => row.id === state.active);
+      if (active && !visible.some((row) => row.id === active.id)) {
+        visible = [...visible.slice(0, SESSION_RECENT - 1), active];
+      }
+    }
     const archived = state.sessions.filter((row) => row.archived);
     const rows =
-      live.map((row) => sessionRow(row, row.id === state.active)).join('') ||
+      visible.map((row) => sessionRow(row, row.id === state.active)).join('') ||
       '<div class="y-sec" style="margin:8px 6px">还没有会话</div>';
+    const more =
+      live.length > SESSION_RECENT
+        ? `<button class="y-sec-more" type="button" data-session-all>${state.sessionAll ? '收起' : `全部会话 · ${live.length}`}</button>`
+        : '';
     // Archived sessions are put away, not older: their own section, at the
     // bottom, still reachable in one click.
-    const folded = archived.length
+    const archivedRows = archived.length
       ? `<div class="y-sec y-sec-arch">已归档<span class="n">${archived.length}</span></div>${archived
           .map((row) => sessionRow(row, row.id === state.active))
           .join('')}`
       : '';
-    sessionList.innerHTML = rows + folded;
+    sessionList.innerHTML = rows + more + archivedRows;
   }
 
   function renderTranscript(state: State): void {
@@ -1149,13 +1312,16 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     const signature = groups.map((group) => `${group.turn}:${group.end?.ending ?? ''}`).join('|');
     if (signature === traceSignature) return;
     traceSignature = signature;
+    hideTracePop();
     const host = trace.parentElement;
     if (host) host.hidden = groups.length < 3;
     trace.innerHTML = groups
       .map((group, index) => {
         const status = turnStatus(group.end);
         const cls = index === groups.length - 1 ? 'now' : group.end?.ending === 'yielded' ? 'wait' : '';
-        return `<button class="y-tick ${cls}" type="button" data-jump="${esc(group.turn)}" title="第 ${group.index} 轮 · ${esc(shortTitle(turnTitle(group), 40))} · ${status.label}"></button>`;
+        const { steps } = turnFacts(group);
+        const label = `第 ${group.index} 轮 · ${shortTitle(turnTitle(group), 40)} · ${status.label} · ${steps} 步`;
+        return `<button class="y-tick ${cls}" type="button" data-jump="${esc(group.turn)}" aria-label="${esc(label)}" aria-describedby="tracePop"></button>`;
       })
       .join('');
   }

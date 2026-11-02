@@ -417,8 +417,12 @@ function docxBytes() {
       '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
     ],
     [
+      'word/styles.xml',
+      '<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style><w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Body Text"/></w:style></w:styles>',
+    ],
+    [
       'word/document.xml',
-      '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>M9 文档预览</w:t></w:r></w:p><w:p><w:r><w:t>第二段：docx 由页面解压读取。</w:t></w:r></w:p><w:p><w:r><w:t>第三个段落带 &amp; 一个转义符。</w:t></w:r></w:p></w:body></w:document>',
+      '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pStyle w:val="Heading1"/><w:r><w:t>M9 文档预览</w:t></w:r></w:p><w:p><w:r><w:t>第二段：docx 由页面解压读取。</w:t></w:r></w:p><w:p><w:r><w:t>第三个段落带 &amp; 一个转义符。</w:t></w:r></w:p></w:body></w:document>',
     ],
   ]);
 }
@@ -427,11 +431,15 @@ function xlsxBytes() {
   return zipBytes([
     [
       'xl/sharedStrings.xml',
-      '<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>月份</t></si><si><t>收入</t></si><si><t>一月</t></si></sst>',
+      '<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>月份</t></si><si><t>收入</t></si><si><t>一月</t></si><si><t>日期</t></si><si><t>合计</t></si></sst>',
+    ],
+    [
+      'xl/styles.xml',
+      '<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/></numFmts><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>',
     ],
     [
       'xl/worksheets/sheet1.xml',
-      '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>42</v></c></row></sheetData></worksheet>',
+      '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>3</v></c></row><row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>42</v></c><c r="C2" s="1"><v>45292</v></c></row><row r="3"><c r="A3" t="s"><v>4</v></c><c r="C3"><v>100</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A3:B3"/></mergeCells></worksheet>',
     ],
   ]);
 }
@@ -445,7 +453,25 @@ function seedArtifacts() {
     'utf8',
   );
   const md = Buffer.from(
-    '# junction 修复验证\n\n- 复现：repro_junction.mjs\n- 修复：lexical + realpath\n- 回归：36 / 36\n',
+    [
+      '# junction 修复验证',
+      '',
+      '| 项 | 结果 |',
+      '| --- | --- |',
+      '| 复现 | repro_junction.mjs |',
+      '| 回归 | 36 / 36 |',
+      '',
+      '1. 复现',
+      '2. 修复 lexical + realpath',
+      '3. 回归',
+      '',
+      '[完整报告](https://example.com/report)',
+      '',
+      `![内嵌图](data:image/gif;base64,${png.toString('base64')})`,
+      '',
+      '![外链图](https://example.com/never-loaded.png)',
+      '',
+    ].join('\n'),
     'utf8',
   );
   for (const [label, bytes] of [
@@ -521,6 +547,13 @@ function seedRealChain() {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'events.jsonl'), readFileSync(source));
 }
+
+/**
+ * A log from the real `subagent.run` capture: a real closed turn, a real
+ * in-process child and its settlement. The fixture is checked for shape in
+ * `main`; the 子代理 tab is covered by the hand-written two-level tree.
+ */
+
 
 /** 100 turns × 10 items: the fold, not the API, is what gets measured. */function seedLong() {
   const log = builder('perf-1000');
@@ -633,6 +666,14 @@ async function main() {
   seedScratch();
   seedRealChain();
   seedLong();
+  // The real-subagent capture is a fixture, not a page in this run: its parent
+  // turn has no plan, so opening 详情 would ask for a panel that is legitimately
+  // absent and log a 404. The shape is checked below; the tab itself is covered
+  // by the hand-written two-level tree.
+  const realSubagent = readFileSync(join(import.meta.dirname, 'fixtures', 'real-subagent', 'events.jsonl'), 'utf8');
+  check('真实子代理样本：有委派', realSubagent.includes('subagent/spawned'));
+  check('真实子代理样本：有结算', /subagent\/(completed|failed|cancelled)/.test(realSubagent));
+  check('真实子代理样本：保留目标', realSubagent.includes('check the notes'));
 
   const logFd = openSync(logPath, 'a');
   server = spawn(binary, ['web', '--port', '0'], {
@@ -662,7 +703,13 @@ async function main() {
   await page.waitForSelector('.y-turn', { timeout: 15_000 });
   check('会话标题取第一条用户消息', (await text(page, '#title')) === 'show the diff and think about it');
   check('轮数与日志一致', (await text(page, '#round')) === '第 4 轮');
-  check('侧栏列出全部会话', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 8);
+  check('侧栏默认只列最近 6 条', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 6);
+  check('全部会话入口写明总数', (await text(page, '[data-session-all]')).includes('全部会话 · 8'));
+  await page.click('[data-session-all]');
+  await page.waitForFunction(() => document.querySelectorAll('.y-session').length === 8, null, {
+    timeout: 10_000,
+  });
+  check('展开后列出全部会话', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 8);
   check('当前轮目标', (await text(page, '.y-goal')).includes('what changed, and is it safe?'));
   check('当前轮回答', (await text(page, '.y-answer')).includes('one hunk'));
   check('思考折叠存在', (await page.$$eval('.y-thinking', (nodes) => nodes.length)) >= 1);
@@ -683,6 +730,30 @@ async function main() {
     (await page.$$eval('.y-past-row', (nodes) => nodes.length)) === 3,
   );
   await page.screenshot({ path: join(shots, 'm7-work.png') });
+
+  // The turn rail: hover/focus previews three lines, Alt↑↓ moves it.
+  check('刻度按轮出现', (await page.$$eval('.y-tick', (nodes) => nodes.length)) === 4);
+  await page.hover('.y-tick:nth-child(2)');
+  await page.waitForSelector('.trace-pop.is-on', { timeout: 10_000 });
+  const railText = await text(page, '.trace-pop');
+  check('刻度 hover 摘要含轮次', railText.includes('第 2 轮'));
+  check('刻度 hover 摘要含状态', /完成|运行中|等待确认/.test(railText));
+  check('刻度 hover 摘要含时间', /\d{2}:\d{2}/.test(railText));
+  check('刻度 hover 摘要含步数', /步/.test(railText));
+  const railBefore = await page.$eval('.trace-pop', (node) => node.getAttribute('data-turn'));
+  await page.focus('.y-tick:nth-child(2)');
+  await page.keyboard.press('Alt+ArrowDown');
+  const railAfter = await page.$eval('.trace-pop', (node) => node.getAttribute('data-turn'));
+  check('Alt↓ 预览下一轮', Boolean(railAfter) && railAfter !== railBefore);
+  check(
+    'Alt↓ 焦点落在刻度上',
+    await page.evaluate(() => document.activeElement?.classList.contains('y-tick') ?? false),
+  );
+  await page.click('.y-tick:first-child');
+  await page.waitForFunction(() => (document.querySelector('#scroll')?.scrollTop ?? 1) < 8, null, {
+    timeout: 10_000,
+  });
+  check('点击刻度回到第一轮', true);
 
   // Evidence sheet: plan / diff / context / subagents.
   await page.click('#details');
@@ -809,6 +880,24 @@ async function main() {
 
   await page.click('#artifactList button:has-text("junction-fix.md")');
   check('Markdown artifact 渲染', await waitText(page, '.y-art-md', 'junction 修复验证'));
+  check(
+    'Markdown 表格',
+    (await page.$$eval('.y-art-md table th', (nodes) => nodes.map((node) => node.textContent?.trim()))).join('|') ===
+      '项|结果',
+  );
+  check('Markdown 表格体', (await text(page, '.y-art-md')).includes('repro_junction.mjs'));
+  check('Markdown 有序列表', (await page.$$eval('.y-art-md ol li', (nodes) => nodes.length)) === 3);
+  check(
+    'Markdown 链接',
+    await page.$eval('.y-art-md a', (node) => node.getAttribute('href') === 'https://example.com/report' && node.getAttribute('target') === '_blank'),
+  );
+  await page.waitForSelector('.y-art-md img[alt="内嵌图"]', { timeout: 10_000 });
+  check(
+    'Markdown 内嵌图',
+    await page.$eval('.y-art-md img[alt="内嵌图"]', (node) => node.complete && node.naturalWidth > 0),
+  );
+  check('Markdown 外链图不加载', (await page.$$('.y-art-md img[alt="外链图"]')).length === 0);
+  check('Markdown 外链图降级为链接', await waitText(page, '.y-art-md', '图片：外链图'));
   await page.click('#artifactList button:has-text("report.html")');
   const frame = await page.waitForSelector('.y-art-frame', { timeout: 10_000 }).catch(() => null);
   check(
@@ -827,9 +916,16 @@ async function main() {
   check('docx 预览读到第一段', await waitText(page, '.y-art-docx', 'M9 文档预览'));
   check('docx 预览读到第二段', await waitText(page, '.y-art-docx', '页面解压'));
   check('docx 转义符还原', await waitText(page, '.y-art-docx', '带 & 一个转义符'));
+  check(
+    'docx 标题样式保留',
+    (await text(page, '.y-art-docx h3')) === 'M9 文档预览',
+    await text(page, '.y-art-docx h3'),
+  );
   await page.click('#artifactList button:has-text("numbers.xlsx")');
   check('xlsx 预览读到单元格', await waitText(page, '.y-art-sheet', '42'));
   check('xlsx 预览带工作表名', await waitText(page, '.y-art-sheet-name', 'sheet1.xml'));
+  check('xlsx 日期格式', await waitText(page, '.y-art-sheet', '2024-01-01'));
+  check('xlsx 合并单元格', await waitText(page, '.y-art-sheet td[colspan="2"]', '合计'));
 
   await page.click('#resultFull');
   await page.waitForSelector('.y-result.full', { timeout: 10_000 });
@@ -972,6 +1068,17 @@ async function main() {
   check('减少动效：成果台无过渡', motion.result === '0s', motion.result);
   await page.emulateMedia({ reducedMotion: 'no-preference' });
 
+  // 1024: below the 1080 drawer breakpoint, above the 720 compact one; the
+  // plan's "1440 → 1024 不塌" is measured here rather than only at 900/390.
+  const laptop = await context.newPage();
+  await laptop.setViewportSize({ width: 1024, height: 900 });
+  await laptop.goto(`${origin}/?session=work#t=${token}`, { waitUntil: 'domcontentloaded' });
+  await laptop.waitForSelector('.y-turn', { timeout: 15_000 });
+  check('1024 无横向溢出', await laptop.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1));
+  check('1024 侧栏变抽屉', await laptop.$eval('.y-app', (node) => node.classList.contains('y-side-off')));
+  await laptop.screenshot({ path: join(shots, 'm10-1024.png') });
+  await laptop.close();
+
   // Narrow screens.
   const narrow = await context.newPage();
   await narrow.setViewportSize({ width: 900, height: 900 });
@@ -1016,6 +1123,19 @@ async function main() {
       .then(() => true)
       .catch(() => false),
   );
+  await page.keyboard.press('Escape');
+
+  // Approval policy: a statement, not an auto-approve switch.
+  await page.click('#policyChip');
+  await page.waitForSelector('#policyMenu:not([hidden])', { timeout: 10_000 });
+  check('审批策略菜单写明逐次确认', await waitText(page, '#policyMenu', '逐次确认'));
+  check('审批策略菜单拒绝自动批准', await waitText(page, '#policyMenu', '本版不提供'));
+  check(
+    '审批策略项不可点',
+    (await page.$$eval('#policyMenu .pop-item', (nodes) => nodes.every((node) => node.disabled))),
+  );
+  check('附件按钮明确禁用', await page.$eval('#attach', (node) => node.disabled));
+  await page.screenshot({ path: join(shots, 'm10-policy.png') });
   await page.keyboard.press('Escape');
 
   // Archive, restore, delete — last, because deleting moves the page to another

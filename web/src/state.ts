@@ -26,6 +26,8 @@ export interface State {
   expanded: Set<string>;
   sidebar: boolean;
   showAllPast: boolean;
+  /** The session list keeps its recent rows; this opens the rest. */
+  sessionAll: boolean;
   panel: PanelState | null;
   result: boolean;
   resultFull: boolean;
@@ -50,6 +52,7 @@ export type Action =
   | { type: 'error'; error: string | null }
   | { type: 'turn/toggle'; turn: string }
   | { type: 'past/toggle' }
+  | { type: 'sessions/all' }
   | { type: 'sidebar/toggle' }
   | { type: 'panel/open'; key: PanelKey; turn?: string }
   | { type: 'panel/loaded'; data: unknown }
@@ -78,6 +81,7 @@ export function initialState(): State {
     expanded: new Set(),
     sidebar: typeof window === 'undefined' ? true : window.innerWidth > 1080,
     showAllPast: false,
+    sessionAll: false,
     panel: null,
     result: false,
     resultFull: false,
@@ -105,6 +109,7 @@ export function reduce(state: State, action: Action): State {
         waiting: Boolean(action.summary?.pending_approvals),
         expanded: new Set(),
         showAllPast: false,
+        sessionAll: false,
         panel: null,
         result: false,
         resultFull: false,
@@ -125,6 +130,7 @@ export function reduce(state: State, action: Action): State {
         waiting: false,
         expanded: new Set(),
         showAllPast: false,
+        sessionAll: false,
         panel: null,
         result: false,
         resultFull: false,
@@ -177,6 +183,8 @@ export function reduce(state: State, action: Action): State {
     }
     case 'past/toggle':
       return { ...state, showAllPast: !state.showAllPast };
+    case 'sessions/all':
+      return { ...state, sessionAll: !state.sessionAll };
     case 'sidebar/toggle':
       return { ...state, sidebar: !state.sidebar };
     case 'panel/open':

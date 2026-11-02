@@ -29,18 +29,22 @@ web/
 
 ## 现在有什么
 
-- 会话栏：真实 `/api/sessions`，待批标记，新任务；已归档的进底部分区；右缘可拖宽
+- 会话栏：真实 `/api/sessions`，待批标记，新任务；默认最近 6 条 +「全部会话」；
+  已归档的进底部分区；右缘可拖宽
 - 顶栏：标题 / 第 N 轮 / 状态 / 详情 / ⋯ 菜单（导出、分叉、归档、删除）
+- 轮次刻度：hover / focus 出三行摘要（轮次 / 状态 / 时间 · 目标 · 步数与文件数），
+  `Alt ↑/↓` 移动，点击跳转
 - 对话：真实 `/api/sessions/{id}/transcript`；旧轮折成一行 + 「更早的 N 轮」
 - 当前轮：目标、思考折叠、行动行（参数 / 耗时 / 输出）、回答、轮末用量、推理链入口
 - 审批门：`pending` / `expired`，四决定走 `POST /approvals/{id}`，过期走 `/resume`，
   TTL 逐秒倒计时
 - 输入框：新轮 `POST /turns`；运行中改走 `/steer`；停止 `POST /interrupt`；
-  模型 chip 切换 `POST /model`（下一轮生效）
+  模型 chip 切换 `POST /model`（下一轮生效）；「审批：逐次」是说明菜单，本版不提供自动批准
 - 证据侧板：计划 / 改动 / 推理链（`/why`）/ 上下文 / 子代理（递归两层）/ 定时；
   左缘可拖宽
-- 成果台：artifact 发现、图片 / HTML（sandbox iframe）/ Markdown / 文本 / PDF /
-  docx / xlsx（页面侧解包，见 `src/office.ts`）、12% 条 / 展开 / 全屏，Esc 逐层退出
+- 成果台：artifact 发现、图片 / HTML（sandbox iframe）/ Markdown（表格·链接·图片·有序列表）/
+  文本 / PDF / docx（标题样式）/ xlsx（合并单元格、日期格式），12% 条 / 展开 / 全屏，
+  Esc 逐层退出
 - 命令面板（⌘K / Ctrl K）、导出 Markdown / JSON、分叉这一轮
 - 流：fetch-streaming SSE，Bearer 头，断线指数退避，`from=<seq>` 续传
 - 1440 / 1280 / 1080 / 720 / 390；`prefers-reduced-motion` 下无过渡与闪烁
@@ -80,7 +84,9 @@ node scripts/gui/perf.mjs  # 本机性能对照 perf-baseline.json
 
 ## 还没做
 
-- Office 保真：只保证内容看得见，不还原样式、图片、合并单元格与日期格式
+- Office 保真：标题、合并单元格、日期已补；图片与 run 级样式（粗体/字号/颜色）仍未还原
 - 真实 vendor 模型：本机没有 `AGENT_MODEL_API_KEY`；有 key 时
   `node scripts/gui/capture-real-chain.mjs --live` 可以重采真实执行链
-- 折叠的跨进程缓存：`Projection` 的检查点还没接进 web 读模型
+- 按工作区分组：一个进程只有一份 workspace，摘要也没有 workspace 字段；目前是最近 6 条 +
+  「全部会话」，等多工作区再补
+- 自动批准：不做。审批是人对一次具体动作的答复，`CONTRACT.md` #178 明确禁止绕过
