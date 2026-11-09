@@ -322,6 +322,8 @@
 
 | 199 | `StdinMode::Closed` 对子进程意味着什么；工具子进程怎样证明自己不是“人工终端” | **关闭 stdin，不给父终端。** `StdProcessLauncher` 对 `Closed` 使用 `Stdio::null()`，子进程读取 stdin 立即得到 EOF；`agent approve` 仍要求 `stdin().is_terminal()`，所以工具子进程不能借继承的终端伪造人工批准。 | ①**继续继承父终端**——会与 `StdinMode::Closed` 的名称和审批隔离前提冲突；②**只靠环境变量标记子进程**——模型可自行构造；③**只修测试**——会掩盖真实启动器语义。 | `crates/agent-tools-fs/tests/stdin.rs`；`apps/agent/tests/security_regression.rs::an_approval_issued_by_a_tool_child_is_refused` 在有 TTY 与无 TTY 两种运行方式下都通过；`CONTRACT.md` §8 保持空。 | `crates/agent-tools-fs/src/env.rs`、`crates/agent-ports/src/process_launcher.rs`、`apps/agent/tests/security_regression.rs` |
 
+| 200 | AppContainer 命令网络如何显式放开；`allow` 与 `internet` 各是什么 | **`AGENT_SANDBOX_NETWORK=internet` 是唯一显式宽泛出站开关，只在 `AGENT_SANDBOX=app-container` 下有效。** 它给子进程授予 Windows `internetClient`，是宽泛 egress，不是 origin allowlist，也不等价于只读 `web.request` 的站点允许源。默认仍是 `deny`；旧拼写 `allow` 继续以 `NetworkNotBoundable` 失败关闭。`local`、`read-only` 或未实现的容器后端拿到 `internet` 时拒绝启动，doctor 也同样失败并点名 `app-container`，绝不回落。 | ①**把 `allow` 改成宽泛出站**——同一个词过去被解释为站点约束，今天改义会让旧脚本静默扩大权限；②**在 local 上接受 `internet`**——local 无法收束命令流量，等于把提示当边界；③**把 `internet` 说成 `web.request` 的 allowlist**——两者一个是子进程全出站、一个是受控只读请求，混写会误导使用者。 | `network(Some("internet")) == Ok(true)`；`network(Some("allow")) == Err(NetworkNotBoundable)`；`network_label(true)` 明说 broad；非 AppContainer + `internet` 启动退 2；doctor 退 1 并点名 `app-container`；`web.request` 的 origin 列表不变。 | `apps/agent/src/sandbox.rs`、`apps/agent/src/stack.rs`、`apps/agent/src/checks.rs`、`apps/agent/tests/cli_end_to_end.rs`、`scripts/gui/start.ps1`、`SECURITY.md` |
+
 ## 8. 已知偏离（契约已声明、代码未做到）
 
 > 这张表是**诚实清单**，不是待办清单的删减版。**契约说了而代码没做到的东西，只能在 §8 出现**——散落到正文会让契约自我麻醉。

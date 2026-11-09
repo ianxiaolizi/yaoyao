@@ -177,6 +177,13 @@ pub enum StackError {
     /// confined one.
     #[error("execution sandbox {mode} is unavailable: {reason}")]
     SandboxUnavailable { mode: &'static str, reason: String },
+    /// Broad process egress is only meaningful where a backend can bound the
+    /// command's traffic. Accepting it elsewhere would claim a boundary the
+    /// selected backend does not have.
+    #[error(
+        "AGENT_SANDBOX_NETWORK=internet requires AGENT_SANDBOX=app-container; {mode} cannot bound a command's traffic"
+    )]
+    NetworkRequiresAppContainer { mode: &'static str },
     /// `AGENT_JUDGMENT` names an arm this build does not know. Fail closed:
     /// a typo must not silently pick the expensive pipeline or the baseline.
     #[error("judgment mode '{0}' is not one of `on`, `gates` or `off`")]
@@ -554,6 +561,9 @@ fn environment_for(
     data_dir: &Path,
     network_allowed: bool,
 ) -> Result<Arc<dyn ExecutionEnvironment>, StackError> {
+    if network_allowed && mode != SandboxMode::WorkspaceSandbox {
+        return Err(StackError::NetworkRequiresAppContainer { mode: sandbox::label(mode) });
+    }
     match mode {
         SandboxMode::ReadOnly => Ok(Arc::new(LocalExecutionEnvironment::read_only(workspace_root))),
         SandboxMode::LocalProcess => {
@@ -1527,6 +1537,16 @@ mod tests {
         assert!(network_notice(SandboxMode::LocalProcess, true, true).is_none());
         assert!(network_notice(SandboxMode::WorkspaceSandbox, false, true).is_none());
         assert!(network_notice(SandboxMode::ReadOnly, false, true).is_none());
+    }
+
+    #[test]
+    fn internet_requires_the_app_container_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match environment_for(SandboxMode::LocalProcess, dir.path(), dir.path(), true) {
+            Ok(_) => panic!("local must not accept broad network egress"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("app-container"), "{error}");
     }
 
     #[test]

@@ -514,6 +514,19 @@ impl DoctorCheck for ExecutionSandboxCheck {
                 message: error.to_string(),
             }];
         }
+        if matches!(&self.network, Ok(true))
+            && let Ok(mode) = &self.selection
+            && *mode != SandboxMode::WorkspaceSandbox
+        {
+            return vec![DiagnosticMessage {
+                check_id: self.id(),
+                status: HealthStatus::Failed,
+                message: format!(
+                    "AGENT_SANDBOX_NETWORK=internet requires AGENT_SANDBOX=app-container; {} cannot bound a command's traffic",
+                    sandbox::label(*mode)
+                ),
+            }];
+        }
         let (status, message) = match &self.selection {
             Ok(SandboxMode::ReadOnly) => (
                 HealthStatus::Passed,

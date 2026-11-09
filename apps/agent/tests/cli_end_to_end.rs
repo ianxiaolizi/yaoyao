@@ -426,6 +426,19 @@ fn the_selected_sandbox_is_reported_and_an_unavailable_one_stops_the_run() {
     assert!(allow_doctor.out.contains("web.request"), "{}", allow_doctor.out);
 }
 
+#[test]
+fn internet_is_refused_without_app_container() {
+    let (workspace, data) = dirs();
+    let result = ran_with(
+        data.path(),
+        workspace.path(),
+        &[("AGENT_SANDBOX", "local"), ("AGENT_SANDBOX_NETWORK", "internet")],
+        &["doctor"],
+    );
+    assert_eq!(result.code, Some(1));
+    assert!(result.out.contains("app-container"));
+}
+
 /// The local backend is the trusted-workspace one, and the doctor says so.
 ///
 /// A run that starts a process or writes a path at `L2` or above is refused
