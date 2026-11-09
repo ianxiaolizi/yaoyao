@@ -206,6 +206,7 @@ pub(crate) fn usage() {
          --session <id>             Act on this session (default: {DEFAULT_SESSION})\n  \
          --profile <name>           Compose this profile for the run\n  \
          --model <name>             Ask the provider for this model\n  \
+         --task <name>              Apply the user configuration's [task_budgets.<name>]\n  \
          --json                     One structured object on stdout\n  \
          --events                   The events this command produced, one JSON object per line\n\
          \nOptions may appear before or after the command. --json and --events are \

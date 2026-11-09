@@ -8,6 +8,7 @@ pub(crate) fn snapshot_with_budget(
 ) -> ResolvedProfileSnapshot {
     ResolvedProfileSnapshot {
         profile_id: "coding".to_string(),
+        task_class: None,
         config_hash: String::new(),
         plugin_versions: std::collections::BTreeMap::new(),
         policy_version: "deadbeef".to_string(),

@@ -17,7 +17,7 @@ use agent_projection::{
     ActionStatus, ApprovalState, ItemBody, Projection, ProjectionDefinition, SessionProjection,
     TranscriptItem, TranscriptProjection, TranscriptState, TurnEnding,
 };
-use agent_protocol::events::StoredEvent;
+use agent_protocol::events::{EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, SessionId};
 use agent_protocol::intent::IntentStatus;
 use agent_protocol::permission::Reversibility;
@@ -442,13 +442,21 @@ pub(crate) async fn status(
     }))
 }
 
-/// The newest `git.diff` observation in a session, as a reader-shaped report.
+/// The newest change evidence in a session, as a reader-shaped report.
 ///
-/// This is a projection of an observation the kernel already recorded, not a
-/// fresh `git diff`: a page refresh must not change what the agent saw, and a
-/// repository may have moved since. A session that never called `git.diff` has
-/// no report — that is a `404`, not an empty diff (which would claim the tree
-/// was clean).
+/// The first choice is the newest completed `git.diff` observation: a
+/// projection of what the agent already saw, not a fresh `git diff`, so a page
+/// refresh cannot change the answer and a repository may have moved since.
+///
+/// A workspace that is not a Git repository has no `git.diff` to record, and
+/// that absence is not the same fact as "nothing changed". Every call that may
+/// write is made under a workspace snapshot, and the comparison against that
+/// snapshot is recorded as `workspace/changes.recorded`; the newest one is the
+/// fallback. It says which paths changed and how their sizes moved, never a
+/// line patch — the ledger holds digests, not bytes.
+///
+/// A session with neither source has no report — that is a `404`, not an empty
+/// diff (which would claim the tree was clean).
 pub(crate) async fn diff(
     data_dir: &Path,
     session: &SessionId,
@@ -481,7 +489,56 @@ pub(crate) async fn diff(
             "diff": parsed,
         })));
     }
+
+    let events =
+        reads.store.read_stream(session, EventSeq::ZERO, usize::MAX).await.map_err(|error| {
+            ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
+        })?;
+    for event in events.iter().rev() {
+        let draft = &event.event;
+        if draft.event_type.as_str() != EventType::WORKSPACE_CHANGES_RECORDED {
+            continue;
+        }
+        // A payload that does not name a change list is not evidence; a later
+        // malformed record must not hide an earlier good one.
+        let Some(changes) = event.event.payload.get("changes").and_then(Value::as_array) else {
+            continue;
+        };
+        let files: Vec<Value> = changes.iter().filter_map(change_entry).collect();
+        let payload = &event.event.payload;
+        return Ok(Some(json!({
+            "v": 1,
+            "session": session.as_str(),
+            "turn": event.event.turn_id.as_ref().map(|turn| turn.as_str()),
+            "seq": event.seq.as_u64(),
+            "source": "workspace.changes",
+            "snapshot_id": payload.get("snapshot_id").cloned(),
+            "task_id": payload.get("task_id").cloned(),
+            "changes_hash": payload.get("changes_hash").cloned(),
+            "complete": payload.get("complete").cloned(),
+            "recorded_at": event.recorded_at,
+            "changes": files,
+        })));
+    }
     Ok(None)
+}
+
+/// One change from a `workspace/changes.recorded` payload, in the shape the
+/// panel reads. A record without a path is not a change and is skipped.
+fn change_entry(change: &Value) -> Option<Value> {
+    let file = change.get("relative_path").and_then(Value::as_str)?;
+    let mut entry = json!({
+        "file": file,
+        "change": change.get("kind").and_then(Value::as_str).unwrap_or("modified"),
+        "before_size": change.get("before_size").and_then(Value::as_u64),
+        "after_size": change.get("after_size").and_then(Value::as_u64),
+    });
+    for key in ["before_sha256", "after_sha256"] {
+        if let Some(digest) = change.get(key).and_then(Value::as_str) {
+            entry[key] = json!(digest);
+        }
+    }
+    Some(entry)
 }
 
 /// What the most recent model request carried.

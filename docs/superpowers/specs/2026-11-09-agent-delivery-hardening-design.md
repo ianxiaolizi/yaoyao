@@ -194,6 +194,8 @@ snapshot 已经是爻爻的事实来源。下一阶段应让“改动”面板�
 3. 把“验证失败后继续编辑”的循环纳入 metrics，用于评估模型与 prompt。
 4. 增加失败成本报表：每个任务的步骤、工具数、编辑数、验证数、最终状态。
 
+> **执行记录（2026-11-09）**：Phase 3 已按 `docs/superpowers/plans/2026-11-09-phase-3-evidence-and-budget.md` 实现。偏差：任务预算由 `--task <name>` 显式选择（用户层 `[task_budgets.<name>]`），不做自动分类，Web 也不支持按消息切换；diff 回退返回变更清单（路径、种类、大小、摘要），不生成逐行补丁；没有终态的日志在报表里显示 `none`，没有打开回合时不会写成 `open`。验证与测试见该计划的 Execution Notes。
+
 ## 6. 验收标准
 
 Phase 0 完成后：

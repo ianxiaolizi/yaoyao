@@ -508,6 +508,117 @@ async fn seeded_diff() -> (Arc<dyn EventStore>, TempDir) {
     (store, dir)
 }
 
+/// A session whose log holds the change ledger entry a non-Git workspace
+/// records in place of a `git.diff` observation.
+///
+/// `tail_malformed` appends a later record whose payload names no change list:
+/// the reader must skip it and keep the earlier evidence rather than treating
+/// the newest record as an answer it cannot parse.
+async fn seeded_changes(tail_malformed: bool) -> (Arc<dyn EventStore>, TempDir) {
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let step = StepId::from_string("s1");
+    let item = InboxItem {
+        item_id: InboxItemId::from_string("i1"),
+        session_id: session.clone(),
+        kind: InboxKind::NextTurn,
+        payload: json!({ "text": "write the notes" }),
+        priority: 0,
+        created_at: Utc::now(),
+        status: InboxItemStatus::Pending,
+    };
+    let changes = json!({
+        "snapshot_id": "snap-1",
+        "session_id": "s1",
+        "task_id": "manual:s1",
+        "action_digest": "d1",
+        "changes": [
+            {
+                "relative_path": "notes.md",
+                "kind": "modified",
+                "before_size": 10,
+                "after_size": 24,
+                "before_sha256": "aaaa",
+                "after_sha256": "bbbb"
+            },
+            {
+                "relative_path": "new.txt",
+                "kind": "added",
+                "before_size": 0,
+                "after_size": 7,
+                "after_sha256": "cccc"
+            }
+        ],
+        "changes_hash": "h1",
+        "complete": true,
+        "created_at": "2026-11-09T00:00:00Z"
+    });
+    let mut drafts = vec![
+        draft(
+            &session,
+            EventType::INBOX_APPENDED,
+            None,
+            None,
+            serde_json::to_value(&item).unwrap(),
+            Actor::User,
+        ),
+        draft(
+            &session,
+            EventType::TURN_STARTED,
+            Some(&turn),
+            None,
+            json!({ "inbox_item": item.item_id }),
+            Actor::Scheduler,
+        ),
+        draft(&session, EventType::STEP_STARTED, Some(&turn), Some(&step), json!({}), Actor::Agent),
+        draft(
+            &session,
+            EventType::TOOL_STARTED,
+            Some(&turn),
+            Some(&step),
+            json!({
+                "tool_name": "fs.write",
+                "provider_tool_call_id": "c1",
+                "arguments": { "path": "notes.md" },
+            }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::TOOL_COMPLETED,
+            Some(&turn),
+            Some(&step),
+            json!({
+                "tool_name": "fs.write",
+                "provider_tool_call_id": "c1",
+                "content": "{\"path\":\"notes.md\",\"bytes\":24}",
+            }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::WORKSPACE_CHANGES_RECORDED,
+            Some(&turn),
+            Some(&step),
+            changes,
+            Actor::Agent,
+        ),
+    ];
+    if tail_malformed {
+        drafts.push(draft(
+            &session,
+            EventType::WORKSPACE_CHANGES_RECORDED,
+            Some(&turn),
+            Some(&step),
+            json!({ "changes": "not a list" }),
+            Actor::Agent,
+        ));
+    }
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the change ledger");
+    (store, dir)
+}
+
 /// A session whose last model request recorded a context breakdown.
 async fn seeded_context() -> (Arc<dyn EventStore>, TempDir) {
     let (store, dir) = empty();
@@ -1207,6 +1318,42 @@ async fn the_diff_report_is_the_observation_the_agent_saw() {
     assert_eq!(payload["diff"]["file_count"], 1);
     assert_eq!(payload["diff"]["files"][0]["file"], "src/lib.rs");
     assert_eq!(payload["diff"]["files"][0]["additions"], 2);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_workspace_change_ledger_answers_when_there_is_no_git_observation() {
+    let (store, dir) = seeded_changes(false).await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/diff", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["source"], "workspace.changes");
+    assert_eq!(payload["snapshot_id"], "snap-1");
+    assert_eq!(payload["complete"], true);
+    let changes = payload["changes"].as_array().expect("a change list");
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0]["file"], "notes.md");
+    assert_eq!(changes[0]["change"], "modified");
+    assert_eq!(changes[0]["before_size"], 10);
+    assert_eq!(changes[0]["after_size"], 24);
+    assert_eq!(changes[0]["after_sha256"], "bbbb");
+    assert_eq!(changes[1]["file"], "new.txt");
+    assert_eq!(changes[1]["change"], "added");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_malformed_change_record_does_not_hide_an_earlier_one() {
+    let (store, dir) = seeded_changes(true).await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/diff", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["source"], "workspace.changes");
+    assert_eq!(payload["changes"][0]["file"], "notes.md");
     handle.abort();
 }
 

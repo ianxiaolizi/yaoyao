@@ -614,11 +614,12 @@ async fn events(
     Ok(stream)
 }
 
-/// `GET /api/sessions/{id}/diff`: the newest `git.diff` observation.
+/// `GET /api/sessions/{id}/diff`: the newest change evidence.
 ///
 /// A reader only. It does not run git and does not ask the workspace what it
-/// looks like now: the page shows what the agent actually saw, which is the
-/// same rule every other read endpoint follows.
+/// looks like now: the page shows what the agent actually saw — a `git.diff`
+/// observation, or the workspace change ledger when there is no repository to
+/// observe — which is the same rule every other read endpoint follows.
 async fn diff(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -630,7 +631,7 @@ async fn diff(
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::diff_unavailable(
-            "这一轮没有 git.diff 观察：模型还没看过改动，或工具调用没有完成",
+            "这一轮没有改动证据：没有 git.diff 观察，也没有工作区变更记录",
         )),
     }
 }

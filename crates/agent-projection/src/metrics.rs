@@ -56,6 +56,13 @@ pub struct SessionMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_at: Option<DateTime<Utc>>,
     pub turns: TurnMetrics,
+    /// How the last terminal turn ended, as `<ending>:<stop reason>`.
+    ///
+    /// The last one wins because that is the state the log left the session
+    /// in. Absent when no turn ever reached a terminal event; a reader showing
+    /// a report then says "open" or "none" rather than inventing an ending.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_status: Option<String>,
     pub runs: RunMetrics,
     pub tools: ToolMetrics,
     /// What the log says about the work itself: how much was changed, how
@@ -139,12 +146,21 @@ pub struct ToolMetrics {
 /// is the other, so they are counted apart.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct TaskMetrics {
+    /// `step/started`. One step is one model request-and-act cycle, so this is
+    /// the cost unit the step ceiling and the stall rule are counted in.
+    pub steps: u64,
     /// `tool/completed` for `fs.write` and `fs.edit`.
     pub edits: u64,
     /// `verification/recorded`.
     pub verifications: u64,
     /// `completion/checked`.
     pub criterion_checks: u64,
+    /// Successful edits made after a failed verification and before any
+    /// passing one. This is the "verification failed, keep editing" loop: the
+    /// difference between a model that fixes the cause and one that keeps
+    /// rewriting until something passes. A check that could not run is not a
+    /// verdict and does not arm the counter.
+    pub post_failure_edits: u64,
     /// The path of the last recorded change, and the digest of what the file
     /// became — the snapshot's `after_sha256`, not a hash of the model's
     /// arguments. Absent until a change manifest records one.
@@ -269,6 +285,9 @@ struct FoldState {
     open_runs: BTreeMap<RunId, DateTime<Utc>>,
     /// The model each run was routed to, from its `profile/resolved`.
     run_models: BTreeMap<RunId, String>,
+    /// A verification failed and no passing one has covered the work since.
+    /// Edits made while true are counted as `post_failure_edits`.
+    verification_failed: bool,
 }
 
 fn apply(metrics: &mut SessionMetrics, state: &mut FoldState, stored: &StoredEvent) {
@@ -317,10 +336,11 @@ fn apply(metrics: &mut SessionMetrics, state: &mut FoldState, stored: &StoredEve
         EventType::TURN_INTERRUPTED => {
             count_ending(metrics, state, event, "interrupted", "interrupted")
         }
+        EventType::STEP_STARTED => metrics.task.steps += 1,
         EventType::TOOL_STARTED => metrics.tools.calls += 1,
         EventType::TOOL_COMPLETED => {
             metrics.tools.completed += 1;
-            count_edit(metrics, event);
+            count_edit(metrics, state, event);
         }
         EventType::TOOL_FAILED => count_tool_failure(metrics, event),
         EventType::TOOL_CANCELLED => metrics.tools.cancelled += 1,
@@ -338,7 +358,10 @@ fn apply(metrics: &mut SessionMetrics, state: &mut FoldState, stored: &StoredEve
         EventType::MODEL_ATTEMPT_STARTED => metrics.tokens.attempts += 1,
         EventType::MODEL_RESPONSE_COMPLETED => count_response(metrics, state, event),
         EventType::JUDGMENT_REQUIRED => metrics.judgment_required += 1,
-        EventType::VERIFICATION_RECORDED => metrics.task.verifications += 1,
+        EventType::VERIFICATION_RECORDED => {
+            metrics.task.verifications += 1;
+            note_verification(state, event);
+        }
         EventType::COMPLETION_CHECKED => metrics.task.criterion_checks += 1,
         EventType::WORKSPACE_CHANGES_RECORDED => record_last_change(metrics, event),
         _ => {}
@@ -346,10 +369,29 @@ fn apply(metrics: &mut SessionMetrics, state: &mut FoldState, stored: &StoredEve
 }
 
 /// A completed write or edit is an edit; anything else that completed is not.
-fn count_edit(metrics: &mut SessionMetrics, event: &EventDraft) {
+///
+/// An edit made while a failed verification stands is counted twice: once as
+/// an edit, and once as the loop this field exists to expose.
+fn count_edit(metrics: &mut SessionMetrics, state: &FoldState, event: &EventDraft) {
     let tool = event.payload.get("tool_name").and_then(serde_json::Value::as_str);
     if matches!(tool, Some("fs.write") | Some("fs.edit")) {
         metrics.task.edits += 1;
+        if state.verification_failed {
+            metrics.task.post_failure_edits += 1;
+        }
+    }
+}
+
+/// Record what a verification said about the work.
+///
+/// `failed` arms the post-failure counter; `passed` disarms it. `error` and a
+/// status this build has no name for leave it exactly as it was: a check that
+/// could not run is not a fact about the task, in either direction.
+fn note_verification(state: &mut FoldState, event: &EventDraft) {
+    match event.payload.get("status").and_then(serde_json::Value::as_str) {
+        Some("failed") => state.verification_failed = true,
+        Some("passed") => state.verification_failed = false,
+        _ => {}
     }
 }
 
@@ -393,6 +435,10 @@ fn count_ending(
 ) {
     *metrics.turns.by_ending.entry(ending).or_default() += 1;
     *metrics.turns.by_stop_reason.entry(stop_reason.to_string()).or_default() += 1;
+    // The log's last terminal event is the state it left the session in. A
+    // later terminal after a yield-and-resume replaces this, which is why it
+    // is written on every one rather than kept from the first.
+    metrics.final_status = Some(format!("{ending}:{stop_reason}"));
     // Only a turn this log saw start can end in it. A terminal naming an
     // unknown turn is still counted under its ending — the event is a fact —
     // but it must not make `open` go negative or `ended` exceed `started`.
@@ -1161,5 +1207,195 @@ mod tests {
         let second = serde_json::to_string(&report(vec![(SessionId::from_string("s"), events)]))
             .expect("serializes");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn steps_are_counted_from_step_started() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::STEP_STARTED,
+                None,
+                Some("t1"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::STEP_STARTED,
+                None,
+                Some("t1"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:01Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write" }),
+                "2026-01-01T00:00:02Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.task.steps, 2);
+        assert_eq!(metrics.task.edits, 1, "a step is not an edit");
+    }
+
+    #[test]
+    fn edits_after_a_failed_verification_count_until_a_pass() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::VERIFICATION_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "status": "failed" }),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write" }),
+                "2026-01-01T00:00:01Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.edit" }),
+                "2026-01-01T00:00:02Z",
+            ),
+            draft(
+                "s",
+                EventType::VERIFICATION_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "status": "passed" }),
+                "2026-01-01T00:00:03Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write" }),
+                "2026-01-01T00:00:04Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.task.edits, 3);
+        assert_eq!(metrics.task.verifications, 2);
+        assert_eq!(metrics.task.post_failure_edits, 2, "the pass cleared the state");
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_is_not_a_failure_verdict() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::VERIFICATION_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "status": "error" }),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write" }),
+                "2026-01-01T00:00:01Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.task.post_failure_edits, 0);
+        assert_eq!(metrics.task.verifications, 1, "it was still recorded");
+    }
+
+    #[test]
+    fn a_failed_edit_is_not_counted_as_post_failure_work() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::VERIFICATION_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "status": "failed" }),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_FAILED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write", "outcome": "tool_error" }),
+                "2026-01-01T00:00:01Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.task.edits, 0);
+        assert_eq!(metrics.task.post_failure_edits, 0);
+    }
+
+    #[test]
+    fn the_final_status_is_the_last_terminal_ending_and_reason() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::TURN_STARTED,
+                None,
+                Some("t1"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TURN_COMPLETED,
+                None,
+                Some("t1"),
+                serde_json::json!({ "stop_reason": "max_steps" }),
+                "2026-01-01T00:00:01Z",
+            ),
+            draft(
+                "s",
+                EventType::TURN_STARTED,
+                None,
+                Some("t2"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:02Z",
+            ),
+            draft(
+                "s",
+                EventType::TURN_YIELDED,
+                None,
+                Some("t2"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:03Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.final_status.as_deref(), Some("yielded:needs_user_input"));
+    }
+
+    #[test]
+    fn an_open_or_empty_log_has_no_final_status() {
+        let empty = fold(&[]);
+        assert!(empty.final_status.is_none());
+
+        let open = fold(&seq(vec![draft(
+            "s",
+            EventType::TURN_STARTED,
+            None,
+            Some("t1"),
+            serde_json::json!({}),
+            "2026-01-01T00:00:00Z",
+        )]));
+        assert!(open.final_status.is_none());
+        assert_eq!(open.turns.open, 1);
     }
 }

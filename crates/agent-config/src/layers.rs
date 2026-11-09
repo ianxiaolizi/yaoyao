@@ -114,6 +114,19 @@ pub struct UserConfig {
     /// a recipe names a program to run, and a repository that could define one
     /// could define the check its own work is graded by. See [`crate::verify`].
     pub verify: Option<crate::verify::VerifySpec>,
+    /// Budgets by task class, selected with `--task <name>`.
+    ///
+    /// Here for the reason `verify` is here, though the stake is money rather
+    /// than authority: a task class decides how much wall clock, how many
+    /// tokens and how many tool calls a run may spend. A repository that could
+    /// name its own class could raise the ceiling of every run inside it, so
+    /// the table belongs to the person who pays for the machine.
+    ///
+    /// A class is a *selection*, never a classification: `--task video` applies
+    /// `[task_budgets.video]`; a run with no `--task` has no class and keeps
+    /// the budget its layers composed.
+    #[serde(default)]
+    pub task_budgets: BTreeMap<String, BudgetSpec>,
 }
 
 /// The `[secrets]` section: which names a reference may use.
@@ -673,6 +686,47 @@ mod tests {
 
         let refused = WorkspaceConfig::from_toml_str("[memory]\nenabled = true\n");
         assert!(refused.is_err(), "a project may not turn the store on");
+    }
+
+    #[test]
+    fn only_the_user_layer_can_name_a_task_budget() {
+        // A class decides what a run may spend, so the table belongs to the
+        // person paying for the machine. A project that could name one could
+        // raise the ceiling of every run inside it; a profile that could would
+        // let a scenario the repository wrote move the same numbers.
+        let user = UserConfig::from_toml_str(
+            "[task_budgets.video]\n\
+             max_steps = 24\n\
+             max_tool_calls = 80\n\
+             wall_clock_timeout = \"10m\"\n\
+             max_total_tokens = 200000\n",
+        )
+        .expect("the user layer may name a task budget");
+        let budget = user.task_budgets.get("video").expect("the class");
+        assert_eq!(budget.max_steps, Some(24));
+        assert_eq!(budget.max_tool_calls, Some(80));
+        assert_eq!(budget.wall_clock_timeout.as_deref(), Some("10m"));
+        assert_eq!(budget.max_total_tokens, Some(200_000));
+
+        for (label, parsed) in [
+            (
+                "workspace",
+                WorkspaceConfig::from_toml_str("[task_budgets.video]\nmax_steps = 24\n")
+                    .map(|_| ()),
+            ),
+            (
+                "managed",
+                ManagedPolicy::from_toml_str("[task_budgets.video]\nmax_steps = 24\n").map(|_| ()),
+            ),
+            (
+                "profile",
+                UserConfig::from_toml_str("[profiles.coding.task_budgets.video]\nmax_steps = 24\n")
+                    .map(|_| ()),
+            ),
+        ] {
+            let error = parsed.expect_err("only the user layer names a task budget");
+            assert!(error.to_string().contains("unknown field"), "{label}: {error}");
+        }
     }
 
     #[test]

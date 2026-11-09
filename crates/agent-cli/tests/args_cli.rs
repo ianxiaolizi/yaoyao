@@ -101,6 +101,7 @@ fn a_flag_that_takes_a_value_is_refused_without_one() {
     // Every value flag is held to the same rule, wherever it appears.
     assert_eq!(parse(&argv("run hi --profile")), Err(missing("--profile")));
     assert_eq!(parse(&argv("run hi --model=")), Err(missing("--model")));
+    assert_eq!(parse(&argv("run hi --task")), Err(missing("--task")));
     // Greedy when a value follows, exactly like `--session`: the parser has no
     // way to know `run` was meant to be the command rather than the profile.
     let greedy = parse(&argv("--profile run hi")).expect("a command");
@@ -120,6 +121,17 @@ fn the_profile_and_model_flags_are_configuration_not_prompt_text() {
     let inline = parse(&argv("--profile=coding run hi")).expect("a run");
     assert_eq!(inline.profile.as_deref(), Some("coding"));
     assert_eq!(inline.joined_text(), "hi");
+}
+
+#[test]
+fn the_task_flag_selects_a_budget_class_and_is_not_prompt_text() {
+    let args = parse(&argv("run --task video render the clip")).expect("a run");
+    assert_eq!(args.task.as_deref(), Some("video"));
+    assert_eq!(args.joined_text(), "render the clip");
+
+    let inline = parse(&argv("--task=video run hi")).expect("a run");
+    assert_eq!(inline.task.as_deref(), Some("video"));
+    assert_eq!(args.task, inline.task);
 }
 
 #[test]

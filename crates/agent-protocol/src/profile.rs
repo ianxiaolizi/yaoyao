@@ -379,6 +379,15 @@ impl CompletionKind {
 pub struct ResolvedProfileSnapshot {
     /// The profile that was composed, or `default` when none was selected.
     pub profile_id: String,
+    /// The budget class `--task` selected, when the run named one.
+    ///
+    /// Absent when no class was named, for the reason `model_routes` is absent
+    /// when empty: a run without a class must hash and compare exactly like the
+    /// runs that came before this field existed. When it is present, the
+    /// snapshot's budget numbers are the class's, and a reader asking why the
+    /// ceiling is what it is has the name to look up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_class: Option<String>,
     /// Digest of every other field; see [`ResolvedProfileSnapshot::sealed`].
     pub config_hash: String,
     /// The plugins this run enabled, mapped to the version each was trusted at.
@@ -479,6 +488,7 @@ mod tests {
     fn snapshot(profile_id: &str, model: &str) -> ResolvedProfileSnapshot {
         ResolvedProfileSnapshot {
             profile_id: profile_id.to_string(),
+            task_class: None,
             config_hash: String::new(),
             plugin_versions: BTreeMap::new(),
             policy_version: "p".to_string(),
@@ -492,6 +502,22 @@ mod tests {
             budget_sources: BTreeMap::new(),
             completion: None,
         }
+    }
+
+    #[test]
+    fn a_task_class_is_omitted_unless_one_was_selected() {
+        let plain = snapshot("coding", "echo").sealed();
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(value.get("task_class").is_none(), "no class, no field: {value}");
+
+        let named = ResolvedProfileSnapshot {
+            task_class: Some("video".to_string()),
+            ..snapshot("coding", "echo")
+        }
+        .sealed();
+        let value = serde_json::to_value(&named).expect("serializes");
+        assert_eq!(value["task_class"], "video");
+        assert_ne!(plain.config_hash, named.config_hash, "the class is part of the run's identity");
     }
 
     #[test]

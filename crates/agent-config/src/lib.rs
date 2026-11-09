@@ -47,6 +47,14 @@ pub enum ConfigError {
     #[error("'{0}' is not a profile this configuration defines")]
     UnknownProfile(String),
 
+    /// `--task` named a class the user layer does not define.
+    ///
+    /// Refused rather than run under the composed budget: a person who asked
+    /// for the video budget and silently got the default one would believe the
+    /// run was bounded when it was not.
+    #[error("'{name}' is not a task class this configuration defines; {known}")]
+    UnknownTaskClass { name: String, known: String },
+
     #[error("profiles extend each other in a circle: {lineage}")]
     CircularExtends { lineage: String },
 

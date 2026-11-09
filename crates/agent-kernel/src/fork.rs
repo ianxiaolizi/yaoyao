@@ -607,6 +607,7 @@ mod tests {
     async fn the_header_carries_the_resolved_configuration_its_history_ran_under() {
         let snapshot = ResolvedProfileSnapshot {
             profile_id: "coding".to_string(),
+            task_class: None,
             config_hash: String::new(),
             plugin_versions: std::collections::BTreeMap::from([(
                 "mcp.foo".to_string(),

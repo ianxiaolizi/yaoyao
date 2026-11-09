@@ -45,6 +45,8 @@ pub struct Layers {
     pub profile_override: Option<String>,
     /// `--model`: names the model for this run.
     pub model_override: Option<String>,
+    /// `--task`: selects a budget class from the user layer's `[task_budgets]`.
+    pub task_override: Option<String>,
 }
 
 /// A configuration resolved to the point where only the model route is open.
@@ -56,6 +58,13 @@ pub struct Layers {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProfile {
     pub profile_id: String,
+    /// The budget class `--task` selected, when the run named one.
+    ///
+    /// Recorded so a reader can tell "the coding budget" from "the video
+    /// budget" without re-reading the user configuration, and so a snapshot
+    /// whose numbers look strange names the class they came from. `None` is a
+    /// run that selected no class: its budget is the layers' composition.
+    pub task_class: Option<String>,
     /// The model the configuration names, if any.
     pub model: Option<String>,
     /// Every tier the configuration named a model for, `main` included.
@@ -153,6 +162,7 @@ impl ResolvedProfile {
     ) -> ResolvedProfileSnapshot {
         ResolvedProfileSnapshot {
             profile_id: self.profile_id,
+            task_class: self.task_class,
             config_hash: String::new(),
             plugin_versions: self.plugin_versions,
             decision_backends: self.decision_backends,
@@ -459,12 +469,14 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
     // against the policy this run would actually enforce.
     let completion =
         completion(composed.completion.as_ref(), &capability_set, &composed, &profile_id)?;
-    let mut budget = budget(&layers.workspace, &composed)?;
+    let task_class = layers.task_override.clone();
+    let mut budget = budget(&layers.workspace, &composed, task_class.as_deref(), &layers.user)?;
     budget.reasoning_effort = composed.model.as_ref().and_then(|model| model.reasoning_effort);
     let model_context_window = composed.model.as_ref().and_then(|model| model.context_window);
 
     Ok(ResolvedProfile {
         profile_id,
+        task_class,
         model: layers
             .model_override
             .clone()
@@ -783,10 +795,27 @@ const DEFAULT_CACHE_HIT_WEIGHT_PERCENT: u32 = 10;
 /// are derived from the model's own capabilities once the route is known, and a
 /// value invented here would override that derivation with a constant sized for
 /// no particular model (the 8k cap that truncated reasoning, CONTRACT §7 #131).
-fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> {
+fn budget(
+    workspace: &WorkspaceConfig,
+    composed: &Profile,
+    task_class: Option<&str>,
+    user: &UserConfig,
+) -> Result<RunBudget> {
     let mut budget = RunBudget::default();
     apply_budget(&mut budget, workspace.budget.as_ref())?;
     apply_budget(&mut budget, composed.budget.as_ref())?;
+    // The class is last because it names this run's kind of work: a profile
+    // says what the scenario needs in general, and `--task video` says this
+    // run is a video. It may add a primary limit the profile did not state or
+    // tighten one it did; the defaults and the validation below still run
+    // after it, so a class cannot smuggle in a zero or a bad percentage.
+    if let Some(name) = task_class {
+        let spec = user.task_budgets.get(name).ok_or_else(|| ConfigError::UnknownTaskClass {
+            name: name.to_string(),
+            known: task_classes(user),
+        })?;
+        apply_budget(&mut budget, Some(spec))?;
+    }
     // A primary limit is what a run with a token or wall-clock budget is
     // measured against. It does not invent a step ceiling: a run that names no
     // `max_steps` is unbounded by step count and stops only on another stated
@@ -883,6 +912,20 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
         });
     }
     Ok(budget)
+}
+
+/// What a refusal should say the configured task classes are.
+///
+/// An empty table is a different message from a list: "none is configured"
+/// tells the person where to add one, while an empty list after "it defines:"
+/// would read as a typo in the message itself.
+fn task_classes(user: &UserConfig) -> String {
+    if user.task_budgets.is_empty() {
+        "no `[task_budgets.<name>]` table is configured; add one to the user configuration"
+            .to_string()
+    } else {
+        format!("it defines {}", user.task_budgets.keys().cloned().collect::<Vec<_>>().join(", "))
+    }
 }
 
 /// Steps between completion checks when the section names none.
@@ -1783,5 +1826,72 @@ mod tests {
             ..Layers::default()
         };
         assert_eq!(resolve(empty).unwrap().secret_allow, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_task_class_applies_after_the_profile_and_is_recorded() {
+        let user = UserConfig::from_toml_str(
+            "[profiles.coding.budget]\n\
+             max_steps = 100\n\
+             \n\
+             [task_budgets.video]\n\
+             max_steps = 24\n\
+             wall_clock_timeout = \"10m\"\n\
+             max_total_tokens = 200000\n",
+        )
+        .unwrap();
+        let layers = Layers {
+            user,
+            profile_override: Some("coding".to_string()),
+            task_override: Some("video".to_string()),
+            ..Layers::default()
+        };
+        let resolved = resolve(layers).unwrap();
+        assert_eq!(resolved.task_class.as_deref(), Some("video"));
+        assert_eq!(resolved.budget.max_steps, Some(24), "the class tightens the profile");
+        assert_eq!(resolved.budget.wall_clock_ms, Some(600_000));
+        assert_eq!(resolved.budget.max_total_tokens, Some(200_000));
+        // The derived trigger runs after the overlay, not against the profile.
+        assert_eq!(resolved.budget.finalize_at_percent, Some(DEFAULT_FINALIZE_AT_PERCENT));
+
+        // No class is not the same run: the profile's budget stands alone.
+        let plain = Layers {
+            user: UserConfig::from_toml_str("[profiles.coding.budget]\nmax_steps = 100\n").unwrap(),
+            profile_override: Some("coding".to_string()),
+            ..Layers::default()
+        };
+        let resolved = resolve(plain).unwrap();
+        assert_eq!(resolved.task_class, None);
+        assert_eq!(resolved.budget.max_steps, Some(100));
+    }
+
+    #[test]
+    fn an_unknown_task_class_is_refused_and_names_the_configured_ones() {
+        let layers = Layers {
+            user: UserConfig::from_toml_str("[task_budgets.video]\nmax_steps = 24\n").unwrap(),
+            task_override: Some("audio".to_string()),
+            ..Layers::default()
+        };
+        let error = resolve(layers).unwrap_err();
+        assert!(matches!(error, ConfigError::UnknownTaskClass { .. }), "{error}");
+        assert!(error.to_string().contains("audio"), "{error}");
+        assert!(error.to_string().contains("video"), "{error}");
+
+        let empty = Layers { task_override: Some("video".to_string()), ..Layers::default() };
+        let error = resolve(empty).unwrap_err();
+        assert!(error.to_string().contains("no `[task_budgets.<name>]` table"), "{error}");
+    }
+
+    #[test]
+    fn a_task_class_is_validated_like_any_other_budget_layer() {
+        let layers = Layers {
+            user: UserConfig::from_toml_str("[task_budgets.video]\nwall_clock_timeout = \"0s\"\n")
+                .unwrap(),
+            task_override: Some("video".to_string()),
+            ..Layers::default()
+        };
+        let error = resolve(layers).unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidBudget { .. }), "{error}");
+        assert!(error.to_string().contains("wall_clock_timeout"), "{error}");
     }
 }

@@ -372,6 +372,24 @@ function panelBody(panel: PanelState): string {
       ${facts.length ? `<div class="sh-h">事实</div>${facts.map((fact) => `<div class="y-fact">${esc(fact)}</div>`).join('')}` : ''}`;
   }
   if (panel.key === 'diff') {
+    // No repository to observe: the panel falls back to the workspace change
+    // ledger, which reports paths, kinds and sizes — never a line patch.
+    if (data.source === 'workspace.changes') {
+      const changes = Array.isArray(data.changes) ? (data.changes as Record<string, unknown>[]) : [];
+      if (!changes.length) return '<div class="y-panel-empty"><b>没有可显示的改动</b><span>最近一次工作区快照比较没有发现改动。</span></div>';
+      const label: Record<string, string> = { added: '新增', modified: '修改', removed: '删除' };
+      return `<div class="sh-h">改动 · ${changes.length} 个文件</div>
+        <div class="y-fact">来自工作区变更账本：记录路径、大小与摘要，没有逐行补丁。</div>
+        ${changes
+          .map((change) => {
+            const before = Number(change.before_size ?? 0);
+            const after = Number(change.after_size ?? 0);
+            const delta = after - before;
+            const size = `${delta >= 0 ? '+' : '−'}${Math.abs(delta)} B`;
+            return `<div class="sh-file"><span class="n">${esc(change.file)}</span><span><span class="st">${label[String(change.change)] ?? esc(change.change)}</span> <span class="${delta >= 0 ? 'a' : 'd'}">${size}</span></span></div>`;
+          })
+          .join('')}`;
+    }
     const diff = asRecord(data.diff);
     const files = Array.isArray(diff.files) ? (diff.files as Record<string, unknown>[]) : [];
     if (!files.length) return '<div class="y-panel-empty"><b>没有可显示的改动</b><span>这一轮没有 git.diff 观察。</span></div>';

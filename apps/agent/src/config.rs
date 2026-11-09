@@ -68,6 +68,7 @@ pub fn load(workspace_root: &str, args: &Args) -> Result<ResolvedProfile, LoadEr
         // a `--profile` is still checked against the user layer's ceiling.
         profile_override: args.profile.clone(),
         model_override: args.model.clone(),
+        task_override: args.task.clone(),
         ..Layers::default()
     };
 
