@@ -528,6 +528,31 @@ mod tests {
         assert_eq!(axes.completion_status, Some(CompletionStatus::BlockedOrParked));
     }
 
+    /// A capability stop delivered nothing, even though the turn wrote text:
+    /// the text is an ask, and the run is blocked rather than complete.
+    #[test]
+    fn a_capability_stop_is_not_a_delivery() {
+        let events = vec![
+            run_event(0, EventType::RUN_STARTED),
+            tool(1),
+            stored(
+                2,
+                EventType::TURN_COMPLETED,
+                serde_json::json!({
+                    "stop_reason": "capability_blocked",
+                    "incomplete": true,
+                    "final_content": "请选择 1、2 或 3",
+                }),
+            ),
+            run_event(3, EventType::RUN_COMPLETED),
+        ];
+        let axes = derive(&events);
+        assert_eq!(axes.run_status, Some(RunStatus::Completed));
+        assert_eq!(axes.delivery_status, DeliveryStatus::Unanswered);
+        assert_eq!(axes.verification_status, VerificationStatus::Unverified);
+        assert_eq!(axes.completion_status, Some(CompletionStatus::BlockedOrParked));
+    }
+
     #[test]
     fn a_passing_security_review_leaves_the_check_standing() {
         let events = vec![

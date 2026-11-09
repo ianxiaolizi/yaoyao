@@ -600,6 +600,71 @@ function seedVerifiedDelivery() {
 }
 
 /**
+ * A capability stop: the backend refused `process.spawn` twice, and the turn
+ * ended as completed-but-incomplete with the three choices as its text. The
+ * page must call this "未完成 · 已阻塞", never "已交付", and must name the
+ * app-container route.
+ */
+function seedCapabilityBlocked() {
+  const log = builder('capability-blocked');
+  log.add('run/started', { actor: 'scheduler' });
+  log.ask('t1', '做一个 3 秒的火柴人战斗视频');
+  for (const [call, command] of [
+    ['call-capability-1', 'ffmpeg -version'],
+    ['call-capability-2', 'ffmpeg -f lavfi -i color=c=black:s=320x240:d=3 out.mp4'],
+  ]) {
+    log.add('tool/started', {
+      turn: 't1',
+      step: 'step-t1',
+      actor: 'tool',
+      payload: {
+        tool_name: 'shell.run',
+        provider_tool_call_id: call,
+        arguments: { command },
+      },
+    });
+    log.add('tool/failed', {
+      turn: 't1',
+      step: 'step-t1',
+      actor: 'tool',
+      payload: {
+        tool_name: 'shell.run',
+        provider_tool_call_id: call,
+        status: 'failed',
+        error_kind: 'permission_denied',
+        outcome: 'gateway_refused',
+        content:
+          "policy denied tool shell.run: capability process.spawn is not provided by this build's execution sandbox",
+        policy: {
+          decision: 'deny',
+          capabilities: ['process.spawn'],
+          refusals: { 'process.spawn': 'sandbox_unavailable' },
+          action_digest: 'sha256:capability-fixture',
+        },
+      },
+    });
+  }
+  log.add('step/completed', { turn: 't1', step: 'step-t1', actor: 'agent', payload: {} });
+  log.add('turn/completed', {
+    turn: 't1',
+    actor: 'scheduler',
+    payload: {
+      stop_reason: 'capability_blocked',
+      incomplete: true,
+      final_content:
+        '能力缺口：`shell.run` 需要 `process.spawn`，当前后端不提供这个能力。已停止，不再用静态文件或页面假装完成。\n' +
+        '请选择下一步：\n' +
+        '1. 用 app-container 后端重启后重试；\n' +
+        '2. 接受降级交付（只交付静态内容，并明确它不是原目标）；\n' +
+        '3. 取消这个任务。\n' +
+        '回复 1、2 或 3。',
+    },
+  });
+  log.add('run/completed', { actor: 'scheduler', payload: { stop_reason: 'capability_blocked' } });
+  log.save();
+}
+
+/**
  * A log captured from a real turn (`capture-real-chain.mjs`): the scheduler,
  * tool gateway, filesystem and `git diff` all ran. Replaying it keeps the
  * panels honest about real event shapes instead of this file's hand-written
@@ -730,6 +795,7 @@ async function main() {
   seedScratch();
   seedUnverifiedDelivery();
   seedVerifiedDelivery();
+  seedCapabilityBlocked();
   seedRealChain();
   seedLong();
   // The real-subagent capture is a fixture, not a page in this run: its parent
@@ -770,12 +836,12 @@ async function main() {
   check('会话标题取第一条用户消息', (await text(page, '#title')) === 'show the diff and think about it');
   check('轮数与日志一致', (await text(page, '#round')) === '第 4 轮');
   check('侧栏默认只列最近 6 条', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 6);
-  check('全部会话入口写明总数', (await text(page, '[data-session-all]')).includes('全部会话 · 10'));
+  check('全部会话入口写明总数', (await text(page, '[data-session-all]')).includes('全部会话 · 11'));
   await page.click('[data-session-all]');
-  await page.waitForFunction(() => document.querySelectorAll('.y-session').length === 10, null, {
+  await page.waitForFunction(() => document.querySelectorAll('.y-session').length === 11, null, {
     timeout: 10_000,
   });
-  check('展开后列出全部会话', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 10);
+  check('展开后列出全部会话', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 11);
   check('当前轮目标', (await text(page, '.y-goal')).includes('what changed, and is it safe?'));
   check('当前轮回答', (await text(page, '.y-answer')).includes('one hunk'));
   check('思考折叠存在', (await page.$$eval('.y-thinking', (nodes) => nodes.length)) >= 1);
@@ -1027,6 +1093,19 @@ async function main() {
   check('已验证交付：顶部状态是已验证完成', await waitText(page, '#statusPill', '已验证完成'));
   check('已验证交付：没有未验证横幅', !(await page.locator('#statusNote').isVisible()));
   await page.screenshot({ path: join(shots, 'm10-verified.png') });
+
+  // A capability stop delivered nothing: the page must not dress its ask as a
+  // delivered result, and must offer the backend switch.
+  await page.goto(`${origin}/?session=capability-blocked#t=${token}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('.y-turn', { timeout: 15_000 });
+  check('能力停止：顶部状态是未完成已阻塞', await waitText(page, '#statusPill', '未完成 · 已阻塞'));
+  check('能力停止：顶部状态没有写成已交付', !(await text(page, '#statusPill')).includes('已交付'));
+  check('能力停止：说明给出 app-container', await waitText(page, '#statusNote', 'app-container'));
+  // The ask is rendered as Markdown, so the ordered list has no literal "1."
+  // in its text; the option wording is what proves all three stayed.
+  check('能力停止：转写保留三分支', (await text(page, '.y-answer')).includes('接受降级交付'));
+  check('能力停止：转写保留取消项', (await text(page, '.y-answer')).includes('取消这个任务'));
+  await page.screenshot({ path: join(shots, 'm10-capability-blocked.png') });
 
   // The real chain: captured from an actual turn (scheduler, gateway, fs,
   // git diff), so the panels are checked against real event shapes too.
@@ -1300,6 +1379,7 @@ async function main() {
           'm9-real-chain.png',
           'm10-unverified.png',
           'm10-verified.png',
+          'm10-capability-blocked.png',
         ],
       },
       null,

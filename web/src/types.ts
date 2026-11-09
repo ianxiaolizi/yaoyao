@@ -35,6 +35,8 @@ export interface SessionStatus {
   delivery_status: 'delivered' | 'unanswered' | null;
   verification_status: 'verified' | 'unverified' | 'stale' | 'not_applicable' | 'blocked' | null;
   completion_status: 'verified_complete' | 'blocked_or_parked' | null;
+  /** Why the latest settled turn stopped, when the log recorded a reason. */
+  stop_reason?: string | null;
 }
 
 export interface SessionSummary {

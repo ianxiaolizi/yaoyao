@@ -532,6 +532,9 @@ pub(crate) fn halted(reason: &StopReason) -> bool {
             // and handing the text over as a delivered result is the one thing
             // that review exists to prevent (B9, CONTRACT §7 #183).
             | StopReason::SecurityBlocked
+            // The turn stopped on a capability the backend cannot provide. The
+            // text is an ask, not a delivered result.
+            | StopReason::CapabilityBlocked
     )
 }
 
@@ -563,6 +566,20 @@ pub(crate) fn stopped_text(report: &RunReport) -> String {
                 _ => format!("[{notice}]"),
             }
         }
+        // Not a limit: the run stopped because the backend cannot provide a
+        // capability the task asked for twice. The advice a budget gets would
+        // be wrong — raising a limit does not add the capability — so the
+        // notice offers the three ways forward a person can choose.
+        StopReason::CapabilityBlocked => {
+            let notice = "not delivered: the backend cannot provide the capability this task \
+                          needs. Choose one: switch to the app-container backend and retry; \
+                          accept a degraded result that is not the original target; or cancel \
+                          the task";
+            match report.final_content.as_deref() {
+                Some(text) if !text.trim().is_empty() => format!("{text}\n\n[{notice}]"),
+                _ => format!("[{notice}]"),
+            }
+        }
         _ => limit_text(report),
     }
 }
@@ -577,6 +594,9 @@ fn limit_text(report: &RunReport) -> String {
         StopReason::TokenBudgetExceeded => "raise `budget.max_total_tokens` and continue",
         StopReason::Stalled => {
             "the run kept repeating itself; narrow the task or change what it is given"
+        }
+        StopReason::CapabilityBlocked => {
+            "switch the backend that provides the missing capability, or change the task"
         }
         _ => "run again",
     };

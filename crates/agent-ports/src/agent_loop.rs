@@ -390,6 +390,17 @@ pub enum StopReason {
     /// the same shape a truncated answer has, because it is the same situation:
     /// something that reads like an answer and is not one.
     SecurityBlocked,
+    /// The turn kept asking for a capability this backend does not provide —
+    /// twice, by recorded `sandbox_unavailable` refusals — so it stopped before
+    /// the work turned into a long detour around a gap that cannot close.
+    ///
+    /// The loop returns this after it has already answered the refused call
+    /// and every call it never dispatched. The turn ends as a completed but
+    /// incomplete record whose final content is the three choices a person can
+    /// make (switch the backend, accept a degraded result, or cancel), so the
+    /// next ordinary turn can act on the answer. It is not a `yield`: a yield
+    /// with no held call has no continuation path in this build.
+    CapabilityBlocked,
 }
 
 impl StopReason {
@@ -413,6 +424,7 @@ impl StopReason {
             Self::Stalled => "stalled",
             Self::Completed => "completed",
             Self::SecurityBlocked => "security_blocked",
+            Self::CapabilityBlocked => "capability_blocked",
         }
     }
 }

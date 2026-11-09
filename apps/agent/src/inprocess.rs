@@ -507,6 +507,16 @@ pub(crate) fn describe_report(
                 .to_string(),
             side_effects: Vec::new(),
         },
+        // The child stopped on a capability its backend does not provide. What
+        // it wrote is an ask for a decision, not a result the parent may pass
+        // on; the choices stay in the child's turn record.
+        StopReason::CapabilityBlocked => SubagentOutcome::Failed {
+            message: format!(
+                "the child stopped on a capability its backend does not provide; its text is a \
+                 question for a person, not a result. The child turn is in session {child}"
+            ),
+            side_effects: Vec::new(),
+        },
         StopReason::UserCancelled => SubagentOutcome::Cancelled,
         StopReason::FatalError => {
             let mut message = "the child's attempt failed".to_string();

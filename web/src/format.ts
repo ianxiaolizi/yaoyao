@@ -275,6 +275,15 @@ export function turnStatus(item: { ending?: string; stop_reason?: string } | und
 export function sessionStatusLabel(status: SessionStatus | null): { label: string; className: string } {
   if (!status) return { label: '已回答', className: 'done' };
   if (status.completion_status === 'verified_complete') return { label: '已验证完成', className: 'done' };
+  // A run that delivered nothing cannot read as delivered, whatever its
+  // verification axis says. This comes before the unverified label: a parked
+  // or capability-stopped turn has no result to hand over — including one
+  // that did no tool work, where the completion axis makes no claim at all.
+  // A session with no run yet is not unfinished work, so it keeps the old
+  // wording.
+  if (status.delivery_status === 'unanswered' && status.run_status !== null) {
+    return { label: '未完成 · 已阻塞', className: 'fail' };
+  }
   if (status.verification_status === 'unverified') return { label: '已交付 · 未验证', className: 'unverified' };
   if (status.verification_status === 'stale') return { label: '验证已过期', className: 'fail' };
   if (status.verification_status === 'not_applicable') return { label: '已回答', className: 'done' };
@@ -285,7 +294,13 @@ export function sessionStatusLabel(status: SessionStatus | null): { label: strin
 /** The one sentence a non-clean status earns; null when nothing needs saying. */
 export function sessionStatusNote(status: SessionStatus | null): string | null {
   if (!status) return null;
-  if (status.verification_status === 'unverified') {
+  if (status.stop_reason === 'capability_blocked') {
+    return '这次任务需要当前后端没有的执行能力（例如启动命令或渲染）。请切换 app-container、接受降级交付，或取消。';
+  }
+  if (status.delivery_status === 'unanswered' && status.run_status !== null) {
+    return '这次运行没有交付结果。请查看转写里的停止原因，再决定下一步。';
+  }
+  if (status.delivery_status === 'delivered' && status.verification_status === 'unverified') {
     return '结果已交付，但没有通过完成检查。请先检查产出；未验证的交付不等于完成。';
   }
   if (status.verification_status === 'stale') {

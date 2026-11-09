@@ -78,6 +78,7 @@ use wording::{
     summarize_arguments,
 };
 mod budget;
+mod capability;
 mod completion;
 mod context_recovery;
 mod cycles;
@@ -85,6 +86,7 @@ mod event_drafts;
 mod loop_call;
 mod output_recovery;
 use output_recovery::RecoveryOutcome;
+mod refusals;
 mod request_record;
 use request_record::message_references;
 mod settle;
@@ -929,6 +931,10 @@ struct LoopTurn {
     /// why a turn that keeps answering itself is stopped rather than left to
     /// spend its step budget.
     progress: stall::Progress,
+    /// The capability gaps this turn has hit. One may be a call the model can
+    /// replace; the second is a capability the backend cannot provide, and the
+    /// turn stops instead of detouring around it.
+    capability_gaps: capability::CapabilityGaps,
     /// The profile's completion criterion, when it named one. `completion`
     /// says why a run whose task is already done is ended rather than left to
     /// finish its step budget.
@@ -1461,6 +1467,7 @@ impl AgentLoop for DefaultAgentLoop {
                 plan_view: ctx.plan.clone(),
                 work: ctx.work.clone(),
                 progress: stall::Progress::default(),
+                capability_gaps: capability::CapabilityGaps::default(),
                 completion,
                 reason_last_observation: None,
                 criterion_expects_check,
@@ -2301,7 +2308,7 @@ impl AgentLoop for DefaultAgentLoop {
                     ReasonSource::Model,
                 );
                 events.push(reason_event(ctx, Some(&step_id), &verdict));
-                refuse_undispatched(
+                refusals::refuse_undispatched(
                     ctx,
                     &step_id,
                     turn,
@@ -3123,12 +3130,23 @@ impl AgentLoop for DefaultAgentLoop {
                             content,
                             true,
                         ));
+                        // A sandbox refusal is a gap, not a decision about
+                        // this call; the second one ends the turn.
+                        if turn.note_capability_gap(&e, &call.tool_name) {
+                            return Ok(capability::stop(
+                                ctx,
+                                &step_id,
+                                turn,
+                                &mut events,
+                                &tool_calls[index + 1..],
+                            ));
+                        }
                     }
                 }
             }
 
             if let Some((reason, index)) = budget_stop {
-                refuse_undispatched(
+                refusals::refuse_undispatched(
                     ctx,
                     &step_id,
                     turn,
@@ -3210,66 +3228,6 @@ fn step_failed(ctx: &TurnContext, step_id: &StepId) -> EventDraft {
     draft(ctx, step_id, EventType::STEP_FAILED, serde_json::json!({}), Actor::Agent)
 }
 
-/// Answer the calls a run limit kept from being dispatched.
-///
-/// `tool/not_started` is the existing word for exactly this: the call provably
-/// did not run, so proposing it again is not a retry. The text names the limit,
-/// so a reader of the log does not have to infer it from the terminal payload.
-fn refuse_undispatched(
-    ctx: &TurnContext,
-    step_id: &StepId,
-    turn: &mut LoopTurn,
-    events: &mut Vec<EventDraft>,
-    calls: &[ToolCall],
-    reason: &StopReason,
-    output_limit: Option<u32>,
-) {
-    let content = match reason {
-        StopReason::MaxToolCalls => format!(
-            "This tool call was never dispatched: the run's tool-call limit ({}) was reached. \
-             Nothing ran; propose it again only if the next run still needs it.",
-            turn.budget.max_tool_calls.unwrap_or_default()
-        ),
-        // The response itself was cut, so the call may be incomplete as well as
-        // unrun: the answer says both, because retrying a half-written call
-        // without changing anything is exactly what the limit would reproduce.
-        StopReason::MaxOutputTokens => format!(
-            "This tool call was never dispatched: the provider stopped the response at the \
-             run's output-token limit ({}), so the calls in it may be incomplete. Nothing ran; \
-             raise `max_output_tokens` and propose them again if the work still needs doing.",
-            output_limit.unwrap_or_default()
-        ),
-        StopReason::ContentFiltered => String::from(
-            "This tool call was never dispatched: the provider withheld the response under its \
-             content filter. Nothing ran; propose it again only if the next run still needs it.",
-        ),
-        _ => String::from(
-            "This tool call was never dispatched: the run's wall-clock limit was reached. \
-             Nothing ran; propose it again only if the next run still needs it.",
-        ),
-    };
-    for call in calls {
-        events.push(draft(
-            ctx,
-            step_id,
-            EventType::TOOL_NOT_STARTED,
-            serde_json::json!({
-                "tool_name": call.tool_name,
-                "provider_tool_call_id": call.tool_call_id,
-                "content": content,
-            }),
-            Actor::Tool,
-        ));
-        turn.messages.push(ModelMessage::tool_for_call(
-            step_id,
-            call.tool_call_id.clone(),
-            call.tool_name.clone(),
-            content.clone(),
-            true,
-        ));
-    }
-}
-
 /// Answer a held step's calls without running them.
 ///
 /// A step-level gate refuses the whole batch, but a provider response's tool
@@ -3339,6 +3297,10 @@ mod tests {
 
     /// What a summary request may send to the fast route.
     mod summary_route;
+
+    /// The capability stop: what counts as a missing capability, when the turn
+    /// ends on it, and what the calls it never dispatched are told.
+    mod capability_stop;
 
     use agent_ports::agent_loop::TurnFailureFacts;
     use agent_ports::agent_loop::{TurnCapabilityFacts, TurnStateFacts};

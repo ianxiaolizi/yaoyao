@@ -429,10 +429,43 @@ pub(crate) fn capability_text(facts: &TurnCapabilityFacts, manifest: &ToolManife
             }
         }
     };
+    // The three lines a task plan depends on: whether the workspace can be
+    // changed, whether a program can be started at all, and whether the run can
+    // render or export what it produces. Stated before the first request so a
+    // model does not discover them one refusal at a time. They describe this
+    // backend, not what the host could do outside it.
+    let files = match facts.sandbox {
+        SandboxMode::ReadOnly => "read-only (writes are refused)",
+        SandboxMode::LocalProcess | SandboxMode::WorkspaceSandbox | SandboxMode::Container => {
+            "read and write inside the workspace"
+        }
+    };
+    let commands = match facts.sandbox {
+        SandboxMode::ReadOnly => "not available (this backend starts no process)",
+        SandboxMode::LocalProcess => {
+            "not available on this backend (`shell.run` is refused; it needs app-container)"
+        }
+        SandboxMode::WorkspaceSandbox => "available under the app-container confinement",
+        SandboxMode::Container => "available inside the container",
+    };
+    let render = match facts.sandbox {
+        SandboxMode::ReadOnly | SandboxMode::LocalProcess => {
+            "not available (needs a process this backend does not start)"
+        }
+        SandboxMode::WorkspaceSandbox | SandboxMode::Container => {
+            "available only if an offered tool can run the renderer or exporter in the confinement"
+        }
+    };
     let mut text = format!(
         "Capabilities in this run:\n\
          - sandbox: {sandbox}\n\
-         - network for sandboxed commands: {network}\n"
+         - files: {files}\n\
+         - commands: {commands}\n\
+         - browser/render/export: {render}\n\
+         - network for sandboxed commands: {network}\n\
+         - If the task needs a capability this run does not have, say so and ask the \
+           user which way to go; do not call a static file, an HTML page, or a mock \
+           the real result.\n"
     );
     if !facts.tool_secrets.is_empty() {
         // A model cannot guess a secret's name, and an unknown one is refused

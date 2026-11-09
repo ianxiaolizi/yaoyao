@@ -386,6 +386,26 @@ pub(crate) async fn status(
         .await
         .map_err(|error| failed(error.to_string()))?;
     let axes = agent_kernel::status::derive(&events);
+    // The reason the latest settled turn wrote, when it wrote one. The axes say
+    // whether a result was delivered; this says why it stopped, so the page can
+    // name a capability gap instead of the generic blocked sentence. Reads the
+    // same event slice as the axes, so one request cannot report a status from
+    // two logs. Logs that predate `stop_reason` report none.
+    let stop_reason = events
+        .iter()
+        .rev()
+        .find(|stored| {
+            matches!(
+                stored.event.event_type.as_str(),
+                agent_protocol::events::EventType::TURN_COMPLETED
+                    | agent_protocol::events::EventType::TURN_FAILED
+                    | agent_protocol::events::EventType::TURN_CANCELLED
+                    | agent_protocol::events::EventType::TURN_INTERRUPTED
+                    | agent_protocol::events::EventType::TURN_YIELDED
+            )
+        })
+        .and_then(|stored| stored.event.payload.get("stop_reason"))
+        .and_then(Value::as_str);
     let intents =
         agent_kernel::intent::fold_intents(&events).map_err(|error| failed(error.to_string()))?;
     let active = intents.iter().rev().find(|intent| intent.status == IntentStatus::Active);
@@ -414,6 +434,7 @@ pub(crate) async fn status(
         "delivery_status": axes.delivery_status,
         "verification_status": axes.verification_status,
         "completion_status": axes.completion_status,
+        "stop_reason": stop_reason,
         "active_intent_id": active.map(|intent| intent.intent_id.as_str()),
         "active_intent_summary": active.map(|intent| intent.summary.as_str()),
         "pending_intents": pending_intents,
