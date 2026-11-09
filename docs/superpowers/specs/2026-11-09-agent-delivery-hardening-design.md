@@ -185,6 +185,8 @@ snapshot 已经是爻爻的事实来源。下一阶段应让“改动”面板�
 3. 对同一文件连续多次编辑但无成功验证的情况注入收敛提示。
 4. 记录“编辑次数、验证次数、最后修改 hash”到 task report。
 
+> **执行记录（2026-11-09）**：Phase 2 已按 `docs/superpowers/plans/2026-11-09-phase-2-verification-and-convergence.md` 实现。recipe 只从用户配置层读取（工作区的 `[verify]` 是未知字段）；收敛提示是提醒而非停止条件；视频检查以“解码出的帧有可见像素”为准，不要求多于一色。偏差与验证见该计划的 Execution Notes。
+
 ### Phase 3：证据与预算
 
 1. 非 Git 工作区的 diff 面板回退到 snapshot / changes ledger。

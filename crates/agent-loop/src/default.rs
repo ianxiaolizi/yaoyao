@@ -81,6 +81,7 @@ mod budget;
 mod capability;
 mod completion;
 mod context_recovery;
+mod convergence;
 mod cycles;
 mod event_drafts;
 mod loop_call;
@@ -931,6 +932,9 @@ struct LoopTurn {
     /// why a turn that keeps answering itself is stopped rather than left to
     /// spend its step budget.
     progress: stall::Progress,
+    /// Edits to each path since this turn's last passing check. `convergence`
+    /// says why a turn that keeps rewriting one file is told to verify it.
+    convergence: convergence::Edits,
     /// The capability gaps this turn has hit. One may be a call the model can
     /// replace; the second is a capability the backend cannot provide, and the
     /// turn stops instead of detouring around it.
@@ -1467,6 +1471,7 @@ impl AgentLoop for DefaultAgentLoop {
                 plan_view: ctx.plan.clone(),
                 work: ctx.work.clone(),
                 progress: stall::Progress::default(),
+                convergence: convergence::Edits::default(),
                 capability_gaps: capability::CapabilityGaps::default(),
                 completion,
                 reason_last_observation: None,
@@ -1697,6 +1702,9 @@ impl AgentLoop for DefaultAgentLoop {
             // more specific problem when both apply, and the budget line is the
             // last thing the request says either way.
             let stall_notice = stall::place_stall_notice(turn, &ctx.turn_id);
+            // The sibling question: not "is anything new?" but "has this file
+            // been checked since you last changed it?".
+            let convergence_notice = convergence::place_notice(turn, &ctx.turn_id);
             // A budget checkpoint is a demand to write the state down, made at
             // the point where there is still enough budget to act on it. The
             // record of having made it is the log's, so a reader can tell a
@@ -1788,6 +1796,15 @@ impl AgentLoop for DefaultAgentLoop {
                     "unchanged_steps": turn.progress_unchanged_steps(),
                     "stall_steps": turn.stall_steps(),
                     "text": text,
+                });
+            }
+            // The convergence reminder, on the same terms: the path, how many
+            // edits armed it, and the sentence the model read.
+            if let Some(notice) = &convergence_notice {
+                prepared["convergence_notice"] = serde_json::json!({
+                    "path": notice.path,
+                    "edits": notice.edits,
+                    "text": notice.text,
                 });
             }
             // The state block, on the same terms: what the model read at the
@@ -2926,13 +2943,14 @@ impl AgentLoop for DefaultAgentLoop {
                         // whose path contains "test" is looking at the check,
                         // not performing it: counting it would let a request to
                         // explain a test file end as "the check observed".
-                        let check_like = turn.criterion_expects_check
-                            && check_command(call)
-                                .is_some_and(|command| is_check_command(&command));
+                        let command_text = check_command(call);
+                        let ran_a_check = command_text.as_deref().is_some_and(is_check_command);
+                        let check_like = turn.criterion_expects_check && ran_a_check;
                         if check_like && result.status == ToolStatus::Completed {
                             turn.criterion_observed = true;
                             turn.criterion_observation = Some(observation.id.clone());
                         }
+                        convergence::note_result(turn, call, ran_a_check, result.status);
                         turn.reason_last_observation = Some(observation.id.clone());
                         events.push(reason_event(ctx, Some(&step_id), &observation));
                         let is_error = result.status != ToolStatus::Completed;
@@ -3291,6 +3309,9 @@ mod tests {
 
     /// Steps that produced no new evidence: the reminder, and the stop.
     mod stall;
+
+    /// One file rewritten repeatedly with no passing check: the reminder.
+    mod convergence;
 
     /// The operator's criterion, asked at a step boundary.
     mod completion;

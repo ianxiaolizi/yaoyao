@@ -216,19 +216,49 @@ fn render_text(report: &MetricsReport) -> String {
         lines.push(format!("judgment blocks: {}", totals.judgment_required));
     }
 
+    // The work itself, after the bookkeeping: what changed and what checked it.
+    lines.push(task_line(&totals.task));
+
     lines.push("sessions:".to_string());
     for row in &report.sessions {
         let metrics = &row.metrics;
-        lines.push(format!(
+        let mut line = format!(
             "  {}  {} turn(s), {} failed tool(s), {} token(s), {}",
             row.session_id.as_str(),
             metrics.turns.started,
             metrics.tools.failed,
             metrics.tokens.total_tokens,
             seconds(metrics.runs.wall_time_ms)
-        ));
+        );
+        // Only where there is work to report: a read-only session should not
+        // grow a suffix that says it edited nothing.
+        if metrics.task.edits > 0 || metrics.task.verifications > 0 {
+            line.push_str(&format!(
+                ", {} edit(s), {} verification(s)",
+                metrics.task.edits, metrics.task.verifications
+            ));
+        }
+        lines.push(line);
     }
     lines.join("\n")
+}
+
+/// The task totals as one line, with the last change's short digest.
+fn task_line(task: &agent_projection::metrics::TaskMetrics) -> String {
+    let mut line = format!(
+        "task: {} edit(s), {} verification(s), {} criterion check(s)",
+        task.edits, task.verifications, task.criterion_checks
+    );
+    if let (Some(path), Some(digest)) = (&task.last_modified_path, &task.last_modified_sha256) {
+        line.push_str(&format!(", last change {path} {}", short_digest(digest)));
+    }
+    line
+}
+
+/// The first twelve characters of a digest — enough to compare two reports by
+/// eye, and always on a character boundary.
+fn short_digest(digest: &str) -> String {
+    digest.chars().take(12).collect()
 }
 
 /// `key=count` pairs in the map's own (sorted) order.
@@ -359,6 +389,70 @@ mod tests {
             run_metrics(&store(dir.path()), dir.path(), None, None, false).await.expect("runs");
         assert_eq!(outcome.verdict, agent_cli::Verdict::Answered);
         assert_eq!(text(&outcome), "no sessions");
+    }
+
+    #[tokio::test]
+    async fn the_text_report_names_the_task_and_the_last_change() {
+        let dir = store_with(&[(
+            "one",
+            vec![
+                draft(
+                    "one",
+                    EventType::TOOL_COMPLETED,
+                    serde_json::json!({ "tool_name": "fs.write" }),
+                ),
+                draft(
+                    "one",
+                    EventType::VERIFICATION_RECORDED,
+                    serde_json::json!({ "check_id": "c1" }),
+                ),
+                draft(
+                    "one",
+                    EventType::WORKSPACE_CHANGES_RECORDED,
+                    serde_json::json!({ "changes": [{
+                        "relative_path": "web/app.js",
+                        "after_sha256": "0123456789abcdef",
+                    }] }),
+                ),
+            ],
+        )])
+        .await;
+        let outcome =
+            run_metrics(&store(dir.path()), dir.path(), None, None, false).await.expect("runs");
+        let rendered = text(&outcome);
+        assert!(
+            rendered.contains(
+                "task: 1 edit(s), 1 verification(s), 0 criterion check(s), \
+                 last change web/app.js 0123456789ab"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("1 edit(s), 1 verification(s)"),
+            "the row has the suffix: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_json_answer_carries_the_task_block_and_omits_a_missing_digest() {
+        let dir = store_with(&[(
+            "one",
+            vec![draft("one", EventType::TURN_STARTED, serde_json::json!({}))],
+        )])
+        .await;
+        let outcome =
+            run_metrics(&store(dir.path()), dir.path(), None, None, true).await.expect("runs");
+        let CliOutput::Json(document) = &outcome.output else {
+            panic!("--json must answer with one object");
+        };
+        let value: serde_json::Value = serde_json::from_str(document.as_str()).expect("parses");
+        assert_eq!(value["totals"]["task"]["edits"], 0);
+        assert_eq!(value["totals"]["task"]["verifications"], 0);
+        assert_eq!(value["totals"]["task"]["criterion_checks"], 0);
+        assert!(
+            value["totals"]["task"].get("last_modified_path").is_none(),
+            "absent digests are omitted"
+        );
     }
 
     #[tokio::test]

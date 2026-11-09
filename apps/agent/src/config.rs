@@ -15,11 +15,13 @@
 //! directory so that a test, a container, and a person can all point the same
 //! binary at a configuration without a code path apiece.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use agent_cli::args::Args;
 use agent_config::{
-    ConfigError, Layers, ManagedPolicy, ResolvedProfile, UserConfig, WorkspaceConfig, resolve,
+    ConfigError, Layers, ManagedPolicy, RecipeSpec, ResolvedProfile, UserConfig, WorkspaceConfig,
+    resolve,
 };
 use agent_kernel::policy::{PolicyEngine, PolicyRule, default_policy_with};
 use agent_protocol::permissions::{Capability, PolicyDecision};
@@ -84,6 +86,25 @@ pub fn load(workspace_root: &str, args: &Args) -> Result<ResolvedProfile, LoadEr
     }
 
     Ok(resolve(layers)?)
+}
+
+/// The verifier recipes the user layer defines.
+///
+/// Deliberately not part of [`load`]: a profile is what a *run* is authorized
+/// to do, while a recipe is a check a *person* runs with `agent verify`. They
+/// share a file by convenience, not by authority, and reading the recipes
+/// through the profile would make the workspace layer's opinion of them
+/// reachable — which is the one layer that must not define a check.
+///
+/// An unset `AGENT_USER_CONFIG` is an empty table, not an error: a machine
+/// that never wrote a recipe is a machine whose `--recipe` names nothing, and
+/// the command says so with the list (empty) rather than failing to start.
+pub fn verify_recipes() -> Result<BTreeMap<String, RecipeSpec>, LoadError> {
+    let Some(path) = env_path(ENV_USER_CONFIG) else {
+        return Ok(BTreeMap::new());
+    };
+    let config: UserConfig = layer(&path, UserConfig::from_toml_str)?;
+    Ok(config.verify.map(|verify| verify.recipes).unwrap_or_default())
 }
 
 /// The policy this run's configuration describes, over what its backend

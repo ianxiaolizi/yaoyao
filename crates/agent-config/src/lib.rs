@@ -17,6 +17,7 @@
 pub mod budget;
 pub mod layers;
 pub mod resolve;
+pub mod verify;
 
 pub use budget::{BudgetPolicy, BudgetResolution, resolve_context_budget};
 
@@ -30,6 +31,7 @@ pub use resolve::{
     Directive, Layers, McpServerConfig, McpTransport, ResolvedLaya, ResolvedPolicy,
     ResolvedProfile, SchemaPolicy, SubagentConfig, SubagentKind, resolve,
 };
+pub use verify::{RecipeSpec, TARGET_PLACEHOLDER, VerifySpec};
 
 /// Why a configuration could not be resolved.
 ///

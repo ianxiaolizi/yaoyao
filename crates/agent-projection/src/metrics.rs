@@ -58,6 +58,9 @@ pub struct SessionMetrics {
     pub turns: TurnMetrics,
     pub runs: RunMetrics,
     pub tools: ToolMetrics,
+    /// What the log says about the work itself: how much was changed, how
+    /// often it was checked, and the digest of the last change.
+    pub task: TaskMetrics,
     pub approvals: ApprovalMetrics,
     pub compactions: CompactionMetrics,
     pub tokens: TokenMetrics,
@@ -124,6 +127,31 @@ pub struct ToolMetrics {
     /// `tool/failed` events that were not refusals, by tool name — calls that
     /// ran (or tried to) and came back unsuccessful.
     pub failures_by_tool: BTreeMap<String, u64>,
+}
+
+/// What the log says about the work: edits, checks, and the last change.
+///
+/// Edits are successful `fs.write` / `fs.edit` calls only. A write that failed
+/// did not change the file, and counting it would make a session that could not
+/// write look busy. Checks are of two kinds because the vocabulary has two: a
+/// verification is a program the operator ran deliberately, a criterion check
+/// is the completion gate asking its own question. Both are evidence; neither
+/// is the other, so they are counted apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct TaskMetrics {
+    /// `tool/completed` for `fs.write` and `fs.edit`.
+    pub edits: u64,
+    /// `verification/recorded`.
+    pub verifications: u64,
+    /// `completion/checked`.
+    pub criterion_checks: u64,
+    /// The path of the last recorded change, and the digest of what the file
+    /// became — the snapshot's `after_sha256`, not a hash of the model's
+    /// arguments. Absent until a change manifest records one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_modified_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_modified_sha256: Option<String>,
 }
 
 /// Approval counters.
@@ -290,7 +318,10 @@ fn apply(metrics: &mut SessionMetrics, state: &mut FoldState, stored: &StoredEve
             count_ending(metrics, state, event, "interrupted", "interrupted")
         }
         EventType::TOOL_STARTED => metrics.tools.calls += 1,
-        EventType::TOOL_COMPLETED => metrics.tools.completed += 1,
+        EventType::TOOL_COMPLETED => {
+            metrics.tools.completed += 1;
+            count_edit(metrics, event);
+        }
         EventType::TOOL_FAILED => count_tool_failure(metrics, event),
         EventType::TOOL_CANCELLED => metrics.tools.cancelled += 1,
         EventType::TOOL_INTERRUPTED => metrics.tools.interrupted += 1,
@@ -307,7 +338,43 @@ fn apply(metrics: &mut SessionMetrics, state: &mut FoldState, stored: &StoredEve
         EventType::MODEL_ATTEMPT_STARTED => metrics.tokens.attempts += 1,
         EventType::MODEL_RESPONSE_COMPLETED => count_response(metrics, state, event),
         EventType::JUDGMENT_REQUIRED => metrics.judgment_required += 1,
+        EventType::VERIFICATION_RECORDED => metrics.task.verifications += 1,
+        EventType::COMPLETION_CHECKED => metrics.task.criterion_checks += 1,
+        EventType::WORKSPACE_CHANGES_RECORDED => record_last_change(metrics, event),
         _ => {}
+    }
+}
+
+/// A completed write or edit is an edit; anything else that completed is not.
+fn count_edit(metrics: &mut SessionMetrics, event: &EventDraft) {
+    let tool = event.payload.get("tool_name").and_then(serde_json::Value::as_str);
+    if matches!(tool, Some("fs.write") | Some("fs.edit")) {
+        metrics.task.edits += 1;
+    }
+}
+
+/// Keep the last change that names the digest of what the file became.
+///
+/// The manifest is read field by field rather than deserialized as
+/// [`agent_protocol::workspace_snapshot::ChangeManifest`]: a metrics fold is
+/// about the counts it can see, and a payload that has drifted from the type
+/// (an older log, a truncated write) should cost the report one change, not the
+/// whole fold. An entry without a path or without a digest is skipped, and a
+/// payload without a `changes` array is ignored.
+fn record_last_change(metrics: &mut SessionMetrics, event: &EventDraft) {
+    let Some(changes) = event.payload.get("changes").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for change in changes {
+        let path = change.get("relative_path").and_then(serde_json::Value::as_str);
+        let digest = change
+            .get("after_sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| !digest.is_empty());
+        if let (Some(path), Some(digest)) = (path, digest) {
+            metrics.task.last_modified_path = Some(path.to_string());
+            metrics.task.last_modified_sha256 = Some(digest.to_string());
+        }
     }
 }
 
@@ -925,6 +992,147 @@ mod tests {
         // The child's own row still counts what its log contains.
         assert_eq!(report.sessions[0].metrics.turns.started, 1);
         assert_eq!(report.sessions[0].metrics.runs.started, 2);
+    }
+
+    #[test]
+    fn edits_are_counted_only_when_the_write_completed() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write" }),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.edit" }),
+                "2026-01-01T00:00:01Z",
+            ),
+            // A failed write changed nothing a report should call work.
+            draft(
+                "s",
+                EventType::TOOL_FAILED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write" }),
+                "2026-01-01T00:00:02Z",
+            ),
+            // A completed read is a completed call, not an edit.
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.read" }),
+                "2026-01-01T00:00:03Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.task.edits, 2);
+        assert_eq!(metrics.tools.completed, 3);
+    }
+
+    #[test]
+    fn a_verification_and_a_criterion_check_are_counted_apart() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::VERIFICATION_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "check_id": "c1" }),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::COMPLETION_CHECKED,
+                None,
+                None,
+                serde_json::json!({ "status": "completed" }),
+                "2026-01-01T00:00:01Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.task.verifications, 1);
+        assert_eq!(metrics.task.criterion_checks, 1);
+    }
+
+    #[test]
+    fn the_last_change_digest_is_the_last_one_recorded() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::WORKSPACE_CHANGES_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "changes": [
+                    { "relative_path": "a.js", "after_sha256": "aaaa" },
+                    { "relative_path": "b.js", "after_sha256": "bbbb" },
+                ] }),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::WORKSPACE_CHANGES_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "changes": [
+                    { "relative_path": "c.js", "after_sha256": "cccc" },
+                ] }),
+                "2026-01-01T00:00:01Z",
+            ),
+            // A later change without a digest — a deletion — does not erase the
+            // last file that had one.
+            draft(
+                "s",
+                EventType::WORKSPACE_CHANGES_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "changes": [{ "relative_path": "d.js" }] }),
+                "2026-01-01T00:00:02Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.task.last_modified_path.as_deref(), Some("c.js"));
+        assert_eq!(metrics.task.last_modified_sha256.as_deref(), Some("cccc"));
+    }
+
+    #[test]
+    fn a_malformed_changes_payload_is_ignored_and_the_fold_continues() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::WORKSPACE_CHANGES_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "changes": "not a list" }),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::WORKSPACE_CHANGES_RECORDED,
+                None,
+                None,
+                serde_json::json!({ "changes": [7, null, { "relative_path": "e.js", "after_sha256": "" }] }),
+                "2026-01-01T00:00:01Z",
+            ),
+            draft(
+                "s",
+                EventType::TOOL_COMPLETED,
+                None,
+                None,
+                serde_json::json!({ "tool_name": "fs.write" }),
+                "2026-01-01T00:00:02Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert!(metrics.task.last_modified_path.is_none(), "no entry carried a digest");
+        assert_eq!(metrics.task.edits, 1, "the rest of the log still counts");
     }
 
     #[test]

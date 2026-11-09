@@ -108,6 +108,12 @@ pub struct UserConfig {
     /// can only ever *narrow* what the host allows (`AGENT_TOOL_SECRETS`): an
     /// absent section narrows nothing, and `allow = []` turns secret use off.
     pub secrets: Option<SecretsSpec>,
+    /// Named checks the user runs with `agent verify --recipe <name>`.
+    ///
+    /// Here rather than in a project for the reason every authorization is:
+    /// a recipe names a program to run, and a repository that could define one
+    /// could define the check its own work is graded by. See [`crate::verify`].
+    pub verify: Option<crate::verify::VerifySpec>,
 }
 
 /// The `[secrets]` section: which names a reference may use.
