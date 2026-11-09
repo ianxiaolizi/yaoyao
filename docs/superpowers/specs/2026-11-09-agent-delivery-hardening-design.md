@@ -176,6 +176,8 @@ snapshot 已经是爻爻的事实来源。下一阶段应让“改动”面板�
 3. 对需要进程/渲染的任务，提供明确的“切换 app-container / 接受降级 / 取消”三分支。
 4. 不在 local 后端静默生成“可导出视频页”并称为视频完成。
 
+> **执行记录（2026-11-09）**：Phase 1 已按 `docs/superpowers/plans/2026-11-09-capability-preamble-and-stop-rules.md` 实现。偏差：第 1 条不停在 `NeedsUserInput`，而是新增 `capability_blocked` 结束（turn completed + `incomplete: true`，正文即三分支提问），因为无挂起调用的 yield 在本构建里不可恢复；计数在 turn 内而非 run 内；本构建的 risk-l3 拒绝即 `sandbox_unavailable` 层，`rule`/`managed_policy` 拒绝按调用级决策处理、不计数。理由与验证见该计划的 Execution Notes。
+
 ### Phase 2：验证闭环与收敛
 
 1. 增加 Web artifact 的 browser render / screenshot / console check。
