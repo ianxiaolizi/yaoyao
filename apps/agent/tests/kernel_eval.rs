@@ -100,7 +100,7 @@ const INVOCATION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Approval is a pause, not a failure. Ten is generous for these fixtures and
 /// small enough that a loop in the harness itself is caught.
-const MAX_APPROVALS: usize = 10;
+const MAX_APPROVALS: usize = 64;
 
 /// The check command as the model is told to run it.
 ///
@@ -1046,14 +1046,15 @@ fn run_turn(
 
         // `deny` is answerable from anywhere — it only takes permission away.
         // `approve` is not: since B4 it needs a terminal, because a pipe cannot
-        // prove a person is watching. A fixture that starts to raise a call
-        // needing a yes will fail here with "an approval must come from an
-        // interactive terminal"; the answer is to settle it in process
-        // (`ApprovalAuthority::test()`), not to widen the grant or the scope.
+        // prove a person is watching. High-risk calls also require one
+        // confirmation per action, so approve `once` and let the loop raise the
+        // next command's approval if the model needs another call. A fixture
+        // that starts to raise one under a pipe still fails with the terminal
+        // diagnostic; this target is run from an interactive personal console.
         let decision = if deny_approvals {
             run_agent(repo, &["deny", &id, "--only", "--session", SESSION, "--events"])
         } else {
-            run_agent(repo, &["approve", &id, "turn", "--session", SESSION, "--events"])
+            run_agent(repo, &["approve", &id, "once", "--session", SESSION, "--events"])
         };
         assert!(decision.status.success(), "settle {id} failed: {}", decision.stderr);
         // The decision's own record belongs to the chain the fixture reads: a

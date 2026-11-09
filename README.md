@@ -120,6 +120,18 @@ cargo run -p agent -- --profile coding ask "hello"
 `[network] allow` 限定；它不会被解释成命令的 origin allowlist。不需要联网时继续用
 `coding` + `deny`。
 
+### 真实模型评测门
+
+在个人配置和真实模型环境变量就绪后运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\personal\eval.ps1 -Runs 3
+```
+
+脚本只打印通过/失败和报告路径，不打印 key；报告写到
+`%LOCALAPPDATA%\yaoyao-agent\eval\`。没有完成至少 3 次真实端点评测时，不应把构建称为
+personal build ready。
+
 连接 OpenAI-compatible 端点：
 
 ```powershell
