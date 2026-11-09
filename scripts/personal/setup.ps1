@@ -136,9 +136,12 @@ try {
 }
 
 if ($doctorCode -ne 0) {
-    if ($sandbox -eq 'app-container') {
+    $doctorText = $doctorOutput -join "`n"
+    $appContainerNotReady = $sandbox -eq 'app-container' -and
+        $doctorText -match 'setup is not in place|null-device grant is missing'
+    if ($appContainerNotReady) {
         Stop-Setup "setup: AppContainer is not ready. In an elevated PowerShell run:`n  `"$exe`" sandbox setup`nor install the boot task:`n  powershell -ExecutionPolicy Bypass -File `"$repo\scripts\sandbox-boot-task.ps1`" -Install" 2
     }
-    Stop-Setup 'setup: agent doctor failed; fix the reported prerequisite and run setup again' 2
+    Stop-Setup 'setup: agent doctor reported another prerequisite or data-health failure; fix the reported check and run setup again' 2
 }
 Write-Output 'setup: ready'
