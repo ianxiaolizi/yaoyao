@@ -143,6 +143,16 @@ $env:AGENT_MODEL_API_KEY = '<your-key>'
 
 凭据只通过环境变量传入，不写入仓库、事件日志或模型上下文。
 
+### 便携包
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\personal\package.ps1
+```
+
+输出在 `scripts\personal\dist\yaoyao-personal\`：`agent.exe`、`启动爻爻.cmd`、
+`config.example.toml`、`README.txt` 和仅供对照的 `web\dist`。包内没有 API key、
+事件日志、`.agent-data` 或开发机的 `start.local.ps1`。
+
 ## 本地 Web GUI
 
 `agent web` 在同一个进程、同一个二进制里起一个只绑 `127.0.0.1` 的页面：

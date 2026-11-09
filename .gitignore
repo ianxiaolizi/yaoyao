@@ -63,3 +63,6 @@ credentials.*
 
 # 本机的启动配置（可能含密钥），不要提交
 scripts/gui/start.local.ps1
+
+# Personal package output
+scripts/personal/dist/
