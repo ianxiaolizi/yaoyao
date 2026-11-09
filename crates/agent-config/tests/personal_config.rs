@@ -34,10 +34,37 @@ fn personal_profiles_resolve_with_narrow_defaults() {
         agent_protocol::permissions::PolicyDecision::Ask
     );
 
+    let online = resolved("coding-online");
+    assert!(
+        online
+            .capability_set
+            .contains(&agent_protocol::permissions::Capability::new("network.request"))
+    );
+    assert_eq!(
+        online
+            .policy
+            .overrides
+            .iter()
+            .find(|d| d.capability.as_str() == "network.request")
+            .unwrap()
+            .decision,
+        agent_protocol::permissions::PolicyDecision::Allow
+    );
+
     let research = resolved("research");
     assert!(
         research
             .capability_set
             .contains(&agent_protocol::permissions::Capability::new("network.request"))
+    );
+    assert_eq!(
+        research
+            .policy
+            .overrides
+            .iter()
+            .find(|d| d.capability.as_str() == "network.request")
+            .unwrap()
+            .decision,
+        agent_protocol::permissions::PolicyDecision::Ask
     );
 }
