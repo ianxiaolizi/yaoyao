@@ -18,6 +18,7 @@ import {
   loadSessions,
   loadSession,
   loadPlan,
+  loadStatus,
   loadSubagents,
   loadTranscript,
   loadWhy,
@@ -65,6 +66,20 @@ async function refreshSessions(): Promise<void> {
     store.dispatch({ type: 'sessions/loaded', sessions });
   } catch (error) {
     say((error as Error).message || '会话列表没有读出来', true);
+  }
+}
+
+/**
+ * Re-read the kernel's status fold. A failed read is not fatal: the top pill
+ * falls back to the turn's own ending and the transcript keeps working.
+ */
+async function refreshStatus(id: string): Promise<void> {
+  try {
+    const status = await loadStatus(id);
+    if (store.get().active !== id) return;
+    store.dispatch({ type: 'status/loaded', status });
+  } catch {
+    // keep the last known status; the next terminal event retries
   }
 }
 
@@ -225,6 +240,7 @@ function connect(id: string): void {
               store.dispatch({ type: 'waiting', waiting: false });
               void refreshSummary(id);
               void refreshSessions();
+              void refreshStatus(id);
             }
           },
           onLive: (live) => {
@@ -265,10 +281,17 @@ async function openSession(id: string, summary: SessionSummary | null = null): P
   streamController?.abort();
   store.dispatch({ type: 'session/select', id, summary });
   try {
-    const [fresh, transcript] = await Promise.all([loadSession(id), loadTranscript(id)]);
+    const [fresh, transcript, status] = await Promise.all([
+      loadSession(id),
+      loadTranscript(id),
+      // A missing status is not a missing transcript: the page keeps the
+      // conversation and falls back to the turn's own ending.
+      loadStatus(id).catch(() => null),
+    ]);
     if (store.get().active !== id) return;
     store.dispatch({ type: 'summary/loaded', summary: fresh });
     store.dispatch({ type: 'transcript/loaded', transcript });
+    if (status) store.dispatch({ type: 'status/loaded', status });
     store.dispatch({ type: 'running', running: Boolean(fresh.open_turn) && !fresh.yielded });
     store.dispatch({ type: 'waiting', waiting: Boolean(fresh.yielded) || Number(fresh.pending_approvals) > 0 });
     syncArtifacts();
@@ -358,6 +381,7 @@ const actions: Actions = {
       say('已继续这一轮');
       connect(id);
       setTimeout(() => void refreshSummary(id), 800);
+      void refreshStatus(id);
     } catch (error) {
       say((error as Error).message || '续跑请求没有送达', true);
     }

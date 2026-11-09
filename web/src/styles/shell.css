@@ -209,6 +209,22 @@ body {
 .y-top .sp {
   flex: 1;
 }
+/* The latest session's status, in the kernel's words; informational, never modal. */
+.y-status-note {
+  flex: none;
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.y-status-note.warn,
+.y-status-note.fail {
+  background: var(--red-soft);
+  border-bottom-color: var(--red-line);
+  color: var(--red);
+}
 
 .y-stage {
   position: relative;
@@ -612,6 +628,17 @@ body {
 .y-composer:focus-within {
   border-color: var(--accent-line);
   box-shadow: 0 0 0 3px var(--accent-ring);
+}
+/* A local backend can edit files but cannot start a command or render: say so
+   where the next request is typed, without blocking it. */
+.y-env-note {
+  margin: 0 0 7px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  line-height: 1.55;
 }
 .y-composer textarea {
   display: block;

@@ -1,3 +1,5 @@
+import type { SessionStatus } from './types';
+
 export function esc(value: unknown): string {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -243,7 +245,9 @@ export function turnStatus(item: { ending?: string; stop_reason?: string } | und
   if (!item) return { label: '进行中', className: 'run' };
   switch (item.ending) {
     case 'answered':
-      return { label: '完成', className: 'done' };
+      // The model gave a final text, not proof of completion. Only the
+      // kernel's status axes may say "verified complete" (CONTRACT §7 #166).
+      return { label: '已回答', className: 'done' };
     case 'max_steps':
       return { label: '达到步数上限', className: 'fail' };
     case 'limit_reached':
@@ -259,4 +263,36 @@ export function turnStatus(item: { ending?: string; stop_reason?: string } | und
     default:
       return { label: item.ending ?? '完成', className: 'done' };
   }
+}
+
+/**
+ * The latest session's status, in the kernel's own vocabulary.
+ *
+ * `answered` is not completion; only `verified_complete` may say so. When the
+ * status endpoint has not answered yet, the page keeps the weaker turn wording
+ * rather than inventing a verdict.
+ */
+export function sessionStatusLabel(status: SessionStatus | null): { label: string; className: string } {
+  if (!status) return { label: '已回答', className: 'done' };
+  if (status.completion_status === 'verified_complete') return { label: '已验证完成', className: 'done' };
+  if (status.verification_status === 'unverified') return { label: '已交付 · 未验证', className: 'unverified' };
+  if (status.verification_status === 'stale') return { label: '验证已过期', className: 'fail' };
+  if (status.verification_status === 'not_applicable') return { label: '已回答', className: 'done' };
+  if (status.completion_status === 'blocked_or_parked') return { label: '未完成 · 已阻塞', className: 'fail' };
+  return { label: '已回答', className: 'done' };
+}
+
+/** The one sentence a non-clean status earns; null when nothing needs saying. */
+export function sessionStatusNote(status: SessionStatus | null): string | null {
+  if (!status) return null;
+  if (status.verification_status === 'unverified') {
+    return '结果已交付，但没有通过完成检查。请先检查产出；未验证的交付不等于完成。';
+  }
+  if (status.verification_status === 'stale') {
+    return '上一次验证已不再覆盖当前改动。继续修改后需要重新验证。';
+  }
+  if (status.completion_status === 'blocked_or_parked') {
+    return '这次运行没有形成可验证的完成结论。请查看证据面板或继续处理。';
+  }
+  return null;
 }

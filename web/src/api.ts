@@ -1,4 +1,4 @@
-import type { Item, Meta, ModelChoice, SessionSummary, Transcript, WhyReport } from './types';
+import type { Item, Meta, ModelChoice, SessionStatus, SessionSummary, Transcript, WhyReport } from './types';
 
 export class ApiError extends Error {
   readonly code: string;
@@ -59,6 +59,11 @@ export async function loadSession(id: string): Promise<SessionSummary> {
 
 export async function loadTranscript(id: string): Promise<Transcript> {
   return api<Transcript>(`/api/sessions/${encodeURIComponent(id)}/transcript`);
+}
+
+/** The kernel's delivery/verification fold; the page never re-derives it. */
+export async function loadStatus(id: string): Promise<SessionStatus> {
+  return api<SessionStatus>(`/api/sessions/${encodeURIComponent(id)}/status`);
 }
 
 export async function startTurn(id: string, text: string): Promise<void> {

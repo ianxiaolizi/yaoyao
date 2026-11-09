@@ -1,5 +1,5 @@
 import type { ArtifactView, Item, ModelOption, PanelKey, SessionSummary } from './types';
-import { argsSummary, dueTime, duration, esc, fmtTokens, mdDoc, mdText, relativeTime, turnStatus } from './format';
+import { argsSummary, dueTime, duration, esc, fmtTokens, mdDoc, mdText, relativeTime, sessionStatusLabel, sessionStatusNote, turnStatus } from './format';
 import { artifactLabel, artifactRefs } from './artifacts';
 import type { PanelState, State, Store } from './state';
 
@@ -513,6 +513,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
         <button class="btn" id="details" type="button" aria-expanded="false">详情</button>
         <button class="ibtn" id="more" type="button" aria-label="更多">⋯</button>
       </header>
+      <div class="y-status-note" id="statusNote" hidden></div>
       <div class="y-evpop" id="evpop" hidden>
         <div class="pop-h">本轮详情<span class="sp"></span><span class="esc">Esc</span></div>
         ${PANEL_TABS.map((tab) => `<button class="pop-item" type="button" data-evpanel="${tab.key}">${tab.label}<span class="v">›</span></button>`).join('')}
@@ -556,6 +557,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
         <div class="y-composer">
           <div class="y-model-menu" id="modelMenu" role="menu" aria-label="选择模型" hidden></div>
           <div class="y-model-menu" id="policyMenu" role="menu" aria-label="审批策略" hidden></div>
+          <div class="y-env-note" id="envNote" hidden></div>
           <textarea id="input" rows="1" placeholder="继续补充要求，或输入 / 命令…"></textarea>
           <div class="y-comp-row">
             <button class="y-chip" type="button" id="attach" aria-label="附件上传（v1.1）" title="附件上传留在 v1.1" disabled>${svg(ICON.plus, 13)}</button>
@@ -591,6 +593,8 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   const title = $('#title');
   const round = $('#round');
   const statusPill = $('#statusPill');
+  const statusNote = $('#statusNote');
+  const envNote = $('#envNote');
   const sessionList = $('#sessionList');
   const sessionCount = $('#sessionCount');
   const trace = $('#trace');
@@ -1418,13 +1422,30 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     if (archiveItem && archiveItem.dataset.armed !== '1') {
       archiveItem.textContent = archived ? '恢复此会话' : '归档此会话';
     }
+    // The top pill reports the kernel's fold for the latest session, not the
+    // turn's ending. Only a session with a current turn may carry a claim.
+    const sessionStatus = current ? state.status : null;
+    const sessionLabel = sessionStatusLabel(sessionStatus);
     statusPill.innerHTML = state.running
       ? '<span class="pill run"><i></i>运行中</span>'
       : state.waiting || pending
         ? '<span class="pill wait"><i></i>等待确认</span>'
         : current
-          ? `<span class="pill ${status.className}"><i></i>${status.label}</span>`
+          ? `<span class="pill ${sessionStatus ? sessionLabel.className : status.className}"><i></i>${sessionStatus ? sessionLabel.label : status.label}</span>`
           : '';
+
+    const note = current ? sessionStatusNote(sessionStatus) : null;
+    statusNote.hidden = !note;
+    statusNote.textContent = note ?? '';
+    statusNote.className = note
+      ? `y-status-note ${sessionLabel.className === 'unverified' ? 'warn' : 'fail'}`
+      : 'y-status-note';
+
+    const local = state.meta?.sandbox === 'local';
+    envNote.hidden = !local;
+    envNote.textContent = local
+      ? '当前是 local 后端：爻爻可以编辑文件，但不会启动命令或渲染进程。需要构建、测试、导出视频时，请用 app-container 启动。'
+      : '';
     stop.hidden = !state.running;
     send.disabled = !stateHasToken() || !input.value.trim() || Boolean(gateOf(state));
     details.title = '证据面板（M5）';

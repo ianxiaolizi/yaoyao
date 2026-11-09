@@ -1,4 +1,4 @@
-import type { ArtifactView, Item, Live, Meta, ModelChoice, PanelKey, SessionSummary, Transcript } from './types';
+import type { ArtifactView, Item, Live, Meta, ModelChoice, PanelKey, SessionStatus, SessionSummary, Transcript } from './types';
 
 export interface PanelState {
   key: PanelKey;
@@ -16,6 +16,8 @@ export interface State {
   summary: SessionSummary | null;
   /** A model chosen for a session that has no summary yet (created by the click). */
   chosenModel: ModelChoice | null;
+  /** The kernel's status fold for the active session; null until it loads. */
+  status: SessionStatus | null;
   items: Map<string, Item>;
   head: number;
   running: boolean;
@@ -41,6 +43,8 @@ export type Action =
   | { type: 'session/select'; id: string; summary: SessionSummary | null }
   | { type: 'session/new'; id: string }
   | { type: 'summary/loaded'; summary: SessionSummary }
+  | { type: 'status/loaded'; status: SessionStatus }
+  | { type: 'status/cleared' }
   | { type: 'model/select'; model: ModelChoice }
   | { type: 'transcript/loaded'; transcript: Transcript }
   | { type: 'item/upsert'; item: Item }
@@ -71,6 +75,7 @@ export function initialState(): State {
     active: null,
     summary: null,
     chosenModel: null,
+    status: null,
     items: new Map(),
     head: 0,
     running: false,
@@ -102,6 +107,7 @@ export function reduce(state: State, action: Action): State {
         active: action.id,
         summary: action.summary,
         chosenModel: null,
+        status: null,
         items: new Map(),
         head: 0,
         live: null,
@@ -123,6 +129,7 @@ export function reduce(state: State, action: Action): State {
         active: action.id,
         summary: null,
         chosenModel: null,
+        status: null,
         items: new Map(),
         head: 0,
         live: null,
@@ -148,6 +155,10 @@ export function reduce(state: State, action: Action): State {
       };
     case 'model/select':
       return { ...state, chosenModel: action.model };
+    case 'status/loaded':
+      return { ...state, status: action.status };
+    case 'status/cleared':
+      return { ...state, status: null };
     case 'transcript/loaded':
       return {
         ...state,

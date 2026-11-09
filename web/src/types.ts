@@ -27,6 +27,16 @@ export interface Meta {
   models?: ModelOption[];
 }
 
+/** The kernel's status axes for one session, as `/api/sessions/{id}/status` folds them. */
+export interface SessionStatus {
+  v: number;
+  session: string;
+  run_status: 'in_progress' | 'completed' | 'interrupted' | 'failed' | null;
+  delivery_status: 'delivered' | 'unanswered' | null;
+  verification_status: 'verified' | 'unverified' | 'stale' | 'not_applicable' | 'blocked' | null;
+  completion_status: 'verified_complete' | 'blocked_or_parked' | null;
+}
+
 export interface SessionSummary {
   id: string;
   title: string;
