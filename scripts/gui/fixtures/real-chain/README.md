@@ -1,7 +1,14 @@
-# real-chain fixture
+﻿# real-chain fixture
 
-Captured by `node scripts/gui/capture-real-chain.mjs` on 2026-11-02T12:39:15.056Z.
+Captured by `node scripts/gui/capture-real-chain.mjs --live` on 2026-11-09T09:05:59.266Z.
 
 One turn driven by the real binary: scheduler, tool gateway, filesystem and `git diff`.
-The model was the scripted loopback stub (no vendor credential on this machine).
-The only rewritten text is the throwaway workspace path (`<workspace>`).
+
+- Model: `deepseek-flash`
+- Provider: OpenAI-compatible (`openai`)
+- Events: 138
+- Capture mode: live vendor endpoint
+
+Redaction rewrites the throwaway workspace path to `<workspace>`. The capture also
+replaces the API key, local user name and host name if they appear. This fixture
+was checked against all four and only the workspace path was present.

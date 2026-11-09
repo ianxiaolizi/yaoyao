@@ -85,8 +85,9 @@ node scripts/gui/perf.mjs  # 本机性能对照 perf-baseline.json
 ## 还没做
 
 - Office 保真：标题、合并单元格、日期已补；图片与 run 级样式（粗体/字号/颜色）仍未还原
-- 真实 vendor 模型：本机没有 `AGENT_MODEL_API_KEY`；有 key 时
-  `node scripts/gui/capture-real-chain.mjs --live` 可以重采真实执行链
+- 真实 vendor 模型：2026-11-09 已用 `deepseek-flash` 的 OpenAI 兼容端点重采
+  138 事件并脱敏；`smoke.mjs` 直接回放这份 live fixture。换模型或端点后运行
+  `node scripts/gui/capture-real-chain.mjs --live` 重采
 - 按工作区分组：一个进程只有一份 workspace，摘要也没有 workspace 字段；目前是最近 6 条 +
   「全部会话」，等多工作区再补
 - 自动批准：不做。审批是人对一次具体动作的答复，`CONTRACT.md` #178 明确禁止绕过

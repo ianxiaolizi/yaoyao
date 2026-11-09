@@ -213,19 +213,35 @@ async function main() {
     .trim()
     .split('\n')
     .map((line) => JSON.parse(line));
-  // The throwaway directory is noise in a fixture that ships; nothing else is
-  // rewritten, so the timestamps, ids and bytes are the run's own.
-  const scrubbed = JSON.stringify(records).split(workspace.replace(/\\/g, '\\\\')).join('<workspace>');
+  // A fixture that ships must not carry the throwaway workspace, credential,
+  // user name or host name. Timestamps, ids and model/tool bytes stay intact.
+  const replacements = [
+    [workspace, '<workspace>'],
+    [process.env.AGENT_MODEL_API_KEY, '<api-key>'],
+    [process.env.USERNAME, '<user>'],
+    [process.env.COMPUTERNAME, '<host>'],
+  ].filter(([from]) => Boolean(from));
+  let scrubbed = JSON.stringify(records);
+  for (const [from, to] of replacements) {
+    scrubbed = scrubbed.split(from.replace(/\\/g, '\\\\')).join(to);
+    scrubbed = scrubbed.split(from).join(to);
+  }
   const events = JSON.parse(scrubbed);
+  const model = live ? (process.env.AGENT_MODEL_NAME || 'unknown') : 'scripted-stub';
 
   mkdirSync(fixtureDir, { recursive: true });
   writeFileSync(join(fixtureDir, 'events.jsonl'), events.map((row) => JSON.stringify(row)).join('\n') + '\n');
   writeFileSync(
     join(fixtureDir, 'README.md'),
-    `# real-chain fixture\n\nCaptured by \`node scripts/gui/capture-real-chain.mjs\` on ${new Date().toISOString()}.\n\n` +
-      'One turn driven by the real binary: scheduler, tool gateway, filesystem and `git diff`.\n' +
-      (live ? 'The model was the configured vendor endpoint.\n' : 'The model was the scripted loopback stub (no vendor credential on this machine).\n') +
-      'The only rewritten text is the throwaway workspace path (`<workspace>`).\n',
+    `# real-chain fixture\n\nCaptured by \`node scripts/gui/capture-real-chain.mjs${live ? ' --live' : ''}\` on ${new Date().toISOString()}.\n\n` +
+      'One turn driven by the real binary: scheduler, tool gateway, filesystem and `git diff`.\n\n' +
+      `- Model: \`${model}\`\n` +
+      '- Provider: OpenAI-compatible (`openai`)\n' +
+      `- Events: ${events.length}\n` +
+      '- Capture mode: ' + (live ? 'live vendor endpoint' : 'scripted loopback stub') + '\n\n' +
+      'Redaction replaces the throwaway workspace path (`<workspace>`), the API key\n' +
+      '(`<api-key>`), the local user name (`<user>`) and host name (`<host>`) when\n' +
+      'present. Timestamps, ids and model/tool output are otherwise the run\'s own.\n',
   );
 
   const tally = {};

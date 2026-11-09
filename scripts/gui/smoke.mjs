@@ -1178,15 +1178,21 @@ async function main() {
   // git diff), so the panels are checked against real event shapes too.
   await page.goto(`${origin}/?session=real-chain#t=${token}`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('.y-turn', { timeout: 15_000 });
-  check('真实执行链：标题取真实输入', (await text(page, '#title')).includes('parseRange'));
+  check('真实执行链：标题取真实输入', (await text(page, '#title')).includes('修一下'));
   check('真实执行链：行动行有 fs.read', await waitText(page, '#transcript', 'fs.read'));
   check('真实执行链：行动行有 git.diff', await waitText(page, '#transcript', 'git.diff'));
-  check('真实执行链：回答是模型原话', await waitText(page, '.y-answer', '闭区间'));
+  check('真实执行链：回答是模型原话', await waitText(page, '.y-answer', '改好了'));
+  check('真实执行链：回答保留最终结论', await waitText(page, '.y-answer', 'end 现在是闭区间'));
   await page.click('#details');
-  check('真实执行链：计划面板读到真实计划', await waitText(page, '#sheetBody', 'off-by-one'));
+  check(
+    '真实执行链：没有真计划时明确降级',
+    await waitText(page, '#sheetBody', '这个会话还没有 plan.update'),
+  );
   await page.click('[data-panel-tab="diff"]');
   check('真实执行链：改动面板读到真实文件', await waitText(page, '#sheetBody', 'src/parser.mjs'));
   check('真实执行链：patch 是 git 的输出', await waitText(page, '#sheetBody', 'diff --git'));
+  const realDiffText = await text(page, '#sheetBody');
+  check('真实执行链：diff 摘要来自工具结果', realDiffText.includes('+11') && realDiffText.includes('−3'));
   await page.click('[data-panel-tab="why"]');
   await page.waitForSelector('.y-why-verdict', { timeout: 10_000 }).catch(() => null);
   check('真实执行链：推理链节点成链', (await page.$$eval('.y-node', (nodes) => nodes.length)) >= 10);
@@ -1418,7 +1424,18 @@ async function main() {
       .catch(() => false),
   );
 
-  check('全程无 console error / pageerror / 4xx', errors.length === 0, errors.join(' | '));
+  // A live model need not emit `plan/updated`; asking for the missing plan is a
+  // legitimate 404 and the panel renders the API's explanation. Exclude exactly
+  // that pair and keep every other console/page/HTTP failure fatal.
+  const expectedPlan404 = errors.some((entry) => entry.includes('/api/sessions/real-chain/plan'));
+  const expectedConsole = 'console: Failed to load resource: the server responded with a status of 404 (Not Found)';
+  const unexpectedErrors = errors.filter(
+    (entry) =>
+      !entry.includes('/api/sessions/real-chain/plan') &&
+      !(expectedPlan404 && entry === expectedConsole),
+  );
+  check('真实执行链：缺计划 404 是预期降级', expectedPlan404);
+  check('全程无 console error / pageerror / 4xx', unexpectedErrors.length === 0, unexpectedErrors.join(' | '));
 
   if (failures.length) {
     throw new Error(`${failures.length} check(s) failed:\n- ${failures.join('\n- ')}`);
