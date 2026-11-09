@@ -175,6 +175,7 @@ async function showArtifact(locator: string): Promise<void> {
         rows: office.rows,
         merges: office.merges,
         sheet: office.sheet,
+        warnings: office.warnings,
         contentType: blob.type,
       };
     } else {

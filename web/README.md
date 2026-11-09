@@ -18,7 +18,7 @@ web/
     format.ts           时间、token、Markdown-lite、状态
     main.ts             启动、会话切换、SSE 生命周期、动作
     artifacts.ts        从 tool 输出里发现 artifact://sha256/<64>
-    office.ts           docx / xlsx 的页面侧解包与抽取
+    office.ts           docx / xlsx 的页面侧解包、run 样式与内嵌图片
     styles/
       tokens.css        来自 design/tokens.css（冻结）
       system.css        来自 design/system.css
@@ -43,8 +43,8 @@ web/
 - 证据侧板：计划 / 改动 / 推理链（`/why`）/ 上下文 / 子代理（递归两层）/ 定时；
   左缘可拖宽
 - 成果台：artifact 发现、图片 / HTML（sandbox iframe）/ Markdown（表格·链接·图片·有序列表）/
-  文本 / PDF / docx（标题样式）/ xlsx（合并单元格、日期格式），12% 条 / 展开 / 全屏，
-  Esc 逐层退出
+  文本 / PDF / docx（标题、粗斜体、字号、颜色、内嵌 PNG/JPEG/GIF/WebP）/ xlsx（合并单元格、
+  日期格式），12% 条 / 展开 / 全屏，Esc 逐层退出；缺关系文件或样式时显示降级说明
 - 命令面板（⌘K / Ctrl K）、导出 Markdown / JSON、分叉这一轮
 - 流：fetch-streaming SSE，Bearer 头，断线指数退避，`from=<seq>` 续传
 - 1440 / 1280 / 1080 / 720 / 390；`prefers-reduced-motion` 下无过渡与闪烁
@@ -84,7 +84,6 @@ node scripts/gui/perf.mjs  # 本机性能对照 perf-baseline.json
 
 ## 还没做
 
-- Office 保真：标题、合并单元格、日期已补；图片与 run 级样式（粗体/字号/颜色）仍未还原
 - 真实 vendor 模型：2026-11-09 已用 `deepseek-flash` 的 OpenAI 兼容端点重采
   138 事件并脱敏；`smoke.mjs` 直接回放这份 live fixture。换模型或端点后运行
   `node scripts/gui/capture-real-chain.mjs --live` 重采

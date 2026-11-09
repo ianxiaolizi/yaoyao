@@ -125,6 +125,31 @@ export interface WhyReport {
   check?: string;
 }
 
+export interface DocxRun {
+  text: string;
+  bold?: boolean;
+  italic?: boolean;
+  /** Points, from Word's half-point `w:sz`. */
+  size?: number;
+  /** Six-digit RGB without the leading #. */
+  color?: string;
+}
+
+export interface DocxImage {
+  /** Only embedded data URLs are accepted; never a remote URL. */
+  src?: string;
+  alt: string;
+  missing?: boolean;
+}
+
+export interface DocxBlock {
+  text: string;
+  /** 1–6 for a Word heading style; absent for body text. */
+  heading?: number;
+  runs?: DocxRun[];
+  image?: DocxImage;
+}
+
 export interface ArtifactView {
   kind: 'image' | 'html' | 'markdown' | 'text' | 'pdf' | 'docx' | 'xlsx';
   name: string;
@@ -133,8 +158,10 @@ export interface ArtifactView {
   contentType?: string;
   /** docx: one entry per paragraph. */
   paragraphs?: string[];
-  /** docx: the same paragraphs with Word heading levels kept. */
-  blocks?: { text: string; heading?: number }[];
+  /** docx: paragraphs with heading, run styles and relationship-backed images. */
+  blocks?: DocxBlock[];
+  /** Non-fatal Office downgrades shown above the preview. */
+  warnings?: string[];
   /** xlsx: cells of the first sheet, gaps padded so columns line up. */
   rows?: string[][];
   /** xlsx: merged ranges, 0-based and inclusive. */

@@ -1,4 +1,4 @@
-// The GUI smoke test, rewritten for M7.
+﻿// The GUI smoke test, rewritten for M7.
 //
 // The page is compiled into the binary, so this drives the binary a user gets:
 // `target/debug/agent.exe web`, no Vite, no `web/dist` on the served path. The
@@ -372,7 +372,7 @@ function zipBytes(entries) {
   const central = [];
   let offset = 0;
   for (const [name, content] of entries) {
-    const data = Buffer.from(content, 'utf8');
+    const data = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
     const packed = deflateRawSync(data);
     const nameBytes = Buffer.from(name, 'utf8');
     const header = Buffer.alloc(30);
@@ -409,10 +409,15 @@ function zipBytes(entries) {
 }
 
 function docxBytes() {
+  // A 1x1 PNG, kept as bytes so zipBytes proves embedded media survives intact.
+  const pixel = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  );
   return zipBytes([
     [
       '[Content_Types].xml',
-      '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+      '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
     ],
     [
       '_rels/.rels',
@@ -423,8 +428,13 @@ function docxBytes() {
       '<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style><w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Body Text"/></w:style></w:styles>',
     ],
     [
+      'word/_rels/document.xml.rels',
+      '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImage" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/pixel.png"/></Relationships>',
+    ],
+    ['word/media/pixel.png', pixel],
+    [
       'word/document.xml',
-      '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pStyle w:val="Heading1"/><w:r><w:t>M9 文档预览</w:t></w:r></w:p><w:p><w:r><w:t>第二段：docx 由页面解压读取。</w:t></w:r></w:p><w:p><w:r><w:t>第三个段落带 &amp; 一个转义符。</w:t></w:r></w:p></w:body></w:document>',
+      '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body><w:p><w:pStyle w:val="Heading1"/><w:r><w:t>M9 文档预览</w:t></w:r></w:p><w:p><w:r><w:rPr><w:b/><w:i/><w:sz w:val="32"/><w:color w:val="C0392B"/></w:rPr><w:t>加粗斜体红色大字</w:t></w:r><w:r><w:t> 普通正文</w:t></w:r></w:p><w:p><w:r><w:t>第二段：docx 由页面解压读取。</w:t></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="1" name="pixel" descr="内嵌 PNG"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><a:blip r:embed="rIdImage"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:t>第三个段落带 &amp; 一个转义符。</w:t></w:r></w:p></w:body></w:document>',
     ],
   ]);
 }
@@ -442,6 +452,32 @@ function xlsxBytes() {
     [
       'xl/worksheets/sheet1.xml',
       '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>3</v></c></row><row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2"><v>42</v></c><c r="C2" s="1"><v>45292</v></c></row><row r="3"><c r="A3" t="s"><v>4</v></c><c r="C3"><v>100</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A3:B3"/></mergeCells></worksheet>',
+    ],
+  ]);
+}
+
+function brokenDocxBytes() {
+  return zipBytes([
+    [
+      '[Content_Types].xml',
+      '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>',
+    ],
+    [
+      'word/document.xml',
+      '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body><w:p><w:r><w:t>降级文档正文仍可读。</w:t></w:r></w:p><w:p><w:r><w:drawing><wp:inline><wp:docPr id="2" name="missing" descr="缺图占位"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><a:blip r:embed="rIdMissing"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p></w:body></w:document>',
+    ],
+  ]);
+}
+
+function brokenXlsxBytes() {
+  return zipBytes([
+    [
+      'xl/sharedStrings.xml',
+      '<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>一月</t></si></sst>',
+    ],
+    [
+      'xl/worksheets/sheet1.xml',
+      '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" s="1"><v>45292</v></c></row></sheetData></worksheet>',
     ],
   ]);
 }
@@ -483,6 +519,8 @@ function seedArtifacts() {
     ['coverage.pdf', pdfBytes()],
     ['notes.docx', docxBytes()],
     ['numbers.xlsx', xlsxBytes()],
+    ['broken.docx', brokenDocxBytes()],
+    ['broken.xlsx', brokenXlsxBytes()],
   ]) {
     const { locator } = putArtifact(bytes);
     const call = `art-${label}`;
@@ -1023,7 +1061,7 @@ async function main() {
   // Artifacts: image, HTML, Markdown and PDF previews from the embedded page.
   await page.goto(`${origin}/?session=artifact-smoke#t=${token}`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#result:not([hidden])', { timeout: 15_000 });
-  check('成果条数', (await text(page, '#resultCount')).includes('6 个产出'));
+  check('成果条数', (await text(page, '#resultCount')).includes('8 个产出'));
   await page.click('#resultMore');
   await page.waitForSelector('.y-result.open', { timeout: 10_000 });
   await page.waitForSelector('#artifactPreview img', { timeout: 10_000 });
@@ -1076,11 +1114,36 @@ async function main() {
     (await text(page, '.y-art-docx h3')) === 'M9 文档预览',
     await text(page, '.y-art-docx h3'),
   );
+  const docxImage = await page.evaluate(() => {
+    const image = document.querySelector('.y-art-docx img');
+    return image ? { src: image.src, alt: image.alt } : null;
+  });
+  check('docx 嵌入图片走 data URL', Boolean(docxImage?.src.startsWith('data:image/png;base64,')), JSON.stringify(docxImage));
+  check('docx 图片保留 alt', docxImage?.alt === '内嵌 PNG', JSON.stringify(docxImage));
+  const docxRun = await page.evaluate(() => {
+    const node = [...document.querySelectorAll('.y-art-docx .y-run')].find((row) => row.textContent?.includes('加粗斜体'));
+    if (!node) return null;
+    const style = getComputedStyle(node);
+    return { text: node.textContent, weight: style.fontWeight, fontStyle: style.fontStyle, size: style.fontSize, color: style.color };
+  });
+  check('docx run 粗体', Number(docxRun?.weight) >= 600, JSON.stringify(docxRun));
+  check('docx run 斜体', docxRun?.fontStyle === 'italic', JSON.stringify(docxRun));
+  check('docx run 字号', parseFloat(docxRun?.size ?? '0') > 20, JSON.stringify(docxRun));
+  check('docx run 前景色', docxRun?.color === 'rgb(192, 57, 43)', JSON.stringify(docxRun));
+  await page.screenshot({ path: join(shots, 'm11-office.png') });
+  await page.click('#artifactList button:has-text("broken.docx")');
+  check('docx 缺关系文件仍显示正文', await waitText(page, '.y-art-docx', '降级文档正文仍可读'));
+  check('docx 缺图显示占位', await waitText(page, '.y-art-docx', '缺图占位'));
+  check('docx 缺图给出警告', await waitText(page, '.y-art-warning', '缺少图片关系文件'));
   await page.click('#artifactList button:has-text("numbers.xlsx")');
   check('xlsx 预览读到单元格', await waitText(page, '.y-art-sheet', '42'));
   check('xlsx 预览带工作表名', await waitText(page, '.y-art-sheet-name', 'sheet1.xml'));
   check('xlsx 日期格式', await waitText(page, '.y-art-sheet', '2024-01-01'));
   check('xlsx 合并单元格', await waitText(page, '.y-art-sheet td[colspan="2"]', '合计'));
+  await page.click('#artifactList button:has-text("broken.xlsx")');
+  check('xlsx 缺样式仍显示主体', await waitText(page, '.y-art-sheet', '一月'));
+  check('xlsx 缺样式降级为原值', await waitText(page, '.y-art-sheet', '45292'));
+  check('xlsx 缺样式给出警告', await waitText(page, '.y-art-warning', '缺少 xl/styles.xml'));
 
   await page.click('#resultFull');
   await page.waitForSelector('.y-result.full', { timeout: 10_000 });
@@ -1461,6 +1524,7 @@ async function main() {
           'm8-model.png',
           'm8-archive.png',
           'm9-real-chain.png',
+          'm11-office.png',
           'm10-unverified.png',
           'm10-verified.png',
           'm10-capability-blocked.png',
