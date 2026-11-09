@@ -49,6 +49,10 @@ const PANEL_TABS: { key: PanelKey; label: string }[] = [
   { key: 'schedules', label: '定时' },
 ];
 
+const LOCAL_BACKEND_NOTE =
+  '当前是 local 后端：爻爻可以编辑文件，但不会启动命令或渲染进程。需要构建、测试、导出视频时，请用 app-container 启动。';
+const DISMISSED_STATUS_KEY = 'yaoyao:dismissed-status-notes';
+
 export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   root.innerHTML = `<div class="y-app">
     <aside class="y-side" id="side">
@@ -70,7 +74,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
         <button class="btn" id="details" type="button" aria-expanded="false">详情</button>
         <button class="ibtn" id="more" type="button" aria-label="更多">⋯</button>
       </header>
-      <div class="y-status-note" id="statusNote" hidden></div>
+      <div class="y-status-note" id="statusNote" hidden><span id="statusNoteText"></span><button class="y-status-dismiss" id="statusNoteDismiss" type="button" aria-label="关闭状态说明">×</button></div>
       <div class="y-evpop" id="evpop" hidden>
         <div class="pop-h">本轮详情<span class="sp"></span><span class="esc">Esc</span></div>
         ${PANEL_TABS.map((tab) => `<button class="pop-item" type="button" data-evpanel="${tab.key}">${tab.label}<span class="v">›</span></button>`).join('')}
@@ -114,10 +118,10 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
         <div class="y-composer">
           <div class="y-model-menu" id="modelMenu" role="menu" aria-label="选择模型" hidden></div>
           <div class="y-model-menu" id="policyMenu" role="menu" aria-label="审批策略" hidden></div>
-          <div class="y-env-note" id="envNote" hidden></div>
           <textarea id="input" rows="1" placeholder="继续补充要求，或输入 / 命令…"></textarea>
           <div class="y-comp-row">
             <button class="y-chip" type="button" id="attach" aria-label="附件上传（v1.1）" title="附件上传留在 v1.1" disabled>${svg(ICON.plus, 13)}</button>
+            <button class="y-chip y-env-chip" type="button" id="envChip" aria-label="本地后端能力说明" hidden>local</button>
             <button class="y-chip" type="button" id="modelChip" aria-haspopup="menu" aria-expanded="false">模型</button>
             <button class="y-chip" type="button" id="policyChip" aria-haspopup="menu" aria-expanded="false" title="审批是逐个动作的门">审批：逐次</button>
             <span class="sp"></span>
@@ -151,7 +155,9 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   const round = $('#round');
   const statusPill = $('#statusPill');
   const statusNote = $('#statusNote');
-  const envNote = $('#envNote');
+  const statusNoteText = $('#statusNoteText');
+  const statusNoteDismiss = $<HTMLButtonElement>('#statusNoteDismiss');
+  const envChip = $<HTMLButtonElement>('#envChip');
   const sessionList = $('#sessionList');
   const sessionCount = $('#sessionCount');
   const trace = $('#trace');
@@ -190,6 +196,34 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   let lastActive: string | null = null;
   let lastGroups = 0;
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  let dismissedStatusNotes = new Set<string>();
+  try {
+    const stored = JSON.parse(localStorage.getItem(DISMISSED_STATUS_KEY) ?? '[]');
+    if (Array.isArray(stored)) {
+      dismissedStatusNotes = new Set(stored.filter((entry): entry is string => typeof entry === 'string'));
+    }
+  } catch {
+    // Dismissal is a convenience; a blocked storage area leaves the note visible.
+  }
+
+  function rememberDismissedStatus(key: string): void {
+    dismissedStatusNotes.add(key);
+    try {
+      localStorage.setItem(DISMISSED_STATUS_KEY, JSON.stringify([...dismissedStatusNotes].slice(-50)));
+    } catch {
+      // The current visit still keeps the note closed through the in-memory set.
+    }
+  }
+
+  statusNoteDismiss.addEventListener('click', () => {
+    const key = statusNote.dataset.noteKey;
+    if (key) rememberDismissedStatus(key);
+    statusNote.hidden = true;
+  });
+  envChip.addEventListener('click', () => {
+    if (store.get().meta?.sandbox !== 'local') return;
+    store.dispatch({ type: 'toast', toast: LOCAL_BACKEND_NOTE });
+  });
 
   // ── layout: the two widths a reader can drag ───────────────────────────
   interface WidthRule {
@@ -997,17 +1031,29 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
       current && !state.running && !state.waiting && !pending
         ? sessionStatusNote(sessionStatus)
         : null;
-    statusNote.hidden = !note;
-    statusNote.textContent = note ?? '';
+    const noteKey = note
+      ? [
+          state.active ?? '',
+          current?.turn ?? '',
+          sessionStatus?.run_status ?? '',
+          sessionStatus?.delivery_status ?? '',
+          sessionStatus?.verification_status ?? '',
+          sessionStatus?.completion_status ?? '',
+          sessionStatus?.stop_reason ?? '',
+        ].join('|')
+      : '';
+    const showNote = Boolean(note) && !dismissedStatusNotes.has(noteKey);
+    statusNote.hidden = !showNote;
+    statusNote.dataset.noteKey = noteKey;
+    statusNoteText.textContent = note ?? '';
     statusNote.className = note
       ? `y-status-note ${sessionLabel.className === 'unverified' ? 'warn' : 'fail'}`
       : 'y-status-note';
 
     const local = state.meta?.sandbox === 'local';
-    envNote.hidden = !local;
-    envNote.textContent = local
-      ? '当前是 local 后端：爻爻可以编辑文件，但不会启动命令或渲染进程。需要构建、测试、导出视频时，请用 app-container 启动。'
-      : '';
+    envChip.hidden = !local;
+    envChip.title = local ? LOCAL_BACKEND_NOTE : '';
+    envChip.setAttribute('aria-label', local ? `本地后端：${LOCAL_BACKEND_NOTE}` : '本地后端能力说明');
     stop.hidden = !state.running;
     send.disabled = !stateHasToken() || !input.value.trim() || Boolean(gateOf(state));
     details.title = '证据面板（M5）';

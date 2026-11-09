@@ -200,7 +200,14 @@ export async function run(ctx) {
     '事故回归：说明写明未验证不等于完成',
     await waitText(page, '#statusNote', '未验证的交付不等于完成'),
   );
-  check('事故回归：local 后端能力提示出现', await waitText(page, '#envNote', 'app-container'));
+  check('事故回归：local 长提示不再常驻', (await page.$('#envNote')) === null);
+  check('事故回归：local 后端有按需入口', await page.locator('#envChip').isVisible());
+  await page.click('#envChip');
+  check('事故回归：local 入口说明能力边界', await waitText(page, '#toast', 'app-container'));
+  check(
+    '事故回归：未验证提示可关闭',
+    await page.locator('#statusNoteDismiss').isVisible(),
+  );
   await page.hover('#details');
   await page.click('[data-evpanel="diff"]');
   await page.waitForSelector('#sheet.open', { timeout: 10_000 });
@@ -209,6 +216,13 @@ export async function run(ctx) {
     await waitText(page, '#sheetBody', '改动清单不完整'),
   );
   await page.screenshot({ path: join(ctx.shots, 'm10-unverified.png') });
+  await page.click('#sheetClose');
+  await page.click('#statusNoteDismiss');
+  check('事故回归：未验证提示关闭后隐藏', await page.$eval('#statusNote', (node) => node.hidden));
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('.y-turn', { timeout: 15_000 });
+  check('事故回归：刷新后同一提示仍保持关闭', await page.$eval('#statusNote', (node) => node.hidden));
+  check('事故回归：顶部未验证状态仍在', await waitText(page, '#statusPill', '已交付 · 未验证'));
 
   // The positive shape: a passing check is the only way to say verified complete.
   await page.goto(`${ctx.origin}/?session=verified-delivery#t=${ctx.token}`, { waitUntil: 'domcontentloaded' });
