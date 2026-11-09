@@ -36,9 +36,10 @@ function write(name, text) {
   return path;
 }
 
-function run(script, args) {
+function run(script, args, env = {}) {
   const result = spawnSync(process.execPath, [join(here, script), ...args], {
     encoding: 'utf8',
+    env: { ...process.env, ...env },
   });
   return { code: result.status, out: result.stdout ?? '', err: result.stderr ?? '' };
 }
@@ -82,13 +83,31 @@ expect('an empty render fails the check', blank.code === 1, `exit ${blank.code}`
 expect('the failure says nothing rendered', blank.err.includes('nothing rendered'), blank.err);
 
 const missing = run('web.mjs', ['--target', join(temp, 'not-there.html')]);
-expect('a missing target is a check that did not run', missing.code === 2, `exit ${missing.code}`);
+expect('a missing target is a failed check', missing.code === 1, `exit ${missing.code}`);
+expect('the failure names the missing target', missing.err.includes('target not found'), missing.err);
+
+const noBrowser = run(
+  'web.mjs',
+  ['--target', okPage],
+  { EDGE_PATH: join(temp, 'missing-browser.exe') },
+);
+expect('a missing browser is a check that did not run', noBrowser.code === 2, `exit ${noBrowser.code}: ${noBrowser.err}`);
 
 // -------------------------------------------------------------- video checks
 
 const text = write('not-a-video.webm', 'this is text, not a container');
 const notVideo = run('video.mjs', ['--target', text]);
 expect('a text file is not a video', notVideo.code === 1, `exit ${notVideo.code}`);
+const noVideoBrowser = run(
+  'video.mjs',
+  ['--target', text],
+  { EDGE_PATH: join(temp, 'missing-browser.exe') },
+);
+expect(
+  'a missing video browser is a check that did not run',
+  noVideoBrowser.code === 2,
+  `exit ${noVideoBrowser.code}: ${noVideoBrowser.err}`,
+);
 expect(
   'the failure says the file could not be decoded',
   notVideo.err.includes('CHECK_FAILED video'),
@@ -101,7 +120,8 @@ let generated = null;
 try {
   generated = await recordWebm(join(temp, 'recorded.webm'));
 } catch (error) {
-  console.error(`SKIP video generation: ${error.message}`);
+  failures.push(`video generation did not run: ${error.message}`);
+  console.error(`FAIL video generation: ${error.message}`);
 }
 
 if (generated) {
@@ -133,7 +153,7 @@ if (failures.length > 0) {
   console.error(`\n${failures.length} check(s) failed`);
   process.exit(1);
 }
-console.log(`\nselftest ok (${generated ? 'web + video' : 'web; video generation skipped'})`);
+console.log('\nselftest ok (web + video)');
 
 // ------------------------------------------------------------------ helpers
 

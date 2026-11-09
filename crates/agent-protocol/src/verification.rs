@@ -33,6 +33,14 @@ use crate::evidence::EvidenceStatus;
 /// a way that reads as a broken task.
 pub const DEFAULT_CHECK_TIMEOUT_MS: u64 = 120_000;
 
+/// The exit status the command-line contract uses for "nothing ran".
+///
+/// A check that was expected to exit zero and instead exited two did not
+/// produce a verdict about the work; it is an environment or invocation error.
+/// A caller that deliberately expects two can still make it a pass by setting
+/// `Expectation::exit_code` to two.
+pub const DID_NOT_RUN_EXIT: i32 = 2;
+
 fn default_timeout() -> u64 {
     DEFAULT_CHECK_TIMEOUT_MS
 }
@@ -192,13 +200,14 @@ impl CheckRun {
     ///
     /// 1. a program that could not run, or that ran out of time, is `error` —
     ///    nothing about the task follows from it;
-    /// 2. an exit status other than the expected one is `failed`;
-    /// 3. a missing expected substring is `failed`;
-    /// 4. an expectation about a test count the output did not carry is
+    /// 2. an unexpected command-line "did not run" status (`2`) is `error`;
+    /// 3. any other exit status than the expected one is `failed`;
+    /// 4. a missing expected substring is `failed`;
+    /// 5. an expectation about a test count the output did not carry is
     ///    `error` — the check ran but cannot be read, and calling that a pass
     ///    is exactly the silence this check exists to remove;
-    /// 5. a count that is readable and different is `failed`;
-    /// 6. otherwise `passed`.
+    /// 6. a count that is readable and different is `failed`;
+    /// 7. otherwise `passed`.
     ///
     /// The ordering matters at one place in particular: a program that printed
     /// the right text but exited nonzero is `failed`, not `passed`, because the
@@ -223,6 +232,15 @@ impl CheckRun {
             };
         };
         if code != expect.exit_code {
+            if code == DID_NOT_RUN_EXIT {
+                return CheckJudgement {
+                    status: EvidenceStatus::Error,
+                    reason: format!(
+                        "the check exited {code}, which means it did not run; expected {}",
+                        expect.exit_code
+                    ),
+                };
+            }
             return CheckJudgement {
                 status: EvidenceStatus::Failed,
                 reason: format!("the check exited {code}, not {}", expect.exit_code),
@@ -307,6 +325,21 @@ mod tests {
         // A non-zero status can be what the operator expects.
         assert_eq!(
             run.judge(&Expectation { exit_code: 1, ..Expectation::default() }).status,
+            EvidenceStatus::Passed
+        );
+    }
+
+    #[test]
+    fn an_unexpected_exit_two_means_the_check_did_not_run() {
+        let mut run = run();
+        run.exit_code = Some(2);
+        let verdict = run.judge(&Expectation::default());
+        assert_eq!(verdict.status, EvidenceStatus::Error, "{}", verdict.reason);
+        assert!(verdict.reason.contains("did not run"), "{}", verdict.reason);
+
+        // Waiting for a different status can make two the operator's answer.
+        assert_eq!(
+            run.judge(&Expectation { exit_code: 2, ..Expectation::default() }).status,
             EvidenceStatus::Passed
         );
     }

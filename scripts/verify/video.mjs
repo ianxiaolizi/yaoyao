@@ -13,7 +13,7 @@
 //        [--width <n>] [--height <n>]
 //
 // It prints one `CHECK_OK …` line on success and `CHECK_FAILED …` on stderr
-// with every reason it found, then exits 1. Bad arguments exit 2.
+// with every reason it found, then exits 1. Bad arguments or harness setup exit 2.
 //
 // Edge is expected at the default Windows path; override with EDGE_PATH.
 
@@ -42,6 +42,10 @@ let url;
 try {
   url = targetUrl(target);
 } catch (error) {
+  if (error.failed) {
+    report(error.reasons);
+    process.exit(1);
+  }
   usage(error.message);
 }
 
@@ -52,9 +56,17 @@ try {
   // local check of a local artifact, so the relaxation is scoped to the browser
   // this script starts and nothing else.
   const launchArgs = url.startsWith('file:') ? ['--allow-file-access-from-files'] : [];
-  browser = await chromium.launch({ executablePath: edge, headless: true, args: launchArgs });
-  const page = await browser.newPage();
-  page.setDefaultTimeout(timeoutMs);
+  if (!existsSync(edge)) {
+    throw harnessFailure(`browser not found at ${edge}`);
+  }
+  let page;
+  try {
+    browser = await chromium.launch({ executablePath: edge, headless: true, args: launchArgs });
+    page = await browser.newPage();
+    page.setDefaultTimeout(timeoutMs);
+  } catch (error) {
+    throw harnessFailure(`browser could not start: ${error.message}`);
+  }
 
   // Navigating to the media file itself gives the page the file's own origin,
   // so drawing a frame to a canvas is not blocked as cross-origin.
@@ -199,8 +211,13 @@ try {
       (screenshot ? ` screenshot=${resolve(screenshot)}` : ''),
   );
 } catch (error) {
-  report(error.failed ? error.reasons : [error.message]);
-  process.exitCode = 1;
+  if (error.harness) {
+    console.error(`CHECK_ERROR video target=${url}: ${error.message}`);
+    process.exitCode = 2;
+  } else {
+    report(error.failed ? error.reasons : [error.message]);
+    process.exitCode = 1;
+  }
 } finally {
   // Reached on the failure path too: a check that fails must not leave a
   // browser behind, because a model may run it many times in a row.
@@ -258,9 +275,17 @@ function targetUrl(value) {
     path = join(path, 'index.html');
   }
   if (!existsSync(path)) {
-    throw new Error(`target not found: ${path}`);
+    throw checkFailure([`target not found: ${path}`]);
   }
   return pathToFileURL(path).href;
+}
+
+// A setup failure means the check did not run; the caller must not mistake it
+// for a verdict about the artifact.
+function harnessFailure(message) {
+  const error = new Error(message);
+  error.harness = true;
+  return error;
 }
 
 // A failure the check itself found, carried to the one place that prints.
@@ -273,7 +298,7 @@ function checkFailure(reasons) {
 
 function report(reasons) {
   for (const reason of reasons) {
-    console.error(`CHECK_FAILED video target=${url}: ${reason}`);
+    console.error(`CHECK_FAILED video target=${url ?? target}: ${reason}`);
   }
 }
 

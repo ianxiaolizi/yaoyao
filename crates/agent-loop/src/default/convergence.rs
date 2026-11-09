@@ -8,8 +8,8 @@
 //!
 //! The count is per path and is cleared by a passing check, not by time or by
 //! steps. Three edits with no check in between is the threshold: one to get it
-//! wrong, one to fix it, one to fix the fix is ordinary work; the fourth edit
-//! in that state is a loop that needs to be told to go and look.
+//! wrong, one to fix it, one to fix the fix. The request after that third edit
+//! is told to go and look.
 //!
 //! The notice is a reminder, never a stop: the turn's budget and its stall
 //! rules decide when it ends. A model that answers it by running a check

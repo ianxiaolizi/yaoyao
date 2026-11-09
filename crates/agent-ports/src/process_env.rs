@@ -53,6 +53,7 @@ const WINDOWS_ALLOWED: &[&str] = &[
     "NUMBER_OF_PROCESSORS",
     "USERNAME",
     "USERDOMAIN",
+    "EDGE_PATH",
     "HOME",
     "LANG",
     "LC_ALL",
@@ -300,6 +301,14 @@ mod tests {
         assert!(names.contains(&"PATH".to_string()));
         assert!(!names.contains(&"CARGO_HOME".to_string()));
         assert!(!names.contains(&"RUSTUP_HOME".to_string()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_browser_override_reaches_a_verifier_child() {
+        let parent = vec![pair("PATH", r"C:\Windows"), pair("EDGE_PATH", r"D:\Edge\msedge.exe")];
+        let env = child_environment(&parent);
+        assert_eq!(value_of(&env, "EDGE_PATH").as_deref(), Some(r"D:\Edge\msedge.exe"));
     }
 
     #[test]

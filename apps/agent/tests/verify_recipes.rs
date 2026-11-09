@@ -158,6 +158,30 @@ fn a_recipe_that_fails_is_recorded_as_failed_and_exits_one() {
 }
 
 #[test]
+fn a_recipe_that_reports_did_not_run_exits_two_and_records_an_error() {
+    let (data, workspace, config) = dirs();
+    let path = write_config(&config, "user.toml", &recipe_toml("not-run", 2));
+
+    let r = ran(
+        data.path(),
+        workspace.path(),
+        &user_env(&path),
+        &["verify", "--recipe", "not-run", "--events"],
+    );
+
+    assert_eq!(r.code, Some(2), "a check that did not run is not an answer: {}", r.out);
+    let events = chain(&r.out);
+    let evidence = recorded(&events);
+    assert_eq!(evidence["payload"]["status"], "error");
+    assert_eq!(evidence["payload"]["exit_code"], 2);
+    assert!(
+        evidence["payload"]["reason"].as_str().unwrap_or_default().contains("did not run"),
+        "{}",
+        evidence["payload"]
+    );
+}
+
+#[test]
 fn an_unknown_recipe_exits_two_and_names_the_ones_that_exist() {
     let (data, workspace, config) = dirs();
     let mut text = recipe_toml("ok", 0);
@@ -170,6 +194,26 @@ fn an_unknown_recipe_exits_two_and_names_the_ones_that_exist() {
     assert!(r.err.contains("no recipe 'web'"), "{}", r.err);
     assert!(r.err.contains("ok"), "the known names are listed: {}", r.err);
     assert!(r.err.contains("video"), "the known names are listed: {}", r.err);
+}
+
+#[test]
+fn a_user_config_inside_the_workspace_is_refused() {
+    let (data, workspace, _config) = dirs();
+    let path = workspace.path().join("user.toml");
+    std::fs::write(&path, recipe_toml("ok", 0)).expect("the in-workspace user config");
+    let path = path.display().to_string();
+    let env = user_env(&path);
+
+    let verify =
+        ran(data.path(), workspace.path(), &env, &["verify", "--recipe", "ok", "--events"]);
+    assert_eq!(verify.code, Some(2), "the recipe must not run: {}", verify.out);
+    assert!(verify.err.contains("inside the model-writable workspace"), "{}", verify.err);
+
+    // The same path is refused before any command assembles a run, not only
+    // by the verify command.
+    let run = ran(data.path(), workspace.path(), &env, &["run", "hello"]);
+    assert_eq!(run.code, Some(2), "{}", run.out);
+    assert!(run.err.contains("inside the model-writable workspace"), "{}", run.err);
 }
 
 #[test]

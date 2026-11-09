@@ -7,6 +7,8 @@
 //! gateway already recorded — `sandbox_unavailable` — so a policy decision is
 //! never mistaken for a capability the build cannot provide.
 
+use std::collections::BTreeMap;
+
 use agent_ports::agent_loop::{StepOutcome, StopReason, TurnContext};
 use agent_ports::tool_gateway::ToolGatewayError;
 use agent_protocol::events::{Actor, EventDraft, EventType};
@@ -21,8 +23,9 @@ use super::refusals::refuse_undispatched;
 /// The capability-gap counters a turn carries between its steps.
 #[derive(Debug, Default)]
 pub(super) struct CapabilityGaps {
-    /// `sandbox_unavailable` refusals this turn has seen.
-    denials: u32,
+    /// `sandbox_unavailable` refusals by missing capability. A different
+    /// capability is a different gap, even when both are unavailable.
+    denials: BTreeMap<String, u32>,
     /// The last refusal that named a gap: (tool, capability).
     last: Option<(String, String)>,
 }
@@ -44,9 +47,14 @@ impl LoopTurn {
         else {
             return false;
         };
-        self.capability_gaps.denials = self.capability_gaps.denials.saturating_add(1);
-        self.capability_gaps.last = Some((tool.to_string(), capability.as_str().to_string()));
-        self.capability_gaps.denials >= 2
+        let capability = capability.as_str().to_string();
+        let hit = {
+            let count = self.capability_gaps.denials.entry(capability.clone()).or_insert(0);
+            *count = count.saturating_add(1);
+            *count >= 2
+        };
+        self.capability_gaps.last = Some((tool.to_string(), capability));
+        hit
     }
 }
 

@@ -135,6 +135,24 @@ fn the_task_flag_selects_a_budget_class_and_is_not_prompt_text() {
 }
 
 #[test]
+fn the_separator_stops_shared_flag_extraction() {
+    // `verify` uses `--` to separate its own flags from the program it runs.
+    // Everything after it belongs to that program, even when a word happens to
+    // be a shared flag (`--json`, `--task`, `--session`, ...).
+    let args = parse(&argv("verify -- node check.mjs --json --task video --session other"))
+        .expect("a verify command");
+
+    assert_eq!(args.command, "verify");
+    assert_eq!(
+        args.command_args(),
+        ["--", "node", "check.mjs", "--json", "--task", "video", "--session", "other"]
+    );
+    assert!(!args.json, "the program's --json is not the command's output mode");
+    assert_eq!(args.task, None, "the program's --task is not a budget class");
+    assert_eq!(args.session.as_str(), DEFAULT_SESSION);
+}
+
+#[test]
 fn an_empty_line_is_not_a_command() {
     assert_eq!(parse(&[]), Err(ArgsError::NoCommand));
     // Flags alone are still no command.

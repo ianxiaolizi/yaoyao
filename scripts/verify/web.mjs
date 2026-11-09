@@ -10,8 +10,8 @@
 //     an empty render is not a page.
 //
 // It prints one `CHECK_OK …` line on success and `CHECK_FAILED …` on stderr
-// with every reason it found, then exits 1. Bad arguments exit 2: the check did
-// not run, which is a different answer from "it ran and failed".
+// with every reason it found, then exits 1. Bad arguments or harness setup exit
+// 2: the check did not run, which is a different answer from "it ran and failed".
 //
 // Usage:
 //   node scripts/verify/web.mjs --target <path-or-url> [--screenshot <png>]
@@ -40,6 +40,10 @@ let url;
 try {
   url = targetUrl(target);
 } catch (error) {
+  if (error.failed) {
+    report(error.reasons);
+    process.exit(1);
+  }
   usage(error.message);
 }
 
@@ -47,8 +51,16 @@ const reasons = [];
 let browser;
 
 try {
-  browser = await chromium.launch({ executablePath: edge, headless: true });
-  const page = await browser.newPage();
+  if (!existsSync(edge)) {
+    throw harnessFailure(`browser not found at ${edge}`);
+  }
+  let page;
+  try {
+    browser = await chromium.launch({ executablePath: edge, headless: true });
+    page = await browser.newPage();
+  } catch (error) {
+    throw harnessFailure(`browser could not start: ${error.message}`);
+  }
 
   page.on('pageerror', (error) => {
     reasons.push(`page error: ${error.message}`);
@@ -93,11 +105,13 @@ try {
       (screenshot ? ` screenshot=${resolve(screenshot)}` : ''),
   );
 } catch (error) {
-  // A navigation timeout is a failure of the page, not of the harness: the
-  // check ran and the answer is "it did not load". Anything else is also a
-  // failed check — this script never claims a pass it did not see.
-  report(error.failed ? error.reasons : [error.message]);
-  process.exitCode = 1;
+  if (error.harness) {
+    console.error(`CHECK_ERROR web target=${url}: ${error.message}`);
+    process.exitCode = 2;
+  } else {
+    report(error.failed ? error.reasons : [error.message]);
+    process.exitCode = 1;
+  }
 } finally {
   // Reached on the failure path too: a check that fails must not leave a
   // browser behind, because a model may run it many times in a row.
@@ -150,9 +164,17 @@ function targetUrl(value) {
     path = join(path, 'index.html');
   }
   if (!existsSync(path)) {
-    throw new Error(`target not found: ${path}`);
+    throw checkFailure([`target not found: ${path}`]);
   }
   return pathToFileURL(path).href;
+}
+
+// A setup failure means the check did not run; the caller must not mistake it
+// for a verdict about the artifact.
+function harnessFailure(message) {
+  const error = new Error(message);
+  error.harness = true;
+  return error;
 }
 
 // A failure the check itself found, carried to the one place that prints.
@@ -165,7 +187,7 @@ function checkFailure(reasons) {
 
 function report(reasons) {
   for (const reason of reasons) {
-    console.error(`CHECK_FAILED web target=${url}: ${reason}`);
+    console.error(`CHECK_FAILED web target=${url ?? target}: ${reason}`);
   }
 }
 

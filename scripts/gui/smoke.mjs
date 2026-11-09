@@ -36,7 +36,9 @@ const binary = process.env.AGENT_BIN || join(root, 'target', 'debug', 'agent.exe
 const edge =
   process.env.EDGE_PATH ||
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
-const shots = join(root, 'web', 'shots');
+const shots = process.env.YAOYAO_SCREENSHOT_DIR
+  ? resolve(process.env.YAOYAO_SCREENSHOT_DIR)
+  : join(root, 'target', 'gui-shots');
 mkdirSync(shots, { recursive: true });
 
 if (!existsSync(binary)) {
@@ -566,6 +568,27 @@ function seedUnverifiedDelivery() {
       content: 'policy denied tool shell.run: risk l3',
     },
   });
+  log.add('workspace/changes.recorded', {
+    turn: 't1',
+    step: 'step-t1',
+    payload: {
+      changes: [
+        {
+          relative_path: 'partial.html',
+          kind: 'modified',
+          before_size: 10,
+          after_size: 20,
+          before_sha256: 'aaaa',
+          after_sha256: 'bbbb',
+        },
+      ],
+      changes_hash: 'partial-hash',
+      complete: false,
+      snapshot_id: 'snap-partial',
+      task_id: 'task-partial',
+      session_id: 'unverified-delivery',
+    },
+  });
   log.add('turn/completed', {
     turn: 't1',
     actor: 'scheduler',
@@ -1085,6 +1108,13 @@ async function main() {
     await waitText(page, '#statusNote', '未验证的交付不等于完成'),
   );
   check('事故回归：local 后端能力提示出现', await waitText(page, '#envNote', 'app-container'));
+  await page.hover('#details');
+  await page.click('[data-evpanel="diff"]');
+  await page.waitForSelector('#sheet.open', { timeout: 10_000 });
+  check(
+    '不完整改动清单有明确提示',
+    await waitText(page, '#sheetBody', '改动清单不完整'),
+  );
   await page.screenshot({ path: join(shots, 'm10-unverified.png') });
 
   // The positive shape: a passing check is the only way to say verified complete.
@@ -1093,6 +1123,43 @@ async function main() {
   check('已验证交付：顶部状态是已验证完成', await waitText(page, '#statusPill', '已验证完成'));
   check('已验证交付：没有未验证横幅', !(await page.locator('#statusNote').isVisible()));
   await page.screenshot({ path: join(shots, 'm10-verified.png') });
+
+  // A new turn must not inherit the previous turn's verified status when the
+  // status refresh fails after the terminal event.
+  await page.evaluate(() => {
+    const original = window.fetch.bind(window);
+    window.__smokeOriginalFetch = original;
+    window.__smokeStatusFailures = 0;
+    window.fetch = (input, init) => {
+      if (String(input).includes('/api/sessions/verified-delivery/status')) {
+        window.__smokeStatusFailures += 1;
+        return Promise.reject(new Error('forced status refresh failure'));
+      }
+      return original(input, init);
+    };
+  });
+  await page.fill('#input', 'follow-up without status');
+  await page.click('#send');
+  check(
+    '新回合仍能收到回答',
+    await waitText(page, '.y-answer', 'echo: follow-up without status', 25_000),
+  );
+  await page.waitForFunction(
+    () => document.querySelector('#stop')?.hidden && !document.querySelector('.y-live'),
+    null,
+    { timeout: 15_000 },
+  );
+  const statusRefreshes = await page.evaluate(() => window.__smokeStatusFailures);
+  check('状态刷新请求已被拦截', statusRefreshes >= 1, `hits=${statusRefreshes}`);
+  const statusAfterFailedRefresh = await text(page, '#statusPill');
+  check(
+    '状态刷新失败时不沿用上一轮已验证状态',
+    !statusAfterFailedRefresh.includes('已验证完成'),
+    statusAfterFailedRefresh,
+  );
+  await page.evaluate(() => {
+    window.fetch = window.__smokeOriginalFetch;
+  });
 
   // A capability stop delivered nothing: the page must not dress its ask as a
   // delivered result, and must offer the backend switch.

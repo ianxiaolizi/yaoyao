@@ -331,7 +331,12 @@ fn apply(metrics: &mut SessionMetrics, state: &mut FoldState, stored: &StoredEve
             count_ending(metrics, state, event, "cancelled", "user_cancelled")
         }
         EventType::TURN_YIELDED => {
-            count_ending(metrics, state, event, "yielded", "needs_user_input")
+            let reason = event
+                .payload
+                .get("stop_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("needs_user_input");
+            count_ending(metrics, state, event, "yielded", reason)
         }
         EventType::TURN_INTERRUPTED => {
             count_ending(metrics, state, event, "interrupted", "interrupted")
@@ -1380,6 +1385,32 @@ mod tests {
         ]);
         let metrics = fold(&events);
         assert_eq!(metrics.final_status.as_deref(), Some("yielded:needs_user_input"));
+    }
+
+    #[test]
+    fn a_yielded_turn_keeps_its_recorded_stop_reason() {
+        let events = seq(vec![
+            draft(
+                "s",
+                EventType::TURN_STARTED,
+                None,
+                Some("t1"),
+                serde_json::json!({}),
+                "2026-01-01T00:00:00Z",
+            ),
+            draft(
+                "s",
+                EventType::TURN_YIELDED,
+                None,
+                Some("t1"),
+                serde_json::json!({ "stop_reason": "max_steps" }),
+                "2026-01-01T00:00:01Z",
+            ),
+        ]);
+        let metrics = fold(&events);
+        assert_eq!(metrics.final_status.as_deref(), Some("yielded:max_steps"));
+        assert_eq!(metrics.turns.by_stop_reason.get("max_steps"), Some(&1));
+        assert_eq!(metrics.turns.by_stop_reason.get("needs_user_input"), None);
     }
 
     #[test]

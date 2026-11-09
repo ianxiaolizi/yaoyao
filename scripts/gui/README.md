@@ -42,7 +42,7 @@ session — then checks:
 - 1024 / 900 drawer and 390px single column;
 - no console error, page error or 4xx along the way.
 
-Screenshots land in `web/shots/m7-*.png`, `m8-*.png`, `m9-*.png` and `m10-*.png`.
+Screenshots land in `target/gui-shots/m7-*.png`, `m8-*.png`, `m9-*.png` and `m10-*.png` by default. Set `YAOYAO_SCREENSHOT_DIR` to choose another directory, including `web/shots` when you deliberately want to refresh the checked-in acceptance images.
 `AGENT_BIN` overrides `target/debug/agent.exe`; `EDGE_PATH` overrides the default Edge path.
 The script owns the server and its temporary workspace; it never touches your
 `.agent-data`. CI runs the same command in the `gui-smoke` job.

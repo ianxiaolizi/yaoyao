@@ -118,6 +118,14 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
     while index < argv.len() {
         let arg = argv[index].as_str();
 
+        // Everything after `--` belongs to the command's child program. The
+        // separator is part of `rest` because `verify` reads it to switch from
+        // its own flags to the program and that program's arguments.
+        if arg == "--" {
+            rest.extend(argv[index..].iter().cloned());
+            break;
+        }
+
         // `--name value` and `--name=value` are one flag spelled two ways. A
         // command's argument that happens to contain an `=` is left alone: the
         // `=` form is only recognized for a flag this parser knows.

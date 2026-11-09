@@ -24,7 +24,8 @@ use crate::support::{assemble, chain_start, watch};
 use crate::{EXIT_DID_NOT_RUN, exit_on};
 
 pub(crate) async fn verify(args: &Args) {
-    let mut spec = parse(args);
+    let workspace_root = crate::support::workspace_root();
+    let mut spec = parse(args, &workspace_root);
     let runtime = assemble(args).await;
     // A profile that names its apparatus is saying what every check of its runs
     // is graded against; a check that names its own overrides that, because the
@@ -64,13 +65,13 @@ pub(crate) async fn verify(args: &Args) {
 /// configuration. They are exclusive — a recipe already names a program, and
 /// two programs on one line would leave which one ran a question the log could
 /// not answer.
-fn parse(args: &Args) -> CheckSpec {
+fn parse(args: &Args, workspace_root: &str) -> CheckSpec {
     let parsed = parse_words(args.command_args());
     match parsed.source {
         Source::Program { .. } => expand(parsed, None),
         Source::Recipe { .. } => {
-            let recipes =
-                config::verify_recipes().unwrap_or_else(|error| usage_failure(&error.to_string()));
+            let recipes = config::verify_recipes(workspace_root)
+                .unwrap_or_else(|error| usage_failure(&error.to_string()));
             expand(parsed, Some(&recipes))
         }
     }
@@ -330,6 +331,23 @@ mod tests {
         assert_eq!(spec.args, ["test", "--workspace"]);
         assert_eq!(spec.timeout_ms, DEFAULT_CHECK_TIMEOUT_MS);
         assert_eq!(spec.expect, Expectation::default());
+    }
+
+    #[test]
+    fn shared_flags_after_the_separator_are_program_arguments() {
+        let spec = parsed(&[
+            "verify",
+            "--",
+            "node",
+            "check.mjs",
+            "--json",
+            "--task",
+            "video",
+            "--session",
+            "other",
+        ]);
+        assert_eq!(spec.program, "node");
+        assert_eq!(spec.args, ["check.mjs", "--json", "--task", "video", "--session", "other"]);
     }
 
     #[test]

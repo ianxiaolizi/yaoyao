@@ -3,6 +3,33 @@
 
 use super::*;
 
+/// A gateway that refuses different tools with different capabilities. The
+/// capability-stop rule is about one missing capability repeating, not about
+/// any two sandbox refusals in a turn.
+struct PerToolCapabilityGateway {
+    refusals: Vec<(&'static str, agent_protocol::tool::ToolPolicyRecord)>,
+}
+
+#[async_trait::async_trait]
+impl ToolGateway for PerToolCapabilityGateway {
+    async fn execute(
+        &self,
+        _session_id: &SessionId,
+        invocation: &ToolInvocation,
+    ) -> Result<ToolResult, ToolGatewayError> {
+        if let Some((_, policy)) =
+            self.refusals.iter().find(|(tool, _)| *tool == invocation.tool_name)
+        {
+            return Err(ToolGatewayError::PolicyDenied {
+                tool: invocation.tool_name.clone(),
+                reason: "the selected capability is not provided".to_string(),
+                policy: Box::new(policy.clone()),
+            });
+        }
+        Ok(ToolResult::completed("ok"))
+    }
+}
+
 /// A gateway that refuses the named tools as a capability gap and runs
 /// everything else. It stands in for the isolation floor: what matters is
 /// the layer the refusal states, not a policy engine.
@@ -124,6 +151,53 @@ async fn two_capability_refusals_stop_the_turn_with_the_three_choices() {
     // The step the stop happened in is closed, like any other ending.
     assert_eq!(of_type(&outcome.events, EventType::STEP_COMPLETED).len(), 2);
     assert_eq!(model.requests().len(), 2, "the stop ends the turn where it is hit");
+}
+
+/// Two different missing capabilities are two separate facts. Each first
+/// refusal may still have a workable alternative, so the turn must continue.
+#[tokio::test]
+async fn different_missing_capabilities_do_not_add_up_to_one_gap() {
+    use agent_protocol::permissions::{Capability, RefusalLayer};
+
+    let model = Arc::new(FakeModelProvider::new(vec![
+        FakeModelProvider::tool_call("shell.run", serde_json::json!({ "command": "ls" })),
+        FakeModelProvider::tool_call(
+            "web.request",
+            serde_json::json!({ "url": "https://example.com" }),
+        ),
+        FakeModelProvider::answer("done"),
+    ]));
+    let gateway = Arc::new(PerToolCapabilityGateway {
+        refusals: vec![
+            (
+                "shell.run",
+                agent_protocol::tool::ToolPolicyRecord::denied(
+                    [Capability::new(Capability::PROCESS_SPAWN)],
+                    [(
+                        Capability::new(Capability::PROCESS_SPAWN),
+                        RefusalLayer::SandboxUnavailable,
+                    )],
+                ),
+            ),
+            (
+                "web.request",
+                agent_protocol::tool::ToolPolicyRecord::denied(
+                    [Capability::new(Capability::NETWORK_REQUEST)],
+                    [(
+                        Capability::new(Capability::NETWORK_REQUEST),
+                        RefusalLayer::SandboxUnavailable,
+                    )],
+                ),
+            ),
+        ],
+    });
+    let loop_ = DefaultAgentLoop::new(model.clone(), gateway, no_context(), one_model_router());
+
+    let outcome = run_turn(&loop_, &ctx()).await;
+
+    assert_eq!(outcome.stop_reason, StopReason::FinalAnswer, "{outcome:?}");
+    assert_eq!(model.requests().len(), 3, "two different gaps did not stop the turn");
+    assert_eq!(of_type(&outcome.events, EventType::TOOL_FAILED).len(), 2);
 }
 
 /// A policy-rule denial is a decision about a call, not a capability gap:

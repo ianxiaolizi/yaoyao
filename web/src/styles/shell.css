@@ -219,6 +219,17 @@ body {
   font-size: 12px;
   line-height: 1.55;
 }
+.y-diff-warning {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--red-line);
+  border-radius: 6px;
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .y-status-note.warn,
 .y-status-note.fail {
   background: var(--red-soft);

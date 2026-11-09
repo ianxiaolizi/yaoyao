@@ -58,6 +58,15 @@ pub enum LoadError {
 
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    /// The user layer is an authorization source. A path inside the workspace
+    /// would let the model edit the capabilities, recipes, or task budgets
+    /// that are supposed to bound it.
+    #[error(
+        "user configuration {path} is inside the model-writable workspace {workspace}; \
+         move it outside the workspace"
+    )]
+    UnsafeUserConfig { path: String, workspace: String },
 }
 
 /// Read the three layers and resolve them.
@@ -76,7 +85,7 @@ pub fn load(workspace_root: &str, args: &Args) -> Result<ResolvedProfile, LoadEr
         layers.managed = layer(&path, ManagedPolicy::from_toml_str)?;
     }
     if let Some(path) = env_path(ENV_USER_CONFIG) {
-        layers.user = layer(&path, UserConfig::from_toml_str)?;
+        layers.user = user_config(&path, workspace_root)?;
     }
 
     let project = Path::new(workspace_root).join(WORKSPACE_CONFIG);
@@ -100,11 +109,11 @@ pub fn load(workspace_root: &str, args: &Args) -> Result<ResolvedProfile, LoadEr
 /// An unset `AGENT_USER_CONFIG` is an empty table, not an error: a machine
 /// that never wrote a recipe is a machine whose `--recipe` names nothing, and
 /// the command says so with the list (empty) rather than failing to start.
-pub fn verify_recipes() -> Result<BTreeMap<String, RecipeSpec>, LoadError> {
+pub fn verify_recipes(workspace_root: &str) -> Result<BTreeMap<String, RecipeSpec>, LoadError> {
     let Some(path) = env_path(ENV_USER_CONFIG) else {
         return Ok(BTreeMap::new());
     };
-    let config: UserConfig = layer(&path, UserConfig::from_toml_str)?;
+    let config = user_config(&path, workspace_root)?;
     Ok(config.verify.map(|verify| verify.recipes).unwrap_or_default())
 }
 
@@ -151,6 +160,21 @@ fn env_path(name: &str) -> Option<String> {
         Ok(path) if !path.trim().is_empty() => Some(path),
         _ => None,
     }
+}
+
+/// Read the user layer after checking that the workspace cannot rewrite it.
+fn user_config(path: &str, workspace_root: &str) -> Result<UserConfig, LoadError> {
+    let config_path = std::fs::canonicalize(path)
+        .map_err(|source| LoadError::Read { path: path.to_string(), source })?;
+    let workspace = std::fs::canonicalize(workspace_root)
+        .map_err(|source| LoadError::Read { path: workspace_root.to_string(), source })?;
+    if config_path.starts_with(&workspace) {
+        return Err(LoadError::UnsafeUserConfig {
+            path: config_path.display().to_string(),
+            workspace: workspace.display().to_string(),
+        });
+    }
+    layer(path, UserConfig::from_toml_str)
 }
 
 fn read(path: impl AsRef<Path>) -> Result<String, LoadError> {

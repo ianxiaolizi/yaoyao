@@ -44,7 +44,6 @@ export type Action =
   | { type: 'session/new'; id: string }
   | { type: 'summary/loaded'; summary: SessionSummary }
   | { type: 'status/loaded'; status: SessionStatus }
-  | { type: 'status/cleared' }
   | { type: 'model/select'; model: ModelChoice }
   | { type: 'transcript/loaded'; transcript: Transcript }
   | { type: 'item/upsert'; item: Item }
@@ -145,20 +144,21 @@ export function reduce(state: State, action: Action): State {
         artifactView: null,
         error: null,
       };
-    case 'summary/loaded':
+    case 'summary/loaded': {
+      const running = Boolean(action.summary.open_turn);
       return {
         ...state,
         summary: action.summary,
         chosenModel: null,
-        running: Boolean(action.summary.open_turn),
+        status: running ? null : state.status,
+        running,
         waiting: Boolean(action.summary.pending_approvals),
       };
+    }
     case 'model/select':
       return { ...state, chosenModel: action.model };
     case 'status/loaded':
       return { ...state, status: action.status };
-    case 'status/cleared':
-      return { ...state, status: null };
     case 'transcript/loaded':
       return {
         ...state,
@@ -179,7 +179,14 @@ export function reduce(state: State, action: Action): State {
     case 'live':
       return { ...state, live: action.live };
     case 'running':
-      return { ...state, running: action.running, live: action.running ? state.live : null };
+      // A status fold belongs to the last settled turn. Once another turn is
+      // running, keeping it would let a failed refresh revive an old verdict.
+      return {
+        ...state,
+        running: action.running,
+        status: action.running ? null : state.status,
+        live: action.running ? state.live : null,
+      };
     case 'waiting':
       return { ...state, waiting: action.waiting };
     case 'toast':

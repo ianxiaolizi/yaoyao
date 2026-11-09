@@ -430,7 +430,10 @@ async fn a_grant_for_one_call_lets_a_later_process_run_the_same_call() {
 
     // A separate process, the same session, the same call. It reads the log the
     // answer went into rather than the process that took it.
-    let user_config = harness.workspace.path().join("memory.toml");
+    // User configuration is an authorization source; keep it outside the
+    // model-writable workspace even in a test.
+    let config_dir = tempfile::tempdir().expect("a user configuration directory");
+    let user_config = config_dir.path().join("memory.toml");
     std::fs::write(&user_config, "[memory]\nenabled = true\n").expect("a configuration");
     let ran = std::process::Command::new(env!("CARGO_BIN_EXE_agent"))
         .args([
