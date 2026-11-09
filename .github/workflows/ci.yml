@@ -79,6 +79,14 @@ jobs:
         # passed".
         run: pwsh -File scripts/test.ps1 -SkipFormat -SkipClippy
 
+      - name: Personal PowerShell self-tests
+        shell: pwsh
+        run: |
+          pwsh -File scripts/personal/setup.selftest.ps1
+          pwsh -File scripts/personal/eval.selftest.ps1
+          pwsh -File scripts/personal/package.selftest.ps1
+          pwsh -File scripts/personal/backup.selftest.ps1
+
   web:
     # The page is compiled into the binary (`crates/agent-web/build.rs`), so
     # `web/dist` is source, not a build artifact to ignore. This job typechecks

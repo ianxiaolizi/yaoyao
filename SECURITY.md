@@ -38,3 +38,11 @@ https://github.com/ianxiaolizi/yaoyao/security/advisories/new
 `internetClient` 能力，只对 `AGENT_SANDBOX=app-container` 生效。这是**宽泛出站**，
 不是按站点限定的 origin allowlist，也不等价于只读 `web.request` 的允许源列表。
 它用于受信任的个人机器，默认仍是 `deny`；旧拼写 `allow` 继续失败关闭。
+
+## Personal mode boundary
+
+Personal mode is Windows-only and assumes one trusted local user on one trusted machine.
+`coding` requires AppContainer for shell execution; `local` is not a fallback. The
+`internet` network mode is broad `internetClient` egress and must remain opt-in. The
+loopback Web GUI, one-time bearer token, approval ledger, backup and diagnostics are
+personal-use controls, not a multi-tenant security boundary.

@@ -224,6 +224,20 @@ node scripts/gui/smoke.mjs
 
 阶段计划、真实使用证据和版本演进记录在独立项目工作区，不进入本仓库。
 
+## 个人模式验收边界
+
+- 个人模式仅支持 Windows 10/11，面向一台受信任机器上的一个本地用户。
+- `coding` / `coding-online` 的 `shell.run` 必须运行在 `app-container`；`local` 永不执行
+  高风险命令，也不会被当作 AppContainer 失败后的回退。
+- `internet` 是显式、宽泛的 AppContainer `internetClient` opt-in，默认 `deny`；它不是站点
+  allowlist。
+- `coding-online` 把只读 `web.request` 与宽泛 `internetClient` 分开描述；前者仍受用户配置的
+  站点 allowlist 约束，后者不受站点列表约束。
+- 真实 OpenAI-compatible 端点的 3 次 `kernel_eval` 必须产生并保存报告，且全部任务通过，
+  才可称为 personal build ready。2026-11-09 的 3 次全量报告为 18/36 通过，当前版本仍不算
+  ready。
+- 公网监听、账号、租户、配额、计费和多租户隔离不在个人模式范围内。
+
 ## 验证状态
 
 以下是 2026-11-09 本次本地审计的验证边界；CI 会按自己的 job 重新运行对应检查。
@@ -232,7 +246,7 @@ node scripts/gui/smoke.mjs
 |---|---|---|
 | Rust 离线门（fmt / clippy / workspace tests） | 已跑 | `powershell -ExecutionPolicy Bypass -File scripts\test.ps1` |
 | TTY 下 stdin 与工具子进程审批回归 | 已跑 | `agent-tools-fs` stdin 测试与 `security_regression` 审批回归 |
-| 真实 OpenAI-compatible endpoint | 未跑 | 需要 `AGENT_MODEL_BASE_URL/NAME/API_KEY` |
+| 真实 OpenAI-compatible endpoint | 已跑，未通过 | 2026-11-09 3 次全量 `kernel_eval` 为 18/36；报告在 `%LOCALAPPDATA%\yaoyao-agent\eval\` |
 | AppContainer live | 已跑 | `scripts\sandbox-live.ps1 -DebugBuild -Jobs 1`：受限进程、stdin/stdout、内核拒绝、文件/Git 与 headless Edge 渲染通过 |
 | 真实公网 `web.request` | 未跑 | 需要显式运行对应 live 测试 |
 | 第三方 MCP | 已跑 | `mcp_third_party` 使用 npm 与真实 stdio server |

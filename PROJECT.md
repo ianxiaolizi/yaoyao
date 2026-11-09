@@ -29,6 +29,11 @@
 - **能力尽量沉淀到内核**：重复出现的判断应逐步变成可验证的确定性过程；模型负责理解和处理前沿问题。
 - **个人优先**：先在一个有明确裁判的领域做深，再扩展到更广的个人任务。
 
+个人模式的发布边界是 Windows-only、单受信任用户、本地回环 GUI。`coding` 的 shell 必须在
+AppContainer 中运行；`internet` 是宽泛且显式 opt-in 的 `internetClient`，不是 origin
+allowlist。真实模型 `kernel_eval` 至少 3 次且全部通过前，不得标记 personal build ready。
+公开多租户、账号、计费、配额与远程沙箱不在范围内。
+
 个人构建的评测门是真实 OpenAI-compatible 端点上的 `kernel_eval`：至少重复 3 次并保存报告。
 没有这份报告，只能称为开发验证通过，不能称为 personal build ready。个人模式仍是
 Windows-only，公开多租户服务不在当前范围内。
