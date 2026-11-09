@@ -1434,7 +1434,12 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
           ? `<span class="pill ${sessionStatus ? sessionLabel.className : status.className}"><i></i>${sessionStatus ? sessionLabel.label : status.label}</span>`
           : '';
 
-    const note = current ? sessionStatusNote(sessionStatus) : null;
+    // A run in flight has no verdict yet: the axes say "unverified" merely
+    // because nothing has been checked, so the note waits for the terminal event.
+    const note =
+      current && !state.running && !state.waiting && !pending
+        ? sessionStatusNote(sessionStatus)
+        : null;
     statusNote.hidden = !note;
     statusNote.textContent = note ?? '';
     statusNote.className = note
