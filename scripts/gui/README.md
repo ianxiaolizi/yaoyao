@@ -11,6 +11,22 @@ npm ci --prefix scripts/gui
 node scripts/gui/smoke.mjs
 ```
 
+
+
+## Smoke layout
+
+`smoke.mjs` is now only the orchestrator. The implementation lives beside it:
+
+- `smoke/seed.mjs` writes every throwaway session and artifact;
+- `smoke/browser.mjs` starts the real `agent.exe web`, owns the browser and exposes
+  `openPage` / `text` / `waitText`;
+- `smoke/checks/core.mjs`, `artifacts.mjs`, `approvals.mjs` and `responsive.mjs`
+  each export `run(ctx): Promise<Result[]>`.
+
+The command line, environment overrides, screenshot names and non-zero failure
+exit are unchanged. The M11 split kept the baseline at 163 PASS / 0 FAIL and the
+same 21 screenshot files.
+
 It seeds a throwaway data directory with eight sessions — a four-turn session with
 thinking, a `git.diff` observation, a plan, context layers and a two-level
 subagent tree; an artifact session with an image / HTML / Markdown / PDF / docx /
