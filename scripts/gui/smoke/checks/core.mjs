@@ -203,7 +203,17 @@ export async function run(ctx) {
   check('事故回归：local 长提示不再常驻', (await page.$('#envNote')) === null);
   check('事故回归：local 后端有按需入口', await page.locator('#envChip').isVisible());
   await page.click('#envChip');
-  check('事故回归：local 入口说明能力边界', await waitText(page, '#toast', 'app-container'));
+  check('能力清单：local 菜单打开', await page.locator('#envMenu').isVisible());
+  check('能力清单：写明当前后端', await waitText(page, '#envMenu', 'local'));
+  check('能力清单：启动进程需要 AppContainer', await waitText(page, '#envMenu', '需要 AppContainer'));
+  check('能力清单：进程自主联网不可用', await waitText(page, '#envMenu', '进程自主联网'));
+  check(
+    '能力清单：受限项有明确标记',
+    (await text(page, '#envMenu')).includes('不可用'),
+  );
+  await page.screenshot({ path: join(ctx.shots, 'm10-capabilities.png') });
+  await page.keyboard.press('Escape');
+  check('能力清单：Esc 关闭', !(await page.locator('#envMenu').isVisible()));
   check(
     '事故回归：未验证提示可关闭',
     await page.locator('#statusNoteDismiss').isVisible(),

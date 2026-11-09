@@ -216,6 +216,62 @@ fn the_workspace_is_writable() {
     assert_eq!(std::fs::read_to_string(&target).unwrap_or_default().trim(), "ok");
 }
 
+/// Headless rendering is just another child process. If Edge is present, the
+/// sandbox must let it read the page and write the screenshot inside the
+/// workspace; a browser needing host profile access is not a render capability
+/// this backend can honestly advertise.
+#[test]
+#[ignore = "needs AGENT_APPCONTAINER_TEST=1, `agent sandbox setup`, and Edge"]
+fn headless_edge_renders_inside_the_workspace() {
+    if !enabled() {
+        eprintln!("skipped: set AGENT_APPCONTAINER_TEST=1");
+        return;
+    }
+    let edge = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file());
+    let Some(edge) = edge else {
+        eprintln!("skipped: Edge is not installed");
+        return;
+    };
+    let fixture = Fixture::new("edge-render");
+    std::fs::write(
+        fixture.workspace.join("page.html"),
+        "<!doctype html><body style='margin:0;background:#123456;color:white;font:24px sans-serif'><h1>rendered</h1></body>",
+    )
+    .expect("write the page");
+    let page = format!(
+        "file:///{}",
+        fixture.workspace.join("page.html").to_string_lossy().replace('\\', "/")
+    );
+    let screenshot = fixture.workspace.join("shot.png");
+    let profile = fixture.workspace.join("edge-profile");
+    let request = SpawnRequest {
+        program: edge.to_string_lossy().into_owned(),
+        args: vec![
+            "--headless=new".to_string(),
+            "--disable-gpu".to_string(),
+            "--no-sandbox".to_string(),
+            "--hide-scrollbars".to_string(),
+            "--window-size=640,360".to_string(),
+            format!("--user-data-dir={}", profile.to_string_lossy()),
+            format!("--screenshot={}", screenshot.to_string_lossy()),
+            page,
+        ],
+        cwd: fixture.workspace.clone(),
+        env: environment(&[]),
+        stdin: StdinMode::Closed,
+    };
+    let (code, stdout, stderr) = run(&fixture.launcher(false), request);
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let bytes = std::fs::read(&screenshot).expect("the screenshot is written");
+    assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']), "not a PNG: {} bytes", bytes.len());
+}
+
 #[test]
 #[ignore = "needs AGENT_APPCONTAINER_TEST=1 and `agent sandbox setup`"]
 fn a_write_outside_the_granted_roots_is_refused_by_the_kernel() {

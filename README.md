@@ -181,10 +181,10 @@ node scripts/gui/smoke.mjs
 | Rust 离线门（fmt / clippy / workspace tests） | 已跑 | `powershell -ExecutionPolicy Bypass -File scripts\test.ps1` |
 | TTY 下 stdin 与工具子进程审批回归 | 已跑 | `agent-tools-fs` stdin 测试与 `security_regression` 审批回归 |
 | 真实 OpenAI-compatible endpoint | 未跑 | 需要 `AGENT_MODEL_BASE_URL/NAME/API_KEY` |
-| AppContainer live | 未跑 | 需要管理员执行 `agent sandbox setup` 并设置 `AGENT_APPCONTAINER_TEST=1` |
+| AppContainer live | 已跑 | `scripts\sandbox-live.ps1 -DebugBuild -Jobs 1`：受限进程、stdin/stdout、内核拒绝、文件/Git 与 headless Edge 渲染通过 |
 | 真实公网 `web.request` | 未跑 | 需要显式运行对应 live 测试 |
 | 第三方 MCP | 已跑 | `mcp_third_party` 使用 npm 与真实 stdio server |
-| GUI smoke / perf | 未跑 | 需要 Edge/Playwright 与 `scripts/gui` 依赖 |
+| GUI smoke / perf | 已跑 | GUI smoke 174 PASS / 0 FAIL；AppContainer 能力清单与性能门通过 |
 ## 安全边界
 
 - 不要将 `shell.run` 暴露给不可信用户。

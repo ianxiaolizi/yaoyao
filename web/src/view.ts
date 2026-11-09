@@ -50,8 +50,26 @@ const PANEL_TABS: { key: PanelKey; label: string }[] = [
 ];
 
 const LOCAL_BACKEND_NOTE =
-  '当前是 local 后端：爻爻可以编辑文件，但不会启动命令或渲染进程。需要构建、测试、导出视频时，请用 app-container 启动。';
+  '当前是 local 后端：爻爻可以编辑文件，但高风险进程会被拒绝。需要构建、测试、导出视频时，请用 app-container 启动。';
 const DISMISSED_STATUS_KEY = 'yaoyao:dismissed-status-notes';
+const SANDBOX_LABELS: Record<string, string> = {
+  local: 'local · 宿主直连',
+  'app-container': 'app-container · Windows 隔离',
+  'read-only': 'read-only · 只读',
+  docker: 'docker · 当前构建不提供',
+};
+const SANDBOX_FEATURES: { key: string; label: string }[] = [
+  { key: 'fs.read', label: '读取工作区' },
+  { key: 'fs.write', label: '编辑工作区' },
+  { key: 'git.status', label: '查看 Git 改动' },
+  { key: 'process.spawn', label: '启动命令 / 构建 / 渲染' },
+  { key: 'network.request', label: '受控网络请求' },
+  { key: 'network.process', label: '进程自主联网' },
+  { key: 'network.package_registry', label: '命令下载依赖' },
+  { key: 'subagent.spawn', label: '子代理' },
+  { key: 'memory.read', label: '读取记忆' },
+  { key: 'memory.write', label: '写入记忆' },
+];
 
 export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   root.innerHTML = `<div class="y-app">
@@ -118,6 +136,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
         <div class="y-composer">
           <div class="y-model-menu" id="modelMenu" role="menu" aria-label="选择模型" hidden></div>
           <div class="y-model-menu" id="policyMenu" role="menu" aria-label="审批策略" hidden></div>
+          <div class="y-model-menu y-cap-menu" id="envMenu" role="dialog" aria-label="执行后端能力" hidden></div>
           <textarea id="input" rows="1" placeholder="继续补充要求，或输入 / 命令…"></textarea>
           <div class="y-comp-row">
             <button class="y-chip" type="button" id="attach" aria-label="附件上传（v1.1）" title="附件上传留在 v1.1" disabled>${svg(ICON.plus, 13)}</button>
@@ -158,6 +177,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   const statusNoteText = $('#statusNoteText');
   const statusNoteDismiss = $<HTMLButtonElement>('#statusNoteDismiss');
   const envChip = $<HTMLButtonElement>('#envChip');
+  const envMenu = $('#envMenu');
   const sessionList = $('#sessionList');
   const sessionCount = $('#sessionCount');
   const trace = $('#trace');
@@ -219,10 +239,6 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     const key = statusNote.dataset.noteKey;
     if (key) rememberDismissedStatus(key);
     statusNote.hidden = true;
-  });
-  envChip.addEventListener('click', () => {
-    if (store.get().meta?.sandbox !== 'local') return;
-    store.dispatch({ type: 'toast', toast: LOCAL_BACKEND_NOTE });
   });
 
   // ── layout: the two widths a reader can drag ───────────────────────────
@@ -345,9 +361,50 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     modelChip.setAttribute('aria-expanded', 'false');
   }
 
+  function closeEnvMenu(): void {
+    envMenu.hidden = true;
+    envChip.setAttribute('aria-expanded', 'false');
+  }
+
+  function renderEnvMenu(state: State): void {
+    const meta = state.meta;
+    if (!meta) return;
+    const available = new Set(meta.sandbox_capabilities ?? []);
+    const highRisk = Boolean(meta.high_risk_workspace_actions);
+    const backend = SANDBOX_LABELS[meta.sandbox] ?? meta.sandbox;
+    const rows = SANDBOX_FEATURES.map((feature) => {
+      const advertised = available.has(feature.key);
+      let stateLabel = advertised ? '可用' : '不可用';
+      let tone = advertised ? 'ok' : 'off';
+      if (feature.key === 'process.spawn' && advertised && !highRisk) {
+        stateLabel = '需要 AppContainer';
+        tone = 'warn';
+      }
+      return `<div class="y-cap-row"><span>${esc(feature.label)}</span><span class="y-cap-state ${tone}">${stateLabel}</span></div>`;
+    }).join('');
+    const hint = highRisk
+      ? '命令在 AppContainer 内执行，仍会逐次请求审批。'
+      : '命令、构建和渲染进程在 local 后端被拒绝；切换到 app-container 后重启生效。';
+    envMenu.innerHTML = `<div class="pop-h">执行后端</div>
+      <div class="y-cap-backend">${esc(backend)}</div>
+      <div class="y-cap-rows">${rows}</div>
+      <div class="pop-note">${hint}</div>`;
+  }
+
+  envChip.addEventListener('click', (event) => {
+    event.stopPropagation();
+    closeModelMenu();
+    closePolicyMenu();
+    if (!envMenu.hidden) return closeEnvMenu();
+    renderEnvMenu(store.get());
+    envMenu.hidden = false;
+    envChip.setAttribute('aria-expanded', 'true');
+  });
+
   modelChip.addEventListener('click', (event) => {
     event.stopPropagation();
     closePolicyMenu();
+    closeEnvMenu();
     if (!modelMenu.hidden) return closeModelMenu();
     renderModelMenu(store.get());
     modelMenu.hidden = false;
@@ -372,6 +429,7 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
   policyChip.addEventListener('click', (event) => {
     event.stopPropagation();
     closeModelMenu();
+    closeEnvMenu();
     if (!policyMenu.hidden) return closePolicyMenu();
     policyMenu.innerHTML =
       '<div class="pop-h">审批策略</div>' +
@@ -519,6 +577,9 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     }
     if (!policyMenu.hidden && !policyMenu.contains(event.target as Node) && !policyChip.contains(event.target as Node)) {
       closePolicyMenu();
+    }
+    if (!envMenu.hidden && !envMenu.contains(event.target as Node) && !envChip.contains(event.target as Node)) {
+      closeEnvMenu();
     }
   });
   menu.addEventListener('click', (event) => {
@@ -689,6 +750,9 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
     } else if (!policyMenu.hidden) {
       event.preventDefault();
       closePolicyMenu();
+    } else if (!envMenu.hidden) {
+      event.preventDefault();
+      closeEnvMenu();
     } else if (!evpop.hidden) {
       event.preventDefault();
       evpop.hidden = true;
@@ -1050,10 +1114,17 @@ export function mount(root: HTMLElement, store: Store, actions: Actions): void {
       ? `y-status-note ${sessionLabel.className === 'unverified' ? 'warn' : 'fail'}`
       : 'y-status-note';
 
-    const local = state.meta?.sandbox === 'local';
-    envChip.hidden = !local;
-    envChip.title = local ? LOCAL_BACKEND_NOTE : '';
-    envChip.setAttribute('aria-label', local ? `本地后端：${LOCAL_BACKEND_NOTE}` : '本地后端能力说明');
+    envChip.hidden = !state.meta;
+    envChip.textContent = state.meta?.sandbox ?? 'sandbox';
+    envChip.title = state.meta?.sandbox === 'local'
+      ? LOCAL_BACKEND_NOTE
+      : `执行后端：${SANDBOX_LABELS[state.meta?.sandbox ?? ''] ?? state.meta?.sandbox ?? ''}`;
+    envChip.setAttribute(
+      'aria-label',
+      state.meta?.sandbox === 'local'
+        ? `本地后端能力：${LOCAL_BACKEND_NOTE}`
+        : `执行后端能力：${state.meta?.sandbox ?? 'unknown'}`,
+    );
     stop.hidden = !state.running;
     send.disabled = !stateHasToken() || !input.value.trim() || Boolean(gateOf(state));
     details.title = '证据面板（M5）';

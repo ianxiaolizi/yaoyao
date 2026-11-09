@@ -40,6 +40,8 @@ fn meta() -> Meta {
         judgment: "gates".to_string(),
         budget: Some(32_000),
         capabilities: vec!["meta".to_string()],
+        sandbox_capabilities: vec!["fs.read".to_string(), "process.spawn".to_string()],
+        high_risk_workspace_actions: false,
         models: vec![agent_web::ModelOption {
             provider: "echo".to_string(),
             model: None,
@@ -1025,6 +1027,8 @@ async fn meta_requires_the_process_token() {
     let payload = body(&response);
     assert!(payload.contains("\"v\":1"), "{payload}");
     assert!(payload.contains("\"workspace\":\"yaoyao-public\""), "{payload}");
+    assert!(payload.contains("\"sandbox_capabilities\""), "{payload}");
+    assert!(payload.contains("\"high_risk_workspace_actions\""), "{payload}");
     handle.abort();
 }
 

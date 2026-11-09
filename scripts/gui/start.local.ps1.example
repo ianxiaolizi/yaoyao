@@ -6,6 +6,10 @@
 # $env:AGENT_MODEL_NAME     = 'deepseek-flash'
 # $env:AGENT_MODEL_API_KEY  = '<your-key>'
 #
+# Windows 上推荐使用 OS 隔离的 AppContainer；先以管理员运行一次
+# `agent.exe sandbox setup`，并在重启后重放授权或安装 sandbox-boot-task。
+# $env:AGENT_SANDBOX = 'app-container'
+#
 # 也可以改端口 / 工作区：
 # $env:AGENT_WORKSPACE_DIR = 'G:\yaoyao-work'
 # $env:AGENT_DATA_DIR      = 'G:\yaoyao-work\.agent'

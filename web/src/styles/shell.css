@@ -1467,6 +1467,47 @@ body.y-resizing embed {
 .y-model-menu .pop-item:disabled:hover {
   background: none;
 }
+.y-cap-menu {
+  width: 300px;
+}
+.y-cap-backend {
+  margin: 2px 8px 7px;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.y-cap-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.y-cap-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.y-cap-row:hover {
+  background: var(--surface-2);
+}
+.y-cap-state {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.y-cap-state.ok {
+  color: var(--green);
+}
+.y-cap-state.warn {
+  color: var(--red);
+}
+.y-cap-state.off {
+  color: var(--ink-3);
+}
 .pop-note {
   padding: 6px 8px 3px;
   font-size: 11px;

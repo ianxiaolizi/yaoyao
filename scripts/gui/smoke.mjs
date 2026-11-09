@@ -106,6 +106,7 @@ try {
           'm8-archive.png',
           'm9-real-chain.png',
           'm11-office.png',
+          'm10-capabilities.png',
           'm10-unverified.png',
           'm10-verified.png',
           'm10-capability-blocked.png',

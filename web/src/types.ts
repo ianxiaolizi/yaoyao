@@ -23,7 +23,12 @@ export interface Meta {
   model: string;
   sandbox: string;
   budget: number | null;
+  /** HTTP/API features offered by this build. */
   capabilities: string[];
+  /** Capabilities advertised by the selected execution sandbox. */
+  sandbox_capabilities?: string[];
+  /** Whether shell/process work is actually runnable in this sandbox. */
+  high_risk_workspace_actions?: boolean;
   models?: ModelOption[];
 }
 

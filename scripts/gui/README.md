@@ -23,9 +23,9 @@ node scripts/gui/smoke.mjs
 - `smoke/checks/core.mjs`, `artifacts.mjs`, `approvals.mjs` and `responsive.mjs`
   each export `run(ctx): Promise<Result[]>`.
 
-The command line, environment overrides, screenshot names and non-zero failure
-exit are unchanged. The M11 split kept the baseline at 163 PASS / 0 FAIL and the
-same 21 screenshot files.
+The command line, environment overrides, non-zero failure exit and existing
+screenshot names are unchanged. The current baseline is 174 PASS / 0 FAIL; the
+capability panel adds `m10-capabilities.png`.
 
 It seeds a throwaway data directory with eight sessions — a four-turn session with
 thinking, a `git.diff` observation, a plan, context layers and a two-level
@@ -62,6 +62,34 @@ Screenshots land in `target/gui-shots/m7-*.png`, `m8-*.png`, `m9-*.png` and `m10
 `AGENT_BIN` overrides `target/debug/agent.exe`; `EDGE_PATH` overrides the default Edge path.
 The script owns the server and its temporary workspace; it never touches your
 `.agent-data`. CI runs the same command in the `gui-smoke` job.
+
+## AppContainer mode
+
+On Windows, process/render work should use the OS-confined AppContainer
+backend. Put this in the gitignored `start.local.ps1`:
+
+```powershell
+$env:AGENT_SANDBOX = 'app-container'
+```
+
+`start.ps1` prints the selected sandbox and runs `agent sandbox status` before
+starting Web. If the grant is missing, run this once from an elevated prompt:
+
+```powershell
+target\debug\agent.exe sandbox setup
+```
+
+The grant is reset by a reboot; install the boot task or rerun `sandbox setup`.
+AppContainer supports `shell.run`, file tools, Git, and headless rendering, but
+raw process networking stays denied. Use the controlled `web.request` tool for
+network reads; package installs need a pre-populated cache or a future egress
+proxy. Every high-risk command still needs one approval per action.
+
+Run the real AppContainer suite with:
+
+```powershell
+powershell -File scripts\sandbox-live.ps1 -DebugBuild -Jobs 1
+```
 
 ## Capturing a real chain
 

@@ -46,9 +46,11 @@ if (Test-Path $local) {
 }
 
 Write-Host ''
+$sandbox = if ($env:AGENT_SANDBOX) { $env:AGENT_SANDBOX.Trim() } else { 'local' }
 Write-Host '  爻爻 · 本地 Web' -ForegroundColor Cyan
 Write-Host "  工作区  $env:AGENT_WORKSPACE_DIR"
 Write-Host "  数据    $env:AGENT_DATA_DIR"
+Write-Host "  沙箱    $sandbox"
 Write-Host "  端口    $Port"
 Write-Host ''
 
@@ -132,6 +134,16 @@ try {
     & icacls.exe $exe /setintegritylevel Medium 2>$null | Out-Null
 } catch {
     # 不是错误：不是每台机器都需要这一步。
+}
+
+if ($sandbox -eq 'app-container') {
+    Write-Host '  检查 AppContainer 授权…' -ForegroundColor DarkGray
+    $statusOutput = & $exe sandbox status 2>&1
+    $statusCode = $LASTEXITCODE
+    $statusOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    if ($statusCode -ne 0) {
+        Stop-WithMessage "AppContainer 未就绪。请在管理员 PowerShell 中运行：`n  `"$exe`" sandbox setup`n或安装开机任务：`n  powershell -File scripts\sandbox-boot-task.ps1 -Install"
+    }
 }
 
 if ($DryRun) {

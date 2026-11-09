@@ -39,6 +39,7 @@ web/
 - 审批门：`pending` / `expired`，四决定走 `POST /approvals/{id}`，过期走 `/resume`，
   TTL 逐秒倒计时
 - 输入框：新轮 `POST /turns`；运行中改走 `/steer`；停止 `POST /interrupt`；
+  `local` / `app-container` 能力标签可展开真实沙箱能力；受限进程项会说明需要 AppContainer；
   模型 chip 切换 `POST /model`（下一轮生效）；「审批：逐次」是说明菜单，本版不提供自动批准
 - 证据侧板：计划 / 改动 / 推理链（`/why`）/ 上下文 / 子代理（递归两层）/ 定时；
   左缘可拖宽

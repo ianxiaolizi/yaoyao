@@ -175,6 +175,12 @@ pub(crate) async fn web(args: &Args) {
         .iter()
         .map(|name| name.to_string())
         .collect(),
+        sandbox_capabilities: sandbox_mode
+            .advertised_capabilities()
+            .iter()
+            .map(|capability| capability.as_str().to_string())
+            .collect(),
+        high_risk_workspace_actions: sandbox_mode.supports_high_risk_workspace_actions(),
         models: model_options(resolved.model.as_deref()),
     };
 

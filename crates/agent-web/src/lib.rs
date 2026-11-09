@@ -67,9 +67,16 @@ pub struct Meta {
     /// page uses it only to draw a proportionate context bar; a missing value
     /// means "no budget was stated", not "zero".
     pub budget: Option<u32>,
-    /// What this build can actually do. The UI greys out what is missing rather
-    /// than offering a button that can only fail.
+    /// HTTP/API features this build can actually offer. The UI greys out what
+    /// is missing rather than offering a button that can only fail.
     pub capabilities: Vec<String>,
+    /// Capabilities the selected execution sandbox advertises. This is what the
+    /// model can actually ask to use, before policy/approval is consulted.
+    pub sandbox_capabilities: Vec<String>,
+    /// Whether this sandbox can run high-risk workspace actions such as
+    /// `shell.run`. `local` advertises process.spawn but cannot isolate it, so
+    /// this is the authoritative distinction the page needs.
+    pub high_risk_workspace_actions: bool,
     /// The models a session may be switched to. Assembled at startup from the
     /// providers this process could actually build, so the page never offers a
     /// choice that can only fail.
@@ -435,6 +442,8 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "judgment": state.meta.judgment,
         "budget": state.meta.budget,
         "capabilities": state.meta.capabilities,
+        "sandbox_capabilities": state.meta.sandbox_capabilities,
+        "high_risk_workspace_actions": state.meta.high_risk_workspace_actions,
         "models": state.meta.models,
     }))
 }
