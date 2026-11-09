@@ -28,6 +28,20 @@
 
 当前版本只以 Windows 为主要运行目标。其他平台尚未纳入 CI。
 
+## 目录结构
+
+| 路径 | 职责 |
+|---|---|
+| `apps/agent/` | CLI 入口、运行时装配与端到端测试 |
+| `crates/` | 24 个 workspace lib crate；协议、端口、内核、循环、工具、存储与 Web 分层 |
+| `web/` | GUI 源码；`web/dist` 是主动纳入版本库的构建产物 |
+| `scripts/` | 启动、测试、覆盖率、发布验证与浏览器自动化脚本 |
+| `perf/` | 性能基线数据 |
+| `.github/` | CI 配置 |
+| `target/`、`.agent-data/`、`.superpowers/`、`node_modules/` | 本地生成物或代理过程状态，均不提交 |
+
+稳定的工程文档位于仓库根目录；阶段计划、实施记录和实验数据不进入主仓库。
+
 ## 双击启动
 
 双击仓库根目录的 `启动爻爻.cmd`（或 ASCII 名 `start-yaoyao.cmd`；两者都只调
@@ -158,6 +172,19 @@ node scripts/gui/smoke.mjs
 
 阶段计划、真实使用证据和版本演进记录在独立项目工作区，不进入本仓库。
 
+## 验证状态
+
+以下是 2026-11-09 本次本地审计的验证边界；CI 会按自己的 job 重新运行对应检查。
+
+| 验证 | 状态 | 说明 |
+|---|---|---|
+| Rust 离线门（fmt / clippy / workspace tests） | 已跑 | `powershell -ExecutionPolicy Bypass -File scripts\test.ps1` |
+| TTY 下 stdin 与工具子进程审批回归 | 已跑 | `agent-tools-fs` stdin 测试与 `security_regression` 审批回归 |
+| 真实 OpenAI-compatible endpoint | 未跑 | 需要 `AGENT_MODEL_BASE_URL/NAME/API_KEY` |
+| AppContainer live | 未跑 | 需要管理员执行 `agent sandbox setup` 并设置 `AGENT_APPCONTAINER_TEST=1` |
+| 真实公网 `web.request` | 未跑 | 需要显式运行对应 live 测试 |
+| 第三方 MCP | 已跑 | `mcp_third_party` 使用 npm 与真实 stdio server |
+| GUI smoke / perf | 未跑 | 需要 Edge/Playwright 与 `scripts/gui` 依赖 |
 ## 安全边界
 
 - 不要将 `shell.run` 暴露给不可信用户。

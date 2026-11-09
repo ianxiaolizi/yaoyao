@@ -14,12 +14,12 @@
 
 use std::path::Path;
 
-use agent_cli::Verdict;
-use agent_cli::args::{self, Args, DEFAULT_SESSION};
-
 use agent::config;
+use agent_cli::Verdict;
+use agent_cli::args::{self, Args};
 
 mod commands;
+mod help;
 mod support;
 
 use commands::approval::{approve, deny, tool};
@@ -108,6 +108,11 @@ async fn main() {
             }
         }
     }
+    if let Some(target) = help::target(&argv) {
+        help::print(target.as_deref());
+        return;
+    }
+
     let args = match args::parse(&argv) {
         Ok(args) => args,
         Err(args::ArgsError::NoCommand) => {
@@ -157,69 +162,7 @@ async fn main() {
 }
 
 pub(crate) fn usage() {
-    eprintln!(
-        "Usage: agent <command> [options]\n\n\
-         Commands:\n  \
-         run <text>                 Ask the agent to do something (alias: ask)\n  \
-         ask <text>                 Alias of run\n  \
-         resume [text]              Continue a turn that was waiting on a decision\n  \
-         fork [--at <turn>]         Derive a new session from a closed turn boundary\n  \
-         steer \"<text>\"           Queue text for the turn in flight (applied at the next step)\n  \
-         interrupt                  Stop the run in flight at its next step boundary\n  \
-         export [--out <dir>]       Write the session as session.md + bundle.json (or stdout)\n  \
-         export --redacted          Same, with secret-shaped tokens replaced by ***\n  \
-         why [--turn <id>] [--depth <n>]\n                              Explain that turn's reasoning chain, backwards\n                              (--help says what a turn's end and verdict mean)\n  \
-         status                     Show session state\n  \
-         verify [flags] -- <program> [args]\n                              Run a check without a shell and record what it found\n  \
-         approve <id> [scope]       Approve a pending request [once|turn|session|always]\n  \
-         deny <id> [--only]         Deny a pending request (cascades to the session's pending)\n  \
-         tool <name> [json-args]    Run a tool through the policy gateway\n  \
-         plugin list                What the configuration, the log and the queue say about plugins\n  \
-         plugin disable <id>        Ask for a plugin to be withdrawn at the next turn boundary\n  \
-         plugin enable <id>         Ask for a disabled plugin to be registered again\n  \
-         session new [--id <id>]    Record that a session has started (idempotent)\n  \
-         session list               Every session under the data directory, newest first\n  \
-         session archive <id>       Hide a session from the working list; its log stays\n  \
-         session unarchive <id>     Show an archived session again\n  \
-         session delete <id>        Remove a session's log (refuses while a turn runs there)\n  \
-         schedule at <when> <text>  Schedule a turn: RFC3339 or +10m; run it with tick\n  \
-         schedule list              Show scheduled turns that have not run\n  \
-         schedule cancel <id>       Withdraw a scheduled turn before it runs\n  \
-         tick                       Run at most one pending or due turn\n  \
-         serve                      Keep running turns as they become due (one per session)\n  \
-         subagent serve [args]      Answer one delegation's objective, then exit. A parent\n                              process starts this, not a person: it is the child half\n                              of kind = \"self\" in [subagents.<id>]\n  \
-         web [--port <n>]           Serve the GUI on loopback, token printed once\n  \
-         memory search <text>       Find events whose text contains <text>\n  \
-         memory reindex             Rebuild the searchable index from the session log\n  \
-         memory remember <text>     Keep a fact across sessions (--key, --supersedes, --private)\n  \
-         memory list [--all]        Show remembered facts (--all includes replaced and expired)\n  \
-         memory forget <id>         Delete a remembered fact for good\n  \
-         memory export [--out]      Every remembered fact as JSON\n  \
-         context inspect            Show what the next request would carry (size, kinds, budget)\n  \
-         metrics [--out <path>]     Count turns, tools, approvals, tokens and time\n                              from the event log (every session unless --session names one)\n  \
-         artifact get <ref> [--out] Fetch a stored blob (locator or hash). Text to stdout otherwise\n  \
-         rollback <snapshot_id>     Restore the workspace to a recovery point; --session names\n                              the log the rollback is recorded in\n  \
-         sandbox setup              Create the AppContainer profile and its grants (elevated)\n  \
-         sandbox status             Report whether the AppContainer setup is in place\n  \
-         doctor                     Run health checks\n\n\
-         Options:\n  \
-         --session <id>             Act on this session (default: {DEFAULT_SESSION})\n  \
-         --profile <name>           Compose this profile for the run\n  \
-         --model <name>             Ask the provider for this model\n  \
-         --task <name>              Apply the user configuration's [task_budgets.<name>]\n  \
-         --json                     One structured object on stdout\n  \
-         --events                   The events this command produced, one JSON object per line\n\
-         \nOptions may appear before or after the command. --json and --events are \
-         mutually exclusive.\n\n\
-         Configuration, in order of authority:\n  \
-         {managed}   machine-wide policy (deny list)\n  \
-         {user}      capabilities and trusted plugins\n  \
-         <workspace>/{workspace}   project configuration\n\
-         \nA profile selects inside what the user configuration authorized; it cannot add to it.",
-        managed = config::ENV_MANAGED_POLICY,
-        user = config::ENV_USER_CONFIG,
-        workspace = config::WORKSPACE_CONFIG,
-    );
+    eprintln!("{}", help::usage_text());
 }
 
 /// The command's positional arguments, with each flag and its value skipped.

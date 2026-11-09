@@ -23,6 +23,9 @@ node_modules/
 Thumbs.db
 .DS_Store
 
+# Agent process state (plans, specs, SDD progress)
+/.superpowers/
+
 # Local runtime state written by `agent` (event logs, artifacts, smoke runs)
 /.agent-data/
 /.agent-smoke*/

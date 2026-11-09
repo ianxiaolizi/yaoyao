@@ -11,9 +11,10 @@
 //! it; a user who guessed the word learned that guessing was how you had to do
 //! this.
 //!
-//! The guard is a **text** guard, and says so. It reads two places in
-//! `apps/agent/src/main.rs` — the `match args.command.as_str()` table and the
-//! string `usage()` prints — and compares them by first word. That makes it
+//! The guard is a **text** guard, and says so. It reads the
+//! `match args.command.as_str()` table in `apps/agent/src/main.rs` and the
+//! string `usage_text()` prints in `apps/agent/src/help.rs`, then compares them
+//! by first word. That makes it
 //! blind in two directions: a name the guard cannot see it treats as absent
 //! (there is no name here built by a macro or a constant), and a name it does
 //! see counts even when the surrounding prose is about something else (the
@@ -24,8 +25,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The one file this guards, relative to the workspace root.
+/// The dispatch table this guards, relative to the workspace root.
 const APP: &str = "apps/agent/src/main.rs";
+
+/// The usage text this guards, relative to the workspace root.
+const HELP: &str = "apps/agent/src/help.rs";
 
 /// The line that opens the dispatch table. Matching on it means a rewrite that
 /// moves the arms elsewhere fails here, loudly, rather than silently guarding
@@ -44,6 +48,11 @@ fn workspace_root() -> PathBuf {
 
 fn app_source() -> String {
     let path = workspace_root().join(APP);
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
+fn help_source() -> String {
+    let path = workspace_root().join(HELP);
     fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
 }
 
@@ -87,8 +96,9 @@ fn quoted(text: &str) -> Vec<String> {
 /// pattern-matching the source — is what makes the rule about the **printed**
 /// line, which is the line a person reads.
 fn usage_lines(source: &str) -> Vec<String> {
-    let start =
-        source.find("fn usage()").unwrap_or_else(|| panic!("{APP} no longer has `fn usage()`"));
+    let start = source
+        .find("fn usage_text()")
+        .unwrap_or_else(|| panic!("{HELP} no longer has `fn usage_text()`"));
     let body = &source[start..];
     let end = body.find(");").unwrap_or(body.len());
     body[..end]
@@ -132,11 +142,11 @@ fn every_dispatched_command_is_documented() {
         dispatched.len()
     );
 
-    let documented = documented_names(usage_lines(&source).iter().map(String::as_str));
+    let documented = documented_names(usage_lines(&help_source()).iter().map(String::as_str));
     let missing = undocumented(&dispatched, &documented);
     assert!(
         missing.is_empty(),
-        "commands {APP} dispatches but `usage()` never prints: {missing:?} — a command whose name \
+        "commands {APP} dispatches but `usage_text()` never prints: {missing:?} — a command whose name \
          exists only in the dispatch table is one a user can find only by reading the source. \
          Either document it, or take it out"
     );

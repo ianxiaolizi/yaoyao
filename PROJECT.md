@@ -53,7 +53,7 @@ protocol → 尽量零依赖    ports → protocol    kernel → ports/protocol/
 2. **`loop`（与 `kernel`）不依赖 `projection`**——loop 只认 `agent-ports` 的 `ContextEngine` 端口，实现由 apps 层注入。否则投影引擎会反转依赖方向。
 3. **依赖方向由测试把守**，不靠自觉：`crates/agent-testkit/tests/architecture_boundaries.rs` 用集合相等双向钉住**两张**矩阵——运行期 `[dependencies]` 与测试期 `[dev-dependencies]`。清单用 `toml` **解析**而不是逐行扫，所以点表写法、重命名与不含斜杠的成员都看得见；另有一条守卫要求每个 `agent-*` 依赖必须是 workspace 内的 `path`。
 
-workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin）。测试期允许跨层（适配器要对着真调用方测，而不是对着它的假替身），但每一处都必须在矩阵里注明理由，不得悄悄发生。
+workspace 现有 **25 个成员**（24 个 lib crate + `apps/agent` 一个 bin）。测试期允许跨层（适配器要对着真调用方测，而不是对着它的假替身），但每一处都必须在矩阵里注明理由，不得悄悄发生。
 
 ## crate 地图
 
@@ -84,7 +84,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-web` | 本地回环 HTTP 入口：内嵌 GUI、一次性令牌、会话/transcript/thinking/why/diff/context/plan/subagent/schedule 读模型、SSE（历史重放 + 实时预览）、导出与 artifact、起轮/审批/过期续跑/分叉/插话/中断；写操作经 `Backend` 缝交给 `apps/agent` 的 `WebBackend`，再由它调用同一套 `agent-cli` 具名命令，不复制内核装配 |
 | `apps/agent` | 唯一具体组装入口（二进制）；`instructions` 模块把工作区根部的 `AGENTS.md` + 内置前言组成每次运行的系统指令 |
 
-`agent-kernel` 一个 crate 占 src 的约四分之一；`agent-loop`、`agent-cli` 是单文件大模块。
+`agent-kernel` 一个 crate 占 src 的约四分之一；`agent-loop` 的默认循环已拆成 `default.rs`、`default/agent_loop_impl.rs` 与各 recovery/limits 子模块，`agent-cli` 仍较大但受模块大小守卫约束。
 
 ## 关键设计决策
 
@@ -95,7 +95,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | 权限模型 | fail closed：缺策略或能力时拒绝，不静默降级 |
 | Inbox | 内核一等能力，统一承载用户输入、审批、定时唤醒与 steering |
 | 模型接入 | provider-neutral 内部协议；第一版提供 OpenAI-compatible 适配器 |
-| 前端 | 单页静态资源，无构建步骤、无框架；时间线按回合分块**键控增量更新**（只重画变化的那块）、点击走一次事件委托，活跃回合的流式文本只重绘自身；性能只与本地记录的基线比（`scripts/gui/perf.mjs`），虚拟滚动等有数据再定（`CONTRACT.md` §7 #120） |
+| 前端 | 单页静态资源，Vite + TypeScript 构建、无框架；`web/dist` 作为构建产物提交并嵌入二进制；时间线按回合分块**键控增量更新**（只重画变化的那块）、点击走一次事件委托，活跃回合的流式文本只重绘自身；性能只与本地记录的基线比（`scripts/gui/perf.mjs`），虚拟滚动等有数据再定（`CONTRACT.md` §7 #120） |
 | 工具扩展 | 工具名全局唯一；MCP 是工具来源之一，不成为内核协议 |
 | 上下文 | 稳定系统前缀 + 状态/任务层 + 计划与步骤账本；按工作集预算压缩 |
 | 审计 | 持久化事件是事实源；请求、工具定义、审批和 artifact 均可回读 |
@@ -232,8 +232,10 @@ Windows 注意：Git Bash 的 `/usr/bin/link` 会遮蔽 MSVC 的 `link.exe` 导�
 
 | 文档 | 回答什么 | 谁该读 |
 |---|---|---|
+| `README.md` | 快速启动、开发命令、Web GUI 入口与安全提示 | 第一次运行或开发 |
 | `PROJECT.md`（本文件） | 要成为什么 / 架构与依赖 / 怎么跑 | 所有人，第一次进项目 |
 | `CONTRACT.md` | **不变量与判据**：事实源、fail closed、退出码、租约、命名、版本化；术语与分类口径 | **改任何一行代码之前** |
 | `STYLE.md` | 代码风格与工程规则：`deny(unsafe_code)`、unwrap 禁令、错误类型、测试与提交约定 | 写代码时 |
+| `SECURITY.md` | 信任边界、安全模型与漏洞报告方式 | 涉及执行、权限或发布时 |
 
 阶段计划、实施记录、真实使用证据和版本演进不进入本仓文档，统一放在项目工作区。

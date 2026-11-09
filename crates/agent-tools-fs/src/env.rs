@@ -908,7 +908,7 @@ struct StdProcess {
 impl ProcessLauncher for StdProcessLauncher {
     fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn RunningProcess>, LaunchError> {
         let stdin = match request.stdin {
-            StdinMode::Closed => Stdio::inherit(),
+            StdinMode::Closed => Stdio::null(),
             StdinMode::Pipe => Stdio::piped(),
         };
         let mut command = Command::new(&request.program);
