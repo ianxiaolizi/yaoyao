@@ -153,6 +153,18 @@ powershell -ExecutionPolicy Bypass -File scripts\personal\package.ps1
 `config.example.toml`、`README.txt` 和仅供对照的 `web\dist`。包内没有 API key、
 事件日志、`.agent-data` 或开发机的 `start.local.ps1`。
 
+### 备份与诊断
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\personal\backup.ps1
+powershell -ExecutionPolicy Bypass -File scripts\personal\diagnose.ps1
+```
+
+备份默认写到 `%LOCALAPPDATA%\yaoyao-agent\backups\`，包含逐文件 SHA-256 清单，且不删除
+源数据。支持包默认写到 `%LOCALAPPDATA%\yaoyao-agent\diagnostics\`，包含 `doctor.txt`、
+`metrics.txt`、最近会话的 redacted export 与 `manifest.json`；所有匹配
+`*KEY*` / `*TOKEN*` / `*SECRET*` 的环境变量值在打包前都会被替换。
+
 ## 本地 Web GUI
 
 `agent web` 在同一个进程、同一个二进制里起一个只绑 `127.0.0.1` 的页面：
