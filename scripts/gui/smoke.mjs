@@ -536,6 +536,70 @@ function seedScratch() {
 }
 
 /**
+ * The incident shape (session `web-20261103090946-2ntt`): the turn answered,
+ * a tool was refused, and the completion gate recorded `verdict=missing`. The
+ * page must call this "已交付 · 未验证", never bare "完成".
+ */
+function seedUnverifiedDelivery() {
+  const log = builder('unverified-delivery');
+  log.add('run/started', { actor: 'scheduler' });
+  log.ask('t1', '做一个 3 秒的火柴人战斗视频');
+  log.add('tool/started', {
+    turn: 't1',
+    step: 'step-t1',
+    actor: 'tool',
+    payload: {
+      tool_name: 'shell.run',
+      provider_tool_call_id: 'call-unverified-1',
+      arguments: { command: 'ffmpeg -version' },
+    },
+  });
+  log.add('tool/failed', {
+    turn: 't1',
+    step: 'step-t1',
+    actor: 'tool',
+    payload: {
+      tool_name: 'shell.run',
+      provider_tool_call_id: 'call-unverified-1',
+      status: 'failed',
+      error_kind: 'sandbox_unavailable',
+      content: 'policy denied tool shell.run: risk l3',
+    },
+  });
+  log.add('turn/completed', {
+    turn: 't1',
+    actor: 'scheduler',
+    payload: { final_content: '交付已完成。', stop_reason: 'final_answer' },
+  });
+  log.add('completion/unverified_result_delivered', {
+    turn: 't1',
+    actor: 'scheduler',
+    payload: { verdict: 'missing', task_revision: 4 },
+  });
+  log.add('run/completed', { actor: 'scheduler', payload: { stop_reason: 'final_answer' } });
+  log.save();
+}
+
+/** A passing check covers the work: the one shape that may say "已验证完成". */
+function seedVerifiedDelivery() {
+  const log = builder('verified-delivery');
+  log.add('run/started', { actor: 'scheduler' });
+  log.ask('t1', '导出并验证一份报告');
+  log.add('completion/checked', {
+    turn: 't1',
+    actor: 'scheduler',
+    payload: { status: 'completed', kind: 'command', steps: 1 },
+  });
+  log.add('turn/completed', {
+    turn: 't1',
+    actor: 'scheduler',
+    payload: { final_content: '报告已导出并通过检查。', stop_reason: 'final_answer' },
+  });
+  log.add('run/completed', { actor: 'scheduler', payload: { stop_reason: 'final_answer' } });
+  log.save();
+}
+
+/**
  * A log captured from a real turn (`capture-real-chain.mjs`): the scheduler,
  * tool gateway, filesystem and `git diff` all ran. Replaying it keeps the
  * panels honest about real event shapes instead of this file's hand-written
@@ -664,6 +728,8 @@ async function main() {
   seedApproval('ui-approval', 'ap-smoke', nowIso());
   seedApproval('ui-expired', 'ap-old', new Date(Date.now() - 25 * 60 * 60_000).toISOString());
   seedScratch();
+  seedUnverifiedDelivery();
+  seedVerifiedDelivery();
   seedRealChain();
   seedLong();
   // The real-subagent capture is a fixture, not a page in this run: its parent
@@ -704,12 +770,12 @@ async function main() {
   check('会话标题取第一条用户消息', (await text(page, '#title')) === 'show the diff and think about it');
   check('轮数与日志一致', (await text(page, '#round')) === '第 4 轮');
   check('侧栏默认只列最近 6 条', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 6);
-  check('全部会话入口写明总数', (await text(page, '[data-session-all]')).includes('全部会话 · 8'));
+  check('全部会话入口写明总数', (await text(page, '[data-session-all]')).includes('全部会话 · 10'));
   await page.click('[data-session-all]');
-  await page.waitForFunction(() => document.querySelectorAll('.y-session').length === 8, null, {
+  await page.waitForFunction(() => document.querySelectorAll('.y-session').length === 10, null, {
     timeout: 10_000,
   });
-  check('展开后列出全部会话', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 8);
+  check('展开后列出全部会话', (await page.$$eval('.y-session', (nodes) => nodes.length)) === 10);
   check('当前轮目标', (await text(page, '.y-goal')).includes('what changed, and is it safe?'));
   check('当前轮回答', (await text(page, '.y-answer')).includes('one hunk'));
   check('思考折叠存在', (await page.$$eval('.y-thinking', (nodes) => nodes.length)) >= 1);
@@ -737,7 +803,7 @@ async function main() {
   await page.waitForSelector('.trace-pop.is-on', { timeout: 10_000 });
   const railText = await text(page, '.trace-pop');
   check('刻度 hover 摘要含轮次', railText.includes('第 2 轮'));
-  check('刻度 hover 摘要含状态', /完成|运行中|等待确认/.test(railText));
+  check('刻度 hover 摘要含状态', /已回答|已验证完成|未完成|运行中|等待确认/.test(railText));
   check('刻度 hover 摘要含时间', /\d{2}:\d{2}/.test(railText));
   check('刻度 hover 摘要含步数', /步/.test(railText));
   const railBefore = await page.$eval('.trace-pop', (node) => node.getAttribute('data-turn'));
@@ -938,6 +1004,29 @@ async function main() {
   check('Esc 退出全屏但保留成果台', await page.$eval('#result', (node) => node.classList.contains('open') && !node.classList.contains('full')));
   await page.keyboard.press('Escape');
   check('再按 Esc 收起成果台', !(await page.$eval('#result', (node) => node.classList.contains('open'))));
+
+  // Incident regression: an answered turn with no completion evidence must not
+  // be called "完成"; the kernel's unverified verdict and the local-backend
+  // capability gap both have to reach the page.
+  await page.goto(`${origin}/?session=unverified-delivery#t=${token}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('.y-turn', { timeout: 15_000 });
+  check('事故回归：顶部状态是未验证交付', await waitText(page, '#statusPill', '已交付 · 未验证'));
+  check('事故回归：顶部状态没有裸“完成”', !(await text(page, '#statusPill')).includes('完成'));
+  check('事故回归：这一轮行末写已回答', await waitText(page, '.y-end', '已回答'));
+  check('事故回归：未验证说明可见', await page.locator('#statusNote').isVisible());
+  check(
+    '事故回归：说明写明未验证不等于完成',
+    await waitText(page, '#statusNote', '未验证的交付不等于完成'),
+  );
+  check('事故回归：local 后端能力提示出现', await waitText(page, '#envNote', 'app-container'));
+  await page.screenshot({ path: join(shots, 'm10-unverified.png') });
+
+  // The positive shape: a passing check is the only way to say verified complete.
+  await page.goto(`${origin}/?session=verified-delivery#t=${token}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('.y-turn', { timeout: 15_000 });
+  check('已验证交付：顶部状态是已验证完成', await waitText(page, '#statusPill', '已验证完成'));
+  check('已验证交付：没有未验证横幅', !(await page.locator('#statusNote').isVisible()));
+  await page.screenshot({ path: join(shots, 'm10-verified.png') });
 
   // The real chain: captured from an actual turn (scheduler, gateway, fs,
   // git diff), so the panels are checked against real event shapes too.
@@ -1209,6 +1298,8 @@ async function main() {
           'm8-model.png',
           'm8-archive.png',
           'm9-real-chain.png',
+          'm10-unverified.png',
+          'm10-verified.png',
         ],
       },
       null,
