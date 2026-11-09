@@ -47,11 +47,18 @@ if (Test-Path $local) {
 
 Write-Host ''
 $sandbox = if ($env:AGENT_SANDBOX) { $env:AGENT_SANDBOX.Trim() } else { 'local' }
+$network = if ($env:AGENT_SANDBOX_NETWORK) { $env:AGENT_SANDBOX_NETWORK.Trim() } else { 'deny' }
+$profile = if ($env:AGENT_PROFILE) { $env:AGENT_PROFILE.Trim() } else { '' }
 Write-Host '  爻爻 · 本地 Web' -ForegroundColor Cyan
 Write-Host "  工作区  $env:AGENT_WORKSPACE_DIR"
 Write-Host "  数据    $env:AGENT_DATA_DIR"
+Write-Host "  档位    $(if ($profile) { $profile } else { '（未选择）' })"
 Write-Host "  沙箱    $sandbox"
+Write-Host "  网络    $network"
 Write-Host "  端口    $Port"
+if ($network -eq 'internet') {
+    Write-Host '  警告：internet 是宽泛出站能力（AppContainer internetClient），不是站点白名单。' -ForegroundColor Yellow
+}
 Write-Host ''
 
 # 端口被占用时不要把第二个服务叠上去，否则同一个会话会有两个驱动者。
@@ -163,7 +170,10 @@ Write-Host '  启动中；看到 URL 会自动打开浏览器。Ctrl+C 停止。
 Write-Host ''
 
 try {
-    & $exe web --port $Port 2>&1 | ForEach-Object {
+    $agentArgs = @()
+    if ($profile) { $agentArgs += @('--profile', $profile) }
+    $agentArgs += @('web', '--port', "$Port")
+    & $exe @agentArgs 2>&1 | ForEach-Object {
         $line = $_.ToString()
         Write-Host $line
         # 日志会被留下来分享；令牌只出现在控制台和浏览器的地址栏里。
