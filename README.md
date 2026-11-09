@@ -102,6 +102,24 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 cargo run -p agent -- ask "hello"
 ```
 
+## 个人配置档位
+
+个人模板在 `examples/personal/config.toml`，提供 `safe`、`coding`、
+`coding-online` 和 `research` 四个档位。把配置放到模型不可写的位置，再选择档位：
+
+```powershell
+$env:AGENT_USER_CONFIG = "$env:LOCALAPPDATA\yaoyao-agent\personal-config.toml"
+$env:AGENT_SANDBOX = 'app-container'
+cargo run -p agent -- --profile coding ask "hello"
+```
+
+`coding` 每次 `shell.run` 都询问，命令后端必须是 `app-container`，网络保持
+`deny`。需要让命令访问包管理器时，显式设置
+`AGENT_SANDBOX_NETWORK=internet`；这是 AppContainer 的宽泛出站能力，不是站点白名单。
+`coding-online` 另外允许只读的 `web.request`，其可访问源仍由用户配置的
+`[network] allow` 限定；它不会被解释成命令的 origin allowlist。不需要联网时继续用
+`coding` + `deny`。
+
 连接 OpenAI-compatible 端点：
 
 ```powershell
