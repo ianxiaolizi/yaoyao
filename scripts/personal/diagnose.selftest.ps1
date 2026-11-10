@@ -15,8 +15,16 @@ try {
     if ($text -notmatch [regex]::Escape('command=agent export --session web-diagnose-test')) {
         throw 'diagnose did not plan an export for the latest session'
     }
-    if ($text -notmatch [regex]::Escape("session_data=$sessionRoot")) {
-        throw 'diagnose did not select the workspace data directory for agent commands'
+    # Compare real paths rather than raw text: the selection is a path, and a
+    # host that reports it with different casing or separators still selected
+    # the right directory. When it selected a different one, report what it
+    # printed instead of only that something was wrong.
+    $selected = @($out | Where-Object { "$_" -like 'session_data=*' })
+    $actual = if ($selected.Count -eq 1) { ("$($selected[0])" -replace '^session_data=', '').Trim() } else { '' }
+    $resolvedActual = if ($actual) { [IO.Path]::GetFullPath($actual).TrimEnd('\') } else { '' }
+    $expected = [IO.Path]::GetFullPath($sessionRoot).TrimEnd('\')
+    if (-not $resolvedActual -or -not [string]::Equals($resolvedActual, $expected, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "diagnose did not select the workspace data directory for agent commands: $text"
     }
     Write-Host 'PASS'
 }
