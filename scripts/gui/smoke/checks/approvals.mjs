@@ -19,9 +19,23 @@ export async function run(ctx) {
   check('审批卡四个决定', (await page.$$eval('#gate [data-decision]', (nodes) => nodes.length)) === 4);
   check('审批卡有 TTL 文案', /失效/.test(await text(page, '#gate .ttl')));
   const ttlFirst = await text(page, '#gate .ttl');
-  await page.waitForTimeout(1_300);
+  // Wait for the page's own one-second tick instead of sleeping a fixed
+  // interval: a busy runner can delay a timer past a 1.3s sleep, and that
+  // would fail the clock check for the machine's load rather than the page.
+  const ttlTicked = await page
+    .waitForFunction(
+      (first) => {
+        const node = document.querySelector('#gate .ttl');
+        const current = node?.textContent ?? '';
+        return current !== first && /后失效/.test(current);
+      },
+      ttlFirst,
+      { timeout: 5_000 },
+    )
+    .then(() => true)
+    .catch(() => false);
   const ttlSecond = await text(page, '#gate .ttl');
-  check('审批 TTL 逐秒走', ttlFirst !== ttlSecond && /后失效/.test(ttlSecond), `${ttlFirst} -> ${ttlSecond}`);
+  check('审批 TTL 逐秒走', ttlTicked, `${ttlFirst} -> ${ttlSecond}`);
   await page.screenshot({ path: join(ctx.shots, 'm7-approval.png') });
   await page.click('#gate [data-decision="once"]');
   // The seeded approval has no live run behind it. What the page must do is

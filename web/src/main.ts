@@ -253,13 +253,18 @@ function connect(id: string): void {
               say(text, true);
               return;
             }
+            // Durable items and live previews travel on two channels of one
+            // stream, so a chunk can arrive after the `turn_end` that settled
+            // its turn. A preview is the shape of a running turn; accepting it
+            // here would show a finished answer as still being written and
+            // leave the live row on screen forever.
+            if (!store.get().running) return;
             const current = store.get().live ?? {};
             if (live.kind === 'reasoning') {
               store.dispatch({ type: 'live', live: { ...current, reasoning: (current.reasoning ?? '') + text } });
             } else {
               store.dispatch({ type: 'live', live: { ...current, text: (current.text ?? '') + text } });
             }
-            store.dispatch({ type: 'running', running: true });
           },
           onHeartbeat: (head) => {
             if (store.get().active === id) store.dispatch({ type: 'head', head });
