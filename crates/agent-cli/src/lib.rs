@@ -1624,3 +1624,157 @@ pub async fn run_rollback(
     };
     Ok(if report.complete { CliOutcome::ok(output) } else { CliOutcome::failed(output) })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report shaped like the scheduler's, so the text helpers can be read
+    /// without a run. The numbers are deliberately non-round: the summary has
+    /// to show what was spent, not a placeholder.
+    fn report(stop: StopReason, content: Option<&str>) -> RunReport {
+        RunReport {
+            run_id: agent_protocol::ids::RunId::from_string("run-1"),
+            turn_id: TurnId::from_string("turn-1"),
+            stop_reason: stop,
+            final_content: content.map(str::to_string),
+            spent: agent_protocol::profile::Spent {
+                input_tokens: 120,
+                output_tokens: 30,
+                cache_hit_tokens: 0,
+                estimated: false,
+            },
+            steps: 3,
+            tool_calls: 2,
+            elapsed_ms: 4_500,
+            intent_id: None,
+        }
+    }
+
+    #[test]
+    fn a_limit_stop_says_what_ran_out_and_how_to_continue() {
+        // The advice is the whole point of the line: a person reading a
+        // stopped run needs the setting to raise, and each limit has its own.
+        for (stop, advice) in [
+            (StopReason::MaxSteps, "budget.max_steps"),
+            (StopReason::MaxToolCalls, "budget.max_tool_calls"),
+            (StopReason::WallClockExceeded, "budget.wall_clock_timeout"),
+            (StopReason::TokenBudgetExceeded, "budget.max_total_tokens"),
+            (StopReason::Stalled, "kept repeating itself"),
+        ] {
+            let label = stop.as_str();
+            let text = stopped_text(&report(stop, None));
+            assert!(text.starts_with("[incomplete:"), "{label}: {text}");
+            assert!(text.contains(advice), "{label}: {text}");
+        }
+
+        // The cost line is the same for every one of them.
+        let text = limit_text(&report(StopReason::ContentFiltered, None));
+        assert!(text.contains("run again"), "{text}");
+        // The cost line's own advice table still knows the capability case,
+        // even though `stopped_text` answers it with the three choices.
+        assert!(
+            limit_text(&report(StopReason::CapabilityBlocked, None)).contains("switch the backend")
+        );
+        assert!(text.contains("ran 3 step(s) and 2 tool call(s)"), "{text}");
+        assert!(text.contains("120 input + 30 output"), "{text}");
+        assert!(text.contains("4s"), "{text}");
+    }
+
+    #[test]
+    fn a_withheld_answer_keeps_its_text_and_names_why_it_is_not_a_delivery() {
+        // Both of these are completed turns whose answer was not delivered.
+        // The text stays, and the notice says so; a run with no text still
+        // says why.
+        for stop in [StopReason::SecurityBlocked, StopReason::CapabilityBlocked] {
+            let label = stop.as_str();
+            let with = stopped_text(&report(stop.clone(), Some("the model said")));
+            assert!(with.starts_with("the model said\n\n["), "{label}: {with}");
+            let without = stopped_text(&report(stop, Some("   ")));
+            assert!(without.starts_with('['), "{label}: {without}");
+        }
+        let withheld = stopped_text(&report(StopReason::SecurityBlocked, None));
+        assert!(withheld.contains("security/review.failed"), "{withheld}");
+        let blocked = stopped_text(&report(StopReason::CapabilityBlocked, None));
+        assert!(blocked.contains("app-container backend"), "{blocked}");
+
+        // The provider cutoffs keep their own wording, and a withheld answer
+        // is not described as a token-limit truncation.
+        let refused = halted_text(&StopReason::ContentFiltered, Some("partial"));
+        assert!(refused.contains("[refused:"), "{refused}");
+        let cut = halted_text(&StopReason::MaxOutputTokens, None);
+        assert!(cut.starts_with("[truncated:"), "{cut}");
+    }
+
+    #[test]
+    fn a_repaired_tail_names_every_marker_it_closed() {
+        let mut repaired = RecoveryReport::default();
+        assert_eq!(repair_summary(&repaired), None);
+        repaired.closed_step = true;
+        assert_eq!(repair_summary(&repaired).as_deref(), Some("step"));
+        repaired.closed_turn = true;
+        repaired.closed_run = true;
+        repaired.tools_outcome_unknown = 2;
+        let summary = repair_summary(&repaired).expect("something was closed");
+        assert!(summary.contains("2 dispatched call(s) marked outcome-unknown"), "{summary}");
+        assert!(summary.contains("step, turn, run"), "{summary}");
+    }
+
+    #[test]
+    fn a_settled_call_says_how_it_ended() {
+        assert_eq!(
+            disposition_text(&Disposition::Ran { status: ToolStatus::Completed }),
+            "run (Completed)"
+        );
+        assert_eq!(
+            disposition_text(&Disposition::Denied {
+                status: agent_protocol::permissions::ApprovalStatus::Denied
+            }),
+            "refused (Denied)"
+        );
+        assert_eq!(
+            disposition_text(&Disposition::Rejected { reason: "no such tool".to_string() }),
+            "refused by the tool gateway: no such tool"
+        );
+        assert_eq!(
+            disposition_text(&Disposition::AlreadySettled),
+            "already settled by an earlier resume"
+        );
+    }
+
+    #[test]
+    fn an_adjudication_line_shows_only_the_facts_it_has() {
+        let bare = agent_kernel::intent_adjudication::AdjudicationStatus {
+            event: "completed".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(adjudication_line(&bare), "adjudicated: -");
+
+        let full = agent_kernel::intent_adjudication::AdjudicationStatus {
+            event: "completed".to_string(),
+            decision: Some("accepted".to_string()),
+            relation: Some("same".to_string()),
+            confidence: Some(0.8123),
+            // An accepted cause is the ordinary outcome; repeating it would
+            // be noise on every line.
+            cause: Some("accepted".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            adjudication_line(&full),
+            "adjudicated: accepted (relation same, confidence 0.81)"
+        );
+
+        let odd = agent_kernel::intent_adjudication::AdjudicationStatus {
+            event: "unclear".to_string(),
+            decision: Some("unclear".to_string()),
+            relation: Some("different".to_string()),
+            cause: Some("no_evidence".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            adjudication_line(&odd),
+            "adjudicated: unclear (relation different) cause: no_evidence"
+        );
+    }
+}

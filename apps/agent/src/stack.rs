@@ -1480,6 +1480,59 @@ mod tests {
         assert_eq!(effort, None);
         assert_eq!(source, "unsupported");
     }
+
+    #[test]
+    fn the_reasoning_depth_comes_from_the_profile_then_the_model_then_high() {
+        let caps = |efforts: Vec<ReasoningEffort>, default: Option<ReasoningEffort>| {
+            ResolvedModelCapabilities {
+                capabilities: ModelCapabilities {
+                    context_window_tokens: 1_000,
+                    max_output_tokens: 100,
+                    reasoning_efforts: efforts,
+                    default_reasoning_effort: default,
+                },
+                source: agent_protocol::model::ModelCapabilitySource::Bundled,
+            }
+        };
+
+        // A profile's explicit choice wins when the model declares it.
+        let (effort, source) = reasoning_effort_for(
+            &Some(ReasoningEffort::Low),
+            &caps(vec![ReasoningEffort::Low, ReasoningEffort::High], None),
+            "route",
+        )
+        .expect("a declared depth");
+        assert_eq!((effort, source), (Some(ReasoningEffort::Low), "explicit"));
+
+        // A depth the model never declared is refused, and the refusal names
+        // the route so the operator knows which one asked.
+        let error = reasoning_effort_for(
+            &Some(ReasoningEffort::Max),
+            &caps(vec![ReasoningEffort::Low], None),
+            "route-x",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("route-x"), "{error}");
+
+        // The model's own default is next, and only when it declared it.
+        let (effort, source) = reasoning_effort_for(
+            &None,
+            &caps(vec![ReasoningEffort::Low, ReasoningEffort::High], Some(ReasoningEffort::Low)),
+            "route",
+        )
+        .expect("the model's default");
+        assert_eq!((effort, source), (Some(ReasoningEffort::Low), "model_default"));
+
+        // With no default, the nearest depth at or below `high`.
+        let (effort, source) = reasoning_effort_for(
+            &None,
+            &caps(vec![ReasoningEffort::Off, ReasoningEffort::Max], None),
+            "route",
+        )
+        .expect("a depth to send");
+        assert_eq!((effort, source), (Some(ReasoningEffort::Off), "default"));
+    }
+
     #[test]
     fn the_fast_route_gets_its_own_complete_summary_budget() {
         // The main model holds a million tokens; the fast one that writes the
@@ -1744,5 +1797,50 @@ mod tests {
         let kept =
             reachable_servers(servers(), &SandboxMode::LocalProcess.advertised_capabilities());
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn the_judgment_arm_has_one_word_for_both_halves_of_a_run() {
+        for (arm, flag) in
+            [(JudgmentArm::Full, "on"), (JudgmentArm::Gates, "gates"), (JudgmentArm::Off, "off")]
+        {
+            assert_eq!(arm.as_flag(), flag);
+        }
+        // A disabled pipeline does not even read the environment: the caller
+        // said off, and a stray variable cannot turn it back on.
+        assert_eq!(judgment_arm(false).unwrap(), JudgmentArm::Off);
+    }
+
+    #[test]
+    fn the_default_reasoning_depth_never_exceeds_high() {
+        // The rule names `high`: the deepest declared depth that does not
+        // exceed it wins, and a model that only offers deeper ones is asked
+        // for its shallowest rather than for a depth it never declared.
+        assert_eq!(
+            nearest_high(&[ReasoningEffort::Off, ReasoningEffort::High, ReasoningEffort::Max]),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            nearest_high(&[ReasoningEffort::Low, ReasoningEffort::Max]),
+            ReasoningEffort::Low
+        );
+        assert_eq!(nearest_high(&[ReasoningEffort::Max]), ReasoningEffort::Max);
+        assert_eq!(nearest_high(&[ReasoningEffort::Off]), ReasoningEffort::Off);
+    }
+
+    #[test]
+    fn a_path_inside_the_workspace_is_recognized_before_it_exists() {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("the workspace");
+        let inside = root.join("nested").join("not-yet-there.txt");
+        assert!(path_is_within(&inside, &root), "a missing child is still inside");
+        assert!(path_is_within(&root, &root), "a directory is within itself");
+        assert!(!path_is_within(&temp.path().join("other"), &root), "a sibling is not inside");
+
+        // A relative path is resolved against the current directory rather
+        // than compared as text.
+        let resolved = canonicalize_with_missing(std::path::Path::new("relative/child"));
+        assert!(resolved.is_absolute(), "{}", resolved.display());
     }
 }

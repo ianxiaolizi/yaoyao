@@ -1719,6 +1719,68 @@ fn memory_forget_with_no_id_is_a_usage_error() {
     assert!(refused.err.contains("Usage: agent memory forget <id>"), "{}", refused.err);
 }
 
+/// Every way to ask for something `memory` cannot do is refused with the
+/// command's own words, before any store is opened.
+#[test]
+fn a_memory_verb_with_no_words_or_a_bad_value_does_not_run() {
+    let (data, workspace) = dirs();
+    let cases: [(&[&str], &str); 6] = [
+        (&["memory"], "Usage: agent memory search <text>"),
+        (&["memory", "nonsense"], "unknown memory subcommand 'nonsense'"),
+        (&["memory", "remember"], "Usage: agent memory remember <text>"),
+        (&["memory", "remember", "a fact", "--confidence", "high"], "--confidence needs a number"),
+        (
+            &["memory", "remember", "a fact", "--expires-in-days", "0"],
+            "--expires-in-days needs a positive number",
+        ),
+        (&["memory", "forget", "--events"], "does not support --events"),
+    ];
+    for (argv, needle) in cases {
+        let refused = ran(data.path(), workspace.path(), argv);
+        assert_eq!(refused.code, Some(2), "{argv:?}: {}", refused.err);
+        assert!(refused.err.contains(needle), "{argv:?}: {}", refused.err);
+    }
+
+    // The values those flags accept reach the store: one fact, with a stated
+    // confidence, a lifetime and private sensitivity.
+    let remembered = ran(
+        data.path(),
+        workspace.path(),
+        &[
+            "memory",
+            "remember",
+            "likes tea",
+            "--confidence",
+            "0.5",
+            "--expires-in-days",
+            "5",
+            "--private",
+        ],
+    );
+    assert!(remembered.ok, "{}", remembered.err);
+    let listed = ran(data.path(), workspace.path(), &["memory", "list"]);
+    assert!(listed.ok, "{}", listed.err);
+    assert!(listed.out.contains("likes tea"), "{}", listed.out);
+}
+
+/// `context` is a reader too: what it cannot inspect is refused by name
+/// rather than measured against a guess.
+#[test]
+fn a_context_verb_with_nothing_to_inspect_does_not_run() {
+    let (data, workspace) = dirs();
+    let cases: [(&[&str], &str); 4] = [
+        (&["context"], "Usage: agent context inspect"),
+        (&["context", "nonsense"], "unknown context subcommand 'nonsense'"),
+        (&["context", "inspect", "--events"], "does not support --events"),
+        (&["context", "inspect", "--top", "0"], "--top needs a positive number"),
+    ];
+    for (argv, needle) in cases {
+        let refused = ran(data.path(), workspace.path(), argv);
+        assert_eq!(refused.code, Some(2), "{argv:?}: {}", refused.err);
+        assert!(refused.err.contains(needle), "{argv:?}: {}", refused.err);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // memory tools: the same store, reached through the gateway a model's calls go
 // through. Off until a configuration turns them on; on, a write still asks.

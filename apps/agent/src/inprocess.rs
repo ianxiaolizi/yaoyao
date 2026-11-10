@@ -846,6 +846,108 @@ mod tests {
         );
     }
 
+    /// Every way a child can stop has to reach the parent as a description the
+    /// parent can act on: a result it may pass on, a partial it must label, or
+    /// a failure with the budget to raise. A reason that fell through would be
+    /// a delegation whose fate the parent cannot report.
+    #[test]
+    fn every_child_stop_reason_reaches_the_parent_with_advice() {
+        let report = |stop_reason: StopReason, said: Option<&str>| RunReport {
+            run_id: RunId::new(),
+            turn_id: agent_protocol::ids::TurnId::new(),
+            stop_reason,
+            final_content: said.map(str::to_string),
+            spent: Spent::default(),
+            steps: 2,
+            tool_calls: 1,
+            elapsed_ms: 0,
+            intent_id: None,
+        };
+        let child = child();
+
+        // A finished child says what it answered; one that said nothing still
+        // finishes, and says so.
+        assert_eq!(
+            describe_report(&report(StopReason::FinalAnswer, Some("done")), &child),
+            SubagentOutcome::Completed { summary: "done".to_string(), result: None }
+        );
+        assert_eq!(
+            describe_report(&report(StopReason::FinalAnswer, None), &child),
+            SubagentOutcome::Completed {
+                summary: format!("the child finished without saying anything ({child})"),
+                result: None,
+            }
+        );
+        assert_eq!(
+            describe_report(&report(StopReason::Completed, None), &child),
+            SubagentOutcome::Completed {
+                summary: format!("the child's completion check passed without a summary ({child})"),
+                result: None,
+            }
+        );
+
+        // The step ceiling is a partial result the parent must label, with the
+        // child's session so the work can continue.
+        let partial = describe_report(&report(StopReason::MaxSteps, Some("half")), &child);
+        match &partial {
+            SubagentOutcome::Partial { summary } => {
+                assert!(summary.contains("max_steps ceiling"), "{summary}");
+                assert!(summary.contains(child.as_str()), "{summary}");
+                assert!(summary.contains("The partial text it produced: half"), "{summary}");
+            }
+            other => panic!("expected a partial, got {other:?}"),
+        }
+        let no_text = describe_report(&report(StopReason::MaxSteps, None), &child);
+        match &no_text {
+            SubagentOutcome::Partial { summary } => {
+                assert!(summary.contains("It produced no final text."), "{summary}");
+            }
+            other => panic!("expected a partial, got {other:?}"),
+        }
+
+        // A limit is a failure with the setting to raise, and the text beside
+        // it is labelled as the beginning of an answer.
+        for (stop, advice) in [
+            (StopReason::MaxToolCalls, "budget.max_tool_calls"),
+            (StopReason::WallClockExceeded, "budget.wall_clock_ms"),
+            (StopReason::MaxOutputTokens, "budget.max_output_tokens"),
+            (StopReason::TokenBudgetExceeded, "budget.max_total_tokens"),
+            (StopReason::Stalled, "going in circles"),
+        ] {
+            let outcome = describe_report(&report(stop.clone(), Some("started")), &child);
+            match &outcome {
+                SubagentOutcome::Failed { message, .. } => {
+                    assert!(message.contains(advice), "{stop:?}: {message}");
+                    assert!(message.contains("beginning of an answer"), "{stop:?}: {message}");
+                }
+                other => panic!("expected a failure for {stop:?}, got {other:?}"),
+            }
+        }
+
+        // The remaining stops are failures or cancellations with their own
+        // sentences; none of them may read as a completed result.
+        for (stop, needle) in [
+            (StopReason::ContentFiltered, "content filter"),
+            (StopReason::NeedsUserInput, "agent resume"),
+            (StopReason::SecurityBlocked, "withheld"),
+            (StopReason::CapabilityBlocked, "question for a person"),
+            (StopReason::FatalError, "attempt failed: boom"),
+        ] {
+            let said = Some("boom");
+            let outcome = describe_report(&report(stop.clone(), said), &child);
+            match &outcome {
+                SubagentOutcome::Failed { message, .. } => {
+                    assert!(message.contains(needle), "{stop:?}: {message}");
+                }
+                other => panic!("expected a failure for {stop:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            describe_report(&report(StopReason::UserCancelled, None), &child),
+            SubagentOutcome::Cancelled
+        );
+    }
+
     #[test]
     fn an_answer_that_arrived_before_the_brake_is_reported_as_itself() {
         let report = RunReport {

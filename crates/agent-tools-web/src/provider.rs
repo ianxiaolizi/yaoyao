@@ -532,4 +532,86 @@ mod tests {
         // A name this provider does not own is not this provider's to classify.
         assert_eq!(provider.risk(&ToolInvocation::proposed("other.tool", json!({}))), None);
     }
+
+    /// Everything the model chose is checked here, before a socket or a DNS
+    /// lookup: a refusal that arrives after the request went out would be a
+    /// refusal of something that already happened.
+    #[test]
+    fn the_request_arguments_are_checked_before_any_socket_is_opened() {
+        let provider = WebToolProvider::new();
+        let error = |arguments: serde_json::Value| match provider
+            .request(&ToolInvocation::proposed(WEB_TOOL_NAME, arguments))
+        {
+            Ok(_) => panic!("the arguments are refused"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error(json!({ "url": "https://docs.rs/", "method": "POST" }))
+                .contains("unsupported method 'POST'")
+        );
+        assert!(
+            error(json!({ "url": "https://docs.rs/", "headers": { "x-trace": 1 } }))
+                .contains("header 'x-trace' is not a string")
+        );
+        assert!(
+            error(json!({ "url": "https://docs.rs/", "headers": { "bad header": "x" } }))
+                .contains("invalid header")
+        );
+        assert!(
+            error(json!({ "url": "https://docs.rs/", "headers": "x" }))
+                .contains("'headers' must be an object")
+        );
+        assert!(
+            error(json!({ "url": "https://docs.rs/", "timeout_ms": "soon" }))
+                .contains("'timeout_ms' must be an integer")
+        );
+        assert!(
+            error(json!({ "url": "https://docs.rs/", "body": "x" }))
+                .contains("carries no request body")
+        );
+        assert!(error(json!({})).contains("missing 'url'"));
+
+        let request = provider
+            .request(&ToolInvocation::proposed(WEB_TOOL_NAME, json!({ "url": "https://docs.rs/" })))
+            .expect("a plain read");
+        assert_eq!(request.url, "https://docs.rs/");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.timeout, provider.timeout);
+        assert!(request.headers.is_empty());
+
+        let lower = provider
+            .request(&ToolInvocation::proposed(
+                WEB_TOOL_NAME,
+                json!({ "url": "https://docs.rs/", "method": "head" }),
+            ))
+            .expect("a lower-case read");
+        assert_eq!(lower.method, "HEAD");
+
+        // A stated deadline is clamped rather than trusted: nothing waits
+        // forever, and nothing is refused for asking for "now".
+        let stated = |milliseconds: serde_json::Value| {
+            provider
+                .request(&ToolInvocation::proposed(
+                    WEB_TOOL_NAME,
+                    json!({ "url": "https://docs.rs/", "timeout_ms": milliseconds }),
+                ))
+                .expect("a request with a deadline")
+                .timeout
+        };
+        assert_eq!(stated(json!(0)), Duration::from_millis(1));
+        assert_eq!(stated(json!(u64::MAX)), Duration::from_millis(MAX_WEB_TIMEOUT_MS));
+    }
+
+    /// The two constructors a wiring uses differ only in what they allow, and
+    /// a caller can replace the default deadline.
+    #[test]
+    fn the_default_and_the_timeout_are_the_documented_ones() {
+        let provider = WebToolProvider::default();
+        assert_eq!(provider.timeout, Duration::from_millis(WEB_TIMEOUT_MS));
+        assert_eq!(provider.max_bytes, MAX_RESPONSE_BYTES);
+
+        let bounded = WebToolProvider::new().with_timeout(Duration::from_secs(2));
+        assert_eq!(bounded.timeout, Duration::from_secs(2));
+    }
 }

@@ -1378,4 +1378,359 @@ mod tests {
         let error = TranscriptProjection::new().apply(&TranscriptProjection::new().init(), &event);
         assert!(matches!(error, Err(ApplyError::UnknownEventType(_))), "unexpected: {error:?}");
     }
+
+    #[test]
+    fn the_fold_reads_every_shape_a_real_session_writes() {
+        // A log is a fact, not a happy path. Each shape below is one a real
+        // session writes and no earlier test happened to reach: a steering
+        // sentence, an unowned reasoning node, a tool whose start and end
+        // disagree about the turn, a provider that withheld or cancelled a
+        // turn, and every way a decision card can close. A fold that quietly
+        // dropped one would leave a page that lies by omission.
+        let projection = TranscriptProjection::default();
+        assert_eq!(projection.key(), "transcript");
+        assert_eq!(projection.state_schema(), "transcript/0.1.0");
+        assert_eq!(projection.state_version(), 3);
+        let empty = projection.init();
+        assert_eq!(
+            projection.view(&empty),
+            TranscriptView { items: Vec::new(), head: EventSeq::ZERO }
+        );
+
+        let turn = TurnId::from_string("t9");
+
+        // A person's prompt, then a steering sentence, then a blank one.
+        let prompt = InboxItem {
+            item_id: agent_protocol::ids::InboxItemId::from_string("i8"),
+            session_id: SessionId::from_string("transcript-test"),
+            kind: InboxKind::NextTurn,
+            payload: json!({ "text": "先看一下 agent-cli" }),
+            priority: 0,
+            created_at: Utc::now(),
+            status: InboxItemStatus::Pending,
+        };
+        let mut state = apply(
+            &projection.init(),
+            &stored(
+                1,
+                EventType::INBOX_APPENDED,
+                None,
+                None,
+                serde_json::to_value(&prompt).unwrap(),
+            ),
+        );
+        state = apply(
+            &state,
+            &stored(
+                2,
+                EventType::TURN_STEERED,
+                Some(turn.clone()),
+                None,
+                json!({ "text": "先别碰目录" }),
+            ),
+        );
+        assert!(
+            state
+                .items
+                .iter()
+                .any(|item| matches!(&item.body, ItemBody::Note { text } if text == "先别碰目录")),
+            "a steering sentence is a note in place"
+        );
+        let before = state.items.len();
+        state = apply(
+            &state,
+            &stored(3, EventType::TURN_STEERED, Some(turn.clone()), None, json!({ "text": "  " })),
+        );
+        assert_eq!(state.items.len(), before, "a blank steering note is not a row");
+
+        // An inbox message addressed to the current step is a note too, and an
+        // empty one is skipped.
+        let next_step = InboxItem {
+            item_id: agent_protocol::ids::InboxItemId::from_string("i9"),
+            kind: InboxKind::NextStep,
+            payload: json!({ "text": "use the smaller file" }),
+            ..prompt.clone()
+        };
+        state = apply(
+            &state,
+            &stored(
+                4,
+                EventType::INBOX_APPENDED,
+                None,
+                None,
+                serde_json::to_value(&next_step).unwrap(),
+            ),
+        );
+        assert!(state.items.iter().any(
+            |item| matches!(&item.body, ItemBody::Note { text } if text == "use the smaller file")
+        ));
+        let blank = InboxItem {
+            item_id: agent_protocol::ids::InboxItemId::from_string("i10"),
+            kind: InboxKind::NextStep,
+            payload: json!({ "text": "" }),
+            ..prompt.clone()
+        };
+        let before = state.items.len();
+        state = apply(
+            &state,
+            &stored(
+                5,
+                EventType::INBOX_APPENDED,
+                None,
+                None,
+                serde_json::to_value(&blank).unwrap(),
+            ),
+        );
+        assert_eq!(state.items.len(), before, "an empty inbox item is not a row");
+
+        // A response with no text says nothing; a text response with no turn
+        // has no row to attach to; two text responses on one turn add up.
+        let tool_only = ModelResponse {
+            content_blocks: vec![ContentBlock::tool_use("c9", "shell.run", json!({}))],
+            usage: None,
+            finish_reason: agent_protocol::model::FinishReason::new(
+                agent_protocol::model::FinishReason::STOP,
+            ),
+            provider_metadata: serde_json::Value::Null,
+        };
+        let before = state.items.len();
+        state = apply(
+            &state,
+            &stored(
+                6,
+                EventType::MODEL_RESPONSE_COMPLETED,
+                Some(turn.clone()),
+                None,
+                json!({ "response": tool_only }),
+            ),
+        );
+        assert_eq!(state.items.len(), before, "a tool-only response is not an answer");
+        state = apply(
+            &state,
+            &stored(
+                7,
+                EventType::MODEL_RESPONSE_COMPLETED,
+                None,
+                None,
+                json!({ "response": ModelResponse::text("orphan") }),
+            ),
+        );
+        assert!(
+            !state
+                .items
+                .iter()
+                .any(|item| matches!(&item.body, ItemBody::Answer { text } if text == "orphan")),
+            "a response with no turn has no row to attach to"
+        );
+        state = apply(
+            &state,
+            &stored(
+                8,
+                EventType::MODEL_RESPONSE_COMPLETED,
+                Some(turn.clone()),
+                None,
+                json!({ "response": ModelResponse::text("first") }),
+            ),
+        );
+        state = apply(
+            &state,
+            &stored(
+                9,
+                EventType::MODEL_RESPONSE_COMPLETED,
+                Some(turn.clone()),
+                None,
+                json!({ "response": ModelResponse::text("second") }),
+            ),
+        );
+        let answer =
+            state.items.iter().find(|item| item.id == format!("ans:{}", turn.as_str())).unwrap();
+        assert_eq!(answer.body, ItemBody::Answer { text: "first\n\nsecond".to_string() });
+
+        // The start did not name a turn; the completion does, and the row
+        // takes it. A cancellation that never started still lands.
+        state = apply(
+            &state,
+            &stored(
+                10,
+                EventType::TOOL_STARTED,
+                None,
+                None,
+                json!({ "tool_name": "shell.run", "provider_tool_call_id": "c9" }),
+            ),
+        );
+        state = apply(
+            &state,
+            &stored(
+                11,
+                EventType::TOOL_COMPLETED,
+                Some(turn.clone()),
+                None,
+                json!({
+                    "tool_name": "shell.run",
+                    "provider_tool_call_id": "c9",
+                    "content": "ok",
+                }),
+            ),
+        );
+        let action = state.items.iter().find(|item| item.id == "a:c9").unwrap();
+        assert_eq!(action.turn_id, Some(turn.clone()), "the completion supplies the turn");
+        assert!(matches!(&action.body, ItemBody::Action { status: ActionStatus::Completed, .. }));
+        state = apply(
+            &state,
+            &stored(
+                12,
+                EventType::TOOL_CANCELLED,
+                Some(turn.clone()),
+                None,
+                json!({ "tool_name": "shell.run", "provider_tool_call_id": "c8" }),
+            ),
+        );
+        assert!(state.items.iter().any(|item| item.id == "a:c8"
+            && matches!(item.body, ItemBody::Action { status: ActionStatus::Cancelled, .. })));
+
+        // A decision card can close without a grant; the closing shapes carry
+        // only the id.
+        let request = ApprovalRequest {
+            approval_id: agent_protocol::ids::ApprovalId::from_string("ap-deny"),
+            session_id: SessionId::from_string("transcript-test"),
+            capability: Capability::new(Capability::PROCESS_SPAWN),
+            tool_name: "shell.run".to_string(),
+            args_summary: "cargo test".to_string(),
+            status: ApprovalStatus::Pending,
+            created_at: Utc::now(),
+            action_digest: None,
+            risk: None,
+            task_id: None,
+            task_revision: None,
+            reversibility: None,
+            targets: Vec::new(),
+        };
+        state = apply(
+            &state,
+            &stored(
+                13,
+                EventType::APPROVAL_REQUESTED,
+                None,
+                None,
+                serde_json::to_value(&request).unwrap(),
+            ),
+        );
+        state = apply(
+            &state,
+            &stored(
+                14,
+                EventType::APPROVAL_DENIED,
+                None,
+                None,
+                json!({ "approval_id": "ap-deny" }),
+            ),
+        );
+        let card = state.items.iter().find(|item| item.id == "ap:ap-deny").unwrap();
+        assert!(
+            matches!(&card.body, ItemBody::Approval { state: ApprovalState::Denied, .. }),
+            "a denial closes the card"
+        );
+        for (seq, kind) in [(15, EventType::APPROVAL_EXPIRED), (16, EventType::APPROVAL_CANCELLED)]
+        {
+            let closed = apply(
+                &projection.init(),
+                &stored(seq, kind, None, None, json!({ "approval_id": "ap-lonely" })),
+            );
+            assert!(closed.items.is_empty(), "without a request there is no card to close");
+        }
+
+        // A turn that yielded on a run limit is not waiting for a person: it
+        // says what ran out.
+        for (reason, expected) in [
+            ("max_steps", TurnEnding::MaxSteps),
+            ("max_tool_calls", TurnEnding::LimitReached),
+            ("wall_clock_exceeded", TurnEnding::LimitReached),
+            ("max_output_tokens", TurnEnding::LimitReached),
+            ("token_budget_exceeded", TurnEnding::LimitReached),
+            ("stalled", TurnEnding::LimitReached),
+        ] {
+            let ended = apply(
+                &projection.init(),
+                &stored(
+                    20,
+                    EventType::TURN_YIELDED,
+                    Some(TurnId::from_string("ty")),
+                    None,
+                    json!({ "stop_reason": reason }),
+                ),
+            );
+            let ending = ended
+                .items
+                .iter()
+                .find_map(|item| match &item.body {
+                    ItemBody::TurnEnd { ending, .. } => Some(*ending),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{reason} ends the turn"));
+            assert_eq!(ending, expected, "{reason}");
+        }
+        let failed = apply(
+            &projection.init(),
+            &stored(21, EventType::TURN_FAILED, Some(TurnId::from_string("tf")), None, json!({})),
+        );
+        assert!(failed.items.iter().any(|item| matches!(
+            &item.body,
+            ItemBody::TurnEnd { ending: TurnEnding::Failed, .. }
+        )));
+        let cancelled = apply(
+            &projection.init(),
+            &stored(
+                22,
+                EventType::TURN_CANCELLED,
+                Some(TurnId::from_string("tc")),
+                None,
+                json!({}),
+            ),
+        );
+        assert!(cancelled.items.iter().any(|item| matches!(
+            &item.body,
+            ItemBody::TurnEnd { ending: TurnEnding::Cancelled, .. }
+        )));
+        let orphan = apply(
+            &projection.init(),
+            &stored(23, EventType::TURN_COMPLETED, None, None, json!({})),
+        );
+        assert!(orphan.items.is_empty(), "a terminal event with no turn closes nothing");
+
+        // A reasoning node with neither an event turn nor one of its own has
+        // no row to attach to, and that is not an error.
+        let unowned = apply(
+            &projection.init(),
+            &stored(
+                24,
+                EventType::REASON_RECORDED,
+                None,
+                None,
+                json!({
+                    "node": ReasonNode {
+                        id: "r/2".to_string(),
+                        turn_id: String::new(),
+                        step: 0,
+                        kind: ReasonKind::Situation,
+                        claim: "no turn yet".to_string(),
+                        basis: vec![Basis::fact("the log")],
+                        rule: "situation/derive".to_string(),
+                        source: ReasonSource::Kernel,
+                    }
+                }),
+            ),
+        );
+        assert!(unowned.items.is_empty());
+
+        // Serializing the fold drops the flags that are only true: a reader of
+        // the serialized form never sees a `resumed: false` it has to ignore.
+        let serialized = serde_json::to_value(&state).expect("the fold serializes");
+        let user = serialized["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["body"]["kind"] == "user")
+            .expect("the prompt is still in the fold");
+        assert!(user["body"].get("resumed").is_none(), "the false flag is skipped: {user}");
+    }
 }

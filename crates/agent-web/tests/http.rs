@@ -2256,3 +2256,115 @@ async fn no_synthetic_step_parking_after_three_hundred_steps() {
     assert_eq!(ending["ending"], "answered", "{transcript}");
     handle.abort();
 }
+
+/// The store keeps bytes, not types; the four image signatures the page can
+/// preview are recognised so an image is shown rather than downloaded.
+#[tokio::test]
+async fn an_image_artifact_keeps_its_shape() {
+    let (store, dir) = empty();
+    let artifacts = dir.path().join("artifacts");
+    std::fs::create_dir_all(&artifacts).expect("artifact directory");
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    // The store verifies a blob against its name, so these are the SHA-256
+    // digests of the bytes beside them.
+    let cases: [(&str, &[u8], &str); 4] = [
+        (
+            "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+            b"\x89PNG\r\n\x1a\n",
+            "image/png",
+        ),
+        (
+            "45ae705277879f7f01d778f7c95a065bb0c06ab9936cf24307f375211fee13d1",
+            b"\xff\xd8\xff\xe0\x00\x10JFIF",
+            "image/jpeg",
+        ),
+        (
+            "a7a3eda6441d137cccef9700fa378c0099d647146be9167def705bf86bb634ec",
+            b"GIF89a\x01\x00",
+            "image/gif",
+        ),
+        (
+            "347ce8f11c673e117e9bac7cebbfc3fc174a4dd2536b8c270cf55346585abedb",
+            b"RIFF\x1a\x00\x00\x00WEBPVP8 ",
+            "image/webp",
+        ),
+    ];
+    for (hash, bytes, kind) in cases {
+        std::fs::write(artifacts.join(format!("{hash}.blob")), bytes).expect("blob");
+        let (status, response) =
+            request(addr, &format!("/api/artifacts/{hash}"), Some(&token), None).await;
+        assert_eq!(status, 200, "{response}");
+        assert!(response.contains(&format!("content-type: {kind}")), "{kind}: {response}");
+    }
+    handle.abort();
+}
+
+/// An export shape the renderer does not have is the request's mistake, not
+/// an empty document: answering with markdown anyway would say the caller got
+/// what they asked for.
+#[tokio::test]
+async fn an_export_in_an_unknown_shape_is_refused() {
+    let (store, dir, _) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) =
+        request(addr, "/api/sessions/s1/export?format=txt", Some(&token), None).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("format must be md or json"), "{response}");
+    handle.abort();
+}
+
+/// A schedule missing either half is refused rather than filled in from the
+/// clock or from the last prompt: the caller has to say what and when.
+#[tokio::test]
+async fn a_schedule_without_a_time_or_text_is_refused() {
+    let (store, dir, _) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    for payload in [json!({ "v": 1, "text": "later" }), json!({ "v": 1, "when": "+10m" })] {
+        let (status, response) = post(addr, "/api/sessions/s1/schedules", &token, &payload).await;
+        assert_eq!(status, 400, "{response}");
+        assert!(body(&response).contains("when and text"), "{response}");
+    }
+    handle.abort();
+}
+
+/// Text that is only whitespace is not a turn: it would open a run with
+/// nothing to answer, and the empty check runs before the driver is asked.
+#[tokio::test]
+async fn an_empty_turn_or_steer_is_refused_before_the_driver() {
+    let (store, dir, _) = seeded().await;
+    let backend = FakeBackend::new();
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/turns", &token, &json!({ "v": 1, "text": "  " })).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("text must not be empty"), "{response}");
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/steer", &token, &json!({ "v": 1, "text": "" })).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("text must not be empty"), "{response}");
+    assert_eq!(backend.turn_count(), 0, "a refused turn must not reach the driver");
+    handle.abort();
+}
+
+/// A session paused on a decision is not started again behind the question:
+/// the next turn has to wait for the answer.
+#[tokio::test]
+async fn a_turn_on_a_session_awaiting_a_decision_is_refused() {
+    let (store, dir) = seeded_approval().await;
+    let backend = FakeBackend::new();
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/turns", &token, &json!({ "v": 1, "text": "again" })).await;
+    assert_eq!(status, 409, "{response}");
+    assert!(body(&response).contains("\"code\":\"awaiting_decision\""), "{response}");
+    assert_eq!(backend.turn_count(), 0, "a refused turn must not reach the driver");
+    handle.abort();
+}
