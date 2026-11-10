@@ -1387,7 +1387,7 @@ mod tests {
         // disagree about the turn, a provider that withheld or cancelled a
         // turn, and every way a decision card can close. A fold that quietly
         // dropped one would leave a page that lies by omission.
-        let projection = TranscriptProjection::default();
+        let projection: TranscriptProjection = Default::default();
         assert_eq!(projection.key(), "transcript");
         assert_eq!(projection.state_schema(), "transcript/0.1.0");
         assert_eq!(projection.state_version(), 3);
