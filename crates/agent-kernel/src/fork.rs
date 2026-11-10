@@ -25,6 +25,12 @@
 //!   point. A paused-and-persisted turn is yaoyao's own shape, so there is no
 //!   precedent to borrow and no reason to guess.
 //!
+//! A turn that ended because its budget ran out is the exception that proves
+//! the rule: it also ends `turn/yielded`, but it is not waiting on anything —
+//! the `budget/parked` record beside it says so. Nothing in it can be settled
+//! by the child, so a fork at that boundary inherits exactly what the parent's
+//! log holds (CONTRACT §7 #173).
+//!
 //! ## What the child's tail is allowed to be
 //!
 //! An *interrupted* tail — an open run/turn/step, or a `tool/started` that never
@@ -152,7 +158,9 @@ struct Boundary {
 ///
 /// `turn/yielded` is not among them: it ends the turn's *running*, not its
 /// business. See this module's header for why that distinction decides whether
-/// a fork is allowed at all.
+/// a fork is allowed at all. There is one exception, handled in [`boundary`]: a
+/// turn that yielded because its budget ran out is not waiting for anything a
+/// child could inherit.
 fn ends_the_turn(event_type: &str) -> bool {
     matches!(
         event_type,
@@ -168,17 +176,35 @@ fn ends_the_turn(event_type: &str) -> bool {
 /// `Err` is a reason for the caller to show a person — every one of them is a
 /// state with an action attached, not a failure of this module.
 fn boundary(events: &[StoredEvent], at: Option<&TurnId>) -> Result<Boundary, String> {
+    // A budget pause (`budget/parked`) ends the turn the way a completion does
+    // — nothing is open after it — but it says so with `turn/yielded`, because
+    // the turn did not answer. Reading the pause from the record it wrote keeps
+    // the stop words out of this module: what matters is that the run parked,
+    // not which limit parked it.
+    let parked: Vec<&TurnId> = events
+        .iter()
+        .filter(|stored| stored.event.event_type.as_str() == EventType::BUDGET_PARKED)
+        .filter_map(|stored| stored.event.turn_id.as_ref())
+        .collect();
+    let ends = |stored: &StoredEvent| {
+        if ends_the_turn(stored.event.event_type.as_str()) {
+            return true;
+        }
+        stored.event.event_type.as_str() == EventType::TURN_YIELDED
+            && stored.event.turn_id.as_ref().is_some_and(|turn| parked.contains(&turn))
+    };
+
     let Some(at) = at else {
         let index = events
             .iter()
-            .rposition(|stored| ends_the_turn(stored.event.event_type.as_str()))
+            .rposition(ends)
             .ok_or_else(|| "this session has no finished turn to fork at".to_string())?;
         return at_index(events, index);
     };
 
-    if let Some(index) = events.iter().rposition(|stored| {
-        stored.event.turn_id.as_ref() == Some(at) && ends_the_turn(stored.event.event_type.as_str())
-    }) {
+    if let Some(index) =
+        events.iter().rposition(|stored| stored.event.turn_id.as_ref() == Some(at) && ends(stored))
+    {
         return at_index(events, index);
     }
 
@@ -581,6 +607,7 @@ mod tests {
     async fn the_header_carries_the_resolved_configuration_its_history_ran_under() {
         let snapshot = ResolvedProfileSnapshot {
             profile_id: "coding".to_string(),
+            task_class: None,
             config_hash: String::new(),
             plugin_versions: std::collections::BTreeMap::from([(
                 "mcp.foo".to_string(),
@@ -812,6 +839,48 @@ mod tests {
         // And the source keeps its dangling tail: a fork borrows, it does not
         // tidy up someone else's log.
         assert_eq!(h.types(&h.session_id).await, parent_types);
+    }
+
+    #[tokio::test]
+    async fn a_budget_parked_turn_is_a_boundary_even_though_it_yielded() {
+        // The pause ends the turn without answering it: there is no held call a
+        // child could settle, so forking here inherits work that simply stopped
+        // where the budget stopped (CONTRACT §7 #173).
+        let h = harness(vec![FakeModelProvider::answer("unused")]);
+        let turn = TurnId::new();
+        seed(
+            &h.store,
+            &h.session_id,
+            vec![
+                draft(
+                    &h.session_id,
+                    EventType::TURN_STARTED,
+                    serde_json::json!({}),
+                    Actor::Scheduler,
+                )
+                .with_turn(&turn),
+                draft(
+                    &h.session_id,
+                    EventType::BUDGET_PARKED,
+                    serde_json::json!({ "parked": { "reason": "max_steps", "percent": 100 } }),
+                    Actor::Scheduler,
+                )
+                .with_turn(&turn),
+                draft(
+                    &h.session_id,
+                    EventType::TURN_YIELDED,
+                    serde_json::json!({ "stop_reason": "max_steps" }),
+                    Actor::Scheduler,
+                )
+                .with_turn(&turn),
+            ],
+        )
+        .await;
+
+        let (_, at_turn, inherited) =
+            forked(h.fork.fork(&h.session_id, Some(&turn), "carry on here").await.unwrap());
+        assert_eq!(at_turn, turn);
+        assert!(inherited >= 3, "the parked history came across: {inherited}");
     }
 
     #[tokio::test]

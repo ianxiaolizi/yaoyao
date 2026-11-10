@@ -58,6 +58,16 @@ impl Scheduler {
             controls: self.controls.clone(),
             instructions: self.instructions.clone(),
             capability: self.capability.clone(),
+            // The adjudicator is part of what makes a run a run, like the
+            // frozen profile: it is stateless, has no session of its own, and a
+            // child whose messages go unadjudicated while its parent's do not
+            // would be a difference nobody asked for.
+            adjudicator: self.adjudicator.clone(),
+            // The reviewer too: a child turn runs read-only and so has nothing
+            // for a review to stand behind, and carrying it costs nothing —
+            // dropping it would make the child's run a different run from its
+            // parent's in a way nobody asked for.
+            security: self.security.clone(),
         }
     }
 }
@@ -95,11 +105,11 @@ mod tests {
     /// enforce two limits where the caller stated one.
     #[test]
     fn a_rebuilt_scheduler_takes_its_step_limit_from_the_budget_it_was_given() {
-        let budget = RunBudget { max_steps: 3, ..RunBudget::default() };
+        let budget = RunBudget { max_steps: Some(3), ..RunBudget::default() };
         let rebuilt = scheduler().rebudgeted(budget.clone());
 
         assert_eq!(rebuilt.budget, budget);
-        assert_eq!(rebuilt.max_steps, 3);
+        assert_eq!(rebuilt.max_steps, Some(3));
     }
 
     /// Rebuilding is a narrowing of one input, not a change to the scheduler it
@@ -108,10 +118,10 @@ mod tests {
     fn rebudgeting_leaves_the_scheduler_it_was_taken_from_alone() {
         let original = scheduler();
         let before = original.budget.clone();
-        let _ = original.rebudgeted(RunBudget { max_steps: 1, ..RunBudget::default() });
+        let _ = original.rebudgeted(RunBudget { max_steps: Some(1), ..RunBudget::default() });
 
         assert_eq!(original.budget, before);
-        assert_eq!(original.max_steps, 8);
+        assert_eq!(original.max_steps, Some(8));
     }
 
     /// Replacing the loop replaces the only thing that runs a turn, and nothing
@@ -125,7 +135,7 @@ mod tests {
         let session = SessionId::from_string("child");
 
         assert_eq!(child.budget, parent.budget);
-        assert_eq!(child.max_steps, 8);
+        assert_eq!(child.max_steps, Some(8));
 
         child
             .inbox()

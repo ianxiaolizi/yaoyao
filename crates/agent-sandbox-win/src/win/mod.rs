@@ -143,6 +143,7 @@ impl AppContainerLauncher {
     fn ensure_grants(&self) -> Result<(), String> {
         self.grants
             .get_or_init(|| {
+                self.grant_workspace_ancestors()?;
                 self.grant_workspace_once()?;
                 for directory in [&self.home, &self.temp, &self.cargo_home, &self.worker] {
                     acl::grant_tree(directory, self.sid.as_ptr(), acl::MODIFY).map_err(
@@ -152,6 +153,29 @@ impl AppContainerLauncher {
                 Ok(())
             })
             .clone()
+    }
+
+    /// Let the container traverse the directories above its workspace.
+    ///
+    /// The workspace grant covers the tree itself, but Windows still resolves
+    /// every component of an absolute path. Without traverse on the ancestors,
+    /// PowerShell cannot adopt the inherited working directory and falls back
+    /// to `C:\`; relative paths then point outside the workspace. These ACEs
+    /// are non-inheriting and do not grant listing or reading, so the tree's
+    /// actual boundary is unchanged.
+    fn grant_workspace_ancestors(&self) -> Result<(), String> {
+        let Some(parent) = self.workspace_root.parent() else {
+            return Ok(());
+        };
+        // The workspace's direct parent is the first directory Windows must
+        // traverse after the drive/share root. System-managed ancestors above it
+        // already grant ordinary users pass-through rights; editing them would
+        // widen the blast radius and is prohibitively slow on some hosts.
+        if parent.parent().is_some() {
+            acl::grant_traverse(parent, self.sid.as_ptr())
+                .map_err(|error| format!("workspace ancestor {}: {error}", parent.display()))?;
+        }
+        Ok(())
     }
 
     /// Grant the workspace tree unless a record says it has already been done.

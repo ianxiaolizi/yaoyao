@@ -245,6 +245,11 @@ impl Backend for WebBackend {
         let outcome = drive(turn, subscription, live).await;
         match outcome {
             Ok(agent_cli::commands::TurnStart::Ran(_)) => Ok(()),
+            // The message was a stop and the stop did its work — withdrawn
+            // queue items and, when a run was open, an interrupt. Nothing was
+            // asked of the model, so there is no answer to stream; the page
+            // learns what happened from the events like any other caller.
+            Ok(agent_cli::commands::TurnStart::Stopped(_)) => Ok(()),
             Ok(agent_cli::commands::TurnStart::NotStarted) => Err(BackendError::busy(
                 "a run is already active, or the prompt was claimed elsewhere",
             )),
@@ -257,6 +262,7 @@ impl Backend for WebBackend {
         session: &SessionId,
         approval_id: &str,
         decision: Decision,
+        authority: &agent_kernel::approval::ApprovalAuthority,
         live: &LiveSink,
     ) -> Result<(), BackendError> {
         let lock = self.session_lock(session).await;
@@ -298,6 +304,7 @@ impl Backend for WebBackend {
                         approval_id,
                         grant,
                         "user",
+                        authority,
                     )
                     .await?;
                 }

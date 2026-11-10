@@ -260,9 +260,9 @@ pub enum SubagentOutcome {
         #[serde(default)]
         result: Option<Value>,
     },
-    /// The child says it did part of the job. Only ever produced because a child
-    /// said so: this build never synthesizes it, because "how much got done" is
-    /// not something the parent can see from outside.
+    /// The child did part of the job. A backend may report this itself, or the
+    /// parent side may synthesize it only when an explicit step ceiling paused
+    /// a known child session. It never means the delegated task completed.
     Partial { summary: String },
     /// The child could not do the job. `side_effects` is what the child says it
     /// did before giving up — the design asks for it because a failed

@@ -234,6 +234,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]
@@ -318,9 +319,13 @@ version = "0.1.0"
 dependencies = [
  "agent-ports",
  "agent-protocol",
+ "agent-sandbox-win",
  "async-trait",
+ "chrono",
  "encoding_rs",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

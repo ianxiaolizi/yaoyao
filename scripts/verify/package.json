@@ -1,0 +1,13 @@
+{
+  "name": "yaoyao-verify",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "selftest": "node selftest.mjs",
+    "web": "node web.mjs",
+    "video": "node video.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.56.1"
+  }
+}

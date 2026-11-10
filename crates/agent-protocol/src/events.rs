@@ -100,6 +100,45 @@ impl EventType {
     pub const INBOX_APPENDED: &'static str = "inbox/appended";
     pub const INBOX_CLAIMED: &'static str = "inbox/claimed";
     pub const INBOX_DISCARDED: &'static str = "inbox/discarded";
+    /// One direct user instruction, recorded as `agent_protocol::intent::Intent`.
+    ///
+    /// Written beside the `inbox/appended` item it asks for, in the same append
+    /// batch, so a queued turn and the request that asked for it cannot exist
+    /// apart. `intent/superseded` is the only event that changes an intent
+    /// after this one in this slice; a consuming event arrives with the answer
+    /// binding.
+    pub const INTENT_RECORDED: &'static str = "intent/recorded";
+    /// An intent was overtaken: payload names `intent_id` and `superseded_by`.
+    ///
+    /// The superseded intent keeps its text, item, and evidence — this event
+    /// records that a later request outranks it, not that it never happened.
+    pub const INTENT_SUPERSEDED: &'static str = "intent/superseded";
+    /// An intent was withdrawn before it ran: payload names `intent_id` and a
+    /// human-readable `reason`.
+    ///
+    /// Distinct from [`INTENT_SUPERSEDED`](Self::INTENT_SUPERSEDED) for the
+    /// reason `turn/cancelled` is distinct from `turn/failed`: a person taking
+    /// their request back is a decision that went exactly as asked, and folding
+    /// it into "something outranked this" would make the log unable to say
+    /// which of the two happened.
+    pub const INTENT_CANCELLED: &'static str = "intent/cancelled";
+    /// The kernel asked the independent adjudicator what one message means for
+    /// the work in flight. Payload carries the route identity, model and pack
+    /// version, prompt and input digests, and the triggering rule — the inputs
+    /// by digest, never by content.
+    pub const INTENT_ADJUDICATION_REQUESTED: &'static str = "intent/adjudication.requested";
+    /// The adjudicator answered and the kernel decided. The payload keeps the
+    /// model's suggestion and the kernel's decision in separate fields, so a
+    /// reader can tell a misclassification from a bad policy.
+    pub const INTENT_ADJUDICATION_COMPLETED: &'static str = "intent/adjudication.completed";
+    /// No usable suggestion reached the kernel: the call failed, timed out, the
+    /// answer did not parse, or the confidence was too low. The kernel produced
+    /// no side effect and queued one minimal clarification question instead.
+    ///
+    /// Separate from `completed` for the reason `turn/cancelled` is separate
+    /// from `turn/failed`: the two are different answers to "what do I do now?"
+    /// and a reader should not have to inspect a payload to tell them apart.
+    pub const INTENT_ADJUDICATION_UNCLEAR: &'static str = "intent/adjudication.unclear";
     pub const TURN_CANCELLED: &'static str = "turn/cancelled";
     /// The tool definitions this turn offers, frozen once before the first
     /// request. `model/request.prepared` says which manifest was sent; this
@@ -128,6 +167,14 @@ impl EventType {
     /// not a retry. Every other unsettled code says the opposite — something
     /// may have happened that the log does not know about.
     pub const TOOL_NOT_STARTED: &'static str = "tool/not_started";
+    /// The same call, with the same arguments, made often enough in one turn
+    /// that it is a loop rather than work.
+    ///
+    /// Written once per repeated signature per turn. It does not stop the
+    /// call — a read that is legitimately repeated is not refused — it is the
+    /// record that the run spent budget going in circles, and the request that
+    /// follows carries a line saying so.
+    pub const TOOL_DUPLICATE_CYCLE: &'static str = "tool/duplicate_cycle";
     /// The session's plan, replaced in full. Written by the loop's own
     /// `plan.update` tool — one event per accepted call, carrying the plan it
     /// recorded. It never reaches a provider; the next turn reads it back.
@@ -173,6 +220,21 @@ impl EventType {
     /// response, so a reader can see the spend grow without re-summing every
     /// response in the log.
     pub const BUDGET_UPDATED: &'static str = "budget/updated";
+    /// A budget point the run was told to write its state at — 50, 75, 90 per
+    /// cent — reached for the first time in that run.
+    ///
+    /// The demand travels in the request's budget notice; this event records
+    /// that the run was at the checkpoint, so a reader can tell "the model was
+    /// asked to say where it stood" from "it said so unprompted".
+    pub const BUDGET_CHECKPOINT: &'static str = "budget/checkpoint";
+    /// Where a run stopped when its budget, not its work, ended it.
+    ///
+    /// Payload is a [`agent_protocol::parking::ParkedState`]. Written in the
+    /// same batch as the turn's terminal events — a parked turn ends
+    /// `turn/yielded`, and the delivery axis already refuses to call that
+    /// delivered — because "continue" without this record means re-reading the
+    /// transcript the budget just refused to pay for.
+    pub const BUDGET_PARKED: &'static str = "budget/parked";
     /// One run of the profile's completion criterion, at a step boundary.
     ///
     /// Written whether or not the check passed, because "the world says it is
@@ -181,6 +243,42 @@ impl EventType {
     /// refused it, the tool failed to start) is recorded the same way with
     /// `status: "error"`: it is not completion, and the turn continues.
     pub const COMPLETION_CHECKED: &'static str = "completion/checked";
+    /// The kernel refused to read a turn's ending as a completion claim.
+    ///
+    /// Written when a turn stops because the operator's criterion passed, but
+    /// the evidence that would make that a completion is missing, stale, came
+    /// from a check that could not run, or was produced by a pipeline that
+    /// masked the program's exit status. The turn is still over — the payload
+    /// carries the reason the claim does not stand (CONTRACT §7 #170).
+    pub const COMPLETION_CLAIM_REJECTED: &'static str = "completion/claim_rejected";
+    /// A turn handed the person an answer, did tool work, and nothing current
+    /// verified it.
+    ///
+    /// The complement of [`COMPLETION_CHECKED`](Self::COMPLETION_CHECKED): the
+    /// answer is real and delivered, and the log says at the moment of delivery
+    /// that no check stands behind it. Without this event, "delivered" and
+    /// "verified" are only distinguishable by re-folding the whole log, and a
+    /// reader who skips that fold reads every answer as checked.
+    pub const COMPLETION_UNVERIFIED_RESULT_DELIVERED: &'static str =
+        "completion/unverified_result_delivered";
+    /// One machine check's observation, in full: what ran, what it exited with,
+    /// the digests of what it printed, and the task revision it covered.
+    ///
+    /// Payload is an [`agent_protocol::evidence::Evidence`]. The completion gate
+    /// reads it in preference to `completion/checked`, whose payload cannot say
+    /// how the program ended; a check that could not start is recorded here with
+    /// `status: "error"` rather than being left out.
+    pub const VERIFICATION_RECORDED: &'static str = "verification/recorded";
+    /// The apparatus a session's checks are graded against, frozen at the first
+    /// check.
+    ///
+    /// Written once per session, in the same batch as the evidence of the check
+    /// that froze it. Later checks record the manifest they actually ran
+    /// against; the gate compares the two and refuses a pass whose apparatus
+    /// moved (CONTRACT §7 #172). The event carries the spec and every entry, so
+    /// a reader can say *which* file changed rather than only that something
+    /// did.
+    pub const VERIFICATION_APPARATUS_FROZEN: &'static str = "verification/apparatus_frozen";
     pub const TOOL_RESULT_TRUNCATED: &'static str = "tool/result.truncated";
     pub const TOOL_RESULT_REDACTED: &'static str = "tool/result.redacted";
     /// A tool result carried a token the high-entropy layer flagged but did
@@ -198,6 +296,58 @@ impl EventType {
     pub const APPROVAL_DENIED: &'static str = "approval/denied";
     pub const APPROVAL_EXPIRED: &'static str = "approval/expired";
     pub const APPROVAL_CANCELLED: &'static str = "approval/cancelled";
+    /// A grant that stood is taken back before it was used (B4).
+    ///
+    /// Separate from `approval/cancelled`, which withdraws a *question* nobody
+    /// has answered: this one withdraws an answer, and the difference is what a
+    /// reader needs to tell "the person never decided" from "the person changed
+    /// their mind". The fold treats both as "no lease here", so a revocation
+    /// stops matching the moment it is written.
+    pub const APPROVAL_REVOKED: &'static str = "approval/revoked";
+    /// The one permission decision a tool call is made on.
+    ///
+    /// Written before the call runs and never after it: a decision appended
+    /// once the result is in hand would be a decision taken with the answer
+    /// visible. The payload is the whole record — action digest, decision,
+    /// authorisation source, refusals, classifier trace — so a reader needs
+    /// nothing else to reconstruct why the call happened.
+    pub const PERMISSION_DECISION: &'static str = "permission/decision";
+    /// A dispatch that is about to use a secret reference.
+    ///
+    /// Written after the decision and before the tool runs, and it holds the
+    /// reference as the model wrote it, the action digest it was answered
+    /// under, the tool, and the origin the call reaches. It never holds a
+    /// value: the plaintext has no field to sit in here, so no later change to
+    /// a redactor can let one in (CONTRACT §7 #181).
+    pub const SECRET_ACCESSED: &'static str = "secret/accessed";
+    /// A recovery point was taken before a call that may change the workspace.
+    ///
+    /// Written before the call runs, and carrying the manifest hash rather than
+    /// the manifest: the entries are content-addressed artifacts, and a reader
+    /// that wants them asks the artifact store by the hash they were recorded
+    /// under. A capture that failed writes nothing and the call does not run —
+    /// there is no "ran without a recovery point" state to record.
+    pub const WORKSPACE_SNAPSHOT_CREATED: &'static str = "workspace/snapshot.created";
+    /// What a call changed, compared against the snapshot taken before it.
+    ///
+    /// Written after the call whatever the result was: a tool that failed may
+    /// still have written half a file, and "the call failed" is not a claim
+    /// about the workspace.
+    pub const WORKSPACE_CHANGES_RECORDED: &'static str = "workspace/changes.recorded";
+    /// A rollback finished, and what it did to each path.
+    ///
+    /// Written by the command that restores, not by the crash-recovery path:
+    /// this build rolls back only what a person or a web API asks it to.
+    pub const WORKSPACE_ROLLBACK_COMPLETED: &'static str = "workspace/rollback.completed";
+    /// The independent security review of a high-risk task did not pass.
+    ///
+    /// Written beside the `verification/recorded` evidence record that carries
+    /// the review's status, and only when that status is not `passed`: the
+    /// evidence says what was observed, and this says the turn may not hand its
+    /// answer over as a delivered result (CONTRACT §7 #183). A review that
+    /// passed writes no such event — a session should not have to read a
+    /// double negative to learn that nothing blocked it.
+    pub const SECURITY_REVIEW_FAILED: &'static str = "security/review.failed";
     /// One fast-decision call's trace. An observation, never an input
     /// to anything in this build: the shadow mode is what makes that true.
     pub const DECISION_TRACE: &'static str = "decision/trace";
@@ -215,8 +365,9 @@ impl EventType {
     /// says what the child did, while this says that the parent asked.
     pub const SUBAGENT_SPAWNED: &'static str = "subagent/spawned";
     /// A child agent ended with an answer, or with less than it was asked for
-    /// (`status: "partial"` in the payload — a child's own report, never this
-    /// build's guess at how far it got).
+    /// (`status: "partial"` in the payload). Partial may be the child's own
+    /// report, or a parent-side result produced only for an explicit step
+    /// ceiling with a known child session.
     ///
     /// The type is the family and the payload's `status` is the precise word, so
     /// that a reader asking the coarse question ("did it come back?") does not
@@ -272,6 +423,12 @@ impl EventType {
         Self::INBOX_APPENDED,
         Self::INBOX_CLAIMED,
         Self::INBOX_DISCARDED,
+        Self::INTENT_RECORDED,
+        Self::INTENT_SUPERSEDED,
+        Self::INTENT_CANCELLED,
+        Self::INTENT_ADJUDICATION_REQUESTED,
+        Self::INTENT_ADJUDICATION_COMPLETED,
+        Self::INTENT_ADJUDICATION_UNCLEAR,
         Self::TURN_CANCELLED,
         Self::MODEL_TOOLS_FROZEN,
         Self::MODEL_REQUEST_PREPARED,
@@ -290,6 +447,7 @@ impl EventType {
         Self::TOOL_INTERRUPTED,
         Self::TOOL_OUTCOME_UNKNOWN,
         Self::TOOL_NOT_STARTED,
+        Self::TOOL_DUPLICATE_CYCLE,
         Self::PLAN_UPDATED,
         Self::STATE_UPDATED,
         Self::JUDGMENT_UPDATED,
@@ -299,7 +457,13 @@ impl EventType {
         Self::CONTEXT_COMPACTION_FAILED,
         Self::CONTEXT_COMPACTED,
         Self::BUDGET_UPDATED,
+        Self::BUDGET_CHECKPOINT,
+        Self::BUDGET_PARKED,
         Self::COMPLETION_CHECKED,
+        Self::COMPLETION_CLAIM_REJECTED,
+        Self::COMPLETION_UNVERIFIED_RESULT_DELIVERED,
+        Self::VERIFICATION_RECORDED,
+        Self::VERIFICATION_APPARATUS_FROZEN,
         Self::TOOL_RESULT_TRUNCATED,
         Self::TOOL_RESULT_REDACTED,
         Self::TOOL_RESULT_HIGH_ENTROPY,
@@ -309,6 +473,13 @@ impl EventType {
         Self::APPROVAL_DENIED,
         Self::APPROVAL_EXPIRED,
         Self::APPROVAL_CANCELLED,
+        Self::APPROVAL_REVOKED,
+        Self::PERMISSION_DECISION,
+        Self::SECRET_ACCESSED,
+        Self::WORKSPACE_SNAPSHOT_CREATED,
+        Self::WORKSPACE_CHANGES_RECORDED,
+        Self::WORKSPACE_ROLLBACK_COMPLETED,
+        Self::SECURITY_REVIEW_FAILED,
         Self::DECISION_TRACE,
         Self::PLUGIN_LOADED,
         Self::PLUGIN_UNLOADED,

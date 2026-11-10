@@ -1,28 +1,31 @@
 {
-  "recorded_at": "2026-10-29T16:49:26.034Z",
-  "on": "Windows 10 IoT LTSC 2021, Edge headless, debug build of agent web",
+  "recorded_at": "2026-11-02T12:44:09.394Z",
+  "on": "Windows 10 IoT LTSC 2021, Edge headless, debug build of agent web (M7 shell)",
   "how": "node scripts/gui/perf.mjs --record",
   "runs": {
     "2000": {
-      "openMs": 188,
-      "scrollFps": 57.5,
-      "scrollMaxGapMs": 18,
-      "liveMaxGapMs": 18,
-      "liveRebuilt": 1
+      "openMs": 103,
+      "unfoldMs": 18,
+      "scrollFps": 58.3,
+      "scrollMaxGapMs": 17,
+      "liveMaxGapMs": 26,
+      "liveRebuilds": 11
     },
     "5000": {
-      "openMs": 772,
-      "scrollFps": 57.5,
+      "openMs": 119,
+      "unfoldMs": 35,
+      "scrollFps": 59.2,
       "scrollMaxGapMs": 18,
-      "liveMaxGapMs": 25,
-      "liveRebuilt": 1
+      "liveMaxGapMs": 34,
+      "liveRebuilds": 11
     },
     "10000": {
-      "openMs": 3859,
-      "scrollFps": 57.5,
+      "openMs": 187,
+      "unfoldMs": 58,
+      "scrollFps": 60,
       "scrollMaxGapMs": 18,
-      "liveMaxGapMs": 113,
-      "liveRebuilt": 1
+      "liveMaxGapMs": 40,
+      "liveRebuilds": 11
     }
   }
 }

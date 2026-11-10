@@ -1,0 +1,55 @@
+# Personal agent profile template.
+#
+# Copy this file outside the model-writable workspace and point
+# AGENT_USER_CONFIG at the copy. The capability ceiling below is the most any
+# profile can grant; each profile then narrows it.
+
+capabilities = [
+  "fs.read",
+  "fs.write",
+  "git.status",
+  "memory.read",
+  "memory.write",
+  "process.spawn",
+  "network.request",
+]
+
+[memory]
+enabled = true
+
+[network]
+# Replace this example with the origins coding-online may read. This list is
+# enforced by the read-only web.request tool; it is not a sandbox egress list.
+allow = ["https://example.com"]
+
+[profiles.safe.tools]
+allow = ["fs.read", "git.status", "memory.read"]
+
+[profiles.safe.policy]
+shell = "deny"
+network = "deny"
+workspace_write = false
+
+[profiles.coding.tools]
+allow = ["fs.read", "fs.write", "git.status", "memory.read", "memory.write", "process.spawn"]
+
+[profiles.coding.policy]
+shell = "ask"
+network = "deny"
+workspace_write = true
+
+[profiles.coding-online.tools]
+allow = ["fs.read", "fs.write", "git.status", "memory.read", "memory.write", "process.spawn", "network.request"]
+
+[profiles.coding-online.policy]
+shell = "ask"
+network = "allow"
+workspace_write = true
+
+[profiles.research.tools]
+allow = ["fs.read", "memory.read", "network.request"]
+
+[profiles.research.policy]
+shell = "deny"
+network = "ask"
+workspace_write = false

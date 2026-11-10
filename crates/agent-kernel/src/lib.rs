@@ -5,15 +5,22 @@
 
 #![deny(unsafe_code)]
 
+mod action;
+pub mod adjudicate;
 pub mod approval;
+pub mod completion;
 pub mod doctor;
 pub mod fork;
 pub mod guarded;
 pub mod inbox;
+pub mod intent;
+pub mod intent_adjudication;
 pub mod judgment;
 pub mod lifecycle;
 pub mod live_bus;
 pub mod model_selection;
+pub mod parking;
+pub mod permission;
 pub mod plan;
 pub mod plugin;
 pub mod policy;
@@ -23,10 +30,16 @@ pub mod resource_guard;
 pub mod resume;
 pub mod schedule;
 pub mod scheduler;
+mod scrub;
+mod secret_refs;
+pub mod security;
 pub mod session_archive;
 pub mod session_lifecycle;
+mod snapshot;
 pub mod state;
+pub mod status;
 pub mod subagent;
 pub mod tool_schema;
 pub mod tools;
+pub mod verifier;
 pub mod workspace;

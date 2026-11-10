@@ -425,8 +425,48 @@ impl DoctorCheck for ProfileHealthCheck {
 
     async fn run(&self) -> Vec<DiagnosticMessage> {
         let (status, message) = match config::load(&self.workspace_root, &self.args) {
+            // The egress the run would have, said beside the profile it
+            // resolved: "the tool is offered" and "the tool can reach a site"
+            // are different facts, and the second is the one a person is
+            // asking when a fetch is refused. Validated here on the same terms
+            // the assembly validates it, so the doctor cannot pass a
+            // configuration the run would refuse to start under.
             Ok(resolved) => {
-                (HealthStatus::Passed, format!("profile '{}' resolves", resolved.profile_id))
+                match agent_tools_web::NetworkAllowlist::from_origins(&resolved.network_allow) {
+                    Ok(allowlist) => {
+                        let origins = allowlist.origins();
+                        let egress = if origins.is_empty() {
+                            "web.request reaches no site (no [network] allow)".to_string()
+                        } else {
+                            format!("web.request may reach {}", origins.join(", "))
+                        };
+                        // The same intersection the assembly performs, so this
+                        // line cannot promise a name the gateway would refuse
+                        // (CONTRACT §7 #181).
+                        let secrets = crate::stack::effective_tool_secrets(
+                            std::env::var("AGENT_TOOL_SECRETS").ok().as_deref(),
+                            resolved.secret_allow.as_deref(),
+                        );
+                        let names: Vec<String> =
+                            secrets.iter().map(|secret| secret.name.clone()).collect();
+                        let resolve = if names.is_empty() {
+                            "no secret reference resolves".to_string()
+                        } else {
+                            format!("secret references resolve {}", names.join(", "))
+                        };
+                        (
+                            HealthStatus::Passed,
+                            format!(
+                                "profile '{}' resolves; {egress}; {resolve}",
+                                resolved.profile_id
+                            ),
+                        )
+                    }
+                    Err(e) => (
+                        HealthStatus::Failed,
+                        format!("the network allowlist does not resolve: {e}"),
+                    ),
+                }
             }
             Err(e) => (HealthStatus::Failed, format!("the configuration does not resolve: {e}")),
         };
@@ -464,6 +504,29 @@ impl DoctorCheck for ExecutionSandboxCheck {
     }
 
     async fn run(&self) -> Vec<DiagnosticMessage> {
+        // The network policy is read for every mode, not only the sandboxed
+        // ones: a value this build cannot honour would otherwise go unreported
+        // by a doctor that passed, and refuse the next command someone ran.
+        if let Err(error) = &self.network {
+            return vec![DiagnosticMessage {
+                check_id: self.id(),
+                status: HealthStatus::Failed,
+                message: error.to_string(),
+            }];
+        }
+        if matches!(&self.network, Ok(true))
+            && let Ok(mode) = &self.selection
+            && *mode != SandboxMode::WorkspaceSandbox
+        {
+            return vec![DiagnosticMessage {
+                check_id: self.id(),
+                status: HealthStatus::Failed,
+                message: format!(
+                    "AGENT_SANDBOX_NETWORK=internet requires AGENT_SANDBOX=app-container; {} cannot bound a command's traffic",
+                    sandbox::label(*mode)
+                ),
+            }];
+        }
         let (status, message) = match &self.selection {
             Ok(SandboxMode::ReadOnly) => (
                 HealthStatus::Passed,
@@ -473,27 +536,29 @@ impl DoctorCheck for ExecutionSandboxCheck {
                      (no command, so no shell or git timeout applies)"
                 ),
             ),
+            // `local` is the trusted-workspace backend, not the high-privilege
+            // one: an action that needs a real process or a write at `L2` or
+            // above is refused here rather than run as this user
+            // (CONTRACT §7 #179). A doctor line that said "confined to the
+            // workspace" and stopped there would read as a boundary this
+            // backend does not have.
             Ok(SandboxMode::LocalProcess) => (
                 HealthStatus::Passed,
                 format!(
                     "mode=local; file tools and command cwd are confined to the workspace and \
-                     the child environment is allowlisted; not isolated: a command runs as this \
-                     user, so absolute paths it opens and the network are not bounded; limits: \
+                     the child environment is allowlisted; refused: any action that starts a \
+                     process or writes a path at risk l2 or higher — `shell.run` is l3, so no \
+                     command runs on this backend; a command runs as this user, so nothing \
+                     bounds what it opens or where it connects. Run high-risk work under \
+                     AGENT_SANDBOX=app-container; not isolated: the network is not bounded by \
+                     this backend; limits: \
                      shell_timeout_ms={SHELL_TIMEOUT_MS} git_timeout_ms={GIT_TIMEOUT_MS} \
                      output_cap_bytes={MAX_OUTPUT_BYTES} file_cap_bytes={MAX_FILE_BYTES}"
                 ),
             ),
             Ok(SandboxMode::WorkspaceSandbox) => {
-                let network = match &self.network {
-                    Ok(allowed) => sandbox::network_label(*allowed),
-                    Err(error) => {
-                        return vec![DiagnosticMessage {
-                            check_id: self.id(),
-                            status: HealthStatus::Failed,
-                            message: error.to_string(),
-                        }];
-                    }
-                };
+                // Checked above for every mode; the value is this run's policy.
+                let network = sandbox::network_label(matches!(&self.network, Ok(true)));
                 // Read-only probe: derive the SID and read the null-device DACL.
                 // It creates no profile and spawns nothing, so running the
                 // doctor cannot change the machine it is examining.
@@ -506,6 +571,8 @@ impl DoctorCheck for ExecutionSandboxCheck {
                              allowlisted environment; reads and writes outside the granted \
                              roots are refused by the kernel (files Windows itself opens to \
                              every AppContainer, some system files, remain readable); \
+                             high-risk workspace actions (l2 and above) are admitted on this \
+                             backend and refused on `local` (CONTRACT §7 #179); \
                              network={network}; shell={} ({}); \
                              the file tools answer from a helper process inside the container; \
                              not isolated: container commands can write anywhere they were \

@@ -20,6 +20,7 @@ use agent_protocol::ids::{
 };
 use agent_protocol::inbox::{InboxItem, InboxItemStatus, InboxKind};
 use agent_protocol::model::ModelResponse;
+use agent_protocol::permission::{ActionTarget, Reversibility, RiskLevel};
 use agent_protocol::permissions::{ApprovalRequest, ApprovalStatus, Capability};
 use agent_protocol::reason::{Basis, ReasonKind, ReasonNode, ReasonSource};
 use agent_store_jsonl::JsonlEventStore;
@@ -39,6 +40,8 @@ fn meta() -> Meta {
         judgment: "gates".to_string(),
         budget: Some(32_000),
         capabilities: vec!["meta".to_string()],
+        sandbox_capabilities: vec!["fs.read".to_string(), "process.spawn".to_string()],
+        high_risk_workspace_actions: false,
         models: vec![agent_web::ModelOption {
             provider: "echo".to_string(),
             model: None,
@@ -77,6 +80,9 @@ struct FakeBackend {
     accept_delete: AtomicBool,
     forks: Mutex<Vec<(String, Option<String>, String)>>,
     hold_approval: AtomicBool,
+    /// The authority each settlement was recorded under, as the entry point
+    /// described it (B4).
+    authorities: Mutex<Vec<String>>,
     /// Whether `set_model` accepts the name it was given. `true` unless a test
     /// makes the provider unknown.
     accept_model: AtomicBool,
@@ -108,6 +114,10 @@ impl FakeBackend {
 
     fn decision_count(&self) -> usize {
         self.decisions.lock().unwrap().len()
+    }
+
+    fn authorities(&self) -> Vec<String> {
+        self.authorities.lock().unwrap().clone()
     }
 
     fn hold_approvals(&self, hold: bool) {
@@ -149,8 +159,10 @@ impl Backend for FakeBackend {
         session: &SessionId,
         approval_id: &str,
         decision: Decision,
+        authority: &agent_kernel::approval::ApprovalAuthority,
         _live: &LiveSink,
     ) -> Result<(), BackendError> {
+        self.authorities.lock().unwrap().push(authority.described().to_string());
         self.decisions.lock().unwrap().push((
             session.as_str().to_string(),
             approval_id.to_string(),
@@ -348,6 +360,30 @@ async fn seeded_approval() -> (Arc<dyn EventStore>, TempDir) {
 
 /// A session paused on one approval request made at `created_at`.
 async fn seeded_approval_at(created_at: DateTime<Utc>) -> (Arc<dyn EventStore>, TempDir) {
+    seeded_request(approval_request(created_at)).await
+}
+
+/// The request those sessions are paused on: everything a pre-B4 log carried.
+fn approval_request(created_at: DateTime<Utc>) -> ApprovalRequest {
+    ApprovalRequest {
+        approval_id: ApprovalId::from_string("ap-1"),
+        session_id: SessionId::from_string("s1"),
+        capability: Capability::new(Capability::PROCESS_SPAWN),
+        tool_name: "shell.run".to_string(),
+        args_summary: "cargo test -p agent".to_string(),
+        status: ApprovalStatus::Pending,
+        created_at,
+        action_digest: None,
+        risk: None,
+        task_id: None,
+        task_revision: None,
+        reversibility: None,
+        targets: Vec::new(),
+    }
+}
+
+/// A session paused on `request`.
+async fn seeded_request(request: ApprovalRequest) -> (Arc<dyn EventStore>, TempDir) {
     let (store, dir) = empty();
     let session = SessionId::from_string("s1");
     let turn = TurnId::from_string("t1");
@@ -360,15 +396,6 @@ async fn seeded_approval_at(created_at: DateTime<Utc>) -> (Arc<dyn EventStore>, 
         priority: 0,
         created_at: Utc::now(),
         status: InboxItemStatus::Pending,
-    };
-    let request = ApprovalRequest {
-        approval_id: ApprovalId::from_string("ap-1"),
-        session_id: session.clone(),
-        capability: Capability::new(Capability::PROCESS_SPAWN),
-        tool_name: "shell.run".to_string(),
-        args_summary: "cargo test -p agent".to_string(),
-        status: ApprovalStatus::Pending,
-        created_at,
     };
     let drafts = vec![
         draft(
@@ -480,6 +507,117 @@ async fn seeded_diff() -> (Arc<dyn EventStore>, TempDir) {
         ),
     ];
     store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the diff");
+    (store, dir)
+}
+
+/// A session whose log holds the change ledger entry a non-Git workspace
+/// records in place of a `git.diff` observation.
+///
+/// `tail_malformed` appends a later record whose payload names no change list:
+/// the reader must skip it and keep the earlier evidence rather than treating
+/// the newest record as an answer it cannot parse.
+async fn seeded_changes(tail_malformed: bool) -> (Arc<dyn EventStore>, TempDir) {
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let step = StepId::from_string("s1");
+    let item = InboxItem {
+        item_id: InboxItemId::from_string("i1"),
+        session_id: session.clone(),
+        kind: InboxKind::NextTurn,
+        payload: json!({ "text": "write the notes" }),
+        priority: 0,
+        created_at: Utc::now(),
+        status: InboxItemStatus::Pending,
+    };
+    let changes = json!({
+        "snapshot_id": "snap-1",
+        "session_id": "s1",
+        "task_id": "manual:s1",
+        "action_digest": "d1",
+        "changes": [
+            {
+                "relative_path": "notes.md",
+                "kind": "modified",
+                "before_size": 10,
+                "after_size": 24,
+                "before_sha256": "aaaa",
+                "after_sha256": "bbbb"
+            },
+            {
+                "relative_path": "new.txt",
+                "kind": "added",
+                "before_size": 0,
+                "after_size": 7,
+                "after_sha256": "cccc"
+            }
+        ],
+        "changes_hash": "h1",
+        "complete": true,
+        "created_at": "2026-11-09T00:00:00Z"
+    });
+    let mut drafts = vec![
+        draft(
+            &session,
+            EventType::INBOX_APPENDED,
+            None,
+            None,
+            serde_json::to_value(&item).unwrap(),
+            Actor::User,
+        ),
+        draft(
+            &session,
+            EventType::TURN_STARTED,
+            Some(&turn),
+            None,
+            json!({ "inbox_item": item.item_id }),
+            Actor::Scheduler,
+        ),
+        draft(&session, EventType::STEP_STARTED, Some(&turn), Some(&step), json!({}), Actor::Agent),
+        draft(
+            &session,
+            EventType::TOOL_STARTED,
+            Some(&turn),
+            Some(&step),
+            json!({
+                "tool_name": "fs.write",
+                "provider_tool_call_id": "c1",
+                "arguments": { "path": "notes.md" },
+            }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::TOOL_COMPLETED,
+            Some(&turn),
+            Some(&step),
+            json!({
+                "tool_name": "fs.write",
+                "provider_tool_call_id": "c1",
+                "content": "{\"path\":\"notes.md\",\"bytes\":24}",
+            }),
+            Actor::Agent,
+        ),
+        draft(
+            &session,
+            EventType::WORKSPACE_CHANGES_RECORDED,
+            Some(&turn),
+            Some(&step),
+            changes,
+            Actor::Agent,
+        ),
+    ];
+    if tail_malformed {
+        drafts.push(draft(
+            &session,
+            EventType::WORKSPACE_CHANGES_RECORDED,
+            Some(&turn),
+            Some(&step),
+            json!({ "changes": "not a list" }),
+            Actor::Agent,
+        ));
+    }
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the change ledger");
     (store, dir)
 }
 
@@ -889,6 +1027,8 @@ async fn meta_requires_the_process_token() {
     let payload = body(&response);
     assert!(payload.contains("\"v\":1"), "{payload}");
     assert!(payload.contains("\"workspace\":\"yaoyao-public\""), "{payload}");
+    assert!(payload.contains("\"sandbox_capabilities\""), "{payload}");
+    assert!(payload.contains("\"high_risk_workspace_actions\""), "{payload}");
     handle.abort();
 }
 
@@ -897,20 +1037,47 @@ async fn the_page_is_public_and_names_the_product() {
     let (addr, _, handle, _dir) = serve().await;
     let (status, response) = request(addr, "/", None, None).await;
     assert_eq!(status, 200, "{response}");
+    assert!(
+        response.to_ascii_lowercase().contains("content-security-policy"),
+        "the page is served under the contract's policy: {response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("object-src 'self' blob:; frame-src 'self' blob:"),
+        "a PDF artifact is handed to the viewer as a blob: {response}"
+    );
     let page = body(&response);
     assert!(page.contains("爻爻"), "the page names the product");
+    assert!(page.contains("./assets/"), "the page names its bundle: {page}");
     handle.abort();
 }
 
 #[tokio::test]
-async fn the_page_assets_are_embedded_and_served() {
+async fn the_bundle_is_embedded_and_served() {
     let (addr, _, handle, _dir) = serve().await;
-    let (status, script) = request(addr, "/app.js", None, None).await;
+    let (_, page) = request(addr, "/", None, None).await;
+    let html = body(&page);
+    let asset = html
+        .split("src=\"./")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the page names its script");
+    let (status, script) = request(addr, &format!("/{asset}"), None, None).await;
     assert_eq!(status, 200, "{script}");
-    assert!(body(&script).contains("renderTimeline"), "the page script is embedded");
-    let (status, style) = request(addr, "/app.css", None, None).await;
-    assert_eq!(status, 200, "{style}");
-    assert!(body(&style).contains(".window"), "the page stylesheet is embedded");
+    assert!(
+        script.to_ascii_lowercase().contains("content-type: text/javascript"),
+        "the script is typed: {script}"
+    );
+    assert!(body(&script).contains("y-sheet"), "the bundle carries the shell");
+    for line in ["cache-control: public, max-age=31536000, immutable", "nosniff"] {
+        assert!(
+            script.to_ascii_lowercase().contains(line),
+            "the hashed asset is cached as immutable: {script}"
+        );
+    }
+
+    let (status, missing) = request(addr, "/assets/does-not-exist.js", None, None).await;
+    assert_eq!(status, 404, "{missing}");
+    assert!(body(&missing).contains("asset_not_found"), "{missing}");
     handle.abort();
 }
 
@@ -1072,6 +1239,16 @@ async fn an_artifact_is_served_only_by_its_content_hash() {
         request(addr, &format!("/api/artifacts/{binary_hash}"), Some(&token), None).await;
     assert_eq!(status, 200, "{response}");
     assert!(response.contains("content-type: application/octet-stream"), "{response}");
+
+    // A PDF is served as one so the page can embed a viewer: the signature is
+    // the only type the store has.
+    let pdf_hash = "14bcd090baf31edba64e9cbd8cdfc15f943344aa72cb3675ad8e91bfcbce03ad";
+    std::fs::write(artifacts.join(format!("{pdf_hash}.blob")), b"%PDF-1.4\n%%EOF\n")
+        .expect("pdf blob");
+    let (status, response) =
+        request(addr, &format!("/api/artifacts/{pdf_hash}"), Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    assert!(response.contains("content-type: application/pdf"), "{response}");
     handle.abort();
 }
 
@@ -1149,6 +1326,42 @@ async fn the_diff_report_is_the_observation_the_agent_saw() {
 }
 
 #[tokio::test]
+async fn a_workspace_change_ledger_answers_when_there_is_no_git_observation() {
+    let (store, dir) = seeded_changes(false).await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/diff", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["source"], "workspace.changes");
+    assert_eq!(payload["snapshot_id"], "snap-1");
+    assert_eq!(payload["complete"], true);
+    let changes = payload["changes"].as_array().expect("a change list");
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0]["file"], "notes.md");
+    assert_eq!(changes[0]["change"], "modified");
+    assert_eq!(changes[0]["before_size"], 10);
+    assert_eq!(changes[0]["after_size"], 24);
+    assert_eq!(changes[0]["after_sha256"], "bbbb");
+    assert_eq!(changes[1]["file"], "new.txt");
+    assert_eq!(changes[1]["change"], "added");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_malformed_change_record_does_not_hide_an_earlier_one() {
+    let (store, dir) = seeded_changes(true).await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/diff", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["source"], "workspace.changes");
+    assert_eq!(payload["changes"][0]["file"], "notes.md");
+    handle.abort();
+}
+
+#[tokio::test]
 async fn the_context_report_is_the_last_prepared_request() {
     let (store, dir) = seeded_context().await;
     let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
@@ -1179,6 +1392,68 @@ async fn the_plan_report_is_the_latest_plan_update() {
     assert_eq!(payload["source"], "plan/updated");
     assert_eq!(payload["plan"]["goal"], "finish the GUI");
     assert_eq!(payload["plan"]["items"][1]["status"], "doing");
+    handle.abort();
+}
+
+/// A settled run the operator's completion criterion passed.
+async fn seeded_status() -> (Arc<dyn EventStore>, TempDir) {
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let drafts = vec![
+        draft(&session, EventType::RUN_STARTED, None, None, json!({}), Actor::Scheduler),
+        draft(
+            &session,
+            EventType::COMPLETION_CHECKED,
+            Some(&turn),
+            None,
+            json!({ "status": "completed", "kind": "command", "steps": 2 }),
+            Actor::Agent,
+        ),
+        draft(&session, EventType::TURN_COMPLETED, Some(&turn), None, json!({}), Actor::Scheduler),
+        draft(&session, EventType::RUN_COMPLETED, None, None, json!({}), Actor::Scheduler),
+    ];
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the log");
+    (store, dir)
+}
+
+#[tokio::test]
+async fn the_status_report_carries_the_three_axes() {
+    let (store, dir) = seeded_status().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/status", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["run_status"], "completed");
+    assert_eq!(payload["delivery_status"], "unanswered");
+    assert_eq!(payload["verification_status"], "verified");
+    assert_eq!(
+        payload["completion_status"], "verified_complete",
+        "the page reads the same axes as the CLI: {payload}"
+    );
+    assert_eq!(payload["pending_intents"], json!([]));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_log_without_run_events_still_answers_status() {
+    // A session written before this slice has turns but no `run/*` events. The
+    // answer is not "no status": the axes still describe what the log says.
+    let (store, dir, _) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/status", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    assert_eq!(payload["run_status"], Value::Null);
+    assert_eq!(payload["delivery_status"], "delivered");
+    assert_eq!(payload["verification_status"], "not_applicable");
+    assert_eq!(
+        payload["completion_status"],
+        Value::Null,
+        "an information answer is delivered, not completed"
+    );
     handle.abort();
 }
 
@@ -1342,6 +1617,10 @@ async fn an_approval_is_settled_once() {
     assert_eq!(status, 200, "{response}");
     assert!(body(&response).contains("\"state\":\"granted\""), "{response}");
     assert!(eventually(|| backend.decision_count() == 1).await);
+    // The answer was accepted on the strength of the loopback token, and that
+    // is what the backend records it under — a GUI answer is a person's only
+    // because the request proved it came from this machine's own handler.
+    assert_eq!(backend.authorities(), vec!["local_http".to_string()]);
 
     // The fake holds the settlement open, so the first decision is still in
     // flight. A second click must not start a second resume.
@@ -1356,6 +1635,50 @@ async fn an_approval_is_settled_once() {
     assert!(body(&response).contains("\"code\":\"approval_not_pending\""), "{response}");
     assert_eq!(backend.decision_count(), 1);
     backend.release.notify_waiters();
+    handle.abort();
+}
+
+/// The card is the moment before the act, and it has to say what the act is.
+///
+/// A person agreeing to a fingerprint they cannot see is agreeing to a
+/// capability. The row carries the risk, whether the action can be taken back,
+/// and every target it would touch — including a named data store, which is the
+/// "what data is in scope" half of the question. (B4, plan threshold 7.)
+#[tokio::test]
+async fn the_approval_card_shows_target_scope_and_reversibility() {
+    let mut ask = approval_request(Utc::now());
+    ask.action_digest = Some("d1e5".to_string());
+    ask.risk = Some(RiskLevel::L3);
+    ask.reversibility = Some(Reversibility::Irreversible);
+    ask.targets = vec![
+        ActionTarget::WorkspacePath {
+            path: "src/main.rs".to_string(),
+            writable_root: Some("C:/repo".to_string()),
+        },
+        ActionTarget::DataStore { name: "memory".to_string() },
+    ];
+    let (store, dir) = seeded_request(ask).await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) = request(addr, "/api/sessions/s1/transcript", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let payload: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    let approval = payload["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["kind"] == "approval")
+        .expect("an approval row");
+
+    assert_eq!(approval["risk"], "l3", "{payload}");
+    assert_eq!(approval["reversibility"], "irreversible", "{payload}");
+    assert_eq!(approval["action_digest"], "d1e5", "{payload}");
+    assert_eq!(approval["targets"][0]["kind"], "workspace_path", "{payload}");
+    assert_eq!(approval["targets"][0]["path"], "src/main.rs", "{payload}");
+    assert_eq!(approval["targets"][1]["kind"], "data_store", "{payload}");
+    assert_eq!(approval["targets"][1]["name"], "memory", "the data in scope is named");
+    // The sentence the person reads is still the summary the request carried.
+    assert_eq!(approval["summary"], "cargo test -p agent", "{payload}");
     handle.abort();
 }
 
@@ -1878,5 +2201,170 @@ async fn a_request_the_surface_cannot_answer_is_refused_by_name() {
         request(addr, "/api/sessions/ghost/events?from=0", Some(&token), None).await;
     assert_eq!(status, 404, "{response}");
     assert!(body(&response).contains("ghost"), "{response}");
+    handle.abort();
+}
+#[tokio::test]
+async fn no_synthetic_step_parking_after_three_hundred_steps() {
+    let (store, dir) = empty();
+    let session = SessionId::from_string("s1");
+    let turn = TurnId::from_string("t1");
+    let mut drafts = vec![draft(
+        &session,
+        EventType::TURN_STARTED,
+        Some(&turn),
+        None,
+        json!({ "inbox_item": "i1" }),
+        Actor::Scheduler,
+    )];
+    for n in 0..301 {
+        let step = StepId::from_string(format!("step-{n}"));
+        drafts.push(draft(
+            &session,
+            EventType::STEP_STARTED,
+            Some(&turn),
+            Some(&step),
+            json!({}),
+            Actor::Scheduler,
+        ));
+    }
+    drafts.push(draft(
+        &session,
+        EventType::TURN_COMPLETED,
+        Some(&turn),
+        None,
+        json!({ "final_content": "finished after the old backstop" }),
+        Actor::Scheduler,
+    ));
+    store.append(&session, EventSeq::ZERO, drafts).await.expect("seed the log");
+    let events =
+        store.read_stream(&session, EventSeq::ZERO, usize::MAX).await.expect("read the log");
+    assert!(
+        events.iter().all(|event| event.event.event_type.as_str() != "budget/parked"),
+        "no step ceiling was configured, so there is nothing to park"
+    );
+
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+    let (status, response) = request(addr, "/api/sessions/s1/transcript", Some(&token), None).await;
+    assert_eq!(status, 200, "{response}");
+    let transcript: Value = serde_json::from_str(body(&response)).expect("a JSON body");
+    let ending = transcript["items"]
+        .as_array()
+        .expect("a list of rows")
+        .iter()
+        .find(|item| item["kind"] == "turn_end")
+        .expect("a turn ending row");
+    assert_eq!(ending["ending"], "answered", "{transcript}");
+    handle.abort();
+}
+
+/// The store keeps bytes, not types; the four image signatures the page can
+/// preview are recognised so an image is shown rather than downloaded.
+#[tokio::test]
+async fn an_image_artifact_keeps_its_shape() {
+    let (store, dir) = empty();
+    let artifacts = dir.path().join("artifacts");
+    std::fs::create_dir_all(&artifacts).expect("artifact directory");
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    // The store verifies a blob against its name, so these are the SHA-256
+    // digests of the bytes beside them.
+    let cases: [(&str, &[u8], &str); 4] = [
+        (
+            "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
+            b"\x89PNG\r\n\x1a\n",
+            "image/png",
+        ),
+        (
+            "45ae705277879f7f01d778f7c95a065bb0c06ab9936cf24307f375211fee13d1",
+            b"\xff\xd8\xff\xe0\x00\x10JFIF",
+            "image/jpeg",
+        ),
+        (
+            "a7a3eda6441d137cccef9700fa378c0099d647146be9167def705bf86bb634ec",
+            b"GIF89a\x01\x00",
+            "image/gif",
+        ),
+        (
+            "347ce8f11c673e117e9bac7cebbfc3fc174a4dd2536b8c270cf55346585abedb",
+            b"RIFF\x1a\x00\x00\x00WEBPVP8 ",
+            "image/webp",
+        ),
+    ];
+    for (hash, bytes, kind) in cases {
+        std::fs::write(artifacts.join(format!("{hash}.blob")), bytes).expect("blob");
+        let (status, response) =
+            request(addr, &format!("/api/artifacts/{hash}"), Some(&token), None).await;
+        assert_eq!(status, 200, "{response}");
+        assert!(response.contains(&format!("content-type: {kind}")), "{kind}: {response}");
+    }
+    handle.abort();
+}
+
+/// An export shape the renderer does not have is the request's mistake, not
+/// an empty document: answering with markdown anyway would say the caller got
+/// what they asked for.
+#[tokio::test]
+async fn an_export_in_an_unknown_shape_is_refused() {
+    let (store, dir, _) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    let (status, response) =
+        request(addr, "/api/sessions/s1/export?format=txt", Some(&token), None).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("format must be md or json"), "{response}");
+    handle.abort();
+}
+
+/// A schedule missing either half is refused rather than filled in from the
+/// clock or from the last prompt: the caller has to say what and when.
+#[tokio::test]
+async fn a_schedule_without_a_time_or_text_is_refused() {
+    let (store, dir, _) = seeded().await;
+    let (addr, token, handle) = serve_over(store, dir.path().to_path_buf()).await;
+
+    for payload in [json!({ "v": 1, "text": "later" }), json!({ "v": 1, "when": "+10m" })] {
+        let (status, response) = post(addr, "/api/sessions/s1/schedules", &token, &payload).await;
+        assert_eq!(status, 400, "{response}");
+        assert!(body(&response).contains("when and text"), "{response}");
+    }
+    handle.abort();
+}
+
+/// Text that is only whitespace is not a turn: it would open a run with
+/// nothing to answer, and the empty check runs before the driver is asked.
+#[tokio::test]
+async fn an_empty_turn_or_steer_is_refused_before_the_driver() {
+    let (store, dir, _) = seeded().await;
+    let backend = FakeBackend::new();
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/turns", &token, &json!({ "v": 1, "text": "  " })).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("text must not be empty"), "{response}");
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/steer", &token, &json!({ "v": 1, "text": "" })).await;
+    assert_eq!(status, 400, "{response}");
+    assert!(body(&response).contains("text must not be empty"), "{response}");
+    assert_eq!(backend.turn_count(), 0, "a refused turn must not reach the driver");
+    handle.abort();
+}
+
+/// A session paused on a decision is not started again behind the question:
+/// the next turn has to wait for the answer.
+#[tokio::test]
+async fn a_turn_on_a_session_awaiting_a_decision_is_refused() {
+    let (store, dir) = seeded_approval().await;
+    let backend = FakeBackend::new();
+    let (addr, token, handle) =
+        serve_over_with(store, dir.path().to_path_buf(), Some(backend.clone())).await;
+
+    let (status, response) =
+        post(addr, "/api/sessions/s1/turns", &token, &json!({ "v": 1, "text": "again" })).await;
+    assert_eq!(status, 409, "{response}");
+    assert!(body(&response).contains("\"code\":\"awaiting_decision\""), "{response}");
+    assert_eq!(backend.turn_count(), 0, "a refused turn must not reach the driver");
     handle.abort();
 }

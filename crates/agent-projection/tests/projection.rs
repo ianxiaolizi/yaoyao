@@ -124,6 +124,36 @@ async fn checkpoint_plus_tail_equals_full_replay() {
 }
 
 #[tokio::test]
+async fn a_checkpoint_tail_can_be_folded_from_an_event_slice() {
+    let store = Arc::new(FakeEventStore::new());
+    let dir = tempfile::tempdir().unwrap();
+    let projection =
+        Projection::new(SessionProjection::new(), store.clone(), dir.path().to_path_buf());
+    let sid = SessionId::from_string("s");
+
+    append(
+        &store,
+        &sid,
+        0,
+        vec![
+            draft("s", EventType::SESSION_STARTED, false),
+            draft("s", EventType::TURN_STARTED, false),
+        ],
+    )
+    .await;
+    let head = projection.build_full(&sid).await.unwrap();
+    projection.checkpoint(&sid, &head).await.unwrap();
+
+    append(&store, &sid, 2, vec![draft("s", EventType::TURN_COMPLETED, false)]).await;
+    let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+    let from_slice = projection.build_from_events(&sid, &events).await.unwrap();
+    let full = projection.build_full(&sid).await.unwrap();
+    assert_eq!(from_slice.state, full.state);
+    assert_eq!(from_slice.as_of_seq, Some(EventSeq::new(2)));
+    assert_eq!(full.as_of_seq, Some(EventSeq::new(2)));
+}
+
+#[tokio::test]
 async fn corrupt_checkpoint_rebuilds_from_zero() {
     let store = Arc::new(FakeEventStore::new());
     let dir = tempfile::tempdir().unwrap();

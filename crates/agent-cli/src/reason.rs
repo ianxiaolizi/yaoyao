@@ -248,7 +248,12 @@ impl TurnEnd {
         match (self.event.as_str(), self.stop.as_deref()) {
             (EventType::TURN_COMPLETED, Some(reason)) => reason.to_string(),
             (EventType::TURN_COMPLETED, None) => String::from("final_answer"),
-            (EventType::TURN_YIELDED, _) => String::from("needs_user_input"),
+            // A yielded turn says why it yielded when it can: a budget stop is
+            // not a question for the user, and reporting it as one would make
+            // `why` offer a decision nobody is being asked for (CONTRACT §7
+            // #173).
+            (EventType::TURN_YIELDED, Some(reason)) => reason.to_string(),
+            (EventType::TURN_YIELDED, None) => String::from("needs_user_input"),
             (EventType::TURN_FAILED, _) => String::from("fatal_error"),
             (EventType::TURN_CANCELLED, _) => String::from("user_cancelled"),
             (other, _) => other.to_string(),
@@ -579,5 +584,85 @@ mod tests {
     #[test]
     fn one_line_collapses_the_claims_whitespace() {
         assert_eq!(one_line("a\n b\tc"), "a b c");
+    }
+
+    /// Append drafts one at a time, in order, so the log has the seq each
+    /// reader expects to find.
+    async fn store_with(drafts: Vec<EventDraft>) -> agent_testkit::FakeEventStore {
+        let store = agent_testkit::FakeEventStore::new();
+        for (index, draft) in drafts.into_iter().enumerate() {
+            store
+                .append(&SessionId::from_string("s"), EventSeq::new(index as u64), vec![draft])
+                .await
+                .expect("the draft is appended");
+        }
+        store
+    }
+
+    /// A reader has to answer when there is nothing to explain, in both
+    /// shapes it is asked in: the CLI's text and the web's structured report.
+    #[tokio::test]
+    async fn a_session_without_a_chain_says_there_is_nothing_to_explain() {
+        let store = agent_testkit::FakeEventStore::new();
+        let session = SessionId::from_string("s");
+
+        let outcome = run_why(&store, &session, None, None, false).await.expect("an answer");
+        assert!(matches!(outcome.verdict, crate::Verdict::DidNotRun));
+        let CliOutput::Text(text) = &outcome.output else { panic!("text was asked for") };
+        assert!(text.contains("no reasoning chain recorded in this session"), "{text}");
+
+        let error = why_report(&store, &session, None).await.expect_err("no chain to serve");
+        assert!(matches!(error, WhyError::Unavailable(_)), "{error}");
+        assert!(error.to_string().contains("no reasoning chain recorded"), "{error}");
+    }
+
+    /// A named turn the chain never recorded is named back; reading it must
+    /// not silently fall back to the latest turn that did leave one.
+    #[tokio::test]
+    async fn a_named_turn_without_nodes_is_refused_rather_than_guessed() {
+        let (_, events) = fixture();
+        let drafts = events.into_iter().map(|stored| stored.event).collect();
+        let store = store_with(drafts).await;
+        let session = SessionId::from_string("s");
+
+        let outcome =
+            run_why(&store, &session, Some("later"), None, false).await.expect("an answer");
+        assert!(matches!(outcome.verdict, crate::Verdict::DidNotRun));
+        let CliOutput::Text(text) = &outcome.output else { panic!("text was asked for") };
+        assert!(text.contains("no reasoning chain recorded for turn 'later'"), "{text}");
+    }
+
+    /// Both readers carry the same facts: the verdict rule, how the turn
+    /// ended, and the edge check — one rendered, one as data.
+    #[tokio::test]
+    async fn the_structured_report_names_the_verdict_and_the_end() {
+        let (_, mut events) = fixture();
+        let mut completed = stored(
+            events.len() as u64,
+            EventType::TURN_COMPLETED,
+            serde_json::json!({ "stop_reason": "max_steps" }),
+        );
+        completed.event.turn_id = Some(agent_protocol::ids::TurnId::from_string("t1"));
+        events.push(completed);
+        let drafts = events.into_iter().map(|stored| stored.event).collect();
+        let store = store_with(drafts).await;
+        let session = SessionId::from_string("s");
+
+        let report = why_report(&store, &session, Some("t1")).await.expect("a report");
+        assert_eq!(report.turn, "t1");
+        assert_eq!(
+            report.verdict.as_ref().map(|verdict| verdict.rule.as_str()),
+            Some("verdict/after-failure")
+        );
+        assert_eq!(report.stop.as_ref().map(|stop| stop.reason.as_str()), Some("max_steps"));
+        assert_eq!(report.check, "ok");
+
+        let outcome = run_why(&store, &session, Some("t1"), None, true).await.expect("an answer");
+        let CliOutput::Json(json) = &outcome.output else { panic!("json was asked for") };
+        let value: serde_json::Value = serde_json::from_str(json.as_str()).expect("a JSON object");
+        assert_eq!(value["turn"], "t1");
+        assert_eq!(value["stop"]["reason"], "max_steps");
+        assert_eq!(value["check"], "ok");
+        assert!(value["nodes"].as_array().expect("nodes").len() >= 7);
     }
 }

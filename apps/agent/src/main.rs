@@ -14,22 +14,24 @@
 
 use std::path::Path;
 
-use agent_cli::Verdict;
-use agent_cli::args::{self, Args, DEFAULT_SESSION};
-
 use agent::config;
+use agent_cli::Verdict;
+use agent_cli::args::{self, Args};
 
 mod commands;
+mod help;
 mod support;
 
 use commands::approval::{approve, deny, tool};
 use commands::inspect::{artifact, context, memory, metrics};
 use commands::plugin::plugin;
+use commands::rollback::rollback;
 use commands::sandbox::{doctor, sandbox_command};
 use commands::schedule::{schedule, tick};
 use commands::session::session;
 use commands::subagent::subagent;
 use commands::turn::{export, fork, interrupt, resume, run, status, steer, why};
+use commands::verify::verify;
 use commands::web::{serve, web};
 
 /// The exit status of a command whose subject answered "no".
@@ -106,6 +108,11 @@ async fn main() {
             }
         }
     }
+    if let Some(target) = help::target(&argv) {
+        help::print(target.as_deref());
+        return;
+    }
+
     let args = match args::parse(&argv) {
         Ok(args) => args,
         Err(args::ArgsError::NoCommand) => {
@@ -128,6 +135,7 @@ async fn main() {
         "interrupt" => interrupt(&args).await,
         "export" => export(&args).await,
         "status" => status(&args).await,
+        "verify" => verify(&args).await,
         "why" => why(&args).await,
         "approve" => approve(&args).await,
         "deny" => deny(&args).await,
@@ -142,6 +150,7 @@ async fn main() {
         "context" => context(&args).await,
         "metrics" => metrics(&args).await,
         "artifact" => artifact(&args).await,
+        "rollback" => rollback(&args).await,
         "sandbox" => sandbox_command(&args),
         "subagent" => subagent(&args).await,
         other => {
@@ -153,66 +162,7 @@ async fn main() {
 }
 
 pub(crate) fn usage() {
-    eprintln!(
-        "Usage: agent <command> [options]\n\n\
-         Commands:\n  \
-         run <text>                 Ask the agent to do something (alias: ask)\n  \
-         ask <text>                 Alias of run\n  \
-         resume [text]              Continue a turn that was waiting on a decision\n  \
-         fork [--at <turn>]         Derive a new session from a closed turn boundary\n  \
-         steer \"<text>\"           Queue text for the turn in flight (applied at the next step)\n  \
-         interrupt                  Stop the run in flight at its next step boundary\n  \
-         export [--out <dir>]       Write the session as session.md + bundle.json (or stdout)\n  \
-         export --redacted          Same, with secret-shaped tokens replaced by ***\n  \
-         why [--turn <id>] [--depth <n>]\n                              Explain that turn's reasoning chain, backwards\n                              (--help says what a turn's end and verdict mean)\n  \
-         status                     Show session state\n  \
-         approve <id> [scope]       Approve a pending request [once|turn|session|always]\n  \
-         deny <id> [--only]         Deny a pending request (cascades to the session's pending)\n  \
-         tool <name> [json-args]    Run a tool through the policy gateway\n  \
-         plugin list                What the configuration, the log and the queue say about plugins\n  \
-         plugin disable <id>        Ask for a plugin to be withdrawn at the next turn boundary\n  \
-         plugin enable <id>         Ask for a disabled plugin to be registered again\n  \
-         session new [--id <id>]    Record that a session has started (idempotent)\n  \
-         session list               Every session under the data directory, newest first\n  \
-         session archive <id>       Hide a session from the working list; its log stays\n  \
-         session unarchive <id>     Show an archived session again\n  \
-         session delete <id>        Remove a session's log (refuses while a turn runs there)\n  \
-         schedule at <when> <text>  Schedule a turn: RFC3339 or +10m; run it with tick\n  \
-         schedule list              Show scheduled turns that have not run\n  \
-         schedule cancel <id>       Withdraw a scheduled turn before it runs\n  \
-         tick                       Run at most one pending or due turn\n  \
-         serve                      Keep running turns as they become due (one per session)\n  \
-         subagent serve [args]      Answer one delegation's objective, then exit. A parent\n                              process starts this, not a person: it is the child half\n                              of kind = \"self\" in [subagents.<id>]\n  \
-         web [--port <n>]           Serve the GUI on loopback, token printed once\n  \
-         memory search <text>       Find events whose text contains <text>\n  \
-         memory reindex             Rebuild the searchable index from the session log\n  \
-         memory remember <text>     Keep a fact across sessions (--key, --supersedes, --private)\n  \
-         memory list [--all]        Show remembered facts (--all includes replaced and expired)\n  \
-         memory forget <id>         Delete a remembered fact for good\n  \
-         memory export [--out]      Every remembered fact as JSON\n  \
-         context inspect            Show what the next request would carry (size, kinds, budget)\n  \
-         metrics [--out <path>]     Count turns, tools, approvals, tokens and time\n                              from the event log (every session unless --session names one)\n  \
-         artifact get <ref> [--out] Fetch a stored blob (locator or hash). Text to stdout otherwise\n  \
-         sandbox setup              Create the AppContainer profile and its grants (elevated)\n  \
-         sandbox status             Report whether the AppContainer setup is in place\n  \
-         doctor                     Run health checks\n\n\
-         Options:\n  \
-         --session <id>             Act on this session (default: {DEFAULT_SESSION})\n  \
-         --profile <name>           Compose this profile for the run\n  \
-         --model <name>             Ask the provider for this model\n  \
-         --json                     One structured object on stdout\n  \
-         --events                   The events this command produced, one JSON object per line\n\
-         \nOptions may appear before or after the command. --json and --events are \
-         mutually exclusive.\n\n\
-         Configuration, in order of authority:\n  \
-         {managed}   machine-wide policy (deny list)\n  \
-         {user}      capabilities and trusted plugins\n  \
-         <workspace>/{workspace}   project configuration\n\
-         \nA profile selects inside what the user configuration authorized; it cannot add to it.",
-        managed = config::ENV_MANAGED_POLICY,
-        user = config::ENV_USER_CONFIG,
-        workspace = config::WORKSPACE_CONFIG,
-    );
+    eprintln!("{}", help::usage_text());
 }
 
 /// The command's positional arguments, with each flag and its value skipped.
@@ -249,7 +199,7 @@ pub(crate) fn positionals(args: &Args) -> Vec<&String> {
 mod tests {
     use super::*;
     use crate::support::{
-        DEFAULT_DATA_DIR, WatchSink, resolve_data_dir, resolve_workspace_root, watch_with,
+        STATE_DIR_NAME, WatchSink, resolve_data_dir_with_state, resolve_workspace_root, watch_with,
     };
     use agent_cli::CliOutput;
     use agent_kernel::live_bus::InMemoryLiveEventBus;
@@ -284,41 +234,57 @@ mod tests {
         );
     }
 
-    /// The data directory follows the workspace root, not the process.
+    /// The data directory is outside the workspace, keyed by the workspace.
     ///
-    /// `AGENT_DATA_DIR` is the one path a run cannot do without when nobody
-    /// named one, and where "nowhere named" points has to be decided by the
-    /// rule every other relative path follows. Otherwise the event log of a run
-    /// against a workspace goes to whatever directory the command was invoked
-    /// from: a different place per invocation, and none of them the workspace.
+    /// The ledger, snapshots and artifacts are evidence about the run; placing
+    /// them where tools can write would let the model rewrite its own evidence.
+    /// An explicit `AGENT_DATA_DIR` is absolute and outside the workspace; with
+    /// no explicit path, the platform user state root keeps workspaces separate.
     #[test]
-    fn an_unnamed_data_directory_is_resolved_inside_the_workspace() {
-        let root = if cfg!(windows) { "C:\\ws" } else { "/ws" };
+    fn an_unnamed_data_directory_is_resolved_outside_the_workspace() {
+        let root = tempfile::TempDir::new().unwrap();
+        let state_root = tempfile::TempDir::new().unwrap();
+        let root_text = root.path().display().to_string();
 
-        // Unset and empty are the same request: a name inside the workspace.
+        // Unset and empty are the same request: the workspace-keyed state
+        // directory under the platform state root.
         for configured in [None, Some("")] {
-            let resolved = resolve_data_dir(root, configured);
-            assert_eq!(resolved, Path::new(root).join(DEFAULT_DATA_DIR).display().to_string());
-            assert!(
-                Path::new(&resolved).starts_with(root),
-                "{resolved:?} is outside the workspace"
-            );
+            let resolved =
+                resolve_data_dir_with_state(&root_text, configured, state_root.path()).unwrap();
+            let resolved = PathBuf::from(resolved);
+            assert!(resolved.starts_with(state_root.path()), "{resolved:?}");
+            assert!(resolved.to_string_lossy().contains(STATE_DIR_NAME), "{resolved:?}");
+            assert!(!resolved.starts_with(root.path()), "state is inside the workspace");
         }
 
-        // A relative value is relative to the workspace root, which is the whole
-        // point — it is not relative to whatever cwd the process has.
-        assert_eq!(
-            resolve_data_dir(root, Some("state")),
-            Path::new(root).join("state").display().to_string()
-        );
-        assert_eq!(
-            resolve_data_dir(root, Some(Path::new("nested").join("state").to_str().unwrap())),
-            Path::new(root).join("nested").join("state").display().to_string()
-        );
+        // A relative explicit value has no safe base: it could put the ledger
+        // inside the workspace or make it depend on cwd. It is refused.
+        let relative = resolve_data_dir_with_state(&root_text, Some("state"), state_root.path())
+            .expect_err("a relative data directory is unsafe");
+        assert!(relative.contains("absolute path"), "{relative}");
 
-        // An absolute value is already unambiguous and is taken as given.
-        let absolute = if cfg!(windows) { "C:\\agent-state" } else { "/var/agent-state" };
-        assert_eq!(resolve_data_dir(root, Some(absolute)), absolute);
+        // An absolute path outside the workspace is taken as given.
+        let outside = state_root.path().join("explicit");
+        let resolved = resolve_data_dir_with_state(
+            &root_text,
+            Some(outside.to_str().unwrap()),
+            state_root.path(),
+        )
+        .unwrap();
+        assert_eq!(PathBuf::from(resolved), outside);
+    }
+
+    #[test]
+    fn a_data_directory_inside_the_workspace_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let inside = root.path().join(".agent-data");
+        let error = resolve_data_dir_with_state(
+            root.path().to_str().unwrap(),
+            Some(inside.to_str().unwrap()),
+            root.path(),
+        )
+        .expect_err("the decision ledger cannot live inside the workspace");
+        assert!(error.contains("inside the model-writable workspace"), "{error}");
     }
 
     /// A run's base is the configured root, or the cwd — and never a panic.

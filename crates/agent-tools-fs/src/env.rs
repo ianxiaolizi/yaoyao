@@ -68,7 +68,7 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// The exit code reported for a command killed at its deadline, matching
 /// `timeout(1)` so the convention is not something a reader has to learn here.
-const TIMEOUT_EXIT_CODE: i32 = 124;
+pub(crate) const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// Directories a write may not create or modify, relative to the workspace
 /// root. Lower-cased and compared component-wise; on a case-insensitive
@@ -187,28 +187,30 @@ impl LocalExecutionEnvironment {
         resolve_within(&self.workspace_root, path)
     }
 
-    /// How the AppContainer shell starts: inside a drive mapped onto the
-    /// workspace root.
+    /// How the AppContainer shell starts: in the real workspace directory.
     ///
-    /// The launcher grants the workspace and nothing above it, so PowerShell
-    /// cannot always adopt the process working directory — when the workspace
-    /// sits below directories the container may not open, PowerShell falls back
-    /// to the drive root (or its own installation directory), and every
-    /// relative path a command uses resolves somewhere else. Mapping the
-    /// workspace onto a PowerShell drive and starting there makes the shell's
-    /// root the sandbox's root: what the shell cannot reach above the
-    /// workspace is also what it cannot name. `New-PSDrive` only builds a
-    /// provider view; the process working directory (what a native child
-    /// inherits) stays the real path.
+    /// The launcher passes the workspace (or the requested subdirectory) as
+    /// `CreateProcessW`'s current directory. PowerShell inherits it, and a
+    /// native child inherits it in turn. An earlier version replaced it with a
+    /// `workspace:` PSDrive and `Set-Location`; the shell could read relative
+    /// paths, but native children still started in the process's real directory
+    /// (or, after a failed move, `C:\`), so `check.cmd` running `powershell
+    /// -File check.ps1` looked for the script's relative files in the wrong
+    /// place. The launcher grants non-inheriting traverse on the directories
+    /// above the workspace, so PowerShell can name the real path without gaining
+    /// access to its siblings.
     ///
-    /// The drive is a named one (`workspace:`) rather than a letter so it
-    /// cannot shadow a real drive.
+    /// The execution-policy preference is set for descendants. Windows
+    /// PowerShell reads the policy from the registry before running a script,
+    /// and an AppContainer cannot read that key: a nested `powershell -File`
+    /// otherwise fails with `AuthorizationManager check failed`. Execution
+    /// policy is not the containment boundary here; the AppContainer is.
     ///
     /// The output encoding is set to UTF-8 first: PowerShell 5.1 decodes a
     /// native program's output with the console code page (936 on this host)
     /// and writes its own messages the same way, so a UTF-8 child and a
     /// localized error both reached the agent as mojibake. Setting it is
-    /// best-effort — a shell that cannot set it still runs the command.
+    /// best-effort - a shell that cannot set it still runs the command.
     ///
     /// The exit code is taken from the native command (`$LASTEXITCODE`) when
     /// there is one. Without this, a command that succeeds but writes to stderr
@@ -222,31 +224,23 @@ impl LocalExecutionEnvironment {
         let root = process_cwd(
             self.workspace_root.canonicalize().unwrap_or_else(|_| self.workspace_root.clone()),
         );
-        // When the requested directory is inside the workspace the drive is
-        // rooted at the workspace, so `..` stays inside the sandbox instead of
-        // stopping at a drive root. When it is not (only possible if
-        // canonicalization of the two differs), the command's own directory is
-        // the least surprising root.
-        let (root, relative) = match cwd.strip_prefix(&root) {
-            Ok(relative) => (root, relative.to_path_buf()),
-            Err(_) => (cwd.to_path_buf(), PathBuf::new()),
+        let location = match cwd.strip_prefix(&root) {
+            Ok(relative) if relative.as_os_str().is_empty() => root.clone(),
+            Ok(relative) => root.join(relative),
+            Err(_) => cwd.to_path_buf(),
         };
-        let mut location = String::from("workspace:\\");
-        if !relative.as_os_str().is_empty() {
-            location.push_str(&relative.to_string_lossy());
-        }
         format!(
             "$__yaoyao_workspace = '{root}'\n\
+             $__yaoyao_location = '{location}'\n\
              try {{\n\
              \x20   [Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n\
              }} catch {{\n\
              \x20   [Console]::Error.WriteLine('sandbox: could not set the output encoding \
              to UTF-8: ' + $_.Exception.Message)\n\
              }}\n\
+             $env:PSExecutionPolicyPreference = 'Bypass'\n\
              try {{\n\
-             \x20   $null = New-PSDrive -Name workspace -PSProvider FileSystem -Root \
-             $__yaoyao_workspace -ErrorAction Stop\n\
-             \x20   Set-Location -LiteralPath '{location}' -ErrorAction Stop\n\
+             \x20   Set-Location -LiteralPath $__yaoyao_location -ErrorAction Stop\n\
              }} catch {{\n\
              \x20   [Console]::Error.WriteLine('sandbox: the shell could not start inside \
              the workspace: ' + $_.Exception.Message)\n\
@@ -258,7 +252,7 @@ impl LocalExecutionEnvironment {
              if ($null -ne $__yaoyao_exit) {{ exit $__yaoyao_exit }}\n\
              if ($__yaoyao_ok) {{ exit 0 }} else {{ exit 1 }}",
             root = root.to_string_lossy().replace('\'', "''"),
-            location = location.replace('\'', "''"),
+            location = location.to_string_lossy().replace('\'', "''"),
             command = command,
         )
     }
@@ -908,7 +902,7 @@ struct StdProcess {
 impl ProcessLauncher for StdProcessLauncher {
     fn spawn(&self, request: SpawnRequest) -> Result<Box<dyn RunningProcess>, LaunchError> {
         let stdin = match request.stdin {
-            StdinMode::Closed => Stdio::inherit(),
+            StdinMode::Closed => Stdio::null(),
             StdinMode::Pipe => Stdio::piped(),
         };
         let mut command = Command::new(&request.program);
@@ -1839,15 +1833,15 @@ mod tests {
         let recorded = recorded.lock().unwrap();
         let args = &recorded.requests.first().expect("the command was started").args;
         let script = args.last().unwrap();
-        assert!(script.contains("New-PSDrive -Name workspace -PSProvider FileSystem"), "{script}");
+        let workspace = process_cwd(dir.path().canonicalize().unwrap());
+        assert!(!script.contains("New-PSDrive"), "{script}");
         assert!(
-            script.contains(&format!(
-                "$__yaoyao_workspace = '{}'",
-                process_cwd(dir.path().canonicalize().unwrap()).display()
-            )),
+            script.contains(&format!("$__yaoyao_location = '{}'", workspace.display())),
             "{script}"
         );
-        assert!(script.contains(r"Set-Location -LiteralPath 'workspace:\'"), "{script}");
+        assert!(script.contains("Set-Location -LiteralPath $__yaoyao_location"), "{script}");
+        assert_eq!(recorded.requests.first().unwrap().cwd, workspace);
+        assert!(script.contains("$env:PSExecutionPolicyPreference = 'Bypass'"), "{script}");
         // Native output and PowerShell's own messages both go through the
         // console encoding; without this a UTF-8 child or a localized error is
         // mojibake in the tool result.
@@ -1890,8 +1884,74 @@ mod tests {
         environment.run_command(&powershell_spec("Get-ChildItem .", Some("sub"))).unwrap();
 
         let recorded = recorded.lock().unwrap();
-        let script = recorded.requests.first().unwrap().args.last().unwrap();
-        assert!(script.contains(r"Set-Location -LiteralPath 'workspace:\sub'"), "{script}");
+        let request = recorded.requests.first().unwrap();
+        let location = process_cwd(dir.path().canonicalize().unwrap()).join("sub");
+        assert_eq!(request.cwd, location);
+        let script = request.args.last().unwrap();
+        assert!(
+            script.contains(&format!("$__yaoyao_location = '{}'", location.display())),
+            "{script}"
+        );
+        assert!(script.contains("Set-Location -LiteralPath $__yaoyao_location"), "{script}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs AGENT_APPCONTAINER_TEST=1 and `agent sandbox setup`"]
+    fn app_container_nested_powershell_keeps_the_workspace_as_cwd() {
+        if std::env::var("AGENT_APPCONTAINER_TEST").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set AGENT_APPCONTAINER_TEST=1");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let sandbox = dir.path().join("sandbox");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::write(workspace.join("report.txt"), "ok\n").unwrap();
+        std::fs::write(
+            workspace.join("check.ps1"),
+            "$ErrorActionPreference = 'Stop'\n             $value = (Get-Content -LiteralPath 'report.txt' -Raw).Trim()\n             Write-Output \"relative=$value\"\n             if ($value -ne 'ok') { exit 1 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("check.cmd"),
+            "@echo off\r\npowershell -NoProfile -File \"%~dp0check.ps1\"\r\nexit /b %ERRORLEVEL%\r\n",
+        )
+        .unwrap();
+
+        let launcher = std::sync::Arc::new(
+            agent_sandbox_win::AppContainerLauncher::new(
+                agent_sandbox_win::PROFILE_NAME,
+                &workspace,
+                &sandbox,
+                false,
+            )
+            .expect("the machine has been set up"),
+        );
+        let environment = LocalExecutionEnvironment::app_container(&workspace, launcher, false);
+        let invocation = environment.shell_invocation(r#".\check.cmd; "exit=$LASTEXITCODE""#);
+        let spec = CommandSpec {
+            program: invocation.program,
+            args: invocation.args,
+            cwd: None,
+            timeout_ms: Some(30_000),
+        };
+
+        let output = environment.run_command(&spec).expect("the command runs");
+        assert_eq!(output.exit_code, 0, "stdout: {}\nstderr: {}", output.stdout, output.stderr);
+        assert!(
+            output.stdout.contains("relative=ok"),
+            "stdout: {}\nstderr: {}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            output.stdout.contains("exit=0"),
+            "stdout: {}\nstderr: {}",
+            output.stdout,
+            output.stderr
+        );
     }
 
     #[cfg(windows)]

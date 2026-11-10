@@ -40,8 +40,15 @@ const SUITES: &[&str] = &[
     "memory_acceptance.rs",
 ];
 
-/// The call that makes a suite a user of the product's assembly.
-const ASSEMBLY: &str = "stack::assemble(";
+/// The calls that make a suite a user of the product's assembly.
+///
+/// `assemble_over` is the same assembly with the backend supplied by the
+/// caller: it is the body `assemble_with_delegation` runs, and the seam a suite
+/// uses when its subject is the decision chain rather than the OS boundary —
+/// a case about an approval that would otherwise need a real AppContainer on the
+/// machine running it (stage B plan §9). It counts, because what this guard is
+/// against is a suite that builds its own stack.
+const ASSEMBLY_CALLS: &[&str] = &["stack::assemble(", "stack::assemble_over("];
 
 /// Constructors that mean "this file is assembling a stack of its own".
 ///
@@ -72,16 +79,17 @@ fn every_acceptance_suite_uses_the_product_assembly() {
         if !markers.is_empty() {
             offenders.push(format!("{suite} builds its own stack: {}", markers.join(", ")));
         }
-        if !source.contains(ASSEMBLY) {
-            offenders.push(format!("{suite} never calls `{ASSEMBLY}`"));
+        if !ASSEMBLY_CALLS.iter().any(|call| source.contains(call)) {
+            offenders.push(format!("{suite} never calls any of {ASSEMBLY_CALLS:?}"));
         }
     }
 
     assert!(
         offenders.is_empty(),
         "an acceptance suite left the product's assembly behind: {offenders:?} — call \
-         `agent::stack::assemble`, and take the model from `stack::Inputs.model`; a suite that \
-         assembles its own stack passes whatever the product does"
+         `agent::stack::assemble` (or `assemble_over` with a backend the case built), and take \
+         the model from `stack::Inputs.model`; a suite that assembles its own stack passes \
+         whatever the product does"
     );
 }
 
@@ -95,7 +103,7 @@ fn every_acceptance_suite_uses_the_product_assembly() {
 fn a_stack_built_in_the_open_is_recognised() {
     let source = "let scheduler = Scheduler::new(store.clone(), loop_, 8);";
     assert_eq!(own_assembly_markers(source), vec!["Scheduler::new("]);
-    assert!(!source.contains(ASSEMBLY));
+    assert!(!ASSEMBLY_CALLS.iter().any(|call| source.contains(call)));
 
     let gateway = "let g = GuardedToolProvider::new(tools, policy, approvals, guard, artifacts);";
     assert_eq!(own_assembly_markers(gateway), vec!["GuardedToolProvider::new("]);

@@ -88,6 +88,38 @@ impl<D: ProjectionDefinition> Projection<D> {
         self.build_from(session_id, Some(cp)).await
     }
 
+    /// Rebuild from an event slice a caller already read.
+    ///
+    /// The web read model reads the log once for its session summaries; this
+    /// lets that same slice feed the transcript projection, using a checkpoint
+    /// for the head and folding only the tail. The grounding rule is the same
+    /// as [`Self::build`]: a checkpoint whose `as_of_seq` is not in the slice
+    /// is ignored, and the fold starts at zero.
+    pub async fn build_from_events(
+        &self,
+        session_id: &SessionId,
+        events: &[StoredEvent],
+    ) -> Result<Projected<D::State>, ProjectionError> {
+        let checkpoint = self.load_checkpoint(session_id).filter(|checkpoint| {
+            checkpoint.as_of_seq.is_none_or(|seq| events.iter().any(|event| event.seq == seq))
+        });
+        let (mut state, mut last_seq, from) = match checkpoint {
+            Some(checkpoint) => {
+                let from = checkpoint
+                    .as_of_seq
+                    .and_then(|seq| events.iter().position(|event| event.seq == seq))
+                    .map_or(0, |index| index + 1);
+                (checkpoint.state, checkpoint.as_of_seq, from)
+            }
+            None => (self.definition.init(), None, 0),
+        };
+        for event in &events[from..] {
+            state = self.apply_event(state, event)?;
+            last_seq = Some(event.seq);
+        }
+        Ok(Projected { state, as_of_seq: last_seq })
+    }
+
     /// Rebuild from seq 0, ignoring any checkpoint.
     pub async fn build_full(
         &self,

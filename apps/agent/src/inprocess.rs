@@ -414,16 +414,32 @@ fn ended(
 
 /// How a finished child turn reads to its parent.
 ///
-/// Every ending that is not an answer is `Failed`, and the message says which
-/// limit or fault it was and what the parent can do about it. `Partial` is
-/// deliberately never produced: the port reserves it for a child that says it
-/// did part of the job, and a parent that reads the child's stop reason still
-/// cannot know how much of the work was done.
+/// Every ending that is not an answer is `Failed`, except an explicit step
+/// ceiling. That one is a `Partial`: the child did work, the session still
+/// identifies it, and the output is explicitly incomplete rather than a claim
+/// that the job is finished.
 pub(crate) fn describe_report(
     report: &agent_kernel::scheduler::RunReport,
     child: &SessionId,
 ) -> SubagentOutcome {
     let said = report.final_content.clone().filter(|text| !text.trim().is_empty());
+    let partial_at_steps = || {
+        let unit = if report.steps == 1 { "step" } else { "steps" };
+        let mut summary = format!(
+            "the child reached its explicit max_steps ceiling after {} {unit}; the result is \
+             incomplete. Child session: {child}. ",
+            report.steps
+        );
+        match &said {
+            Some(text) => summary.push_str(&format!("The partial text it produced: {text}")),
+            None => summary.push_str("It produced no final text."),
+        }
+        summary.push_str(
+            " Continue the child session or re-delegate with a wider budget if more work is \
+             needed.",
+        );
+        SubagentOutcome::Partial { summary }
+    };
     let limit = |what: &str, advice: &str| {
         let mut message = format!("the child {what} before it finished. {advice}");
         if let Some(text) = &said {
@@ -439,10 +455,7 @@ pub(crate) fn describe_report(
                 .unwrap_or_else(|| format!("the child finished without saying anything ({child})")),
             result: None,
         },
-        StopReason::MaxSteps => limit(
-            "used all its steps",
-            "Give the delegation a larger `budget.max_steps` if the work needs more.",
-        ),
+        StopReason::MaxSteps => partial_at_steps(),
         StopReason::MaxToolCalls => limit(
             "used its whole tool-call allowance",
             "Give the delegation a larger `budget.max_tool_calls` if the work needs more.",
@@ -480,6 +493,27 @@ pub(crate) fn describe_report(
                 "the child stopped waiting on an approval nobody can answer — a child turn is \
                  read-only and asks nothing; its turn is still open in session {child}, and \
                  `agent resume` settles it"
+            ),
+            side_effects: Vec::new(),
+        },
+        // A child turn runs read-only (CONTRACT §7 #133), so it cannot run the
+        // L2/L3 action a review is about and has nothing that reaches this arm.
+        // If a child ever did, the answer would still not be one this parent may
+        // pass on: an unaccepted review is a withheld result, in a child exactly
+        // as in a turn.
+        StopReason::SecurityBlocked => SubagentOutcome::Failed {
+            message: "the child's answer was withheld: the independent security review of its \
+                      actions did not pass"
+                .to_string(),
+            side_effects: Vec::new(),
+        },
+        // The child stopped on a capability its backend does not provide. What
+        // it wrote is an ask for a decision, not a result the parent may pass
+        // on; the choices stay in the child's turn record.
+        StopReason::CapabilityBlocked => SubagentOutcome::Failed {
+            message: format!(
+                "the child stopped on a capability its backend does not provide; its text is a \
+                 question for a person, not a result. The child turn is in session {child}"
             ),
             side_effects: Vec::new(),
         },
@@ -718,7 +752,7 @@ mod tests {
                 &child(),
                 None,
                 SubagentRequest {
-                    budget: Some(RunBudget { max_steps: 1, ..RunBudget::default() }),
+                    budget: Some(RunBudget { max_steps: Some(1), ..RunBudget::default() }),
                     ..SubagentRequest::new("look at the thing")
                 },
             )
@@ -726,21 +760,29 @@ mod tests {
             .unwrap();
 
         match provider.wait(&handle).await.unwrap() {
-            SubagentOutcome::Failed { message, .. } => {
-                assert!(message.contains("used all its steps"), "{message}");
+            SubagentOutcome::Partial { summary } => {
+                assert!(summary.contains("after 1 step"), "{summary}");
+                assert!(summary.contains("incomplete"), "{summary}");
             }
-            other => panic!("a child held to one step did not answer: {other:?}"),
+            other => panic!("a child held to one step returned an unexpected ending: {other:?}"),
         }
         let stored = store.read_stream(&child(), EventSeq::ZERO, usize::MAX).await.unwrap();
-        let completed = stored
+        // A child held to its step budget parked, it did not complete: the
+        // parent is told the limit, and the log says the same thing
+        // (CONTRACT §7 #173).
+        let yielded = stored
             .iter()
-            .find(|event| event.event.event_type.as_str() == "turn/completed")
-            .expect("the turn ended");
+            .find(|event| event.event.event_type.as_str() == "turn/yielded")
+            .expect("the turn yielded");
         assert_eq!(
-            completed.event.payload.pointer("/budget/steps").and_then(|v| v.as_u64()),
+            yielded.event.payload.pointer("/budget/steps").and_then(|v| v.as_u64()),
             Some(1),
             "the child's terminal event says what it was held to: {}",
-            completed.event.payload
+            yielded.event.payload
+        );
+        assert!(
+            stored.iter().any(|event| event.event.event_type.as_str() == "budget/parked"),
+            "the pause is recorded for the child too"
         );
     }
 
@@ -804,6 +846,108 @@ mod tests {
         );
     }
 
+    /// Every way a child can stop has to reach the parent as a description the
+    /// parent can act on: a result it may pass on, a partial it must label, or
+    /// a failure with the budget to raise. A reason that fell through would be
+    /// a delegation whose fate the parent cannot report.
+    #[test]
+    fn every_child_stop_reason_reaches_the_parent_with_advice() {
+        let report = |stop_reason: StopReason, said: Option<&str>| RunReport {
+            run_id: RunId::new(),
+            turn_id: agent_protocol::ids::TurnId::new(),
+            stop_reason,
+            final_content: said.map(str::to_string),
+            spent: Spent::default(),
+            steps: 2,
+            tool_calls: 1,
+            elapsed_ms: 0,
+            intent_id: None,
+        };
+        let child = child();
+
+        // A finished child says what it answered; one that said nothing still
+        // finishes, and says so.
+        assert_eq!(
+            describe_report(&report(StopReason::FinalAnswer, Some("done")), &child),
+            SubagentOutcome::Completed { summary: "done".to_string(), result: None }
+        );
+        assert_eq!(
+            describe_report(&report(StopReason::FinalAnswer, None), &child),
+            SubagentOutcome::Completed {
+                summary: format!("the child finished without saying anything ({child})"),
+                result: None,
+            }
+        );
+        assert_eq!(
+            describe_report(&report(StopReason::Completed, None), &child),
+            SubagentOutcome::Completed {
+                summary: format!("the child's completion check passed without a summary ({child})"),
+                result: None,
+            }
+        );
+
+        // The step ceiling is a partial result the parent must label, with the
+        // child's session so the work can continue.
+        let partial = describe_report(&report(StopReason::MaxSteps, Some("half")), &child);
+        match &partial {
+            SubagentOutcome::Partial { summary } => {
+                assert!(summary.contains("max_steps ceiling"), "{summary}");
+                assert!(summary.contains(child.as_str()), "{summary}");
+                assert!(summary.contains("The partial text it produced: half"), "{summary}");
+            }
+            other => panic!("expected a partial, got {other:?}"),
+        }
+        let no_text = describe_report(&report(StopReason::MaxSteps, None), &child);
+        match &no_text {
+            SubagentOutcome::Partial { summary } => {
+                assert!(summary.contains("It produced no final text."), "{summary}");
+            }
+            other => panic!("expected a partial, got {other:?}"),
+        }
+
+        // A limit is a failure with the setting to raise, and the text beside
+        // it is labelled as the beginning of an answer.
+        for (stop, advice) in [
+            (StopReason::MaxToolCalls, "budget.max_tool_calls"),
+            (StopReason::WallClockExceeded, "budget.wall_clock_ms"),
+            (StopReason::MaxOutputTokens, "budget.max_output_tokens"),
+            (StopReason::TokenBudgetExceeded, "budget.max_total_tokens"),
+            (StopReason::Stalled, "going in circles"),
+        ] {
+            let outcome = describe_report(&report(stop.clone(), Some("started")), &child);
+            match &outcome {
+                SubagentOutcome::Failed { message, .. } => {
+                    assert!(message.contains(advice), "{stop:?}: {message}");
+                    assert!(message.contains("beginning of an answer"), "{stop:?}: {message}");
+                }
+                other => panic!("expected a failure for {stop:?}, got {other:?}"),
+            }
+        }
+
+        // The remaining stops are failures or cancellations with their own
+        // sentences; none of them may read as a completed result.
+        for (stop, needle) in [
+            (StopReason::ContentFiltered, "content filter"),
+            (StopReason::NeedsUserInput, "agent resume"),
+            (StopReason::SecurityBlocked, "withheld"),
+            (StopReason::CapabilityBlocked, "question for a person"),
+            (StopReason::FatalError, "attempt failed: boom"),
+        ] {
+            let said = Some("boom");
+            let outcome = describe_report(&report(stop.clone(), said), &child);
+            match &outcome {
+                SubagentOutcome::Failed { message, .. } => {
+                    assert!(message.contains(needle), "{stop:?}: {message}");
+                }
+                other => panic!("expected a failure for {stop:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            describe_report(&report(StopReason::UserCancelled, None), &child),
+            SubagentOutcome::Cancelled
+        );
+    }
+
     #[test]
     fn an_answer_that_arrived_before_the_brake_is_reported_as_itself() {
         let report = RunReport {
@@ -815,6 +959,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         let outcome = ended(Ok(Some(report)), &child(), Some(Asked::Cancelled), DEFAULT_CEILING);
@@ -836,6 +981,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         assert_eq!(
@@ -862,6 +1008,47 @@ mod tests {
 
     /// A limit is not an answer, and pretending otherwise would repeat the
     /// 2026-10-30 reading (CONTRACT §7 #131, #132) one layer up.
+    fn step_capped_report(final_content: Option<&str>, steps: u32) -> RunReport {
+        RunReport {
+            run_id: RunId::new(),
+            turn_id: agent_protocol::ids::TurnId::new(),
+            stop_reason: StopReason::MaxSteps,
+            final_content: final_content.map(str::to_string),
+            spent: Spent::default(),
+            steps,
+            tool_calls: 0,
+            elapsed_ms: 0,
+            intent_id: None,
+        }
+    }
+
+    #[test]
+    fn a_step_capped_child_with_text_is_partial() {
+        let report = step_capped_report(Some("half done"), 20);
+        match describe_report(&report, &child()) {
+            SubagentOutcome::Partial { summary } => {
+                assert!(summary.contains("20 steps"), "{summary}");
+                assert!(summary.contains("child-1"), "{summary}");
+                assert!(summary.contains("incomplete"), "{summary}");
+                assert!(summary.contains("half done"), "{summary}");
+            }
+            other => panic!("a step-capped child with text is partial, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_step_capped_child_without_text_is_still_partial() {
+        let report = step_capped_report(None, 7);
+        match describe_report(&report, &child()) {
+            SubagentOutcome::Partial { summary } => {
+                assert!(summary.contains("7 steps"), "{summary}");
+                assert!(summary.contains("no final text"), "{summary}");
+                assert!(summary.contains("child-1"), "{summary}");
+            }
+            other => panic!("a step-capped child without text is partial, not {other:?}"),
+        }
+    }
+
     #[test]
     fn a_limit_stop_is_a_failure_that_keeps_what_the_child_said() {
         let report = RunReport {
@@ -873,6 +1060,7 @@ mod tests {
             steps: 1,
             tool_calls: 0,
             elapsed_ms: 0,
+            intent_id: None,
         };
 
         match describe_report(&report, &child()) {

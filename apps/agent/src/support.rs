@@ -5,6 +5,7 @@
 //! reads. It is split from `main.rs` so the dispatch table and the handlers can
 //! be read as commands rather than as output handling.
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -456,36 +457,166 @@ pub(crate) fn resolve_workspace_root(
     }
 }
 
-/// The data directory's name when the environment names none.
-///
-/// A bare name rather than a path: it resolves against the workspace root like
-/// every other relative path, so it means "inside the workspace", not "wherever"
-/// this process was started from".
-pub(crate) const DEFAULT_DATA_DIR: &str = ".agent-data";
+/// The program directory under the platform's per-user state root.
+pub(crate) const STATE_DIR_NAME: &str = "yaoyao-agent";
 
-/// Where event logs and artifacts go.
+/// Where event logs, artifacts and snapshots go.
+///
+/// This is deliberately resolved before any command opens a store: an unsafe
+/// directory is a refusal to start, not a directory that gets created and then
+/// discovered to be writable by the model.
 pub(crate) fn data_dir() -> String {
-    resolve_data_dir(&workspace_root(), std::env::var("AGENT_DATA_DIR").ok().as_deref())
+    let root = workspace_root();
+    match resolve_data_dir(&root, std::env::var("AGENT_DATA_DIR").ok().as_deref()) {
+        Ok(path) => path,
+        Err(reason) => {
+            eprintln!("agent data directory: {reason}");
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    }
 }
 
-/// `AGENT_DATA_DIR` against the workspace root, or the default inside it.
+/// Resolve the directory the session's own state lives in.
 ///
-/// A relative value resolves against the workspace root — the same rule
-/// `ResourceGuard` and the tool layer follow, and the reason the workspace root
-/// exists: a run's paths all share one base, so a run's own state cannot land
-/// in whatever directory the command happened to be invoked from. An absolute
-/// value is already unambiguous and is taken as given. An empty value names no
-/// directory at all and is treated as unset, because resolving "" against the
-/// root yields the root itself — which would put the event log and the artifact
-/// directory at the top of the workspace.
-pub(crate) fn resolve_data_dir(root: &str, configured: Option<&str>) -> String {
-    let configured = configured.filter(|dir| !dir.is_empty()).unwrap_or(DEFAULT_DATA_DIR);
-    let path = Path::new(configured);
-    if path.is_absolute() {
-        configured.to_string()
-    } else {
-        Path::new(root).join(path).display().to_string()
+/// `AGENT_DATA_DIR`, when set, must be absolute. A relative value would have
+/// to resolve against either the workspace or the caller's cwd; the first puts
+/// the decision ledger inside the model's writable boundary, and the second
+/// makes it depend on where a command happened to start. Neither is a stable
+/// trust boundary, so the only accepted explicit form is an absolute path.
+///
+/// With no explicit path, state goes under the platform's per-user state root,
+/// keyed by the workspace. That keeps two workspaces' logs separate without
+/// placing either inside a path a tool can change.
+pub(crate) fn resolve_data_dir(root: &str, configured: Option<&str>) -> Result<String, String> {
+    resolve_data_dir_with_state(root, configured, &platform_state_root())
+}
+
+/// Pure form of [`resolve_data_dir`] with the platform state root injected.
+///
+/// Kept separate so the security decision can be tested without reading or
+/// mutating the test process's environment.
+pub(crate) fn resolve_data_dir_with_state(
+    root: &str,
+    configured: Option<&str>,
+    state_root: &Path,
+) -> Result<String, String> {
+    let root_path = Path::new(root);
+    let path = match configured.filter(|value| !value.trim().is_empty()) {
+        Some(value) => {
+            let configured = Path::new(value);
+            if !configured.is_absolute() {
+                return Err(format!(
+                    "AGENT_DATA_DIR must be an absolute path outside the workspace; got {value:?}"
+                ));
+            }
+            configured.to_path_buf()
+        }
+        None => {
+            let key = agent_protocol::digest::fnv1a_hex(root.as_bytes());
+            let candidate = state_root.join(STATE_DIR_NAME).join(key);
+            if path_is_within(&candidate, root_path) {
+                // A user profile can itself be the workspace. In that case the
+                // platform state root is inside the boundary too; try a sibling
+                // of the workspace before refusing the default outright.
+                let sibling = root_path
+                    .parent()
+                    .map(|parent| parent.join(format!(".{STATE_DIR_NAME}")))
+                    .map(|parent| parent.join(agent_protocol::digest::fnv1a_hex(root.as_bytes())))
+                    .ok_or_else(|| {
+                        "the platform state directory is inside the workspace; set an absolute AGENT_DATA_DIR outside it"
+                            .to_string()
+                    })?;
+                if path_is_within(&sibling, root_path) {
+                    return Err(
+                        "the platform state directory is inside the workspace; set an absolute AGENT_DATA_DIR outside it"
+                            .to_string(),
+                    );
+                }
+                sibling
+            } else {
+                candidate
+            }
+        }
+    };
+
+    if path_is_within(&path, root_path) {
+        return Err(format!(
+            "the agent data directory {} is inside the model-writable workspace {}; choose an absolute path outside it",
+            path.display(),
+            root_path.display()
+        ));
     }
+    Ok(path.display().to_string())
+}
+
+/// The user-local root for durable state.
+fn platform_state_root() -> PathBuf {
+    if cfg!(windows) {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local);
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(profile).join("AppData").join("Local");
+        }
+    } else {
+        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+            return PathBuf::from(xdg);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".local").join("state");
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Whether `child` is the same path as `parent` or below it.
+///
+/// Existing ancestors are canonicalized, so `..` and a symlinked parent cannot
+/// disguise a data directory inside the workspace. A missing tail is appended
+/// after the nearest existing ancestor, which is what makes the check work
+/// before the directory has been created.
+fn path_is_within(child: &Path, parent: &Path) -> bool {
+    let child = canonicalize_with_missing(child);
+    let parent = canonicalize_with_missing(parent);
+    if cfg!(windows) {
+        let child = child.to_string_lossy().to_lowercase();
+        let parent = parent.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+        child == parent
+            || child.starts_with(&format!("{parent}\\"))
+            || child.starts_with(&format!("{parent}/"))
+    } else {
+        child.starts_with(parent)
+    }
+}
+
+fn canonicalize_with_missing(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut missing: Vec<OsString> = Vec::new();
+    let mut current = absolute.clone();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(&current) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = current.file_name().map(ToOwned::to_owned) else {
+            break;
+        };
+        missing.push(name);
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    absolute
 }
 
 pub(crate) fn print(output: &agent_cli::CliOutput) {

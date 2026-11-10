@@ -7,16 +7,20 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use agent_kernel::approval::PENDING_TTL;
+use agent_kernel::inbox::{Inbox, item_intent_id};
 use agent_kernel::model_selection::ModelChoice;
 use agent_ports::event_store::EventStore;
 use agent_projection::{
-    ActionStatus, ApprovalState, ItemBody, ProjectionDefinition, SessionProjection, TranscriptItem,
-    TranscriptProjection, TranscriptState, TurnEnding,
+    ActionStatus, ApprovalState, ItemBody, Projection, ProjectionDefinition, SessionProjection,
+    TranscriptItem, TranscriptProjection, TranscriptState, TurnEnding,
 };
-use agent_protocol::events::StoredEvent;
+use agent_protocol::events::{EventType, StoredEvent};
 use agent_protocol::ids::{EventSeq, SessionId};
+use agent_protocol::intent::IntentStatus;
+use agent_protocol::permission::Reversibility;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
@@ -82,7 +86,7 @@ impl LiveTranscript {
         let projection = TranscriptProjection::new();
         let mut state = projection.init();
         for event in events {
-            state = projection.apply(&state, event).map_err(|error| ReadError::Session {
+            projection.apply_in_place(&mut state, event).map_err(|error| ReadError::Session {
                 session: event.event.session_id.as_str().to_string(),
                 message: error.to_string(),
             })?;
@@ -113,11 +117,14 @@ impl LiveTranscript {
 
     /// Apply one durable event and return the rows whose wire shape changed.
     pub(crate) fn apply(&mut self, event: &StoredEvent) -> Result<Vec<Value>, ReadError> {
-        self.state =
-            self.projection.apply(&self.state, event).map_err(|error| ReadError::Session {
+        // In place, for the same reason the read fold is: an SSE client on a
+        // long session applies every event to one growing state.
+        self.projection.apply_in_place(&mut self.state, event).map_err(|error| {
+            ReadError::Session {
                 session: event.event.session_id.as_str().to_string(),
                 message: error.to_string(),
-            })?;
+            }
+        })?;
 
         let mut changed = Vec::new();
         // Only rows this event touched can have a new wire shape. The filter
@@ -135,6 +142,11 @@ impl LiveTranscript {
     }
 }
 
+/// The event count above which a fold leaves a checkpoint behind. Normal
+/// sessions stay memory-only; a long one pays one write so the next process
+/// start folds only the tail.
+const CHECKPOINT_MIN_EVENTS: usize = 1_000;
+
 /// A small cache of folded logs, keyed by the file signature they were read at.
 ///
 /// Listing ten sessions on every sidebar refresh means folding ten logs; most
@@ -143,9 +155,11 @@ impl LiveTranscript {
 /// this process or another one invalidates the entry by touching the file. A
 /// fold whose read spans a write is not cached, because the file's signature
 /// changed underneath it and the entry would be stale before it was stored.
-#[derive(Default)]
 pub(crate) struct ReadModel {
     cache: std::sync::Mutex<HashMap<String, Cached>>,
+    /// The transcript projection writes checkpoints under the data directory;
+    /// the store is held here so a cache miss does not need a second read.
+    store: Arc<dyn EventStore>,
 }
 
 #[derive(Clone)]
@@ -155,8 +169,8 @@ struct Cached {
 }
 
 impl ReadModel {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(store: Arc<dyn EventStore>) -> Self {
+        Self { cache: std::sync::Mutex::new(HashMap::new()), store }
     }
 
     fn signature(
@@ -168,10 +182,10 @@ impl ReadModel {
         Some((metadata.len(), metadata.modified().ok()))
     }
 
-    /// The folded session, from the cache when the log has not moved.
+    /// The folded session, from the cache when the log has not moved, from a
+    /// transcript checkpoint when one is grounded, and otherwise from the log.
     pub(crate) async fn fold(
         &self,
-        store: &dyn EventStore,
         data_dir: &Path,
         session: &SessionId,
     ) -> Result<Folded, ReadError> {
@@ -184,7 +198,34 @@ impl ReadModel {
             return Ok(cached.folded.clone());
         }
 
-        let folded = fold(store, session).await?;
+        let events =
+            self.store.read_stream(session, EventSeq::ZERO, usize::MAX).await.map_err(|error| {
+                ReadError::Session {
+                    session: session.as_str().to_string(),
+                    message: error.to_string(),
+                }
+            })?;
+        let projection = Projection::new(
+            TranscriptProjection::new(),
+            self.store.clone(),
+            data_dir.to_path_buf(),
+        );
+        let projected = projection.build_from_events(session, &events).await.map_err(|error| {
+            ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
+        })?;
+        if events.len() >= CHECKPOINT_MIN_EVENTS {
+            let session = session.clone();
+            let checkpoint = projected.clone();
+            // A checkpoint is a cache: a write failure costs the next read a
+            // full fold, not this response. Wait out the first paint and the
+            // reader's first scroll — serializing 6k items competes with the
+            // frames a person is actually watching.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let _ = projection.checkpoint(&session, &checkpoint).await;
+            });
+        }
+        let folded = fold_events(session, &events, projected.state)?;
         let after = Self::signature(data_dir, session);
         if before.is_some() && before == after {
             let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -200,20 +241,18 @@ impl ReadModel {
     }
 }
 
-/// Fold one session's log through both projections.
-pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<Folded, ReadError> {
-    let events = store.read_stream(session, EventSeq::ZERO, usize::MAX).await.map_err(|error| {
-        ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
-    })?;
-
+/// Fold one session's metadata and a transcript already built by the caller.
+fn fold_events(
+    session: &SessionId,
+    events: &[StoredEvent],
+    transcript: TranscriptState,
+) -> Result<Folded, ReadError> {
     let session_projection = SessionProjection::new();
     let mut session_state = session_projection.init();
-    let transcript_projection = TranscriptProjection::new();
-    let mut transcript = transcript_projection.init();
     let mut last_request = None;
     let mut last_plan = None;
     let mut subagents: Vec<Value> = Vec::new();
-    for event in &events {
+    for event in events {
         let event_type = event.event.event_type.as_str();
         if event_type == agent_protocol::events::EventType::MODEL_REQUEST_PREPARED {
             last_request = Some(event.event.payload.clone());
@@ -259,15 +298,12 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
         session_state = session_projection.apply(&session_state, event).map_err(|error| {
             ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
         })?;
-        transcript = transcript_projection.apply(&transcript, event).map_err(|error| {
-            ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
-        })?;
     }
 
     // A payload that will not read back is a log anomaly, not "no choice": the
     // page would label the session with the default and hide the damage.
     let model =
-        agent_kernel::model_selection::current(&events).map_err(|error| ReadError::Session {
+        agent_kernel::model_selection::current(events).map_err(|error| ReadError::Session {
             session: session.as_str().to_string(),
             message: format!("model selection: {error}"),
         })?;
@@ -283,20 +319,19 @@ pub(crate) async fn fold(store: &dyn EventStore, session: &SessionId) -> Result<
         last_plan,
         subagents,
         model,
-        archived: agent_kernel::session_archive::current(&events),
+        archived: agent_kernel::session_archive::current(events),
     })
 }
 
 /// Every session under the data directory, newest activity first.
 pub(crate) async fn list(
-    store: &dyn EventStore,
     data_dir: &Path,
     reads: &ReadModel,
     now: DateTime<Utc>,
 ) -> Result<Vec<Value>, ReadError> {
     let mut sessions: Vec<(Option<DateTime<Utc>>, String, Value)> = Vec::new();
     for id in session_ids(data_dir)? {
-        let folded = reads.fold(store, data_dir, &id).await?;
+        let folded = reads.fold(data_dir, &id).await?;
         let summary = summary(&id, &folded, now);
         sessions.push((folded.last_activity_at, id.as_str().to_string(), summary));
     }
@@ -308,14 +343,13 @@ pub(crate) async fn list(
 
 /// One session's transcript, with items changed after `since`.
 pub(crate) async fn transcript(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     since: Option<u64>,
     reads: &ReadModel,
     now: DateTime<Utc>,
 ) -> Result<Value, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     let items: Vec<Value> = folded
         .transcript
         .items
@@ -334,20 +368,101 @@ pub(crate) async fn transcript(
     }))
 }
 
-/// The newest `git.diff` observation in a session, as a reader-shaped report.
+/// A session's status axes, the instruction ledger behind them, and the latest
+/// adjudication.
 ///
-/// This is a projection of an observation the kernel already recorded, not a
-/// fresh `git diff`: a page refresh must not change what the agent saw, and a
-/// repository may have moved since. A session that never called `git.diff` has
-/// no report — that is a `404`, not an empty diff (which would claim the tree
-/// was clean).
+/// The axes come from the kernel's own fold rather than a second reading of
+/// the same events: the page and `agent status` must not disagree about what
+/// "verified complete" means. The instruction and adjudication reads use the
+/// same event slice, so one request cannot report a session from two logs.
+pub(crate) async fn status(
+    store: Arc<dyn EventStore>,
+    session: &SessionId,
+) -> Result<Value, ReadError> {
+    let session_name = session.as_str().to_string();
+    let failed = |message: String| ReadError::Session { session: session_name.clone(), message };
+    let events = store
+        .read_stream(session, EventSeq::ZERO, usize::MAX)
+        .await
+        .map_err(|error| failed(error.to_string()))?;
+    let axes = agent_kernel::status::derive(&events);
+    // The reason the latest settled turn wrote, when it wrote one. The axes say
+    // whether a result was delivered; this says why it stopped, so the page can
+    // name a capability gap instead of the generic blocked sentence. Reads the
+    // same event slice as the axes, so one request cannot report a status from
+    // two logs. Logs that predate `stop_reason` report none.
+    let stop_reason = events
+        .iter()
+        .rev()
+        .find(|stored| {
+            matches!(
+                stored.event.event_type.as_str(),
+                agent_protocol::events::EventType::TURN_COMPLETED
+                    | agent_protocol::events::EventType::TURN_FAILED
+                    | agent_protocol::events::EventType::TURN_CANCELLED
+                    | agent_protocol::events::EventType::TURN_INTERRUPTED
+                    | agent_protocol::events::EventType::TURN_YIELDED
+            )
+        })
+        .and_then(|stored| stored.event.payload.get("stop_reason"))
+        .and_then(Value::as_str);
+    let intents =
+        agent_kernel::intent::fold_intents(&events).map_err(|error| failed(error.to_string()))?;
+    let active = intents.iter().rev().find(|intent| intent.status == IntentStatus::Active);
+    // The instructions whose queue entries are still waiting, in queue order.
+    // A pending item with no instruction behind it contributes nothing, for
+    // the same reason `status` reports none: it is not work a person asked for.
+    let pending = Inbox::new(store.clone())
+        .pending(session)
+        .await
+        .map_err(|error| failed(error.to_string()))?;
+    let mut pending_intents: Vec<String> = Vec::new();
+    for item in &pending {
+        let Some(intent_id) = item_intent_id(item) else {
+            continue;
+        };
+        if !pending_intents.iter().any(|id| id == intent_id.as_str()) {
+            pending_intents.push(intent_id.as_str().to_string());
+        }
+    }
+    let adjudication = agent_kernel::intent_adjudication::latest(&events)
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(json!({
+        "v": 1,
+        "session": session.as_str(),
+        "run_status": axes.run_status,
+        "delivery_status": axes.delivery_status,
+        "verification_status": axes.verification_status,
+        "completion_status": axes.completion_status,
+        "stop_reason": stop_reason,
+        "active_intent_id": active.map(|intent| intent.intent_id.as_str()),
+        "active_intent_summary": active.map(|intent| intent.summary.as_str()),
+        "pending_intents": pending_intents,
+        "adjudication": adjudication,
+    }))
+}
+
+/// The newest change evidence in a session, as a reader-shaped report.
+///
+/// The first choice is the newest completed `git.diff` observation: a
+/// projection of what the agent already saw, not a fresh `git diff`, so a page
+/// refresh cannot change the answer and a repository may have moved since.
+///
+/// A workspace that is not a Git repository has no `git.diff` to record, and
+/// that absence is not the same fact as "nothing changed". Every call that may
+/// write is made under a workspace snapshot, and the comparison against that
+/// snapshot is recorded as `workspace/changes.recorded`; the newest one is the
+/// fallback. It says which paths changed and how their sizes moved, never a
+/// line patch — the ledger holds digests, not bytes.
+///
+/// A session with neither source has no report — that is a `404`, not an empty
+/// diff (which would claim the tree was clean).
 pub(crate) async fn diff(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     for item in folded.transcript.items.iter().rev() {
         let ItemBody::Action {
             tool,
@@ -374,7 +489,56 @@ pub(crate) async fn diff(
             "diff": parsed,
         })));
     }
+
+    let events =
+        reads.store.read_stream(session, EventSeq::ZERO, usize::MAX).await.map_err(|error| {
+            ReadError::Session { session: session.as_str().to_string(), message: error.to_string() }
+        })?;
+    for event in events.iter().rev() {
+        let draft = &event.event;
+        if draft.event_type.as_str() != EventType::WORKSPACE_CHANGES_RECORDED {
+            continue;
+        }
+        // A payload that does not name a change list is not evidence; a later
+        // malformed record must not hide an earlier good one.
+        let Some(changes) = event.event.payload.get("changes").and_then(Value::as_array) else {
+            continue;
+        };
+        let files: Vec<Value> = changes.iter().filter_map(change_entry).collect();
+        let payload = &event.event.payload;
+        return Ok(Some(json!({
+            "v": 1,
+            "session": session.as_str(),
+            "turn": event.event.turn_id.as_ref().map(|turn| turn.as_str()),
+            "seq": event.seq.as_u64(),
+            "source": "workspace.changes",
+            "snapshot_id": payload.get("snapshot_id").cloned(),
+            "task_id": payload.get("task_id").cloned(),
+            "changes_hash": payload.get("changes_hash").cloned(),
+            "complete": payload.get("complete").cloned(),
+            "recorded_at": event.recorded_at,
+            "changes": files,
+        })));
+    }
     Ok(None)
+}
+
+/// One change from a `workspace/changes.recorded` payload, in the shape the
+/// panel reads. A record without a path is not a change and is skipped.
+fn change_entry(change: &Value) -> Option<Value> {
+    let file = change.get("relative_path").and_then(Value::as_str)?;
+    let mut entry = json!({
+        "file": file,
+        "change": change.get("kind").and_then(Value::as_str).unwrap_or("modified"),
+        "before_size": change.get("before_size").and_then(Value::as_u64),
+        "after_size": change.get("after_size").and_then(Value::as_u64),
+    });
+    for key in ["before_sha256", "after_sha256"] {
+        if let Some(digest) = change.get(key).and_then(Value::as_str) {
+            entry[key] = json!(digest);
+        }
+    }
+    Some(entry)
 }
 
 /// What the most recent model request carried.
@@ -385,12 +549,11 @@ pub(crate) async fn diff(
 /// input). A category is omitted when the request did not record its number,
 /// rather than shown as zero.
 pub(crate) async fn context(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     let Some(request) = folded.last_request.as_ref() else {
         return Ok(None);
     };
@@ -451,12 +614,11 @@ pub(crate) async fn context(
 
 /// The session's latest plan ledger, if the loop recorded one.
 pub(crate) async fn plan(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     Ok(folded.last_plan.map(|plan| {
         json!({
             "v": 1,
@@ -469,12 +631,11 @@ pub(crate) async fn plan(
 
 /// The children this session delegated to, with their last known status.
 pub(crate) async fn subagents(
-    store: &dyn EventStore,
     data_dir: &Path,
     session: &SessionId,
     reads: &ReadModel,
 ) -> Result<Option<Value>, ReadError> {
-    let folded = reads.fold(store, data_dir, session).await?;
+    let folded = reads.fold(data_dir, session).await?;
     if folded.subagents.is_empty() {
         return Ok(None);
     }
@@ -573,11 +734,14 @@ fn wire_item_at(item: &TranscriptItem, now: DateTime<Utc>) -> Value {
     }
 
     match &item.body {
-        ItemBody::User { text, resumed, .. } => {
+        ItemBody::User { text, resumed, at, .. } => {
             row.insert("kind".to_string(), "user".into());
             row.insert("text".to_string(), text.clone().into());
             if *resumed {
                 row.insert("resumed".to_string(), true.into());
+            }
+            if let Some(at) = at {
+                row.insert("at".to_string(), at.to_rfc3339().into());
             }
         }
         ItemBody::Note { text } => {
@@ -601,12 +765,41 @@ fn wire_item_at(item: &TranscriptItem, now: DateTime<Utc>) -> Value {
                 row.insert("duration_ms".to_string(), (*duration_ms).into());
             }
         }
-        ItemBody::Approval { approval_id, tool, summary, state, created_at } => {
+        ItemBody::Approval {
+            approval_id,
+            tool,
+            summary,
+            state,
+            created_at,
+            action_digest,
+            risk,
+            reversibility,
+            targets,
+        } => {
             let expired = *state == ApprovalState::Pending && approval_expired(*created_at, now);
             row.insert("kind".to_string(), "approval".into());
             row.insert("approval_id".to_string(), approval_id.as_str().into());
             row.insert("tool".to_string(), tool.clone().into());
             row.insert("summary".to_string(), summary.clone().into());
+            // What the person is being asked to agree to, carried to the card
+            // rather than left in the log: the risk, whether it can be taken
+            // back, and everything it would touch — paths, the command line,
+            // origins, and named data stores. Absent on a request written
+            // before B4 raised them. (CONTRACT.md §7 #178)
+            if let Some(digest) = action_digest {
+                row.insert("action_digest".to_string(), digest.clone().into());
+            }
+            if let Some(risk) = risk {
+                row.insert("risk".to_string(), risk.as_str().into());
+            }
+            if let Some(reversibility) = reversibility {
+                row.insert("reversibility".to_string(), reversibility_name(*reversibility).into());
+            }
+            if !targets.is_empty()
+                && let Ok(value) = serde_json::to_value(targets)
+            {
+                row.insert("targets".to_string(), value);
+            }
             row.insert(
                 "state".to_string(),
                 if expired { "expired" } else { approval_state(*state) }.into(),
@@ -647,6 +840,19 @@ fn action_status(status: ActionStatus) -> &'static str {
         ActionStatus::Refused => "refused",
         ActionStatus::Waiting => "waiting",
         ActionStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Whether a card says the action can be taken back.
+///
+/// The risk word is the log's own ([`RiskLevel::as_str`]); this one is derived
+/// here because the vocabulary is the card's, not the ledger's — the page
+/// translates all three to a sentence either way.
+fn reversibility_name(reversibility: Reversibility) -> &'static str {
+    match reversibility {
+        Reversibility::Reversible => "reversible",
+        Reversibility::Compensatable => "compensatable",
+        Reversibility::Irreversible => "irreversible",
     }
 }
 
@@ -758,6 +964,7 @@ mod tests {
                 text: "The approval ended the wait".to_string(),
                 inbox_item: None,
                 resumed: true,
+                at: None,
             },
         };
         let wire = wire_item_at(&item, Utc::now());
@@ -769,6 +976,7 @@ mod tests {
                 text: "what I typed".to_string(),
                 inbox_item: None,
                 resumed: false,
+                at: None,
             },
             ..item
         };

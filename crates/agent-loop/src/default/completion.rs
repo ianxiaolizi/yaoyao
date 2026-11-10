@@ -21,6 +21,7 @@
 
 use agent_ports::tool_gateway::ToolGateway;
 use agent_protocol::ids::SessionId;
+use agent_protocol::permission::AuthorizationSubject;
 use agent_protocol::profile::{CompletionKind, CompletionSpec};
 use agent_protocol::redactor::Redactor;
 use agent_protocol::tool::{ToolInvocation, ToolStatus};
@@ -118,6 +119,7 @@ impl LoopTurn {
 pub(super) async fn run(
     gateway: &dyn ToolGateway,
     session_id: &SessionId,
+    subject: &AuthorizationSubject,
     spec: &CompletionSpec,
     call_id: String,
 ) -> Finding {
@@ -138,7 +140,8 @@ pub(super) async fn run(
             }),
         ),
     };
-    let invocation = ToolInvocation::from_tool_call(call_id, tool, arguments);
+    let invocation = ToolInvocation::from_tool_call(call_id, tool, arguments)
+        .with_authorization_subject(subject.clone());
     match gateway.execute(session_id, &invocation).await {
         Ok(result) if result.status == ToolStatus::Completed => Finding::Complete,
         Ok(result) => Finding::Incomplete { detail: result.content },
@@ -170,7 +173,7 @@ pub(super) async fn check_at_boundary(
     let journal = turn.journal.clone();
     journal.commit(std::mem::take(events)).await?;
     let call_id = format!("completion/{}/{step_index}", ctx.turn_id);
-    let finding = run(gateway, &ctx.session_id, &spec, call_id).await;
+    let finding = run(gateway, &ctx.session_id, &ctx.authorization_subject, &spec, call_id).await;
     let mut payload = serde_json::json!({
         "kind": spec.kind.as_str(),
         "target": target(&spec, redactor),
@@ -217,6 +220,7 @@ mod tests {
             url: None,
             interval_steps: 1,
             timeout_ms: 1_000,
+            apparatus: Vec::new(),
         }
     }
 

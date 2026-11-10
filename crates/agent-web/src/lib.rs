@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_cli::reason::WhyError;
+use agent_kernel::approval::ApprovalAuthority;
 use agent_kernel::inbox::{Inbox, scheduled_due_at};
 use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::event_store::EventStore;
@@ -36,7 +37,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -66,9 +67,16 @@ pub struct Meta {
     /// page uses it only to draw a proportionate context bar; a missing value
     /// means "no budget was stated", not "zero".
     pub budget: Option<u32>,
-    /// What this build can actually do. The UI greys out what is missing rather
-    /// than offering a button that can only fail.
+    /// HTTP/API features this build can actually offer. The UI greys out what
+    /// is missing rather than offering a button that can only fail.
     pub capabilities: Vec<String>,
+    /// Capabilities the selected execution sandbox advertises. This is what the
+    /// model can actually ask to use, before policy/approval is consulted.
+    pub sandbox_capabilities: Vec<String>,
+    /// Whether this sandbox can run high-risk workspace actions such as
+    /// `shell.run`. `local` advertises process.spawn but cannot isolate it, so
+    /// this is the authoritative distinction the page needs.
+    pub high_risk_workspace_actions: bool,
     /// The models a session may be switched to. Assembled at startup from the
     /// providers this process could actually build, so the page never offers a
     /// choice that can only fail.
@@ -280,11 +288,11 @@ impl Server {
         let app = router(Arc::new(AppState {
             token: token.clone(),
             meta,
-            store,
+            store: store.clone(),
             data_dir,
             backend,
             now,
-            reads: sessions::ReadModel::new(),
+            reads: sessions::ReadModel::new(store),
             live: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
             settling: Mutex::new(HashSet::new()),
@@ -313,13 +321,31 @@ impl Server {
     }
 }
 
+/// The page's assets, compiled in by `build.rs` from `web/dist`.
+///
+/// The generated table names every file with its content type, so the binary
+/// needs nothing beside it and a request cannot reach outside the build.
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
+}
+
+/// The policy the page is served under. Only this origin, and inline styles
+/// because the glass and the drag handles are computed at runtime. The bundle's
+/// script is an external file under `/assets/`, so `script-src 'self'` still
+/// forbids inline script; `object-src` names `blob:` because a PDF artifact is
+/// handed to the browser's viewer as a blob URL, never as a network fetch, and
+/// `frame-src` names it too because the viewer frames its own document.
+const PAGE_CSP: &str = "default-src 'self'; img-src 'self' data: blob:; \
+                        object-src 'self' blob:; frame-src 'self' blob:; \
+                        style-src 'self' 'unsafe-inline'; connect-src 'self' blob:; \
+                        script-src 'self'";
+
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/favicon.ico", get(favicon))
-        .route("/app.css", get(app_css))
-        .route("/app.js", get(app_js))
+        .route("/assets/{*path}", get(asset))
         .route("/api/meta", get(meta))
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{id}", get(session).delete(delete_session))
@@ -329,6 +355,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/diff", get(diff))
         .route("/api/sessions/{id}/context", get(context))
         .route("/api/sessions/{id}/plan", get(plan))
+        .route("/api/sessions/{id}/status", get(status))
         .route("/api/sessions/{id}/subagents", get(subagents))
         .route("/api/sessions/{id}/schedules", get(schedules).post(schedule))
         .route("/api/sessions/{id}/schedules/{item_id}", axum::routing::delete(cancel_schedule))
@@ -348,35 +375,59 @@ fn router(state: Arc<AppState>) -> Router {
 
 /// The page shell.
 ///
-/// The page is public because it holds no data; every `/api/` call is gated. The
-/// CSP is the same one the contract promises: only this origin, and inline
-/// styles because the glass and the drag handles are computed at runtime.
-async fn index() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_SECURITY_POLICY,
-            "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; \
-             connect-src 'self' blob:; script-src 'self'",
-        )],
-        Html(include_str!("../static/index.html")),
-    )
+/// The page is public because it holds no data; every `/api/` call is gated. It
+/// is compiled in (`embedded::INDEX`), so the binary serves the exact bundle it
+/// was built with.
+async fn index() -> Response {
+    page(embedded::INDEX)
+}
+
+/// Answer with the page, under the policy the contract promises.
+fn page(bytes: &'static [u8]) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_SECURITY_POLICY, PAGE_CSP)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        // The document names hashed assets; a cached copy would pin an old
+        // bundle across a restart. The assets themselves are immutable.
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(bytes))
+        .expect("static headers are valid")
+}
+
+/// One asset from the built bundle.
+///
+/// A miss is a 404, not the page: an unknown asset means the binary and the
+/// document disagree, and answering HTML would hide that as a parse error.
+async fn asset(AxumPath(path): AxumPath<String>) -> Response {
+    let key = format!("assets/{path}");
+    let Some(asset) = embedded::ASSETS.iter().find(|asset| asset.path == key) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "v": PROTOCOL,
+                "ok": false,
+                "kind": "not_found",
+                "code": "asset_not_found",
+                "message": "这个构建里没有这个资源",
+            })),
+        )
+            .into_response();
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, asset.content_type)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        // Vite names each bundle after its content, so a URL is immutable and a
+        // new build cannot overwrite one a page still points at.
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(Body::from(asset.bytes))
+        .expect("static headers are valid")
 }
 
 /// No icon is served; the page uses the inline mark. Answering 204 rather than
 /// letting the browser log a 404 keeps the console useful for real failures.
 async fn favicon() -> StatusCode {
     StatusCode::NO_CONTENT
-}
-
-/// The stylesheet, embedded like the page so production runs no separate web
-/// server.
-async fn app_css() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../static/app.css"))
-}
-
-/// The page's script, embedded for the same reason.
-async fn app_js() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../static/app.js"))
 }
 
 async fn meta(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -391,6 +442,8 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "judgment": state.meta.judgment,
         "budget": state.meta.budget,
         "capabilities": state.meta.capabilities,
+        "sandbox_capabilities": state.meta.sandbox_capabilities,
+        "high_risk_workspace_actions": state.meta.high_risk_workspace_actions,
         "models": state.meta.models,
     }))
 }
@@ -400,9 +453,8 @@ async fn sessions(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiFailure> {
     let now = state.now();
-    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads, now)
-        .await
-        .map_err(ApiFailure::read)?;
+    let list =
+        sessions::list(&state.data_dir, &state.reads, now).await.map_err(ApiFailure::read)?;
     Ok(Json(serde_json::json!({ "v": PROTOCOL, "sessions": list })))
 }
 
@@ -413,9 +465,8 @@ async fn session(
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
     let now = state.now();
-    let list = sessions::list(state.store.as_ref(), &state.data_dir, &state.reads, now)
-        .await
-        .map_err(ApiFailure::read)?;
+    let list =
+        sessions::list(&state.data_dir, &state.reads, now).await.map_err(ApiFailure::read)?;
     let found = list
         .into_iter()
         .find(|row| row["id"].as_str() == Some(id.as_str()))
@@ -512,7 +563,6 @@ async fn transcript(
         return Err(ApiFailure::not_found(format!("no session '{id}'")));
     }
     let payload = sessions::transcript(
-        state.store.as_ref(),
         &state.data_dir,
         &SessionId::from_string(&id),
         since,
@@ -573,28 +623,24 @@ async fn events(
     Ok(stream)
 }
 
-/// `GET /api/sessions/{id}/diff`: the newest `git.diff` observation.
+/// `GET /api/sessions/{id}/diff`: the newest change evidence.
 ///
 /// A reader only. It does not run git and does not ask the workspace what it
-/// looks like now: the page shows what the agent actually saw, which is the
-/// same rule every other read endpoint follows.
+/// looks like now: the page shows what the agent actually saw — a `git.diff`
+/// observation, or the workspace change ledger when there is no repository to
+/// observe — which is the same rule every other read endpoint follows.
 async fn diff(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::diff(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::diff(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::diff_unavailable(
-            "这一轮没有 git.diff 观察：模型还没看过改动，或工具调用没有完成",
+            "这一轮没有改动证据：没有 git.diff 观察，也没有工作区变更记录",
         )),
     }
 }
@@ -609,14 +655,9 @@ async fn context(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::context(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::context(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::context_unavailable(
@@ -631,14 +672,9 @@ async fn plan(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::plan(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::plan(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::plan_unavailable(
@@ -647,20 +683,34 @@ async fn plan(
     }
 }
 
+/// `GET /api/sessions/{id}/status`: execution, delivery and verification, the
+/// instruction still standing, and the latest adjudication.
+///
+/// A read, and the axis words are the kernel's own fold — the page must not
+/// spell "verified complete" differently from `agent status` (CONTRACT §7
+/// #166). The response carries one `v` and the session id like its neighbours,
+/// and the payload's fields are additive: a page from before this endpoint
+/// simply does not call it.
+async fn status(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiFailure> {
+    check_session(&state, &id)?;
+    let report = sessions::status(state.store.clone(), &SessionId::from_string(&id))
+        .await
+        .map_err(ApiFailure::read)?;
+    Ok(Json(report))
+}
+
 /// `GET /api/sessions/{id}/subagents`: children this session delegated to.
 async fn subagents(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiFailure> {
     check_session(&state, &id)?;
-    let report = sessions::subagents(
-        state.store.as_ref(),
-        &state.data_dir,
-        &SessionId::from_string(&id),
-        &state.reads,
-    )
-    .await
-    .map_err(ApiFailure::read)?;
+    let report = sessions::subagents(&state.data_dir, &SessionId::from_string(&id), &state.reads)
+        .await
+        .map_err(ApiFailure::read)?;
     match report {
         Some(report) => Ok(Json(report)),
         None => Err(ApiFailure::subagents_unavailable(
@@ -836,6 +886,11 @@ async fn artifact(
         "image/gif"
     } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         "image/webp"
+    } else if bytes.starts_with(b"%PDF-") {
+        // A PDF is a document the page can put in a viewer, not an opaque
+        // download; its signature is the only type a content-addressed store
+        // can honestly offer.
+        "application/pdf"
     } else if is_plain_text(&bytes) {
         // A tab pointed at `application/octet-stream` stays blank: the browser
         // has nothing it can render. Text is common here (the model's own
@@ -925,11 +980,7 @@ async fn turn(
     // missing one: the turn's own inbox append creates its log. Only the checks
     // that need a history are skipped.
     if state.data_dir.join(&id).join("events.jsonl").is_file() {
-        let folded = state
-            .reads
-            .fold(state.store.as_ref(), &state.data_dir, &session)
-            .await
-            .map_err(ApiFailure::read)?;
+        let folded = state.reads.fold(&state.data_dir, &session).await.map_err(ApiFailure::read)?;
         if folded.yielded {
             return Err(ApiFailure::conflict(
                 "awaiting_decision",
@@ -1001,11 +1052,7 @@ async fn approve(
     };
 
     let session = SessionId::from_string(&id);
-    let folded = state
-        .reads
-        .fold(state.store.as_ref(), &state.data_dir, &session)
-        .await
-        .map_err(ApiFailure::read)?;
+    let folded = state.reads.fold(&state.data_dir, &session).await.map_err(ApiFailure::read)?;
     let now = state.now();
     let pending = folded.transcript.items.iter().any(|item| {
         matches!(
@@ -1037,11 +1084,19 @@ async fn approve(
         }
     }
 
+    // The request already passed the gate, which is where the token was
+    // checked; carrying it here is what turns "someone on loopback" into "the
+    // authenticated GUI handler", and it is the only way an answer from this
+    // process is recorded as a person's. (B4)
+    let authority = ApprovalAuthority::local_http(&state.token)
+        .map_err(|error| ApiFailure::internal(error.to_string()))?;
     let state_for_task = state.clone();
     let sink = state.live_sink(&id);
     let approval_for_task = approval_id.clone();
     tokio::spawn(async move {
-        let result = backend.settle_approval(&session, &approval_for_task, decision, &sink).await;
+        let result = backend
+            .settle_approval(&session, &approval_for_task, decision, &authority, &sink)
+            .await;
         if let Err(error) = result {
             let _ = sink.send(LiveChunk::notice(format!(
                 "审批没有续跑（{}）：{}",

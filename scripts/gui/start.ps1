@@ -34,14 +34,10 @@ if (-not $env:AGENT_WORKSPACE_DIR) {
         $env:AGENT_WORKSPACE_DIR = $repo
     }
 }
-if (-not $env:AGENT_DATA_DIR) {
-    $legacy = Join-Path $env:AGENT_WORKSPACE_DIR '.agent'
-    if (Test-Path $legacy) {
-        $env:AGENT_DATA_DIR = $legacy
-    } else {
-        $env:AGENT_DATA_DIR = Join-Path $env:AGENT_WORKSPACE_DIR '.agent-data'
-    }
-}
+# AGENT_DATA_DIR is intentionally left unset by default. The binary places
+# logs, snapshots and artifacts under the platform's per-user state root, outside
+# the model-writable workspace. Set it explicitly only to an absolute path
+# outside the workspace.
 
 # 可选的机器本地设置：不要把它提交进仓库。
 $local = Join-Path $PSScriptRoot 'start.local.ps1'
@@ -50,10 +46,19 @@ if (Test-Path $local) {
 }
 
 Write-Host ''
+$sandbox = if ($env:AGENT_SANDBOX) { $env:AGENT_SANDBOX.Trim() } else { 'local' }
+$network = if ($env:AGENT_SANDBOX_NETWORK) { $env:AGENT_SANDBOX_NETWORK.Trim() } else { 'deny' }
+$profile = if ($env:AGENT_PROFILE) { $env:AGENT_PROFILE.Trim() } else { '' }
 Write-Host '  爻爻 · 本地 Web' -ForegroundColor Cyan
 Write-Host "  工作区  $env:AGENT_WORKSPACE_DIR"
 Write-Host "  数据    $env:AGENT_DATA_DIR"
+Write-Host "  档位    $(if ($profile) { $profile } else { '（未选择）' })"
+Write-Host "  沙箱    $sandbox"
+Write-Host "  网络    $network"
 Write-Host "  端口    $Port"
+if ($network -eq 'internet') {
+    Write-Host '  警告：internet 是宽泛出站能力（AppContainer internetClient），不是站点白名单。' -ForegroundColor Yellow
+}
 Write-Host ''
 
 # 端口被占用时不要把第二个服务叠上去，否则同一个会话会有两个驱动者。
@@ -65,6 +70,47 @@ if ($listener) {
 }
 
 if (-not $SkipBuild) {
+    # The page is compiled into the binary (crates/agent-web/build.rs), so the
+    # bundle has to be current before cargo runs. Rebuild it only when web/src is
+    # newer than web/dist; a machine without Node keeps the bundle it has.
+    $web = Join-Path $repo 'web'
+    $index = Join-Path $web 'dist\index.html'
+    $stale = -not (Test-Path $index)
+    if (-not $stale) {
+        $builtAt = (Get-Item $index).LastWriteTime
+        $newestSource = Get-ChildItem (Join-Path $web 'src') -Recurse -File |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($newestSource -and $newestSource.LastWriteTime -gt $builtAt) { $stale = $true }
+        # The entry, the Vite config and the lockfile also decide the bundle;
+        # editing them without rebuilding would leave the old page in the exe.
+        foreach ($name in 'index.html', 'package.json', 'pnpm-lock.yaml', 'vite.config.ts', 'tsconfig.json') {
+            $candidate = Join-Path $web $name
+            if ((Test-Path $candidate) -and (Get-Item $candidate).LastWriteTime -gt $builtAt) { $stale = $true }
+        }
+    }
+    if ($stale -and $DryRun) {
+        Write-Host '  前端产物已过期（或缺失），正式启动会先构建。' -ForegroundColor Yellow
+    }
+    if ($stale) {
+        $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue
+        if (-not $pnpm) {
+            Stop-WithMessage "前端产物缺失或已过期，且找不到 pnpm。`n先在 web\ 里运行 pnpm install 和 pnpm build，或删掉 -SkipBuild 改用已提交的 dist。"
+        }
+        Push-Location $web
+        try {
+            if (-not (Test-Path (Join-Path $web 'node_modules'))) {
+                Write-Host '  正在安装前端依赖…' -ForegroundColor DarkGray
+                & $pnpm.Source install
+                if ($LASTEXITCODE -ne 0) { Stop-WithMessage 'pnpm install 失败。上面的输出就是原因。' }
+            }
+            Write-Host '  正在构建页面…' -ForegroundColor DarkGray
+            & $pnpm.Source build
+            if ($LASTEXITCODE -ne 0) { Stop-WithMessage '页面构建失败。上面的输出就是原因。' }
+        } finally {
+            Pop-Location
+        }
+    }
+
     $cargo = Get-Command cargo -ErrorAction SilentlyContinue
     if (-not $cargo) {
         Stop-WithMessage '找不到 cargo。请先安装 Rust，或用已经构建好的 target\debug\agent.exe。'
@@ -97,6 +143,16 @@ try {
     # 不是错误：不是每台机器都需要这一步。
 }
 
+if ($sandbox -eq 'app-container') {
+    Write-Host '  检查 AppContainer 授权…' -ForegroundColor DarkGray
+    $statusOutput = & $exe sandbox status 2>&1
+    $statusCode = $LASTEXITCODE
+    $statusOutput | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    if ($statusCode -ne 0) {
+        Stop-WithMessage "AppContainer 未就绪。请在管理员 PowerShell 中运行：`n  `"$exe`" sandbox setup`n或安装开机任务：`n  powershell -File scripts\sandbox-boot-task.ps1 -Install"
+    }
+}
+
 if ($DryRun) {
     Write-Host "  exe     $exe" -ForegroundColor DarkGray
     Write-Host "  log     $log" -ForegroundColor DarkGray
@@ -114,7 +170,10 @@ Write-Host '  启动中；看到 URL 会自动打开浏览器。Ctrl+C 停止。
 Write-Host ''
 
 try {
-    & $exe web --port $Port 2>&1 | ForEach-Object {
+    $agentArgs = @()
+    if ($profile) { $agentArgs += @('--profile', $profile) }
+    $agentArgs += @('web', '--port', "$Port")
+    & $exe @agentArgs 2>&1 | ForEach-Object {
         $line = $_.ToString()
         Write-Host $line
         # 日志会被留下来分享；令牌只出现在控制台和浏览器的地址栏里。

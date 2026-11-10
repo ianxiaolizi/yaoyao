@@ -412,4 +412,140 @@ mod tests {
         assert_eq!(resolution.budget.completion_cap_tokens, 32_768);
         assert_eq!(resolution.sources["context_window_tokens"], "fallback");
     }
+
+    fn caps_with(window: u32, output: u32) -> ResolvedModelCapabilities {
+        let mut caps = deepseek_flash_caps();
+        caps.capabilities.context_window_tokens = window;
+        caps.capabilities.max_output_tokens = output;
+        caps
+    }
+
+    #[test]
+    fn the_default_policy_is_the_balanced_preset() {
+        // `Default` is what every caller that does not name a policy gets, and
+        // a silently different default would change budgets without a config.
+        let default = BudgetPolicy::default();
+        assert_eq!(default.preset, BudgetPreset::Balanced);
+        let explicit = BudgetPolicy::balanced();
+        assert_eq!(default.preset, explicit.preset);
+        assert_eq!(default.compact_at_percent, explicit.compact_at_percent);
+        assert_eq!(default.retain_recent_tokens, explicit.retain_recent_tokens);
+    }
+
+    #[test]
+    fn a_window_the_operator_names_is_used_and_labelled() {
+        let caps = deepseek_flash_caps();
+        let policy =
+            BudgetPolicy { context_window_tokens: Some(500_000), ..BudgetPolicy::balanced() };
+        let resolution = resolve_context_budget(&caps, &policy).unwrap();
+        assert_eq!(resolution.budget.context_window_tokens, 500_000);
+        assert_eq!(resolution.sources["context_window_tokens"], "explicit");
+    }
+
+    #[test]
+    fn every_unusable_budget_is_refused_with_the_field_it_names() {
+        // Each row is a policy a person could write and the field the error
+        // must name, so the message points at the line to edit rather than at
+        // the budget as a whole.
+        let cases: Vec<(&str, ResolvedModelCapabilities, BudgetPolicy, &str)> = vec![
+            (
+                "the model reports no window",
+                caps_with(0, 393_216),
+                BudgetPolicy::balanced(),
+                "context_window_tokens",
+            ),
+            (
+                "an explicit zero window",
+                deepseek_flash_caps(),
+                BudgetPolicy { context_window_tokens: Some(0), ..BudgetPolicy::balanced() },
+                "context_window_tokens",
+            ),
+            (
+                "a window larger than the model's",
+                deepseek_flash_caps(),
+                BudgetPolicy { context_window_tokens: Some(1_200_000), ..BudgetPolicy::balanced() },
+                "context_window_tokens",
+            ),
+            (
+                "an explicit zero completion cap",
+                deepseek_flash_caps(),
+                BudgetPolicy { completion_cap_tokens: Some(0), ..BudgetPolicy::balanced() },
+                "completion_cap_tokens",
+            ),
+            (
+                "a completion cap above the model's output",
+                deepseek_flash_caps(),
+                BudgetPolicy { completion_cap_tokens: Some(400_000), ..BudgetPolicy::balanced() },
+                "completion_cap_tokens",
+            ),
+            (
+                "a completion cap with no room for input",
+                caps_with(100, 1_000),
+                BudgetPolicy { completion_cap_tokens: Some(100), ..BudgetPolicy::balanced() },
+                "completion_cap_tokens",
+            ),
+            (
+                "zero compaction headroom",
+                deepseek_flash_caps(),
+                BudgetPolicy { compaction_headroom_tokens: Some(0), ..BudgetPolicy::balanced() },
+                "compaction_headroom_tokens",
+            ),
+            (
+                "headroom that leaves no window beside the cap",
+                deepseek_flash_caps(),
+                BudgetPolicy {
+                    compaction_headroom_tokens: Some(786_432),
+                    ..BudgetPolicy::balanced()
+                },
+                "compaction_headroom_tokens",
+            ),
+            (
+                "an explicit zero working set",
+                deepseek_flash_caps(),
+                BudgetPolicy { input_working_set_tokens: Some(0), ..BudgetPolicy::balanced() },
+                "input_working_set_tokens",
+            ),
+            (
+                "a preset whose share of the window rounds to zero",
+                caps_with(4, 1),
+                BudgetPolicy { preset: BudgetPreset::Frugal, ..BudgetPolicy::balanced() },
+                "input_working_set_tokens",
+            ),
+            (
+                "a compaction trigger that is not a share",
+                deepseek_flash_caps(),
+                BudgetPolicy { compact_at_percent: Some(0), ..BudgetPolicy::balanced() },
+                "compact_at_percent",
+            ),
+            (
+                "a compaction trigger above 99 percent",
+                deepseek_flash_caps(),
+                BudgetPolicy { compact_at_percent: Some(100), ..BudgetPolicy::balanced() },
+                "compact_at_percent",
+            ),
+            (
+                "a trigger that derives to zero on a one-token working set",
+                deepseek_flash_caps(),
+                BudgetPolicy {
+                    input_working_set_tokens: Some(1),
+                    compact_at_percent: Some(1),
+                    ..BudgetPolicy::balanced()
+                },
+                "compact_at_percent",
+            ),
+            (
+                "retention that matches the trigger",
+                deepseek_flash_caps(),
+                BudgetPolicy { retain_recent_tokens: Some(300_000), ..BudgetPolicy::balanced() },
+                "retain_recent_tokens",
+            ),
+        ];
+        for (what, caps, policy, field) in cases {
+            let error = match resolve_context_budget(&caps, &policy) {
+                Ok(resolution) => panic!("{what} resolved to {:?}", resolution.budget),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(field), "{what}: the error does not name {field}: {error}");
+        }
+    }
 }

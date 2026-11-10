@@ -3,7 +3,8 @@
 use std::time::Instant;
 
 use agent_ports::agent_loop::StopReason;
-use agent_protocol::ids::{RunId, TurnId};
+use agent_protocol::ids::{IntentId, RunId, TurnId};
+use agent_protocol::inbox::InboxItem;
 use agent_protocol::profile::Spent;
 
 /// What one driven turn produced.
@@ -19,6 +20,13 @@ pub struct RunReport {
     pub steps: u32,
     pub tool_calls: u32,
     pub elapsed_ms: u64,
+    /// The instruction this run answered, when the item it claimed named one.
+    ///
+    /// `None` is a real answer: the item was queued before the intent ledger,
+    /// or by something that is not a person's message (a wakeup, a tool). A
+    /// caller that shows this answer as the session's current one has to look
+    /// at this field first — that is the whole reason it is here.
+    pub intent_id: Option<IntentId>,
 }
 
 /// The spend and the clock reading a turn ended with.
@@ -92,6 +100,7 @@ impl Finished {
         turn_id: TurnId,
         stop_reason: StopReason,
         final_content: Option<String>,
+        intent_id: Option<IntentId>,
     ) -> RunReport {
         RunReport {
             run_id,
@@ -102,7 +111,30 @@ impl Finished {
             steps: u32::try_from(self.steps).unwrap_or(u32::MAX),
             tool_calls: u32::try_from(self.tool_calls).unwrap_or(u32::MAX),
             elapsed_ms: self.elapsed_ms,
+            intent_id,
         }
+    }
+}
+
+/// The payload a `turn/started` carries: what it consumed, and — when the item
+/// asked for something a person said — the instruction it is an answer *to*.
+///
+/// The binding lives on `turn/started` rather than on the terminal payload
+/// because the terminal events are the run's ending and already carry several
+/// shapes for `stop_reason`; a turn that dies before its ending would lose a
+/// binding recorded only there, and the log has to be able to say which request
+/// was being worked on when it died. An item from before the ledger keeps its
+/// exact old payload: a null binding would be a claim the log cannot make.
+pub(super) fn turn_started_payload(
+    item: &InboxItem,
+    intent_id: Option<&IntentId>,
+) -> serde_json::Value {
+    match intent_id {
+        Some(intent_id) => serde_json::json!({
+            "inbox_item": item.item_id,
+            "intent_id": intent_id,
+        }),
+        None => serde_json::json!({ "inbox_item": item.item_id }),
     }
 }
 

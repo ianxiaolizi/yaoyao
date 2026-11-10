@@ -23,6 +23,9 @@ node_modules/
 Thumbs.db
 .DS_Store
 
+# Agent process state (plans, specs, SDD progress)
+/.superpowers/
+
 # Local runtime state written by `agent` (event logs, artifacts, smoke runs)
 /.agent-data/
 /.agent-smoke*/
@@ -44,9 +47,27 @@ credentials.*
 # is missing from every fresh clone.
 !crates/agent-ports/src/secret_provider.rs
 
+# The same hazard again for the argument-resolution module split out of
+# `guarded.rs` when the permission gate pushed it past its ratchet: it reads
+# references, it holds no credential.
+!crates/agent-kernel/src/secret_refs.rs
+
+# And once more for `guarded`'s split-out test module. It exercises reference
+# resolution and holds no credential; ignored, the crate's tests would not
+# compile in a fresh clone.
+!crates/agent-kernel/src/guarded/tests/secrets.rs
+
+# The GUI's design tokens are a stylesheet, not a credential. The broad
+# `*token*` pattern above would keep it out of git; the page then builds locally
+# and fails on a fresh clone with a missing `@import`.
+!web/src/styles/tokens.css
+
 # Local kernel-eval output (reports and transcripts from live runs)
 /apps/agent/kernel-eval-*.json
 /apps/agent/target/
 
 # 本机的启动配置（可能含密钥），不要提交
 scripts/gui/start.local.ps1
+
+# Personal package output
+scripts/personal/dist/

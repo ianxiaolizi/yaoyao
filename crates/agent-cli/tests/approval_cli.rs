@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use agent_cli::{CliOutput, run_approve, run_deny};
-use agent_kernel::approval::ApprovalService;
+use agent_kernel::approval::{ApprovalAuthority, ApprovalService};
 use agent_kernel::inbox::Inbox;
 use agent_protocol::ids::SessionId;
 use agent_protocol::inbox::InboxKind;
@@ -27,9 +27,17 @@ async fn approve_records_a_grant() {
         .await
         .unwrap();
 
-    let output = run_approve(&approvals, &inbox, &sid, req.approval_id.as_str(), "once", false)
-        .await
-        .unwrap();
+    let output = run_approve(
+        &approvals,
+        &inbox,
+        &sid,
+        req.approval_id.as_str(),
+        "once",
+        &ApprovalAuthority::test(),
+        false,
+    )
+    .await
+    .unwrap();
     match output {
         CliOutput::Text(t) => assert!(t.contains("approved"), "unexpected output: {t}"),
         _ => panic!("expected text output"),
@@ -44,9 +52,17 @@ async fn approve_json_reports_decision_and_scope() {
         .await
         .unwrap();
 
-    let output = run_approve(&approvals, &inbox, &sid, req.approval_id.as_str(), "turn", true)
-        .await
-        .unwrap();
+    let output = run_approve(
+        &approvals,
+        &inbox,
+        &sid,
+        req.approval_id.as_str(),
+        "turn",
+        &ApprovalAuthority::test(),
+        true,
+    )
+    .await
+    .unwrap();
     match output {
         CliOutput::Json(j) => {
             let value: serde_json::Value = serde_json::from_str(j.as_str()).unwrap();
@@ -81,7 +97,17 @@ async fn approve_enqueues_a_wakeup_item() {
         .await
         .unwrap();
 
-    run_approve(&approvals, &inbox, &sid, req.approval_id.as_str(), "once", false).await.unwrap();
+    run_approve(
+        &approvals,
+        &inbox,
+        &sid,
+        req.approval_id.as_str(),
+        "once",
+        &ApprovalAuthority::test(),
+        false,
+    )
+    .await
+    .unwrap();
 
     let pending = inbox.pending(&sid).await.unwrap();
     let wakeups: Vec<_> = pending.iter().filter(|i| i.kind == InboxKind::Wakeup).collect();
@@ -98,9 +124,17 @@ async fn approve_with_unknown_scope_errors() {
         .await
         .unwrap();
 
-    let err = run_approve(&approvals, &inbox, &sid, req.approval_id.as_str(), "forever", false)
-        .await
-        .unwrap_err();
+    let err = run_approve(
+        &approvals,
+        &inbox,
+        &sid,
+        req.approval_id.as_str(),
+        "forever",
+        &ApprovalAuthority::test(),
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(err.contains("unknown scope"), "unexpected error: {err}");
 }
 
@@ -112,9 +146,17 @@ async fn session_scope_is_rejected_when_not_configured() {
         .await
         .unwrap();
 
-    let err = run_approve(&approvals, &inbox, &sid, req.approval_id.as_str(), "session", false)
-        .await
-        .unwrap_err();
+    let err = run_approve(
+        &approvals,
+        &inbox,
+        &sid,
+        req.approval_id.as_str(),
+        "session",
+        &ApprovalAuthority::test(),
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(err.contains("allow_for_session"), "unexpected error: {err}");
 }
 
@@ -140,9 +182,17 @@ async fn approve_always_settles_the_same_kind_and_wakes_each_one() {
         .await
         .unwrap();
 
-    let output = run_approve(&approvals, &inbox, &sid, first.approval_id.as_str(), "always", true)
-        .await
-        .unwrap();
+    let output = run_approve(
+        &approvals,
+        &inbox,
+        &sid,
+        first.approval_id.as_str(),
+        "always",
+        &ApprovalAuthority::test(),
+        true,
+    )
+    .await
+    .unwrap();
     match output {
         CliOutput::Json(j) => {
             let value: serde_json::Value = serde_json::from_str(j.as_str()).unwrap();

@@ -1089,6 +1089,8 @@ impl SubagentToolProvider {
                     artifacts: Vec::new(),
                     truncated: false,
                     facts: Default::default(),
+                    // A child is this run's own work, not a page it read.
+                    trust: Default::default(),
                     // This provider runs a child; it does not decide policy. The
                     // gateway that handed it the call stamps the decision.
                     policy: None,
@@ -1104,6 +1106,8 @@ impl SubagentToolProvider {
                     artifacts: Vec::new(),
                     truncated: false,
                     facts: Default::default(),
+                    // A child is this run's own work, not a page it read.
+                    trust: Default::default(),
                     policy: None,
                     redaction_metadata: Default::default(),
                     duration_ms: Some(started.elapsed().as_millis() as u64),
@@ -1183,6 +1187,7 @@ impl SubagentToolProvider {
             artifacts: Vec::new(),
             truncated: false,
             facts: Default::default(),
+            trust: Default::default(),
             policy: None,
             redaction_metadata: Default::default(),
             duration_ms: Some(started.elapsed().as_millis() as u64),
@@ -1254,6 +1259,7 @@ impl SubagentToolProvider {
             artifacts: Vec::new(),
             truncated: false,
             facts: Default::default(),
+            trust: Default::default(),
             policy: None,
             redaction_metadata: Default::default(),
             duration_ms: None,

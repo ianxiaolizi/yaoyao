@@ -45,6 +45,8 @@ pub struct Layers {
     pub profile_override: Option<String>,
     /// `--model`: names the model for this run.
     pub model_override: Option<String>,
+    /// `--task`: selects a budget class from the user layer's `[task_budgets]`.
+    pub task_override: Option<String>,
 }
 
 /// A configuration resolved to the point where only the model route is open.
@@ -56,6 +58,13 @@ pub struct Layers {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedProfile {
     pub profile_id: String,
+    /// The budget class `--task` selected, when the run named one.
+    ///
+    /// Recorded so a reader can tell "the coding budget" from "the video
+    /// budget" without re-reading the user configuration, and so a snapshot
+    /// whose numbers look strange names the class they came from. `None` is a
+    /// run that selected no class: its budget is the layers' composition.
+    pub task_class: Option<String>,
     /// The model the configuration names, if any.
     pub model: Option<String>,
     /// Every tier the configuration named a model for, `main` included.
@@ -73,6 +82,22 @@ pub struct ResolvedProfile {
     /// only decides whether they are on the surface at all — so a run with the
     /// store off has no way to reach it even by naming a tool.
     pub memory_enabled: bool,
+    /// The remote origins this run may reach, as the user layer wrote them.
+    ///
+    /// Read from `[network] allow` in the user layer and nowhere else. The
+    /// strings are not validated here — this crate reads no URLs; assembly
+    /// canonicalizes them into the web tool's allowlist and refuses the run if
+    /// one is not an origin. Empty means no egress at all, which is the
+    /// shipped posture: a run reaches the sites a person named and no others.
+    pub network_allow: Vec<String>,
+    /// The secret names this run may resolve, as the user layer narrowed them.
+    ///
+    /// `None` is "the user layer said nothing", and the host's own list
+    /// (`AGENT_TOOL_SECRETS`) governs unchanged. `Some(names)` is a narrowing:
+    /// the run resolves the intersection, so a name the host does not allow is
+    /// still not resolvable. Values never appear here — this is a list of
+    /// names, and the backend is the only producer of a value.
+    pub secret_allow: Option<Vec<String>>,
     pub capability_set: CapabilitySet,
     pub plugin_versions: BTreeMap<String, String>,
     /// The MCP servers this run starts, one per enabled `mcp.<server>` plugin,
@@ -137,6 +162,7 @@ impl ResolvedProfile {
     ) -> ResolvedProfileSnapshot {
         ResolvedProfileSnapshot {
             profile_id: self.profile_id,
+            task_class: self.task_class,
             config_hash: String::new(),
             plugin_versions: self.plugin_versions,
             decision_backends: self.decision_backends,
@@ -443,18 +469,27 @@ pub fn resolve(layers: Layers) -> Result<ResolvedProfile> {
     // against the policy this run would actually enforce.
     let completion =
         completion(composed.completion.as_ref(), &capability_set, &composed, &profile_id)?;
-    let mut budget = budget(&layers.workspace, &composed)?;
+    let task_class = layers.task_override.clone();
+    let mut budget = budget(&layers.workspace, &composed, task_class.as_deref(), &layers.user)?;
     budget.reasoning_effort = composed.model.as_ref().and_then(|model| model.reasoning_effort);
     let model_context_window = composed.model.as_ref().and_then(|model| model.context_window);
 
     Ok(ResolvedProfile {
         profile_id,
+        task_class,
         model: layers
             .model_override
             .clone()
             .or_else(|| composed.model.as_ref().and_then(|model| model.main.clone())),
         model_tiers: model_tiers(&layers, composed.model.as_ref()),
         memory_enabled: layers.user.memory.as_ref().is_some_and(|memory| memory.enabled),
+        network_allow: layers
+            .user
+            .network
+            .as_ref()
+            .map(|network| network.allow.clone())
+            .unwrap_or_default(),
+        secret_allow: layers.user.secrets.as_ref().map(|secrets| secrets.allow.clone()),
         capability_set,
         plugin_versions,
         mcp_servers,
@@ -741,11 +776,6 @@ fn with_rules(
     policy
 }
 
-/// The step ceiling a profile gets when it configured a primary limit but no
-/// step count. The limit is the plan; this is the backstop that stops a loop
-/// whose other limits never fire.
-const DEFAULT_BACKSTOP_STEPS: u32 = 300;
-
 /// When a run with a primary limit is told to finalize.
 const DEFAULT_FINALIZE_AT_PERCENT: u32 = 85;
 
@@ -765,20 +795,32 @@ const DEFAULT_CACHE_HIT_WEIGHT_PERCENT: u32 = 10;
 /// are derived from the model's own capabilities once the route is known, and a
 /// value invented here would override that derivation with a constant sized for
 /// no particular model (the 8k cap that truncated reasoning, CONTRACT §7 #131).
-fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> {
+fn budget(
+    workspace: &WorkspaceConfig,
+    composed: &Profile,
+    task_class: Option<&str>,
+    user: &UserConfig,
+) -> Result<RunBudget> {
     let mut budget = RunBudget::default();
     apply_budget(&mut budget, workspace.budget.as_ref())?;
     apply_budget(&mut budget, composed.budget.as_ref())?;
-    // A primary limit (token budget or wall clock) is what makes the step
-    // ceiling a backstop rather than the plan: a run meant to last an hour
-    // must not die at the eighth step because nobody raised it. Only a profile
-    // that configured no `max_steps` of its own gets the raised value.
-    let primary_limit = budget.max_total_tokens.is_some() || budget.wall_clock_ms.is_some();
-    let named_steps = workspace.budget.as_ref().and_then(|spec| spec.max_steps).is_some()
-        || composed.budget.as_ref().and_then(|spec| spec.max_steps).is_some();
-    if primary_limit && !named_steps {
-        budget.max_steps = DEFAULT_BACKSTOP_STEPS;
+    // The class is last because it names this run's kind of work: a profile
+    // says what the scenario needs in general, and `--task video` says this
+    // run is a video. It may add a primary limit the profile did not state or
+    // tighten one it did; the defaults and the validation below still run
+    // after it, so a class cannot smuggle in a zero or a bad percentage.
+    if let Some(name) = task_class {
+        let spec = user.task_budgets.get(name).ok_or_else(|| ConfigError::UnknownTaskClass {
+            name: name.to_string(),
+            known: task_classes(user),
+        })?;
+        apply_budget(&mut budget, Some(spec))?;
     }
+    // A primary limit is what a run with a token or wall-clock budget is
+    // measured against. It does not invent a step ceiling: a run that names no
+    // `max_steps` is unbounded by step count and stops only on another stated
+    // condition.
+    let primary_limit = budget.max_total_tokens.is_some() || budget.wall_clock_ms.is_some();
     if primary_limit && budget.finalize_at_percent.is_none() {
         budget.finalize_at_percent = Some(DEFAULT_FINALIZE_AT_PERCENT);
     }
@@ -872,6 +914,20 @@ fn budget(workspace: &WorkspaceConfig, composed: &Profile) -> Result<RunBudget> 
     Ok(budget)
 }
 
+/// What a refusal should say the configured task classes are.
+///
+/// An empty table is a different message from a list: "none is configured"
+/// tells the person where to add one, while an empty list after "it defines:"
+/// would read as a typo in the message itself.
+fn task_classes(user: &UserConfig) -> String {
+    if user.task_budgets.is_empty() {
+        "no `[task_budgets.<name>]` table is configured; add one to the user configuration"
+            .to_string()
+    } else {
+        format!("it defines {}", user.task_budgets.keys().cloned().collect::<Vec<_>>().join(", "))
+    }
+}
+
 /// Steps between completion checks when the section names none.
 const DEFAULT_COMPLETION_INTERVAL_STEPS: u32 = 5;
 
@@ -915,6 +971,10 @@ fn completion(
         ));
     }
     let timeout_ms = spec.timeout_ms.unwrap_or(DEFAULT_COMPLETION_TIMEOUT_MS);
+    let apparatus = match apparatus_globs(spec.apparatus.as_deref()) {
+        Ok(globs) => globs,
+        Err(detail) => return refuse(detail),
+    };
     let (command, url) = match kind {
         CompletionKindSpec::Command => {
             let command = spec.command.as_deref().map(str::trim).unwrap_or_default();
@@ -994,7 +1054,48 @@ fn completion(
         url,
         interval_steps,
         timeout_ms,
+        apparatus,
     }))
+}
+
+/// The apparatus globs, checked for the shapes a walk cannot honour.
+///
+/// A glob is a path the manifest walker will follow, so an absolute one, a
+/// `..` segment or a Windows separator is refused here — where the operator can
+/// see which line is wrong — rather than becoming a manifest that quietly
+/// covers the wrong files, or a walk that reaches outside the workspace and is
+/// refused at its first step with a message about a file nobody named.
+fn apparatus_globs(globs: Option<&[String]>) -> std::result::Result<Vec<String>, String> {
+    let Some(globs) = globs else {
+        return Ok(Vec::new());
+    };
+    let mut checked = Vec::with_capacity(globs.len());
+    for glob in globs {
+        let glob = glob.trim();
+        if glob.is_empty() {
+            return Err(String::from("`apparatus` contains an empty glob"));
+        }
+        if glob.starts_with('/') || glob.starts_with('\\') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} is absolute; globs are relative to the workspace root"
+            ));
+        }
+        if glob.contains('\\') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} uses `\\`; write workspace-relative paths with `/`"
+            ));
+        }
+        if glob.contains(':') {
+            return Err(format!(
+                "`apparatus` glob {glob:?} names a drive or a stream; globs are workspace-relative"
+            ));
+        }
+        if glob.split('/').any(|segment| segment == "..") {
+            return Err(format!("`apparatus` glob {glob:?} reaches above the workspace root"));
+        }
+        checked.push(glob.to_string());
+    }
+    Ok(checked)
 }
 
 /// The longest a command check may run, matching `shell.run`'s own ceiling.
@@ -1022,7 +1123,7 @@ fn apply_budget(budget: &mut RunBudget, spec: Option<&BudgetSpec>) -> Result<()>
                     .to_string(),
             });
         }
-        budget.max_steps = steps;
+        budget.max_steps = Some(steps);
     }
     if let Some(calls) = spec.max_tool_calls {
         if calls == 0 {
@@ -1678,3 +1779,6 @@ impl From<Disposition> for PolicyDecision {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -12,16 +12,68 @@ use std::sync::Arc;
 use agent_ports::event_store::{EventStore, EventStoreError};
 use agent_protocol::events::{Actor, EventDraft, EventType, StoredEvent};
 use agent_protocol::ids::{
-    EventId, EventSeq, InboxItemId, RunId, SchemaVersion, SessionId, TurnId,
+    EventId, EventSeq, InboxItemId, IntentId, RunId, SchemaVersion, SessionId, TurnId,
 };
 use agent_protocol::inbox::{InboxItem, InboxItemStatus, InboxKind};
+use agent_protocol::intent::{Intent, IntentStatus};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+use crate::adjudicate;
 
 /// The payload key holding when a [`InboxKind::Scheduled`] item is due.
 pub const SCHEDULED_DUE_AT: &str = "due_at";
 /// The payload key holding the text a [`InboxKind::Scheduled`] turn carries.
 pub const SCHEDULED_TEXT: &str = "text";
+/// The payload key binding an item to the intent that asked for it.
+pub const INTENT_ID: &str = "intent_id";
+/// The payload key carrying what the rule layer made of the message that queued
+/// the item ([`crate::adjudicate::Route::as_str`]).
+///
+/// Recorded at write time because the route is a function of the queue as it
+/// was when the message arrived; a later reader looking at a different queue
+/// would answer a different question. Slice A3 reads this to find exactly the
+/// messages the rules left `unclear`, instead of re-running the rules against a
+/// queue they were not written for.
+pub const ROUTE: &str = "route";
+
+/// Why a queued instruction was discarded when a newer one displaced it.
+const SUPERSEDED_REASON: &str = "a newer instruction from the same person stands in its place";
+/// Why a queued instruction was discarded when a stop withdrew it.
+const STOPPED_REASON: &str = "withdrawn by a stop";
+
+/// What a submitted message asked for, and what the queue did about it.
+///
+/// The route is reported back rather than left in the log alone: the caller
+/// that took the message (the CLI, the web API) has to tell the person what
+/// happened to it, and "your message was taken as a stop that withdrew two
+/// queued instructions" is a different answer from "your message is queued".
+#[derive(Debug, Clone)]
+pub struct Submitted {
+    /// What the rule layer made of the message.
+    pub route: adjudicate::Route,
+    /// The durable record of what was asked.
+    pub intent: Intent,
+    /// The item queued for it: a turn for anything that opens one, an interrupt
+    /// for a stop that had a run to stop. `None` when nothing was queued.
+    pub item: Option<InboxItem>,
+    /// Every queue item this message took out, in queue order — including the
+    /// ones queued before the ledger, which have no intent to name.
+    pub displaced: Vec<InboxItemId>,
+    /// Instructions this one displaced, in queue order.
+    pub superseded: Vec<IntentId>,
+    /// Instructions a stop withdrew, in queue order.
+    pub cancelled: Vec<IntentId>,
+}
+
+/// The intent an item was queued for, if it was queued for one.
+///
+/// Items written before the ledger have no `intent_id`; that is a fact about
+/// the log, not an error, so it reads as `None` rather than failing the fold.
+pub fn item_intent_id(item: &InboxItem) -> Option<IntentId> {
+    let raw = item.payload.get(INTENT_ID)?;
+    serde_json::from_value(raw.clone()).ok()
+}
 
 /// The kernel's pending-input queue, backed by the durable event log.
 pub struct Inbox {
@@ -91,6 +143,13 @@ pub enum DiscardCause {
     Spent,
     /// The user withdrew the request before it ran (a cancelled schedule).
     Cancelled,
+    /// A later instruction from the same person outranks this one.
+    ///
+    /// Not [`Cancelled`](Self::Cancelled): nothing was taken back, the request
+    /// still stands in the record and only stopped being the newest one. The
+    /// distinction is what lets a reader tell "I changed my mind" from "I said
+    /// what I wanted next".
+    Superseded,
 }
 
 impl DiscardCause {
@@ -102,6 +161,7 @@ impl DiscardCause {
             Self::Unreadable => "unreadable",
             Self::Spent => "spent",
             Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
         }
     }
 }
@@ -119,6 +179,11 @@ pub enum InboxError {
     NotScheduled(InboxItemId),
     #[error("scheduled text is empty")]
     EmptyText,
+    /// A direct message with nothing in it. Nothing was written: an empty turn
+    /// would ask the model to act on nothing, and the queue would carry an item
+    /// no reader could tell apart from a blank steer.
+    #[error("the message is empty; there is nothing to ask for")]
+    EmptyInstruction,
     #[error("inbox payload error: {0}")]
     Payload(#[from] serde_json::Error),
 }
@@ -146,13 +211,223 @@ impl Inbox {
             created_at: Utc::now(),
             status: InboxItemStatus::Pending,
         };
+        self.append_item(session_id, item.clone(), Vec::new(), actor).await?;
+        Ok(item)
+    }
+
+    /// Record a direct user instruction, decide what it displaces, and queue
+    /// whatever it asks for — as one append.
+    ///
+    /// This is the path a person's message takes into the session. It exists
+    /// because the 2026-11-01 incident had one shape: a new instruction
+    /// arrived, the queue still held the old one, and the scheduler answered
+    /// the old one. Reading the log afterwards could not say which request an
+    /// answer belonged to. So the intent, the queue item it asks for, and the
+    /// withdrawals it causes all land in **one** batch under **one** lease:
+    /// there is no moment where a queued turn exists without the intent that
+    /// asked for it, or where an item was discarded by a message that was never
+    /// recorded.
+    ///
+    /// What it displaces is [`adjudicate::route`]'s decision, not this
+    /// function's: this one only writes down what that decision says. A route
+    /// that displaces nothing writes no withdrawal; a route that displaces
+    /// writes one per instruction it overtakes, and each names the new intent
+    /// as what overtook it.
+    ///
+    /// The stamp is taken once and reused for every record in the batch
+    /// (CONTRACT §7 裁决 #20): the request, the item that waits for it, and the
+    /// withdrawals it caused happened at the same instant by construction. It
+    /// is a parameter rather than a clock read because a caller that already
+    /// has a `now` (the CLI, the web loop) must not have a second one read
+    /// behind its back.
+    pub async fn submit_user_message(
+        &self,
+        session_id: &SessionId,
+        text: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> Result<Submitted, InboxError> {
+        let text = text.into();
+        // Read and append under one lease: a decision about what this message
+        // displaces is only sound against the queue as it is when the batch
+        // lands, and another process driving this session — `agent steer` is
+        // exactly that — can move the sequence in between. (YA-36)
+        let _lease = self.store.lease(session_id).await?;
+        let events = self.store.read_stream(session_id, EventSeq::ZERO, usize::MAX).await?;
+        let next = events.last().map(|stored| stored.seq.next()).unwrap_or(EventSeq::ZERO);
+        let pending_turns: Vec<InboxItem> = fold_inbox(&events)?
+            .into_iter()
+            .filter(|item| item.status == InboxItemStatus::Pending)
+            .filter(|item| item.kind == InboxKind::NextTurn)
+            .collect();
+        let lifecycle = crate::lifecycle::fold(&events);
+        // Whether a run is in flight — the only state an interrupt is addressed
+        // to. A turn waiting on a decision counts: interrupting it is exactly
+        // what a person means by stopping a session that is asking them
+        // something.
+        let has_run = lifecycle.open_run.is_some() || lifecycle.yielded_turn.is_some();
+        // Anything this message could be *about*: a run in flight, a turn
+        // waiting on a decision, or an instruction queued ahead of it.
+        let has_work = has_run || !pending_turns.is_empty();
+        let route = adjudicate::route(&text, adjudicate::RouteState { has_work });
+        let Some(kind) = route.intent_kind() else {
+            return Err(InboxError::EmptyInstruction);
+        };
+
+        // A stop only has an item when there is a run to address: an interrupt
+        // is a request to *a run*, and one queued with nothing running would
+        // kill the next turn before its first step (the same rule
+        // `commands::interrupt` follows). A stop that only empties the queue
+        // does so directly and queues nothing.
+        let item_kind = if route.queues_a_turn() {
+            Some(InboxKind::NextTurn)
+        } else if route == adjudicate::Route::Stop && has_run {
+            Some(InboxKind::Interrupt)
+        } else {
+            None
+        };
+        let mut item = item_kind.map(|kind| InboxItem {
+            item_id: InboxItemId::new(),
+            session_id: session_id.clone(),
+            kind,
+            payload: serde_json::Value::Null,
+            priority: 0,
+            created_at: now,
+            status: InboxItemStatus::Pending,
+        });
+
+        let mut intent = Intent::user_direct(
+            session_id.clone(),
+            text.clone(),
+            item.as_ref().map(|i| i.item_id.clone()).unwrap_or_else(InboxItemId::new),
+            now,
+        );
+        // `user_direct` records what the write path can assert on its own. The
+        // relation and the discharge are the rule layer's answers, so they are
+        // overwritten here rather than guessed in the constructor.
+        intent.kind = kind;
+        if item.is_none() {
+            // Nothing was queued for it: the instruction names no item.
+            intent.item_id = None;
+        }
+        if route == adjudicate::Route::Stop {
+            // A stop does its whole job at once — it withdraws what is queued
+            // and asks the run to stop — so there is no turn that will answer
+            // it later. Recording it as still standing would leave `status`
+            // reporting an instruction that nothing is going to run.
+            intent.status = IntentStatus::Consumed;
+        }
+
+        // What this message takes out of the queue, decided before anything is
+        // written so the new intent can name the intents it replaces.
+        let displaced: Vec<(&InboxItem, Option<IntentId>)> =
+            if route.displaces_pending() || route == adjudicate::Route::Stop {
+                pending_turns.iter().map(|item| (item, item_intent_id(item))).collect()
+            } else {
+                Vec::new()
+            };
+
+        let mut drafts: Vec<EventDraft> = Vec::new();
+        if next == EventSeq::ZERO {
+            drafts.push(crate::session_lifecycle::started_draft(session_id, Actor::User));
+        }
+
+        let stopping = route == adjudicate::Route::Stop;
+        // The intents behind the items this message displaces. An item queued
+        // before the ledger (by a test, a tool, or an older build) is still
+        // displaced — the queue is the queue — but there is no record to mark.
+        let displaced_intents: Vec<IntentId> =
+            displaced.iter().filter_map(|(_, intent)| intent.clone()).collect();
+        if !stopping {
+            // The new request names what it replaced, in the same record that
+            // says it arrived.
+            intent.supersedes = displaced_intents.clone();
+        }
+
+        // The request first, then what it displaced, then where it waits: a
+        // reader following the batch sees the instruction arrive before it sees
+        // anything taken out of the queue because of it.
+        drafts.push(self.draft(
+            session_id,
+            EventType::INTENT_RECORDED,
+            serde_json::to_value(&intent)?,
+            Actor::User,
+        ));
+        let (cause, reason) = if stopping {
+            (DiscardCause::Cancelled, STOPPED_REASON)
+        } else {
+            (DiscardCause::Superseded, SUPERSEDED_REASON)
+        };
+        let mut superseded = Vec::new();
+        let mut cancelled = Vec::new();
+        for (old, old_intent) in &displaced {
+            drafts.push(self.discard_draft(session_id, &old.item_id, cause, Some(reason)).await?);
+            let Some(old_intent) = old_intent else { continue };
+            if stopping {
+                drafts.push(self.draft(
+                    session_id,
+                    EventType::INTENT_CANCELLED,
+                    serde_json::json!({ "intent_id": old_intent, "reason": reason }),
+                    Actor::User,
+                ));
+                cancelled.push(old_intent.clone());
+            } else {
+                drafts.push(self.draft(
+                    session_id,
+                    EventType::INTENT_SUPERSEDED,
+                    serde_json::json!({
+                        "intent_id": old_intent,
+                        "superseded_by": intent.intent_id,
+                    }),
+                    Actor::User,
+                ));
+                superseded.push(old_intent.clone());
+            }
+        }
+
+        if let Some(item) = &mut item {
+            item.payload = match item.kind {
+                InboxKind::Interrupt => serde_json::json!({
+                    "reason": "user_stop",
+                    "intent_id": intent.intent_id,
+                }),
+                _ => serde_json::json!({
+                    "text": text,
+                    "intent_id": intent.intent_id,
+                    "route": route.as_str(),
+                }),
+            };
+            drafts.push(self.draft(
+                session_id,
+                EventType::INBOX_APPENDED,
+                serde_json::to_value(&*item)?,
+                Actor::User,
+            ));
+        }
+
+        self.store.append(session_id, next, drafts).await?;
+        let displaced_items = displaced.iter().map(|(item, _)| item.item_id.clone()).collect();
+        Ok(Submitted { route, intent, item, displaced: displaced_items, superseded, cancelled })
+    }
+
+    /// Append one item, plus any events that must land with it, atomically.
+    ///
+    /// Order in the batch is fixed: `session/started` (when this is the
+    /// session's first event), then `leading`, then `inbox/appended`. A reader
+    /// that sees the item can therefore see everything the item depends on.
+    async fn append_item(
+        &self,
+        session_id: &SessionId,
+        item: InboxItem,
+        leading: Vec<EventDraft>,
+        actor: Actor,
+    ) -> Result<(), InboxError> {
         // Read the log's end and append at it as one step: another process on
         // this session — `agent steer` is exactly this path — can move the
         // sequence in between, and an append from a stale read is refused.
         // (YA-36)
         let _lease = self.store.lease(session_id).await?;
         let next = self.next_seq(session_id).await?;
-        let mut drafts = Vec::with_capacity(2);
+        let mut drafts = Vec::with_capacity(leading.len() + 2);
         // A session used for the first time starts here. `next == 0` means this
         // append is the first event the session will ever have, so writing
         // `session/started` beside it is what makes "a session's log says it
@@ -163,6 +438,7 @@ impl Inbox {
         if next == EventSeq::ZERO {
             drafts.push(crate::session_lifecycle::started_draft(session_id, actor.clone()));
         }
+        drafts.extend(leading);
         drafts.push(self.draft(
             session_id,
             EventType::INBOX_APPENDED,
@@ -170,7 +446,7 @@ impl Inbox {
             actor,
         ));
         self.store.append(session_id, next, drafts).await?;
-        Ok(item)
+        Ok(())
     }
 
     /// Queue text for the turn already in flight.
@@ -607,6 +883,169 @@ mod tests {
 
         inbox.claim(&sid, &claimed.item_id, &RunId::new()).await.unwrap();
         inbox.discard(&sid, &discarded.item_id, DiscardCause::Refused, None).await.unwrap();
+        inbox.submit_user_message(&sid, "lease please", Utc::now()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn submitting_a_user_turn_records_the_intent_beside_the_item() {
+        let (inbox, store, sid) = inbox();
+
+        let submitted =
+            inbox.submit_user_message(&sid, "fix the junction escape", Utc::now()).await.unwrap();
+        let intent = submitted.intent.clone();
+        let item = submitted.item.expect("an instruction opens a turn");
+
+        assert_eq!(item.kind, InboxKind::NextTurn);
+        assert_eq!(item.payload["text"], "fix the junction escape");
+        assert_eq!(item.payload["intent_id"], intent.intent_id.as_str());
+        assert_eq!(intent.item_id.as_ref(), Some(&item.item_id));
+        assert_eq!(intent.text, "fix the junction escape");
+
+        // One append batch: the intent and the item it asks for cannot exist
+        // apart in the log.
+        let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.event.event_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![EventType::SESSION_STARTED, EventType::INTENT_RECORDED, EventType::INBOX_APPENDED]
+        );
+        assert_eq!(events[1].event.actor, Actor::User);
+        assert_eq!(events[1].event.payload["summary"], "fix the junction escape");
+    }
+
+    #[tokio::test]
+    async fn a_new_instruction_supersedes_the_turn_queued_before_it() {
+        let (inbox, store, sid) = inbox();
+
+        let first =
+            inbox.submit_user_message(&sid, "修复 junction 逃逸", Utc::now()).await.unwrap();
+        let second = inbox.submit_user_message(&sid, "先把越权检查补上", Utc::now()).await.unwrap();
+
+        assert_eq!(second.route, adjudicate::Route::NewTask);
+        let first_intent = first.intent.intent_id.clone();
+        assert_eq!(second.superseded, vec![first_intent.clone()]);
+        assert_eq!(second.intent.supersedes, vec![first_intent.clone()]);
+
+        // The old item left the queue as `superseded`, not as work that ran.
+        let old = first.item.expect("the first instruction queued a turn");
+        let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let discarded = events
+            .iter()
+            .find(|e| {
+                e.event.event_type.as_str() == EventType::INBOX_DISCARDED
+                    && e.event.payload["item_id"] == serde_json::json!(old.item_id)
+            })
+            .expect("the old item is recorded as discarded");
+        assert_eq!(discarded.event.payload["cause"], "superseded");
+
+        // Both directions of the relation are on the record: the old intent says
+        // what overtook it, the new one says what it replaced.
+        let ledger = crate::intent::IntentLedger::new(store);
+        let all = ledger.all(&sid).await.unwrap();
+        assert_eq!(all[0].status, IntentStatus::Superseded);
+        assert_eq!(all[0].superseded_by.as_ref(), Some(&second.intent.intent_id));
+        assert_eq!(all[1].status, IntentStatus::Active);
+
+        // And the queue now holds exactly the newer instruction.
+        let pending = inbox.pending(&sid).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].payload["text"], "先把越权检查补上");
+    }
+
+    #[tokio::test]
+    async fn a_continuation_is_queued_beside_the_work_not_instead_of_it() {
+        let (inbox, _, sid) = inbox();
+
+        let first =
+            inbox.submit_user_message(&sid, "修复 junction 逃逸", Utc::now()).await.unwrap();
+        let second = inbox.submit_user_message(&sid, "继续", Utc::now()).await.unwrap();
+
+        assert_eq!(second.route, adjudicate::Route::Continue);
+        assert_eq!(second.intent.kind, agent_protocol::intent::IntentKind::Continuation);
+        assert!(second.superseded.is_empty(), "an acknowledgement displaces nothing");
+
+        let pending = inbox.pending(&sid).await.unwrap();
+        assert_eq!(pending.len(), 2, "both instructions are still queued");
+        let first_item = first.item.expect("the first instruction queued a turn");
+        assert!(pending.iter().any(|item| item.item_id == first_item.item_id));
+    }
+
+    #[tokio::test]
+    async fn a_stop_withdraws_the_queue_and_queues_no_turn() {
+        let (inbox, store, sid) = inbox();
+
+        let first =
+            inbox.submit_user_message(&sid, "修复 junction 逃逸", Utc::now()).await.unwrap();
+        let stop = inbox.submit_user_message(&sid, "停止", Utc::now()).await.unwrap();
+
+        assert_eq!(stop.route, adjudicate::Route::Stop);
+        assert!(stop.item.is_none(), "a stop that has stopped nothing is not a turn");
+        assert_eq!(stop.intent.status, IntentStatus::Consumed);
+        assert_eq!(stop.intent.kind, agent_protocol::intent::IntentKind::Interrupt);
+        assert_eq!(stop.cancelled, vec![first.intent.intent_id.clone()]);
+
+        assert!(inbox.pending(&sid).await.unwrap().is_empty(), "nothing is left to run");
+
+        let events = store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap();
+        let discarded = events
+            .iter()
+            .find(|e| e.event.event_type.as_str() == EventType::INBOX_DISCARDED)
+            .expect("the withdrawal is recorded");
+        assert_eq!(discarded.event.payload["cause"], "cancelled");
+        assert!(
+            events.iter().any(|e| e.event.event_type.as_str() == EventType::INTENT_CANCELLED),
+            "the withdrawn instruction is marked, not silently dropped"
+        );
+
+        let ledger = crate::intent::IntentLedger::new(store);
+        let all = ledger.all(&sid).await.unwrap();
+        assert_eq!(all[0].status, IntentStatus::Cancelled, "withdrawn is not superseded");
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_a_run_is_open_queues_an_interrupt_that_names_it() {
+        let (inbox, store, sid) = inbox();
+        // A run the lifecycle fold can see: `run/started` with the run it
+        // opens (a draft built by `Inbox::draft` names no run, which is right
+        // for the events the queue writes itself and wrong for this one).
+        let started = EventDraft {
+            event_id: EventId::new(),
+            event_type: EventType::new(EventType::RUN_STARTED),
+            schema_version: SchemaVersion::current(),
+            session_id: sid.clone(),
+            run_id: Some(RunId::new()),
+            turn_id: None,
+            step_id: None,
+            actor: Actor::Scheduler,
+            created_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            payload: serde_json::json!({}),
+            metadata: serde_json::json!({}),
+            ignorable: false,
+        };
+        store.append(&sid, EventSeq::ZERO, vec![started]).await.unwrap();
+
+        let stop = inbox.submit_user_message(&sid, "停止", Utc::now()).await.unwrap();
+
+        let interrupt = stop.item.expect("a running session gets an interrupt");
+        assert_eq!(interrupt.kind, InboxKind::Interrupt);
+        assert_eq!(interrupt.payload["reason"], "user_stop");
+        assert_eq!(interrupt.payload["intent_id"], stop.intent.intent_id.as_str());
+        assert_eq!(
+            inbox.pending_interrupt(&sid).await.unwrap().map(|item| item.item_id),
+            Some(interrupt.item_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_message_is_refused_and_writes_nothing() {
+        let (inbox, store, sid) = inbox();
+        assert!(matches!(
+            inbox.submit_user_message(&sid, "   ", Utc::now()).await,
+            Err(InboxError::EmptyInstruction)
+        ));
+        assert!(store.read_stream(&sid, EventSeq::ZERO, usize::MAX).await.unwrap().is_empty());
     }
 
     #[tokio::test]

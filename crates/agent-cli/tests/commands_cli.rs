@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use agent_cli::commands::{self, CommandError, Grant, InterruptOutcome, TurnStart};
-use agent_kernel::approval::ApprovalService;
+use agent_kernel::approval::{ApprovalAuthority, ApprovalService};
 use agent_kernel::inbox::Inbox;
 use agent_kernel::scheduler::Scheduler;
 use agent_loop::DefaultAgentLoop;
@@ -72,6 +72,7 @@ async fn start_turn_returns_the_run_it_drove() {
             assert_eq!(report.stop_reason, StopReason::FinalAnswer);
         }
         TurnStart::NotStarted => panic!("a free session must start the turn"),
+        TurnStart::Stopped(receipt) => panic!("\"hi\" is not a stop: {receipt:?}"),
     }
 }
 
@@ -104,6 +105,19 @@ async fn status_counts_what_is_pending() {
 }
 
 #[tokio::test]
+async fn status_reports_the_latest_intent_a_turn_was_asked_for() {
+    let (scheduler, _, sid) = harness();
+
+    commands::start_turn(&scheduler, &sid, "hi", Utc::now()).await.unwrap();
+
+    let report = commands::status(&scheduler, &sid).await.unwrap();
+    let latest = report.latest_intent_id.expect("the instruction was recorded");
+    let ledger = scheduler.intents();
+    assert_eq!(ledger.latest(&sid).await.unwrap().expect("an intent").intent_id, latest);
+    assert_eq!(ledger.all(&sid).await.unwrap().len(), 1, "one direct instruction, one intent");
+}
+
+#[tokio::test]
 async fn a_grant_reports_the_reply_and_queues_a_wakeup() {
     let (_, store, sid) = harness();
     let approvals = ApprovalService::new(store.clone());
@@ -120,6 +134,7 @@ async fn a_grant_reports_the_reply_and_queues_a_wakeup() {
         request.approval_id.as_str(),
         Grant::Once,
         "user",
+        &ApprovalAuthority::test(),
     )
     .await
     .unwrap();

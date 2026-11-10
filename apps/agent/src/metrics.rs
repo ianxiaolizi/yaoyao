@@ -216,19 +216,82 @@ fn render_text(report: &MetricsReport) -> String {
         lines.push(format!("judgment blocks: {}", totals.judgment_required));
     }
 
+    // The work itself, after the bookkeeping: what it cost, what changed, what
+    // checked it, and how the log left it.
+    lines.push(task_line(
+        &totals.task,
+        totals.tools.calls,
+        &final_label(totals.final_status.as_deref(), totals.turns.open),
+    ));
+
     lines.push("sessions:".to_string());
     for row in &report.sessions {
         let metrics = &row.metrics;
-        lines.push(format!(
+        let mut line = format!(
             "  {}  {} turn(s), {} failed tool(s), {} token(s), {}",
             row.session_id.as_str(),
             metrics.turns.started,
             metrics.tools.failed,
             metrics.tokens.total_tokens,
             seconds(metrics.runs.wall_time_ms)
-        ));
+        );
+        // Only where there was work to report: a session that never started a
+        // step has no cost to show, and a zero suffix would only add noise.
+        if metrics.task.steps > 0
+            || metrics.task.edits > 0
+            || metrics.task.verifications > 0
+            || metrics.task.post_failure_edits > 0
+        {
+            line.push_str(&format!(
+                ", {} step(s), {} tool call(s), {} edit(s), {} verification(s), \
+                 {} post-failure edit(s), final {}",
+                metrics.task.steps,
+                metrics.tools.calls,
+                metrics.task.edits,
+                metrics.task.verifications,
+                metrics.task.post_failure_edits,
+                final_label(metrics.final_status.as_deref(), metrics.turns.open),
+            ));
+        }
+        lines.push(line);
     }
     lines.join("\n")
+}
+
+/// How a task ended, in the report's words.
+///
+/// A session with no terminal event is `open` when it still has a turn in
+/// flight, and `none` when it never started one. The two are different facts:
+/// one is work in progress, the other is a log that has no work in it.
+fn final_label(status: Option<&str>, open_turns: u64) -> String {
+    match status {
+        Some(status) => status.to_string(),
+        None if open_turns > 0 => "open".to_string(),
+        None => "none".to_string(),
+    }
+}
+
+/// The task totals as one line, with the last change's short digest.
+fn task_line(
+    task: &agent_projection::metrics::TaskMetrics,
+    tool_calls: u64,
+    final_status: &str,
+) -> String {
+    let mut line = format!(
+        "task: {} step(s), {tool_calls} tool call(s), {} edit(s), {} verification(s), \
+         {} criterion check(s), {} post-failure edit(s), final {final_status}",
+        task.steps, task.edits, task.verifications, task.criterion_checks, task.post_failure_edits,
+    );
+    if let (Some(path), Some(digest)) = (&task.last_modified_path, &task.last_modified_sha256) {
+        line.push_str(&format!(", last change {path} {}", short_digest(digest)));
+    }
+    line
+}
+
+/// The first twelve characters of a digest — enough to compare two reports by
+/// eye, and always on a character boundary.
+fn short_digest(digest: &str) -> String {
+    digest.chars().take(12).collect()
 }
 
 /// `key=count` pairs in the map's own (sorted) order.
@@ -359,6 +422,128 @@ mod tests {
             run_metrics(&store(dir.path()), dir.path(), None, None, false).await.expect("runs");
         assert_eq!(outcome.verdict, agent_cli::Verdict::Answered);
         assert_eq!(text(&outcome), "no sessions");
+    }
+
+    #[tokio::test]
+    async fn the_text_report_names_the_task_and_the_last_change() {
+        let dir = store_with(&[(
+            "one",
+            vec![
+                draft(
+                    "one",
+                    EventType::TOOL_COMPLETED,
+                    serde_json::json!({ "tool_name": "fs.write" }),
+                ),
+                draft(
+                    "one",
+                    EventType::VERIFICATION_RECORDED,
+                    serde_json::json!({ "check_id": "c1" }),
+                ),
+                draft(
+                    "one",
+                    EventType::WORKSPACE_CHANGES_RECORDED,
+                    serde_json::json!({ "changes": [{
+                        "relative_path": "web/app.js",
+                        "after_sha256": "0123456789abcdef",
+                    }] }),
+                ),
+            ],
+        )])
+        .await;
+        let outcome =
+            run_metrics(&store(dir.path()), dir.path(), None, None, false).await.expect("runs");
+        let rendered = text(&outcome);
+        assert!(
+            rendered.contains(
+                "task: 0 step(s), 0 tool call(s), 1 edit(s), 1 verification(s), \
+                 0 criterion check(s), 0 post-failure edit(s), final none, \
+                 last change web/app.js 0123456789ab"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "0 step(s), 0 tool call(s), 1 edit(s), 1 verification(s), \
+                 0 post-failure edit(s), final none"
+            ),
+            "the row has the suffix: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_counts_edits_after_a_failed_check_until_a_pass() {
+        let dir = store_with(&[(
+            "one",
+            vec![
+                draft("one", EventType::STEP_STARTED, serde_json::json!({})),
+                draft(
+                    "one",
+                    EventType::VERIFICATION_RECORDED,
+                    serde_json::json!({ "check_id": "c1", "status": "failed" }),
+                ),
+                draft(
+                    "one",
+                    EventType::TOOL_COMPLETED,
+                    serde_json::json!({ "tool_name": "fs.write" }),
+                ),
+                draft(
+                    "one",
+                    EventType::TOOL_COMPLETED,
+                    serde_json::json!({ "tool_name": "fs.edit" }),
+                ),
+                draft(
+                    "one",
+                    EventType::VERIFICATION_RECORDED,
+                    serde_json::json!({ "check_id": "c2", "status": "passed" }),
+                ),
+                // The pass cleared the state: this edit is ordinary work.
+                draft(
+                    "one",
+                    EventType::TOOL_COMPLETED,
+                    serde_json::json!({ "tool_name": "fs.write" }),
+                ),
+                draft("one", EventType::TURN_COMPLETED, serde_json::json!({})),
+            ],
+        )])
+        .await;
+        let outcome =
+            run_metrics(&store(dir.path()), dir.path(), None, None, false).await.expect("runs");
+        let rendered = text(&outcome);
+        assert!(
+            rendered.contains(
+                "task: 1 step(s), 0 tool call(s), 3 edit(s), 2 verification(s), \
+                 0 criterion check(s), 2 post-failure edit(s), final completed:final_answer"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_json_answer_carries_the_task_block_and_omits_a_missing_digest() {
+        let dir = store_with(&[(
+            "one",
+            vec![draft("one", EventType::TURN_STARTED, serde_json::json!({}))],
+        )])
+        .await;
+        let outcome =
+            run_metrics(&store(dir.path()), dir.path(), None, None, true).await.expect("runs");
+        let CliOutput::Json(document) = &outcome.output else {
+            panic!("--json must answer with one object");
+        };
+        let value: serde_json::Value = serde_json::from_str(document.as_str()).expect("parses");
+        assert_eq!(value["totals"]["task"]["steps"], 0);
+        assert_eq!(value["totals"]["task"]["edits"], 0);
+        assert_eq!(value["totals"]["task"]["verifications"], 0);
+        assert_eq!(value["totals"]["task"]["criterion_checks"], 0);
+        assert_eq!(value["totals"]["task"]["post_failure_edits"], 0);
+        assert!(
+            value["totals"]["task"].get("last_modified_path").is_none(),
+            "absent digests are omitted"
+        );
+        assert!(
+            value["totals"].get("final_status").is_none(),
+            "no terminal event, no invented ending"
+        );
     }
 
     #[tokio::test]

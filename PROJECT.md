@@ -29,6 +29,15 @@
 - **能力尽量沉淀到内核**：重复出现的判断应逐步变成可验证的确定性过程；模型负责理解和处理前沿问题。
 - **个人优先**：先在一个有明确裁判的领域做深，再扩展到更广的个人任务。
 
+个人模式的发布边界是 Windows-only、单受信任用户、本地回环 GUI。`coding` 的 shell 必须在
+AppContainer 中运行；`internet` 是宽泛且显式 opt-in 的 `internetClient`，不是 origin
+allowlist。真实模型 `kernel_eval` 至少 3 次且全部通过前，不得标记 personal build ready。
+公开多租户、账号、计费、配额与远程沙箱不在范围内。
+
+个人构建的评测门是真实 OpenAI-compatible 端点上的 `kernel_eval`：至少重复 3 次并保存报告。
+没有这份报告，只能称为开发验证通过，不能称为 personal build ready。个人模式仍是
+Windows-only，公开多租户服务不在当前范围内。
+
 阶段计划、设计细节、真实使用证据和版本演进记录在项目工作区；稳定的不变量与裁决记录在 `CONTRACT.md` §7。
 
 ## 架构与依赖方向（硬规则）
@@ -53,7 +62,7 @@ protocol → 尽量零依赖    ports → protocol    kernel → ports/protocol/
 2. **`loop`（与 `kernel`）不依赖 `projection`**——loop 只认 `agent-ports` 的 `ContextEngine` 端口，实现由 apps 层注入。否则投影引擎会反转依赖方向。
 3. **依赖方向由测试把守**，不靠自觉：`crates/agent-testkit/tests/architecture_boundaries.rs` 用集合相等双向钉住**两张**矩阵——运行期 `[dependencies]` 与测试期 `[dev-dependencies]`。清单用 `toml` **解析**而不是逐行扫，所以点表写法、重命名与不含斜杠的成员都看得见；另有一条守卫要求每个 `agent-*` 依赖必须是 workspace 内的 `path`。
 
-workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin）。测试期允许跨层（适配器要对着真调用方测，而不是对着它的假替身），但每一处都必须在矩阵里注明理由，不得悄悄发生。
+workspace 现有 **25 个成员**（24 个 lib crate + `apps/agent` 一个 bin）。测试期允许跨层（适配器要对着真调用方测，而不是对着它的假替身），但每一处都必须在矩阵里注明理由，不得悄悄发生。
 
 ## crate 地图
 
@@ -62,7 +71,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-protocol` | IDs, Event, DTO, schema 版本（零业务依赖）；请求面是 `InboxItem`；`reason` 是推理链节点与具名规则表 |
 | `agent-ports` | EventStore / ModelProvider / ToolProvider / AgentLoop / ToolGateway / ContextEngine 等 trait 缝 |
 | `agent-config` | 配置分层与解析 |
-| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded、reason 链折叠 |
+| `agent-kernel` | Inbox、Scheduler、Recovery、Policy、Approval、PermissionService（执行前决策账本）、ResourceGuard、Redactor、plugin、fork、resume、subagent、guarded（含秘密引用、快照、安全审查门）、reason 链折叠 |
 | `agent-loop` | `DefaultAgentLoop`（model → tool → model → answer） |
 | `agent-projection` | 投影引擎 + SessionProjection + ModelContextProjection（纯 fold + checkpoint） |
 | `agent-context` | `ProjectionContextEngine`（唯一同时看见 projection 引擎与 loop 面向的端口 `agent-ports` 的 crate；运行期不依赖 `agent-loop`，那是 dev 依赖） |
@@ -74,7 +83,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-tools-fs` | `FsToolProvider`（`fs.list`/`fs.glob`/`fs.grep`/`fs.read`/`fs.write`/`fs.edit`/`shell.run`）+ `LocalExecutionEnvironment`（含 `list_dir`，符号链接只报告不跟随） |
 | `agent-tools-git` | git 工具（编码证据链）：`git.status`/`git.diff` 由进程内 libgit2 读取仓库，不 spawn `git`（AppContainer 下 git 拿不到工作目录，`CONTRACT.md` §7 #59） |
 | `agent-tools-mcp` | MCP 工具适配器（能力闸门下的注册） |
-| `agent-tools-web` | `web.request`：一次 HTTP 调用，只去公网地址（每跳重定向重新校验、DNS 钉住已校验地址）、body 截在 1 MB、per-call 超时上限 120 s（`CONTRACT.md` §7 #144） |
+| `agent-tools-web` | `web.request`：一次只读（`GET`/`HEAD`）HTTP 调用，只去公网地址与用户层 allowlist 里的 origin（每跳重定向重新校验并重新比对 allowlist、DNS 钉住已校验地址）、结果标 `Untrusted`、body 截在 1 MB、per-call 超时上限 120 s（`CONTRACT.md` §7 #144/#180） |
 | `agent-subagent-stdio` | 外部 CLI subagent 适配器（stdio 后端） |
 | `agent-sandbox-win` | Windows AppContainer 执行后端：profile/SID、ACL 授予、`STARTUPINFOEX` + Job Object 启动；唯一允许 `unsafe` 的 crate（`CONTRACT.md` §7 #38） |
 | `agent-model-openai` | OpenAI 兼容适配器（SSE 流式 + ContentBlock 规范化） |
@@ -84,7 +93,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | `agent-web` | 本地回环 HTTP 入口：内嵌 GUI、一次性令牌、会话/transcript/thinking/why/diff/context/plan/subagent/schedule 读模型、SSE（历史重放 + 实时预览）、导出与 artifact、起轮/审批/过期续跑/分叉/插话/中断；写操作经 `Backend` 缝交给 `apps/agent` 的 `WebBackend`，再由它调用同一套 `agent-cli` 具名命令，不复制内核装配 |
 | `apps/agent` | 唯一具体组装入口（二进制）；`instructions` 模块把工作区根部的 `AGENTS.md` + 内置前言组成每次运行的系统指令 |
 
-`agent-kernel` 一个 crate 占 src 的约四分之一；`agent-loop`、`agent-cli` 是单文件大模块。
+`agent-kernel` 一个 crate 占 src 的约四分之一；`agent-loop` 的默认循环已拆成 `default.rs`、`default/agent_loop_impl.rs` 与各 recovery/limits 子模块，`agent-cli` 仍较大但受模块大小守卫约束。
 
 ## 关键设计决策
 
@@ -95,7 +104,7 @@ workspace 现有 **23 个成员**（22 个 lib crate + `apps/agent` 一个 bin�
 | 权限模型 | fail closed：缺策略或能力时拒绝，不静默降级 |
 | Inbox | 内核一等能力，统一承载用户输入、审批、定时唤醒与 steering |
 | 模型接入 | provider-neutral 内部协议；第一版提供 OpenAI-compatible 适配器 |
-| 前端 | 单页静态资源，无构建步骤、无框架；时间线按回合分块**键控增量更新**（只重画变化的那块）、点击走一次事件委托，活跃回合的流式文本只重绘自身；性能只与本地记录的基线比（`scripts/gui/perf.mjs`），虚拟滚动等有数据再定（`CONTRACT.md` §7 #120） |
+| 前端 | 单页静态资源，Vite + TypeScript 构建、无框架；`web/dist` 作为构建产物提交并嵌入二进制；时间线按回合分块**键控增量更新**（只重画变化的那块）、点击走一次事件委托，活跃回合的流式文本只重绘自身；性能只与本地记录的基线比（`scripts/gui/perf.mjs`），虚拟滚动等有数据再定（`CONTRACT.md` §7 #120） |
 | 工具扩展 | 工具名全局唯一；MCP 是工具来源之一，不成为内核协议 |
 | 上下文 | 稳定系统前缀 + 状态/任务层 + 计划与步骤账本；按工作集预算压缩 |
 | 审计 | 持久化事件是事实源；请求、工具定义、审批和 artifact 均可回读 |
@@ -142,9 +151,11 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 
 `app-container` 需要先以管理员权限运行 `sandbox setup`。它的授权、网络策略、启动和保活细节由 `CONTRACT.md` §7 约束；选中但环境未准备好时退 `2`，不会悄悄回落到 `local`。`AGENT_SANDBOX_NETWORK=allow|deny` 控制沙箱网络，默认 `deny`。它只对能收回网络的后端生效：`local` 以你的用户身份起命令，网络就是你的网络，`deny` 在那里没有作用（装配时打一行提示，能力层也如实告诉模型「不被该后端限制」）。
 
-模型档位写在 profile 的 `[model]` 里：`main` 是本次运行的模型，`fast` / `thinking` 留给摘要与审查；`--model` 只覆盖 `main`，不会动另两档。今天**只有上下文压缩**按 `summarize` 真的走到 `fast`，`review` 还没有生产者，所以配了 `thinking` 也只会被记录、不会被用到。档位只换模型名，不换 provider——一个进程仍然只说一种 provider kind。没配任何档位时行为与以前完全一致，`profile/resolved` 也不多一个字段（`CONTRACT.md` §7 #118）。配了 `fast` 时，摘要请求用那个模型自己的数字：窗口与补全上限按它声明的派生，推理深度只从它声明过的档位里挑；摘要候选装不下时按整组取最旧的那段，一段都装不下才回落到 `main`（`CONTRACT.md` §7 #157）。
+模型档位写在 profile 的 `[model]` 里：`main` 是本次运行的模型，`fast` / `thinking` 留给摘要与审查；`--model` 只覆盖 `main`，不会动另两档。今天**只有上下文压缩**按 `summarize` 真的走到 `fast`，`review` 还没有生产者，所以配了 `thinking` 也只会被记录、不会被用到。档位只换模型名，不换 provider——一个进程仍然只说一种 provider kind。没配任何档位时行为与以前完全一致，`profile/resolved` 也不多一个字段（`CONTRACT.md` §7 #118）。配了 `fast` 时，摘要请求用那个模型自己的数字：窗口与补全上限按它声明的派生，推理深度只从它声明过的档位里挑；摘要候选装不下时按整组取最旧的那段，一段都装不下才回落到 `main`；只有 cap、没有完整摘要预算的旧快照同样强制回落到 `main`。显式 reasoning effort 若 fast 模型未声明会在装配期拒绝启动（`CONTRACT.md` §7 #157）。
 
 上下文预算不再写死。路由确定后，爻爻先 `GET /models` 问模型自己声明能装多少，再按预设（`[budget] preset`：`frugal`/`balanced`/`deep`/`max`，默认 `balanced` = 窗口的 1/4）派生这一轮冻结的 `ResolvedContextBudget`：物理窗口、输入工作集、补全上限（**含 reasoning tokens**）、补全上界、压缩预留、压缩触发点、最近保留量。派生是纯整数运算，每个字段的来源（`provider:/models`、`preset:balanced`、`derived:0.25W`、`config`、`fallback`）随 `profile/resolved` 一起落盘，`context inspect` 读的就是这份记录。端点答不出时用保守的 131,072 窗口并标 `fallback`，不再回到 8,000。旧配置里的 `max_input_tokens`/`max_output_tokens` 仍可用；`reserved_output_tokens` 接受但忽略（记一条 note）。模型只产出思路、`finish_reason = length` 时，本次运行会带更大额度（已在物理上限时改降推理深度）重问一次；第二次仍是纯思考才以 `max_output_tokens` 结束，并说明是思考烧完了额度。provider 明确拒绝一条请求太长时（413，或带上下文长度信号的 400），本次运行不重发同一份字节：先结算，再按原子组从最旧删到工作集与触发点取小者以下，把删掉的东西记成一条 `context/compacted`（`strategy = "overflow-trim"`），换新 attempt 只重试一次；再被拒就以 `FatalError` 结束，不会循环。当前用户输入、回合中的用户消息和最新工具周期永远不在删除范围里（`CONTRACT.md` §7 #156、#158）。传输层同理：连接 30 秒、首事件 60 秒、流内空闲 300 秒，没有总时长上限——持续出字的流不会被砍（`CONTRACT.md` §7 #151–#158）。
+
+步数预算与上下文预算分开。`[budget] max_steps` 省略时主循环没有固定步数上限；显式正整数仍在该步数边界停车，`0` 是非法配置。旧 `profile/resolved` 里的数字继续按显式上限读取，缺字段按历史默认 8 读取，新快照的无上限写 JSON `null`。不再因为配置了 Token 或墙钟预算就自动补 300 步；用户取消、停滞检测、工具调用、Token、墙钟、错误和完成判据仍是停止条件。子代理撞到显式步数上限时返回 partial，而不是伪装完成（`CONTRACT.md` §7 #193）。
 
 记忆检索是**词面**的：`entries` 表存事件正文，`entries_fts`（FTS5，`tokenize='trigram'`，external content）负责查找。查询三个字符以上走 trigram 短语匹配，两字（中文常用词，例如「记账」）退回子串扫描——trigram 没有更短的 token，硬走索引会静默零命中。命中按 `score` 排序：`-bm25`（词在事件里有多密、事件有多短）+ 按日志末尾归一的时间项 + 事件种类权重（人说的话 0.3 / 助手的话 0.1 / 工具输出 0），同分取新。`score` 只在一次结果内可比，不是概率；`memory search --json` 会给出它。索引版本 `memory-index/0.2.0`，旧库搜索会得到版本错误，`memory reindex` 重建即可。`CONTRACT.md` §7 #119。
 
@@ -230,8 +241,10 @@ Windows 注意：Git Bash 的 `/usr/bin/link` 会遮蔽 MSVC 的 `link.exe` 导�
 
 | 文档 | 回答什么 | 谁该读 |
 |---|---|---|
+| `README.md` | 快速启动、开发命令、Web GUI 入口与安全提示 | 第一次运行或开发 |
 | `PROJECT.md`（本文件） | 要成为什么 / 架构与依赖 / 怎么跑 | 所有人，第一次进项目 |
 | `CONTRACT.md` | **不变量与判据**：事实源、fail closed、退出码、租约、命名、版本化；术语与分类口径 | **改任何一行代码之前** |
 | `STYLE.md` | 代码风格与工程规则：`deny(unsafe_code)`、unwrap 禁令、错误类型、测试与提交约定 | 写代码时 |
+| `SECURITY.md` | 信任边界、安全模型与漏洞报告方式 | 涉及执行、权限或发布时 |
 
 阶段计划、实施记录、真实使用证据和版本演进不进入本仓文档，统一放在项目工作区。

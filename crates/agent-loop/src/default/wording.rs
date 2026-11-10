@@ -66,6 +66,7 @@ pub(super) fn ending_word(ending: TurnEnding) -> String {
         TurnEnding::Cancelled => "cancelled",
         TurnEnding::Interrupted => "interrupted",
         TurnEnding::Yielded => "yielded",
+        TurnEnding::Parked => "parked",
     })
 }
 

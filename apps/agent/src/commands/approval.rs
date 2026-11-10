@@ -1,8 +1,11 @@
 //! `approve`, `deny` and `tool`: the verbs that settle or exercise the tool
 //! boundary.
 
+use std::io::IsTerminal;
+
 use agent_cli::args::Args;
 use agent_cli::{run_approve, run_deny, run_tool};
+use agent_kernel::approval::ApprovalAuthority;
 
 use crate::support::{assemble, chain_start, watch};
 use crate::{EXIT_DID_NOT_RUN, exit_on, positionals};
@@ -14,6 +17,16 @@ pub(crate) async fn approve(args: &Args) {
         std::process::exit(EXIT_DID_NOT_RUN);
     };
     let scope = positional.get(1).map(|s| s.as_str()).unwrap_or("once");
+    // The answer has to come from a person. A tool child process inherits a
+    // pipe rather than a terminal, so it cannot produce this value at all —
+    // which is the point: the model cannot approve its own calls. (B4)
+    let authority = match ApprovalAuthority::interactive_tty(std::io::stdin().is_terminal()) {
+        Ok(authority) => authority,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(EXIT_DID_NOT_RUN);
+        }
+    };
     let runtime = assemble(args).await;
     let from = chain_start(runtime.store.as_ref(), args).await;
 
@@ -27,6 +40,7 @@ pub(crate) async fn approve(args: &Args) {
             &args.session,
             approval_id,
             scope,
+            &authority,
             args.json,
         ),
     )

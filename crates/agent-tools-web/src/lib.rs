@@ -12,7 +12,7 @@
 pub mod guard;
 mod provider;
 
-pub use guard::{Addresses, GuardError, Target, is_public};
+pub use guard::{Addresses, GuardError, NetworkAllowlist, Origin, OriginError, Target, is_public};
 pub use provider::{
     MAX_RESPONSE_BYTES, MAX_WEB_TIMEOUT_MS, WEB_TIMEOUT_MS, WEB_TOOL_NAME, WebToolProvider,
 };

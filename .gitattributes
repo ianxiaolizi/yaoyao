@@ -1,0 +1,6 @@
+# The committed web bundle is compared byte-for-byte in CI. On Windows a
+# CRLF checkout (core.autocrlf=true is the installer default) makes the
+# generated HTML/CSS/JS differ from the committed files even though no source
+# changed, and the page job reports a stale bundle. Pin the working tree to LF
+# for the whole tree the page build reads and writes.
+web/** text eol=lf

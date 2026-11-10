@@ -283,6 +283,22 @@ impl ModelMessage {
         }
     }
 
+    /// A reminder that one file has been edited repeatedly without a passing
+    /// check, for one turn.
+    ///
+    /// The sibling of [`Self::stall_notice_for_turn`]: same placement, same
+    /// role, same uid-per-turn replacement, and never folded into history. The
+    /// stall notice is about steps that learned nothing; this one is about a
+    /// file that has been rewritten without being verified, which can happen
+    /// while every step still produces new evidence.
+    pub fn convergence_notice_for_turn(turn_id: &TurnId, text: impl Into<String>) -> Self {
+        Self {
+            message_uid: MessageUid::from_string(format!("msg/convergence/{turn_id}")),
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(text)],
+        }
+    }
+
     /// Where the run stands, placed at the tail of every request.
     ///
     /// Objective facts (steps, budget, the last failure) and the model's own

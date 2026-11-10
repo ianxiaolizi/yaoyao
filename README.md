@@ -28,12 +28,29 @@
 
 当前版本只以 Windows 为主要运行目标。其他平台尚未纳入 CI。
 
+## 目录结构
+
+| 路径 | 职责 |
+|---|---|
+| `apps/agent/` | CLI 入口、运行时装配与端到端测试 |
+| `crates/` | 24 个 workspace lib crate；协议、端口、内核、循环、工具、存储与 Web 分层 |
+| `web/` | GUI 源码；`web/dist` 是主动纳入版本库的构建产物 |
+| `scripts/` | 启动、测试、覆盖率、发布验证与浏览器自动化脚本 |
+| `perf/` | 性能基线数据 |
+| `.github/` | CI 配置 |
+| `target/`、`.agent-data/`、`.superpowers/`、`node_modules/` | 本地生成物或代理过程状态，均不提交 |
+
+稳定的工程文档位于仓库根目录；阶段计划、实施记录和实验数据不进入主仓库。
+
 ## 双击启动
 
-双击仓库根目录的 `启动爻爻.cmd`（它只负责调 `scripts\gui\start.ps1`，真正的逻辑在那一个脚本里）：
+双击仓库根目录的 `启动爻爻.cmd`（或 ASCII 名 `start-yaoyao.cmd`；两者都只调
+`scripts\gui\start.ps1`，真正的逻辑在那一个脚本里）：
 
+- 在 `web/src` 或前端入口比 `web/dist` 新时先 `pnpm build`，再把 `web/dist` 编进二进制；
 - 自动构建 `target\debug\agent.exe`；
-- 使用 `G:\yaoyao-work` 作为工作区（存在时），数据目录用 `G:\yaoyao-work\.agent`；
+- 使用 `G:\yaoyao-work` 作为工作区（存在时）；
+- 数据目录默认不设置，由二进制决定（显式设置时必须是工作区之外的绝对路径）；
 - 在 `7441` 起服务；
 - 读到带一次性令牌的 URL 后自动打开默认浏览器；
 - 控制台保留服务日志，Ctrl+C 停止。
@@ -49,6 +66,15 @@ notepad scripts\gui\start.local.ps1
 
 `start.local.ps1` 已在 `.gitignore` 里，可以放模型 key，不要提交。示例里给了
 DeepSeek / OpenAI-compatible 的四个环境变量。
+
+步数预算默认不设固定上限。`[budget] max_steps` 省略时，主循环会继续到正常完成或其他显式停止条件；需要严格上限时再写正整数：
+
+```toml
+[budget]
+# max_steps = 20
+```
+
+已有配置中的 `max_steps` 行必须删除，才会得到无固定步数上限的行为。`0` 不是“无限”，会被拒绝；`max_tool_calls`、`max_total_tokens`、`wall_clock_timeout` 和停滞检测仍是独立的安全阀。
 
 启动器参数（直接跑 PowerShell 脚本时）：
 
@@ -76,6 +102,36 @@ powershell -ExecutionPolicy Bypass -File scripts\test.ps1   # fmt + clippy + 全
 cargo run -p agent -- ask "hello"
 ```
 
+## 个人配置档位
+
+个人模板在 `examples/personal/config.toml`，提供 `safe`、`coding`、
+`coding-online` 和 `research` 四个档位。把配置放到模型不可写的位置，再选择档位：
+
+```powershell
+$env:AGENT_USER_CONFIG = "$env:LOCALAPPDATA\yaoyao-agent\personal-config.toml"
+$env:AGENT_SANDBOX = 'app-container'
+cargo run -p agent -- --profile coding ask "hello"
+```
+
+`coding` 每次 `shell.run` 都询问，命令后端必须是 `app-container`，网络保持
+`deny`。需要让命令访问包管理器时，显式设置
+`AGENT_SANDBOX_NETWORK=internet`；这是 AppContainer 的宽泛出站能力，不是站点白名单。
+`coding-online` 另外允许只读的 `web.request`，其可访问源仍由用户配置的
+`[network] allow` 限定；它不会被解释成命令的 origin allowlist。不需要联网时继续用
+`coding` + `deny`。
+
+### 真实模型评测门
+
+在个人配置和真实模型环境变量就绪后运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\personal\eval.ps1 -Runs 3
+```
+
+脚本只打印通过/失败和报告路径，不打印 key；报告写到
+`%LOCALAPPDATA%\yaoyao-agent\eval\`。没有完成至少 3 次真实端点评测时，不应把构建称为
+personal build ready。
+
 连接 OpenAI-compatible 端点：
 
 ```powershell
@@ -86,6 +142,28 @@ $env:AGENT_MODEL_API_KEY = '<your-key>'
 ```
 
 凭据只通过环境变量传入，不写入仓库、事件日志或模型上下文。
+
+### 便携包
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\personal\package.ps1
+```
+
+输出在 `scripts\personal\dist\yaoyao-personal\`：`agent.exe`、`启动爻爻.cmd`、
+`config.example.toml`、`README.txt` 和仅供对照的 `web\dist`。包内没有 API key、
+事件日志、`.agent-data` 或开发机的 `start.local.ps1`。
+
+### 备份与诊断
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\personal\backup.ps1
+powershell -ExecutionPolicy Bypass -File scripts\personal\diagnose.ps1
+```
+
+备份默认写到 `%LOCALAPPDATA%\yaoyao-agent\backups\`，包含逐文件 SHA-256 清单，且不删除
+源数据。支持包默认写到 `%LOCALAPPDATA%\yaoyao-agent\diagnostics\`，包含 `doctor.txt`、
+`metrics.txt`、最近会话的 redacted export 与 `manifest.json`；所有匹配
+`*KEY*` / `*TOKEN*` / `*SECRET*` 的环境变量值在打包前都会被替换。
 
 ## 本地 Web GUI
 
@@ -146,6 +224,34 @@ node scripts/gui/smoke.mjs
 
 阶段计划、真实使用证据和版本演进记录在独立项目工作区，不进入本仓库。
 
+## 个人模式验收边界
+
+- 个人模式仅支持 Windows 10/11，面向一台受信任机器上的一个本地用户。
+- `coding` / `coding-online` 的 `shell.run` 必须运行在 `app-container`；`local` 永不执行
+  高风险命令，也不会被当作 AppContainer 失败后的回退。
+- `internet` 是显式、宽泛的 AppContainer `internetClient` opt-in，默认 `deny`；它不是站点
+  allowlist。
+- `coding-online` 把只读 `web.request` 与宽泛 `internetClient` 分开描述；前者仍受用户配置的
+  站点 allowlist 约束，后者不受站点列表约束。
+- 真实 OpenAI-compatible 端点的 3 次 `kernel_eval` 必须产生并保存报告，且全部任务通过，
+  才可称为 personal build ready。2026-11-10 的 3 次全量报告为 36/36 通过，报告在
+  `%LOCALAPPDATA%\yaoyao-agent\eval\`；真实模型评测门已过，其余验收项（新机器 setup、
+  真实任务重启与审批续跑、备份不泄密）仍以对应脚本或手工记录为准。
+- 公网监听、账号、租户、配额、计费和多租户隔离不在个人模式范围内。
+
+## 验证状态
+
+以下是 2026-11-10 本次更新后的验证边界；此前记录保留，CI 会按自己的 job 重新运行对应检查。
+
+| 验证 | 状态 | 说明 |
+|---|---|---|
+| Rust 离线门（fmt / clippy / workspace tests） | 已跑 | `powershell -ExecutionPolicy Bypass -File scripts\test.ps1` |
+| TTY 下 stdin 与工具子进程审批回归 | 已跑 | `agent-tools-fs` stdin 测试与 `security_regression` 审批回归 |
+| 真实 OpenAI-compatible endpoint | 已跑，通过 | 2026-11-10 3 次全量 `kernel_eval` 为 36/36；报告在 `%LOCALAPPDATA%\yaoyao-agent\eval\` |
+| AppContainer live | 已跑 | `scripts\sandbox-live.ps1 -DebugBuild -Jobs 1`：受限进程、stdin/stdout、内核拒绝、文件/Git 与 headless Edge 渲染通过 |
+| 真实公网 `web.request` | 未跑 | 需要显式运行对应 live 测试 |
+| 第三方 MCP | 已跑 | `mcp_third_party` 使用 npm 与真实 stdio server |
+| GUI smoke / perf | 已跑 | GUI smoke 174 PASS / 0 FAIL；AppContainer 能力清单与性能门通过 |
 ## 安全边界
 
 - 不要将 `shell.run` 暴露给不可信用户。

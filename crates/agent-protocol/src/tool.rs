@@ -11,6 +11,7 @@
 //! field on the request would be one the caller could fill with a decision
 //! nobody made.
 
+use crate::permission::AuthorizationSubject;
 use crate::permissions::{
     ArtifactRef, Capability, PolicyDecision, RedactionMetadata, RefusalLayer,
 };
@@ -159,12 +160,22 @@ pub struct ToolInvocation {
     /// The model's `ToolUse` id this invocation came from. `None` for
     /// invocations started outside a model response, such as `agent tool`.
     pub provider_tool_call_id: Option<String>,
+    /// The intent and revision this call belongs to. The loop fills this from
+    /// the turn context; a manual CLI call leaves it absent and the gateway
+    /// names the call `manual:<session>` at revision zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_subject: Option<AuthorizationSubject>,
 }
 
 impl ToolInvocation {
     /// An invocation proposed without a model-originated call id.
     pub fn proposed(tool_name: impl Into<String>, arguments: serde_json::Value) -> Self {
-        Self { tool_name: tool_name.into(), arguments, provider_tool_call_id: None }
+        Self {
+            tool_name: tool_name.into(),
+            arguments,
+            provider_tool_call_id: None,
+            authorization_subject: None,
+        }
     }
 
     /// An invocation derived from a model's `ToolUse` block. Keeping the call id
@@ -178,7 +189,14 @@ impl ToolInvocation {
             tool_name: tool_name.into(),
             arguments,
             provider_tool_call_id: Some(tool_call_id.into()),
+            authorization_subject: None,
         }
+    }
+
+    /// Attach the task identity the turn was opened for.
+    pub fn with_authorization_subject(mut self, subject: AuthorizationSubject) -> Self {
+        self.authorization_subject = Some(subject);
+        self
     }
 }
 
@@ -211,6 +229,16 @@ pub struct ToolPolicyRecord {
     /// declares no capabilities has nothing to name here.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub refusals: std::collections::BTreeMap<Capability, RefusalLayer>,
+    /// The action this record was made about, by digest.
+    ///
+    /// A result and its `permission/decision` are two statements about one
+    /// call, and a reader must be able to tell they are about the *same* one
+    /// without trusting that they were written in the same step: the digest is
+    /// the join key. `None` for a record made before this field existed, and
+    /// for the paths that state a decision without an action (a resumed call
+    /// whose facts live in the approval events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<String>,
 }
 
 impl ToolPolicyRecord {
@@ -220,6 +248,7 @@ impl ToolPolicyRecord {
             decision: PolicyDecision::Allow,
             capabilities: capabilities.into_iter().collect(),
             refusals: Default::default(),
+            action_digest: None,
         }
     }
 
@@ -232,7 +261,14 @@ impl ToolPolicyRecord {
             decision: PolicyDecision::Deny,
             capabilities: capabilities.into_iter().collect(),
             refusals: refusals.into_iter().collect(),
+            action_digest: None,
         }
+    }
+
+    /// Name the action this record is about.
+    pub fn about(mut self, action_digest: impl Into<String>) -> Self {
+        self.action_digest = Some(action_digest.into());
+        self
     }
 }
 
@@ -269,6 +305,38 @@ impl ToolFacts {
     }
 }
 
+/// How much a tool's output is the session's own word.
+///
+/// A file this run wrote, a command it ran, a memory it stored: trusted, in
+/// the sense that the result is about the session's own work. A web page, an
+/// API response, an MCP server's answer: untrusted — it was written by someone
+/// outside, and the model must read it as data. The distinction is a property
+/// the provider states, not one a reader infers from the tool's name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    /// The result is the session's own work.
+    #[default]
+    Trusted,
+    /// The result came from outside; it is data, never instructions.
+    Untrusted,
+}
+
+impl TrustLevel {
+    /// Whether this is the default, which payloads omit.
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+
+    /// The name a payload records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
 /// A tool run's result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -292,6 +360,14 @@ pub struct ToolResult {
     /// Structured facts beside the text, for readers that must not parse it.
     #[serde(default, skip_serializing_if = "ToolFacts::is_empty")]
     pub facts: ToolFacts,
+    /// Whether this result is the session's own work or something it read.
+    ///
+    /// `Trusted` is the default and is omitted from payloads, so a result from
+    /// a provider that never states a trust level serializes exactly as it did
+    /// before this field existed. The provider states it; the projection reads
+    /// it and shows untrusted text as data.
+    #[serde(default, skip_serializing_if = "TrustLevel::is_trusted")]
+    pub trust: TrustLevel,
     /// What the gate decided about this call.
     ///
     /// Set by the gateway, which is the only party that made the decision. A
@@ -314,6 +390,7 @@ impl ToolResult {
             artifacts: Vec::new(),
             truncated: false,
             facts: ToolFacts::default(),
+            trust: TrustLevel::Trusted,
             policy: None,
             redaction_metadata: RedactionMetadata::default(),
             duration_ms: None,
@@ -328,6 +405,12 @@ impl ToolResult {
     /// Mark that the underlying output was cut at the source.
     pub fn truncated(mut self) -> Self {
         self.truncated = true;
+        self
+    }
+
+    /// Mark this result as written by someone outside the session.
+    pub fn untrusted(mut self) -> Self {
+        self.trust = TrustLevel::Untrusted;
         self
     }
 
@@ -505,6 +588,7 @@ mod tests {
             }],
             truncated: false,
             facts: ToolFacts::default(),
+            trust: TrustLevel::Trusted,
             policy: None,
             redaction_metadata: RedactionMetadata {
                 redacted: true,

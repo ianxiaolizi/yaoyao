@@ -1,4 +1,4 @@
-// A local performance harness for the timeline.
+// A local performance harness for the new shell (M7).
 //
 // It is deliberately not part of CI: the numbers are only comparable on the
 // machine that recorded the baseline, so a GitHub runner would be measuring a
@@ -7,14 +7,16 @@
 //   node scripts/gui/perf.mjs            # compare against perf-baseline.json
 //   node scripts/gui/perf.mjs --record   # rewrite the baseline
 //
-// Each size is a seeded session of that many events; a turn is six events and
-// renders as one block. Three numbers per size, all end-user wall clock:
+// Each size is a seeded session of that many events, six events per turn. Four
+// numbers per size, all end-user wall clock:
 //
-//   open      navigation → the timeline holds every block (ms)
-//   scroll    frames per second while scrolling the whole timeline (fps)
+//   open      navigation → the current turn and its two folded neighbours (ms)
+//   unfold    click "更早的 N 轮" → every earlier turn is a row again (ms)
+//   scroll    frames per second while scrolling the unfolded list (fps)
 //   live max  worst frame gap while a real reply streams (ms)
-//   rebuilt   finished blocks replaced during that reply (0, or 1 when the
-//             open turn folds into a summary as the next one starts)
+//   rebuilds  times the transcript was replaced during that reply (reported,
+//             not gated: this shell redraws the column per durable item, and
+//             the fold — not incremental patching — is what bounds the cost)
 //
 // The comparison is relative to the recorded baseline, with wide margins: this
 // catches "the page got several times slower", not "the page got 8% slower".
@@ -48,9 +50,12 @@ if (!existsSync(binary)) {
   throw new Error(`agent binary not found at ${binary}; run cargo build -p agent first`);
 }
 
-const workspace = mkdtempSync(join(tmpdir(), 'yaoyao-gui-perf-'));
-const dataDir = join(workspace, '.agent-data');
-const logPath = join(workspace, 'server.log');
+const temp = mkdtempSync(join(tmpdir(), 'yaoyao-gui-perf-'));
+const workspace = join(temp, 'workspace');
+const dataDir = join(temp, 'data');
+const logPath = join(temp, 'server.log');
+mkdirSync(workspace, { recursive: true });
+mkdirSync(dataDir, { recursive: true });
 let server;
 let browser;
 
@@ -144,13 +149,67 @@ async function measure(page, origin, token, session, turns) {
   const started = Date.now();
   await page.goto(`${origin}/?session=${session}#t=${token}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(
-    (want) => document.querySelectorAll('#timeline > .tblock[data-key^="turn:"]').length >= want,
-    turns,
+    () => Boolean(document.querySelector('.y-turn')) && document.querySelectorAll('.y-past-row').length === 2,
+    null,
     { timeout: 180_000 },
   );
-  // Two frames, so the last block has been painted before the clock stops.
+  // Two frames, so the current turn has been painted before the clock stops.
   await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
   const openMs = Date.now() - started;
+
+  // The reply is measured first, in the state the page opens in: a reader who
+  // sends a message is looking at the folded column. (Measuring it after the
+  // unfolded view would bill the reply for the browser collecting that page.)
+  await page.evaluate(() => {
+    const transcript = document.getElementById('transcript');
+    window.__perf = { gaps: [], rebuilds: 0, raf: 0 };
+    let last = performance.now();
+    const tick = () => {
+      const now = performance.now();
+      window.__perf.gaps.push(now - last);
+      last = now;
+      window.__perf.raf = requestAnimationFrame(tick);
+    };
+    window.__perf.raf = requestAnimationFrame(tick);
+    new MutationObserver((rows) => {
+      for (const row of rows) {
+        if (row.removedNodes.length || row.addedNodes.length) window.__perf.rebuilds += 1;
+      }
+    }).observe(transcript, { childList: true });
+  });
+  await page.fill('#input', 'live update');
+  await page.click('#send');
+  await page.waitForFunction(
+    () => [...document.querySelectorAll('.y-answer')].some((node) => node.textContent.includes('echo: live update')),
+    null,
+    { timeout: 60_000 },
+  );
+  const live = await page.evaluate(() => {
+    cancelAnimationFrame(window.__perf.raf);
+    const gaps = window.__perf.gaps.slice(1);
+    return {
+      frames: gaps.length,
+      maxGapMs: Math.round(Math.max(0, ...gaps)),
+      rebuilds: window.__perf.rebuilds,
+    };
+  });
+
+  // A fresh page for unfolding: the reply added a turn, and the fold is what
+  // decides how many rows the click has to build.
+  await page.goto(`${origin}/?session=${session}#t=${token}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => Boolean(document.querySelector('.y-turn')), null, { timeout: 120_000 });
+  const unfoldMs = await page.evaluate(async (want) => {
+    const began = performance.now();
+    document.querySelector('[data-past-toggle]').click();
+    await new Promise((done) => {
+      const check = () => {
+        if (document.querySelectorAll('.y-past-row').length === want) done();
+        else requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
+    });
+    return performance.now() - began;
+  }, turns);
 
   const scroll = await page.evaluate(async () => {
     const box = document.getElementById('scroll');
@@ -181,41 +240,13 @@ async function measure(page, origin, token, session, turns) {
     };
   });
 
-  await page.evaluate(() => {
-    const blocks = [...document.getElementById('timeline').children];
-    window.__perf = { blocks, gaps: [], raf: 0 };
-    let last = performance.now();
-    const tick = () => {
-      const now = performance.now();
-      window.__perf.gaps.push(now - last);
-      last = now;
-      window.__perf.raf = requestAnimationFrame(tick);
-    };
-    window.__perf.raf = requestAnimationFrame(tick);
-  });
-  await page.fill('#input', 'live update');
-  await page.click('#sendBtn');
-  await page.waitForFunction(
-    () => [...document.querySelectorAll('.ans')].some((node) => node.textContent.includes('echo: live update')),
-    null,
-    { timeout: 60_000 },
-  );
-  const live = await page.evaluate(() => {
-    cancelAnimationFrame(window.__perf.raf);
-    const gaps = window.__perf.gaps.slice(1);
-    return {
-      frames: gaps.length,
-      maxGapMs: Math.round(Math.max(0, ...gaps)),
-      rebuilt: window.__perf.blocks.filter((node) => !node.isConnected).length,
-    };
-  });
-
   return {
     openMs,
+    unfoldMs: Math.round(unfoldMs),
     scrollFps: scroll.fps,
     scrollMaxGapMs: scroll.maxGapMs,
     liveMaxGapMs: live.maxGapMs,
-    liveRebuilt: live.rebuilt,
+    liveRebuilds: live.rebuilds,
   };
 }
 
@@ -226,6 +257,11 @@ function verdict(now, base) {
     what: 'open',
     text: `${now.openMs}ms (${times(now.openMs, base.openMs).toFixed(2)}× baseline)`,
     ok: times(now.openMs, base.openMs) <= 2,
+  });
+  claims.push({
+    what: 'unfold',
+    text: `${now.unfoldMs}ms (${times(now.unfoldMs, base.unfoldMs).toFixed(2)}× baseline)`,
+    ok: times(now.unfoldMs, base.unfoldMs) <= 2,
   });
   claims.push({
     what: 'scroll',
@@ -242,7 +278,6 @@ function verdict(now, base) {
     text: `${now.liveMaxGapMs}ms (${times(now.liveMaxGapMs, base.liveMaxGapMs).toFixed(2)}× baseline)`,
     ok: times(now.liveMaxGapMs, base.liveMaxGapMs) <= 2,
   });
-  claims.push({ what: 'rebuilt', text: `${now.liveRebuilt} finished blocks`, ok: now.liveRebuilt <= 1 });
   return claims;
 }
 
@@ -270,16 +305,16 @@ async function main() {
   const errors = [];
   page.on('pageerror', (error) => errors.push(`pageerror: ${error.message}`));
 
-  // The first navigation of a fresh Edge pays for the browser's own cold
-  // start (20s the first time this ran). Warm it up on a throwaway session, so
-  // "open" measures the page instead of the browser.
+  // The first navigation of a fresh Edge pays for the browser's own cold start.
+  // Warm it up on a throwaway session, so "open" measures the page instead.
   const warm = seed('perf-warm', 600);
   await page.goto(`${origin}/?session=perf-warm#t=${token}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(
-    (want) => document.querySelectorAll('#timeline > .tblock[data-key^="turn:"]').length >= want,
-    warm,
+    () => Boolean(document.querySelector('.y-turn')),
+    null,
     { timeout: 120_000 },
   );
+  void warm;
 
   const measured = {};
   for (const { size, session, turns } of seeded) {
@@ -290,12 +325,13 @@ async function main() {
   const failed = [];
   for (const { size } of seeded) {
     const now = measured[size];
-    const line = `${String(size).padStart(6)} events  open ${String(now.openMs).padStart(6)}ms  scroll ${String(now.scrollFps).padStart(5)}fps (max ${String(now.scrollMaxGapMs).padStart(4)}ms)  live max ${String(now.liveMaxGapMs).padStart(5)}ms  rebuilt ${now.liveRebuilt}`;
-    if (!baseline) {
-      console.log(line);
-      continue;
-    }
+    const line =
+      `${String(size).padStart(6)} events  open ${String(now.openMs).padStart(6)}ms  ` +
+      `unfold ${String(now.unfoldMs).padStart(5)}ms  scroll ${String(now.scrollFps).padStart(5)}fps ` +
+      `(max ${String(now.scrollMaxGapMs).padStart(4)}ms)  live max ${String(now.liveMaxGapMs).padStart(5)}ms  ` +
+      `rebuilds ${now.liveRebuilds}`;
     console.log(line);
+    if (!baseline) continue;
     for (const claim of verdict(now, baseline.runs?.[size] || {})) {
       console.log(`        ${claim.ok ? 'ok  ' : 'FAIL'} ${claim.what}: ${claim.text}`);
       if (!claim.ok) failed.push(`${size} events: ${claim.what} ${claim.text}`);
@@ -310,7 +346,7 @@ async function main() {
       JSON.stringify(
         {
           recorded_at: new Date().toISOString(),
-          on: 'Windows 10 IoT LTSC 2021, Edge headless, debug build of agent web',
+          on: 'Windows 10 IoT LTSC 2021, Edge headless, debug build of agent web (M7 shell)',
           how: 'node scripts/gui/perf.mjs --record',
           runs: measured,
         },
@@ -340,8 +376,8 @@ try {
     await Promise.race([exited, new Promise((done) => setTimeout(done, 2000))]);
   }
   try {
-    rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    rmSync(temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   } catch {
-    // A leftover temp directory is not a failure.
+    // A leftover temp directory is not a test failure.
   }
 }

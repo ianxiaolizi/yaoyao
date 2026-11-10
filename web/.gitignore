@@ -1,0 +1,5 @@
+node_modules/
+
+# `dist/` is checked in on purpose: build.rs compiles the page into the binary,
+# so a fresh checkout builds and runs with no Node toolchain. Rebuild it with
+# `pnpm build` after touching `src/`; the `web` CI job fails when it drifts.

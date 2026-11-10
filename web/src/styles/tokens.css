@@ -1,0 +1,112 @@
+/* 生成物 · 勿手改。源：design/tokens.json；命令：node design/generate.mjs */
+:root{
+  /* color */
+  --bg: #FFFFFF;
+  --surface: #FFFFFF;
+  --surface-2: #F4F5F7;
+  --surface-3: #EEF0F2;
+  --sunken: #F7F8FA;
+  --ink: #1D2126;
+  --ink-2: #555B63;
+  --ink-3: #666C74;
+  --ink-4: #858B94;
+  --line: #EBEDEF;
+  --line-2: #D9DCE1;
+  --line-control: #8A9099;
+  --accent: #3D6A9E;
+  --accent-soft: #EEF3F9;
+  --accent-line: #C9D8E8;
+  --accent-ring: rgba(61,106,158,.10);
+  --red: #B04A4F;
+  --red-soft: #FBF1F1;
+  --red-line: #ECD2D3;
+  --green: #2F6E4F;
+  --green-soft: #EEF6F1;
+  --green-line: #D7E6DD;
+  --on-ink: #FFFFFF;
+  --code: #F4F5F7;
+  /* font */
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "SF Mono", monospace;
+  /* size */
+  --text-display: 19px;
+  --text-body: 14.5px;
+  --text-ui: 13px;
+  --text-ui-sm: 12.5px;
+  --text-meta: 11.5px;
+  --text-micro: 11px;
+  --text-code: 12px;
+  /* leading */
+  --leading-display: 1.45;
+  --leading-body: 1.8;
+  --leading-ui: 1.65;
+  --leading-tight: 1.5;
+  /* weight */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-emphasis: 550;
+  --weight-semibold: 600;
+  /* space */
+  --space-2: 2px;
+  --space-4: 4px;
+  --space-6: 6px;
+  --space-8: 8px;
+  --space-10: 10px;
+  --space-12: 12px;
+  --space-14: 14px;
+  --space-16: 16px;
+  --space-18: 18px;
+  --space-24: 24px;
+  --space-28: 28px;
+  --space-32: 32px;
+  --space-36: 36px;
+  --space-48: 48px;
+  /* radius */
+  --radius-4: 4px;
+  --radius-5: 5px;
+  --radius-6: 6px;
+  --radius-7: 7px;
+  --radius-8: 8px;
+  --radius-10: 10px;
+  --radius-12: 12px;
+  --radius-999: 999px;
+  /* layout */
+  --topbar-h: 48px;
+  --sidebar-w: 236px;
+  --content-w: 840px;
+  --sheet-w: 420px;
+  --dock-h: 52px;
+  --dock-open-h: 342px;
+  --pop-w: 268px;
+  --control-h: 28px;
+  --icon-btn: 30px;
+  --trace-w: 30px;
+  /* shadow */
+  --shadow-pop: 0 12px 40px rgba(20,24,30,.10), 0 2px 8px rgba(20,24,30,.05);
+  --shadow-stage: 0 18px 50px rgba(20,24,30,.16);
+  --shadow-dock: 0 2px 10px rgba(20,24,30,.06);
+  --shadow-sheet: -24px 0 60px rgba(20,24,30,.14);
+  --shadow-full: 0 30px 90px rgba(20,24,30,.28);
+  --shadow-composer: 0 1px 2px rgba(20,24,30,.04);
+  /* motion */
+  --motion-fast: 80ms;
+  --motion-base: 140ms;
+  --motion-slow: 180ms;
+  --motion-ease: cubic-bezier(.2,.7,.3,1);
+  --motion-ease-out: cubic-bezier(0,0,.2,1);
+  /* z */
+  --z-dock: 20;
+  --z-top: 30;
+  --z-pop: 40;
+  --z-sheet: 70;
+  --z-full: 90;
+  --z-toast: 100;
+  /* focus */
+  --focus-width: 2px;
+  --focus-offset: 2px;
+  color-scheme: light;
+}
+
+@media (prefers-reduced-motion: reduce){
+  :root{ --motion-fast: 1ms; --motion-base: 1ms; --motion-slow: 1ms; }
+}

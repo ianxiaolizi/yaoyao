@@ -29,6 +29,37 @@ pub enum SandboxMode {
 }
 
 impl SandboxMode {
+    /// The name the host selects and the log records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::LocalProcess => "local",
+            Self::WorkspaceSandbox => "app-container",
+            Self::Container => "docker",
+        }
+    }
+
+    /// Whether this backend confines a high-risk workspace action from the host.
+    ///
+    /// The question a permission decision asks before it lets a command or a
+    /// workspace write run at `L2` or above (CONTRACT §7 #179). Only the
+    /// workspace sandbox answers yes: its commands run under an OS confinement,
+    /// so what they read and write is refused by the kernel rather than by this
+    /// process.
+    ///
+    /// * `local` runs as the invoking user — nothing bounds a command it starts,
+    ///   and "approval as the backstop" is a person's answer about a call, not a
+    ///   boundary around its effects.
+    /// * `read-only` starts no process and writes nothing, so there is no
+    ///   high-risk action for it to run.
+    /// * `container` is not this build's high-risk default: it ships no
+    ///   container backend at all, and a backend this build cannot build is not
+    ///   a confinement a decision may assume. A later phase that ships one says
+    ///   so here, once.
+    pub fn supports_high_risk_workspace_actions(self) -> bool {
+        matches!(self, SandboxMode::WorkspaceSandbox)
+    }
+
     /// The capabilities this mode's backend provides at all.
     ///
     /// This is the *advertisement*, not a grant: a capability listed here still
@@ -288,6 +319,50 @@ mod tests {
         {
             assert_eq!(invocation.program, "sh");
             assert_eq!(invocation.args, vec!["-c", "echo hello"]);
+        }
+    }
+
+    #[test]
+    fn only_the_workspace_sandbox_confines_a_high_risk_workspace_action() {
+        assert!(SandboxMode::WorkspaceSandbox.supports_high_risk_workspace_actions());
+        // A local process runs as this user: a person's approval is an answer
+        // about the call, not a boundary around what the command does.
+        assert!(!SandboxMode::LocalProcess.supports_high_risk_workspace_actions());
+        // Read-only starts no process and writes nothing, so it has nothing to
+        // confine; and this build ships no container backend, so a decision may
+        // not assume one.
+        assert!(!SandboxMode::ReadOnly.supports_high_risk_workspace_actions());
+        assert!(!SandboxMode::Container.supports_high_risk_workspace_actions());
+    }
+
+    #[test]
+    fn app_container_advertises_http_tool_capability_but_not_raw_process_network() {
+        // The AppContainer is the high-risk backend, and the network it can
+        // still reach is the controlled one: `network.request` is what
+        // `web.request` asks for, and a command's own traffic is not a
+        // capability this build offers to anyone.
+        let caps = SandboxMode::WorkspaceSandbox.advertised_capabilities();
+        assert!(names(&caps).contains(&Capability::NETWORK_REQUEST));
+        assert!(!names(&caps).contains(&Capability::NETWORK_PROCESS));
+    }
+
+    #[test]
+    fn no_backend_advertises_a_raw_process_network_in_this_build() {
+        // Phase B's second gate, stated as one property over every mode: the
+        // capability exists as a name, and every backend leaves it out.
+        for mode in [
+            SandboxMode::ReadOnly,
+            SandboxMode::LocalProcess,
+            SandboxMode::WorkspaceSandbox,
+            SandboxMode::Container,
+        ] {
+            assert!(
+                !mode
+                    .advertised_capabilities()
+                    .iter()
+                    .any(|cap| cap.as_str() == Capability::NETWORK_PROCESS),
+                "{mode:?} advertises a raw process network"
+            );
         }
     }
 

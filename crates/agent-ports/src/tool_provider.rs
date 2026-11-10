@@ -5,6 +5,7 @@
 //! `agent_protocol::tool`; they are re-exported here for the trait's public
 //! surface.
 
+pub use agent_protocol::permission::RiskLevel;
 pub use agent_protocol::tool::{
     ToolDefinition, ToolErrorKind, ToolInvocation, ToolResult, ToolSideEffect, ToolSource,
     ToolStatus,
@@ -22,6 +23,22 @@ pub trait ToolProvider: Send + Sync {
     /// The side-effect class of a tool, if known. Callers must treat an unknown
     /// tool as `Destructive` (fail closed).
     fn side_effect(&self, tool_name: &str) -> Option<ToolSideEffect>;
+
+    /// The risk floor this provider claims for one call, if it knows better
+    /// than the side-effect class does.
+    ///
+    /// The question takes the whole invocation because the answer can depend on
+    /// the arguments: `web.request` is a read at `GET` and a side effect at
+    /// `POST`. The declaration is the base risk for a tool the provider knows;
+    /// the kernel does not second-guess it, because the provider is the only
+    /// layer that can tell those two calls apart. What the kernel does enforce
+    /// is the unclassified case: no declaration and no side-effect class is
+    /// [`RiskLevel::UNKNOWN`], never `L0`. The default is `None` — "ask the
+    /// side-effect class", not "no risk".
+    fn risk(&self, invocation: &ToolInvocation) -> Option<RiskLevel> {
+        let _ = invocation;
+        None
+    }
 
     /// The argument names that may hold a filesystem path for `tool_name`.
     ///

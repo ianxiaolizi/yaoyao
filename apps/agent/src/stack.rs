@@ -23,6 +23,7 @@
 //! resume and fork.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ use agent_kernel::approval::ApprovalService;
 use agent_kernel::fork::Fork;
 use agent_kernel::guarded::GuardedToolProvider;
 use agent_kernel::live_bus::InMemoryLiveEventBus;
+use agent_kernel::permission::PermissionService;
 use agent_kernel::plugin::{PluginRegistry, RegistryToolProvider};
 use agent_kernel::recovery::Recovery;
 use agent_kernel::resource_guard::ResourceGuard;
@@ -46,13 +48,18 @@ use agent_ports::artifact_store::ArtifactStore;
 use agent_ports::control::ControlHandler;
 use agent_ports::decision::DecisionAdvisor;
 use agent_ports::execution_environment::{ExecutionEnvironment, SandboxMode};
+use agent_ports::intent_adjudication::IntentAdjudicator;
 use agent_ports::memory_index::MemoryIndex;
 use agent_ports::memory_store::MemoryStore;
 use agent_ports::model_provider::{ModelProvider, ResolvedModelCapabilities};
 use agent_ports::model_router::ModelRouter;
+use agent_ports::permission_classifier::PermissionClassifier;
 use agent_ports::process_launcher::ProcessLauncher;
+use agent_ports::security_reviewer::SecurityReviewer;
 use agent_ports::tool_gateway::ToolGateway;
 use agent_ports::tool_provider::ToolProvider;
+use agent_ports::verifier::CommandVerifier;
+use agent_ports::workspace_snapshot::WorkspaceSnapshotter;
 use agent_protocol::ids::SessionId;
 use agent_protocol::model::{
     ModelCapabilities, ModelCapabilitySource, ModelRoute, ModelTier, ReasoningEffort,
@@ -63,9 +70,12 @@ use agent_protocol::redactor::{HighEntropy, Redactor};
 use agent_store_artifact::FsArtifactStore;
 use agent_store_jsonl::JsonlEventStore;
 use agent_store_secret::EnvSecretProvider;
-use agent_tools_fs::{FsToolProvider, LocalExecutionEnvironment, SandboxedFileEnvironment};
+use agent_tools_fs::{
+    EnvCommandVerifier, FsToolProvider, FsWorkspaceSnapshotter, LocalExecutionEnvironment,
+    SandboxedFileEnvironment,
+};
 use agent_tools_git::GitToolProvider;
-use agent_tools_web::WebToolProvider;
+use agent_tools_web::{NetworkAllowlist, WebToolProvider};
 
 use crate::config;
 use crate::decisions;
@@ -74,6 +84,18 @@ use crate::plugins;
 use crate::providers::{self, ProviderConfigError, SelectedProvider};
 use crate::sandbox;
 use crate::subagents;
+
+/// What assembly hands the run: the router it executes with, the advisor that
+/// observes (or `None` when the run is unobserved), and the adjudicator that
+/// resolves messages the rules could not (or `None` when no sidecar is
+/// configured).
+type DecisionParts = (
+    Arc<dyn ModelRouter>,
+    Option<Arc<dyn DecisionAdvisor>>,
+    Option<Arc<dyn IntentAdjudicator>>,
+    Option<Arc<dyn PermissionClassifier>>,
+    Option<Arc<dyn SecurityReviewer>>,
+);
 
 /// What the assembly needs that it cannot decide for itself.
 ///
@@ -118,6 +140,13 @@ pub enum Decisions {
     /// No advisor at all: nothing observes the run's choices and no decision
     /// trace is written. The router still routes.
     Unobserved,
+    /// A supplied independent reviewer and nothing else.
+    ///
+    /// The binary never builds this: it assembles whatever the configured
+    /// sidecar gives it. It is here for the test that has to state the one fact
+    /// the gate turns on — that a high-risk task was reviewed, and what the
+    /// reviewer said (B9).
+    Reviewing(Arc<dyn SecurityReviewer>),
 }
 
 /// Why the stack could not be assembled.
@@ -133,6 +162,9 @@ pub enum StackError {
     /// No provider could be built for the configured model.
     #[error("model provider: {0}")]
     Model(#[from] ProviderConfigError),
+    /// The session's own state sits inside a path its tools can write.
+    #[error("unsafe agent data directory: {0}")]
+    UnsafeDataDir(String),
     /// The configured decision backend this build will not honor.
     #[error("decision backend: {0}")]
     DecisionBackend(#[from] decisions::AssembleError),
@@ -145,6 +177,13 @@ pub enum StackError {
     /// confined one.
     #[error("execution sandbox {mode} is unavailable: {reason}")]
     SandboxUnavailable { mode: &'static str, reason: String },
+    /// Broad process egress is only meaningful where a backend can bound the
+    /// command's traffic. Accepting it elsewhere would claim a boundary the
+    /// selected backend does not have.
+    #[error(
+        "AGENT_SANDBOX_NETWORK=internet requires AGENT_SANDBOX=app-container; {mode} cannot bound a command's traffic"
+    )]
+    NetworkRequiresAppContainer { mode: &'static str },
     /// `AGENT_JUDGMENT` names an arm this build does not know. Fail closed:
     /// a typo must not silently pick the expensive pipeline or the baseline.
     #[error("judgment mode '{0}' is not one of `on`, `gates` or `off`")]
@@ -163,6 +202,12 @@ pub enum StackError {
         #[source]
         source: agent_config::ConfigError,
     },
+    /// The user layer's `[network] allow` names something that is not an
+    /// origin, or names one the tool would never reach (loopback, a private
+    /// address, a wildcard). Fail closed: an entry the run cannot honor must
+    /// not sit in the allowlist looking like permission.
+    #[error("network allowlist: {0}")]
+    NetworkAllowlist(String),
     /// The configuration chose a reasoning depth the route's model does not
     /// declare. Fail closed: a depth the provider never confirmed is a request
     /// it may reject mid-turn, or silently ignore while the run believes it was
@@ -221,6 +266,26 @@ fn tool_secret_refs(raw: Option<&str>) -> Vec<SecretRef> {
     names.sort();
     names.dedup();
     names.into_iter().map(|name| SecretRef { source: "env".to_string(), name }).collect()
+}
+
+/// The host's list, narrowed by the user layer's `[secrets] allow`.
+///
+/// The user layer can only take names away (CONTRACT §7 #181). `None` there is
+/// "the person wrote no section", which leaves the host's list as it is; an
+/// empty list is a person who turned secret use off, and reads as exactly
+/// that. Both are computed here rather than at each of the two places that ask
+/// — the gateway that resolves and the prompt that tells the model what it may
+/// name — because two lists that disagree would be a model told about a secret
+/// the gateway would refuse.
+pub(crate) fn effective_tool_secrets(
+    raw: Option<&str>,
+    user_allow: Option<&[String]>,
+) -> Vec<SecretRef> {
+    let host = tool_secret_refs(raw);
+    let Some(narrow) = user_allow else {
+        return host;
+    };
+    host.into_iter().filter(|secret| narrow.contains(&secret.name)).collect()
 }
 
 /// The high-entropy layer's setting, from `AGENT_REDACT_HIGH_ENTROPY`.
@@ -398,6 +463,20 @@ pub struct Runtime {
     /// The run's one artifact store: the MCP adapter and the gateway's own
     /// output offload both write here.
     pub artifacts: Arc<dyn ArtifactStore>,
+    /// The snapshotter the gateway takes recovery points with (B8), kept so
+    /// `agent rollback` restores through the same object rather than opening a
+    /// second view of the snapshot index.
+    pub snapshots: Arc<dyn WorkspaceSnapshotter>,
+    /// The decision ledger, kept for the same reason: a rollback is a fact
+    /// about this session, and it belongs in the session's stream. The gateway
+    /// holds its own clone; this is the command's way in.
+    pub permissions: Arc<PermissionService>,
+    /// Structured checks, run against the same execution backend the tools
+    /// use — so a check is confined, deadline-bounded and env-scrubbed exactly
+    /// as a tool call is, and `agent verify` cannot become a way around the
+    /// sandbox. It is a separate object rather than a tool because a check is
+    /// not something the model may name or call.
+    pub verifier: Arc<dyn CommandVerifier>,
     /// The children this process started and has not collected.
     ///
     /// Held here rather than inside the delegation tool because two callers
@@ -423,6 +502,54 @@ impl Runtime {
     }
 }
 
+/// Whether `child` is the same path as `parent` or below it.
+///
+/// Existing ancestors are canonicalized so a missing data directory and a
+/// symlinked workspace still compare as the paths they will be.
+fn path_is_within(child: &Path, parent: &Path) -> bool {
+    let child = canonicalize_with_missing(child);
+    let parent = canonicalize_with_missing(parent);
+    if cfg!(windows) {
+        let child = child.to_string_lossy().to_lowercase();
+        let parent = parent.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+        child == parent
+            || child.starts_with(&format!("{parent}\\"))
+            || child.starts_with(&format!("{parent}/"))
+    } else {
+        child.starts_with(parent)
+    }
+}
+
+fn canonicalize_with_missing(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut missing: Vec<OsString> = Vec::new();
+    let mut current = absolute.clone();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(&current) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let Some(name) = current.file_name().map(ToOwned::to_owned) else {
+            break;
+        };
+        missing.push(name);
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    absolute
+}
+
 /// The execution backend the selected mode names, or a refusal.
 ///
 /// Fail closed: a mode this build has no backend for stops assembly. Falling
@@ -434,6 +561,9 @@ fn environment_for(
     data_dir: &Path,
     network_allowed: bool,
 ) -> Result<Arc<dyn ExecutionEnvironment>, StackError> {
+    if network_allowed && mode != SandboxMode::WorkspaceSandbox {
+        return Err(StackError::NetworkRequiresAppContainer { mode: sandbox::label(mode) });
+    }
     match mode {
         SandboxMode::ReadOnly => Ok(Arc::new(LocalExecutionEnvironment::read_only(workspace_root))),
         SandboxMode::LocalProcess => {
@@ -560,6 +690,66 @@ pub async fn assemble_with_delegation(
     inputs: Inputs,
     delegation: subagents::Delegation,
 ) -> Result<Runtime, StackError> {
+    // What the configuration says is checked before the host is touched. A
+    // typo in `[network] allow` is the person's to fix; probing the backend
+    // first would report the machine's state and hide the configuration error
+    // behind it.
+    validate_before_backend(&inputs)?;
+    // The backend is chosen before anything is built on it, and a backend this
+    // build cannot supply stops assembly. Nothing below decides to use a less
+    // confined one instead: that would run the tools under a boundary nobody
+    // selected.
+    let env = environment_for(
+        inputs.sandbox,
+        &inputs.workspace_root,
+        &inputs.data_dir,
+        inputs.network_allowed,
+    )?;
+    assemble_over(inputs, delegation, env).await
+}
+
+/// The refusals that do not depend on the host, made before a backend is built.
+///
+/// `assemble_over` repeats them for callers that supply their own backend: the
+/// checks are a path comparison and a parse, so the second reading costs
+/// nothing and the two entry points cannot disagree about what a valid
+/// configuration is.
+fn validate_before_backend(inputs: &Inputs) -> Result<(), StackError> {
+    if path_is_within(&inputs.data_dir, &inputs.workspace_root) {
+        return Err(StackError::UnsafeDataDir(format!(
+            "{} is inside the model-writable workspace {}",
+            inputs.data_dir.display(),
+            inputs.workspace_root.display()
+        )));
+    }
+    NetworkAllowlist::from_origins(&inputs.resolved.network_allow)
+        .map_err(|error| StackError::NetworkAllowlist(error.to_string()))?;
+    Ok(())
+}
+
+/// Assemble the stack over a backend the caller already built.
+///
+/// Every product path reaches this through [`assemble_with_delegation`], which
+/// builds the backend [`Inputs::sandbox`] names and refuses when this build has
+/// none. This entry point exists so a case whose subject is **the decision
+/// chain** — approval, resume, refusal — can state the backend it runs over
+/// without this build needing a real AppContainer on the machine: the
+/// isolation floor asks the backend what it is, and a test that answers
+/// "app-container" is a test about what the chain does once that question has
+/// an isolating answer (stage B plan §9: a fake-backend case beside the
+/// ignored real-run command). Nothing in `apps/agent` calls it.
+pub async fn assemble_over(
+    inputs: Inputs,
+    delegation: subagents::Delegation,
+    env: Arc<dyn ExecutionEnvironment>,
+) -> Result<Runtime, StackError> {
+    // The ledger, snapshots and artifact store are evidence about the run. If
+    // any of them sits inside the model-writable workspace, the model can
+    // rewrite the evidence, so assembly refuses before opening a store. The
+    // network allowlist is validated in the same pass, so a caller that supplied
+    // its own backend gets the same refusal as the product path.
+    validate_before_backend(&inputs)?;
+
     let Inputs {
         session,
         workspace_root,
@@ -567,7 +757,11 @@ pub async fn assemble_with_delegation(
         mut resolved,
         model,
         decisions,
-        sandbox,
+        // The backend was built by the caller and is what every decision below
+        // asks; what the host named is not read again here, because a second
+        // reading is how a run comes to describe a confinement it does not
+        // have.
+        sandbox: _,
         network_allowed,
         judgment,
     } = inputs;
@@ -575,15 +769,12 @@ pub async fn assemble_with_delegation(
     let store = Arc::new(JsonlEventStore::new(&data_dir));
 
     let approvals = Arc::new(ApprovalService::new(store.clone()).with_session_scope(true));
-
-    // The backend is chosen before anything is built on it, and a backend this
-    // build cannot supply stops assembly. Nothing below decides to use a less
-    // confined one instead: that would run the tools under a boundary nobody
-    // selected.
-    let env = environment_for(sandbox, &workspace_root, &data_dir, network_allowed)?;
     // What the gateway may resolve when a tool argument names a reference. The
     // same list is what the model is told it may name, one fact read once.
-    let tool_secrets = tool_secret_refs(std::env::var("AGENT_TOOL_SECRETS").ok().as_deref());
+    let tool_secrets = effective_tool_secrets(
+        std::env::var("AGENT_TOOL_SECRETS").ok().as_deref(),
+        resolved.secret_allow.as_deref(),
+    );
     // One redactor for the whole assembly: the loop and the tool boundary must
     // not disagree about whether a long mixed token is reported or replaced.
     let redactor = Redactor::new().with_high_entropy(high_entropy_from(
@@ -593,6 +784,11 @@ pub async fn assemble_with_delegation(
     // handed out. The policy and the plugin surface both ask this question and
     // must get the same answer.
     let advertised = env.advertised_capabilities();
+    // The mode the backend really is, read from the backend rather than from
+    // the host's setting: the permission floor, the policy and the surface all
+    // answer from what was built, so none of them can describe a confinement
+    // the run does not have (CONTRACT §7 #179).
+    let sandbox_mode = env.mode();
     // The policy is decided over what this run's backend actually advertises,
     // not over what the build can do in principle: a read-only run must refuse
     // a configured fs.write as unavailable rather than let a rule grant it.
@@ -676,7 +872,11 @@ pub async fn assemble_with_delegation(
                         .map_err(|source| StackError::Budget { route: route_key(route), source })?;
                 // A summary is its own request. Do not inherit the main
                 // route's effort: the fast model may not even offer it.
-                let (effort, source) = reasoning_effort_for(&None, caps, &route_key(route))?;
+                let (effort, source) = reasoning_effort_for(
+                    &resolved.budget.reasoning_effort,
+                    caps,
+                    &route_key(route),
+                )?;
                 (resolution, caps, effort, source)
             }
             // With no fast route the summary is asked of the main model, so it
@@ -764,6 +964,7 @@ pub async fn assemble_with_delegation(
     // is already the run's. The names are read off the providers themselves
     // rather than written down here, so the reserved list cannot drift from
     // what the built-ins actually offer.
+    let verifier: Arc<dyn CommandVerifier> = Arc::new(EnvCommandVerifier::new(env.clone()));
     let fs_tools: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::new(env));
     // The git tools read the repository in process, so they take the root
     // itself rather than the execution backend. Under the AppContainer
@@ -786,7 +987,15 @@ pub async fn assemble_with_delegation(
     // not advertise `network.request` — a read-only run — is not refused here:
     // the gateway drops the tool from the surface it offers, which is the same
     // answer every other built-in gets.
-    let web_tools: Arc<dyn ToolProvider> = Arc::new(WebToolProvider::new());
+    //
+    // Where it may go is the user layer's alone: an absent or empty `[network]
+    // allow` reaches nothing at all. The entries are validated here, at
+    // assembly, so a typo is a refusal to start rather than a call refused
+    // mid-turn with the run believing it had egress.
+    let allowlist = NetworkAllowlist::from_origins(&resolved.network_allow)
+        .map_err(|error| StackError::NetworkAllowlist(error.to_string()))?;
+    let web_tools: Arc<dyn ToolProvider> =
+        Arc::new(WebToolProvider::new().with_allowlist(allowlist));
     // The built-in families are listed once. `reserved` is read off this list
     // and the composite is assembled from it, so a family cannot be added to
     // one and forgotten in the other.
@@ -869,6 +1078,15 @@ pub async fn assemble_with_delegation(
     // not have to know which of them wrote it.
     let artifacts: Arc<dyn ArtifactStore> =
         Arc::new(FsArtifactStore::new(data_dir.join("artifacts")));
+    // The recovery point every workspace-changing call is made under (B8). One
+    // snapshotter, built here beside the store its blobs live in: the gateway
+    // takes the points and `agent rollback` restores them, and two of them
+    // built in two places would be two answers to "where is snapshot 7?".
+    let snapshots: Arc<dyn WorkspaceSnapshotter> = Arc::new(FsWorkspaceSnapshotter::new(
+        workspace_root.clone(),
+        artifacts.clone(),
+        data_dir.join("snapshots"),
+    ));
     let registry = Arc::new(PluginRegistry::new(store.clone()).with_reserved_tools(reserved));
     let servers = reachable_servers(plugins::server_specs(&resolved), &advertised);
     let suppressed = match plugins::suppressed(store.as_ref(), &session).await {
@@ -950,44 +1168,64 @@ pub async fn assemble_with_delegation(
         ),
     };
 
+    // The decision ledger every gateway below writes to, built once: one log,
+    // one writer. A decision is written before the call runs, and a call whose
+    // decision cannot be written does not run.
+    let permissions = Arc::new(PermissionService::new(store.clone()));
+
+    // Shadow decisions are assembled here, next to the provider they are built
+    // from, and nowhere else decides which model a run talks to. They come
+    // before the gateway because the gateway is handed the classifier they
+    // build: the judge is a property of the assembly, decided once, rather than
+    // something wired into a gate that has already been built.
+    let (router, advisor, adjudicator, classifier, reviewer): DecisionParts = match decisions {
+        Decisions::FromConfiguration => {
+            let router = providers::router(selected.route.clone(), &routes);
+            let stack = decisions::assemble(Arc::new(router), resolved.laya.clone())?;
+            (stack.router, Some(stack.advisor), stack.adjudicator, stack.classifier, stack.reviewer)
+        }
+        // No advisor, but still a router: the loop is always given one, and a
+        // run without an observation is a run whose choices are still routed.
+        Decisions::Unobserved => {
+            (Arc::new(providers::router(selected.route.clone(), &routes)), None, None, None, None)
+        }
+        // A reviewer and nothing else: the state a test needs to ask what the
+        // completion gate does with a high-risk task when the judge says no.
+        Decisions::Reviewing(reviewer) => (
+            Arc::new(providers::router(selected.route.clone(), &routes)),
+            None,
+            None,
+            None,
+            Some(reviewer),
+        ),
+    };
+
     // One step's output is bounded by the window the run actually has: a
     // result larger than the working set cannot be compacted away afterwards,
     // because the newest group is kept whole. The gateway also decides what the
     // model is offered (`model_definitions`): the surface minus every tool this
     // policy could refuse for every possible call.
-    let gateway = Arc::new(
-        GuardedToolProvider::new(
-            tools.clone(),
-            // Kept as well as handed over: an in-process child's policy is
-            // derived from this one, by narrowing it (CONTRACT §7 #133).
-            policy.clone(),
-            approvals.clone(),
-            guard.clone(),
-            artifacts.clone(),
-        )
-        .with_offload_limit(resolved.budget.tool_output_limit_bytes())
-        .with_redactor(redactor.clone())
-        .with_secrets(Arc::new(EnvSecretProvider::new(
-            tool_secrets.iter().map(|secret| secret.name.clone()),
-        ))),
-    );
-
-    // Shadow decisions are assembled here, next to the provider they are built
-    // from, and nowhere else decides which model a run talks to.
-    let (router, advisor): (Arc<dyn ModelRouter>, Option<Arc<dyn DecisionAdvisor>>) =
-        match decisions {
-            Decisions::FromConfiguration => {
-                let router = providers::router(selected.route.clone(), &routes);
-                let (router, advisor) =
-                    decisions::assemble(Arc::new(router), resolved.laya.clone())?;
-                (router, Some(advisor))
-            }
-            // No advisor, but still a router: the loop is always given one, and a
-            // run without an observation is a run whose choices are still routed.
-            Decisions::Unobserved => {
-                (Arc::new(providers::router(selected.route.clone(), &routes)), None)
-            }
-        };
+    let mut gateway = GuardedToolProvider::new(
+        tools.clone(),
+        // Kept as well as handed over: an in-process child's policy is
+        // derived from this one, by narrowing it (CONTRACT §7 #133).
+        policy.clone(),
+        approvals.clone(),
+        guard.clone(),
+        artifacts.clone(),
+    )
+    .with_offload_limit(resolved.budget.tool_output_limit_bytes())
+    .with_redactor(redactor.clone())
+    .with_sandbox_mode(sandbox_mode)
+    .with_secrets(Arc::new(EnvSecretProvider::new(
+        tool_secrets.iter().map(|secret| secret.name.clone()),
+    )))
+    .with_permission_service(permissions.clone())
+    .with_snapshotter(snapshots.clone());
+    if let Some(classifier) = &classifier {
+        gateway = gateway.with_permission_classifier(classifier.clone());
+    }
+    let gateway = Arc::new(gateway);
     // Which advisors this run has is said out loud when there is something to
     // say. The snapshot records the same list, but a run that attached a
     // sidecar that is down would otherwise only be visible in the trace of a
@@ -1067,17 +1305,30 @@ pub async fn assemble_with_delegation(
                 Arc::new(crate::inprocess::ReadOnlySurface::new(builtins.clone()));
             let child_policy =
                 crate::inprocess::never_asking(&policy, surface.as_ref(), &advertised);
-            let child_gateway: Arc<dyn ToolGateway> = Arc::new(
-                GuardedToolProvider::new(
-                    surface,
-                    child_policy,
-                    approvals.clone(),
-                    guard.clone(),
-                    artifacts.clone(),
-                )
-                .with_offload_limit(resolved.budget.tool_output_limit_bytes())
-                .with_redactor(redactor.clone()),
-            );
+            let mut child_gate = GuardedToolProvider::new(
+                surface,
+                child_policy,
+                approvals.clone(),
+                guard.clone(),
+                artifacts.clone(),
+            )
+            .with_offload_limit(resolved.budget.tool_output_limit_bytes())
+            .with_redactor(redactor.clone())
+            // The child runs under the same backend as the parent, so the same
+            // isolation floor applies to it.
+            .with_sandbox_mode(sandbox_mode)
+            // A delegated call is a tool call: it is decided and recorded
+            // in the same ledger, so an audit of the session does not stop
+            // at the thing that spawned work in it.
+            .with_permission_service(permissions.clone());
+            // A child's surface is read-only, but "read-only" is a claim about
+            // the tools, not about the risk: a child that reached a boundary
+            // action gets the same independent judgement the parent's gate
+            // gives it.
+            if let Some(classifier) = &classifier {
+                child_gate = child_gate.with_permission_classifier(classifier.clone());
+            }
+            let child_gateway: Arc<dyn ToolGateway> = Arc::new(child_gate);
             let mut child = DefaultAgentLoop::new(
                 selected.provider.clone(),
                 child_gateway,
@@ -1128,14 +1379,31 @@ pub async fn assemble_with_delegation(
     // the next turn executes under; the root is the same one the file boundary
     // was built over, so "the workspace" is one place in both places.
     let instructions = Arc::new(WorkspaceInstructions::new(workspace_root.clone()));
-    let scheduler = Scheduler::new(store.clone(), loop_, snapshot.budget.max_steps)
+    let mut scheduler = Scheduler::new(store.clone(), loop_, snapshot.budget.max_steps)
         .with_profile_snapshot(snapshot)
         .with_control_handlers(controls)?
         .with_instructions(instructions)
         // The boundary the host chose, told to the model before it reaches it.
         // These are the same two facts the environment was built over, not a
         // second reading of the environment.
-        .with_capability(TurnCapabilityFacts { sandbox, network_allowed, tool_secrets });
+        .with_capability(TurnCapabilityFacts {
+            sandbox: sandbox_mode,
+            network_allowed,
+            tool_secrets,
+        });
+    // The same sidecar that observes routes is asked what an unclear message
+    // means — a second, independent call with its own bound context, never a
+    // continuation of the executing session. No sidecar means no adjudicator,
+    // and unclear messages then keep their turns unadjudicated.
+    if let Some(adjudicator) = adjudicator {
+        scheduler = scheduler.with_intent_adjudicator(adjudicator);
+    }
+    // The independent reviewer, when this build has one. No sidecar means no
+    // reviewer, and a high-risk task then has no evidence to complete on rather
+    // than a silence read as a pass (B9, CONTRACT §7 #183).
+    if let Some(reviewer) = reviewer {
+        scheduler = scheduler.with_security_reviewer(reviewer);
+    }
     // Every in-process backend is handed the run its children execute on: this
     // scheduler with the child's loop in place of the parent's, and the request's
     // own budget applied at each spawn on top of it. Done here because this run
@@ -1162,6 +1430,9 @@ pub async fn assemble_with_delegation(
         registry,
         tools,
         artifacts,
+        snapshots,
+        permissions,
+        verifier,
         children,
     })
 }
@@ -1169,6 +1440,30 @@ pub async fn assemble_with_delegation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_user_layer_can_only_narrow_the_hosts_secrets() {
+        // Two directions the same fact can go wrong: a name the user added and
+        // the host never allowed must not become resolvable, and a section the
+        // user wrote must not be ignored.
+        let names = |secrets: Vec<SecretRef>| -> Vec<String> {
+            secrets.into_iter().map(|secret| secret.name).collect()
+        };
+
+        // No section: the host's list as it stands.
+        assert_eq!(names(effective_tool_secrets(Some("A,B"), None)), ["A", "B"]);
+
+        // A section narrows, and a name only the user wrote resolves to
+        // nothing — the host has to have allowed it too.
+        assert_eq!(names(effective_tool_secrets(Some("A,B"), Some(&["B".to_string()]))), ["B"]);
+        assert!(effective_tool_secrets(Some("A"), Some(&["C".to_string()])).is_empty());
+
+        // An explicit empty list is a person turning secret use off.
+        assert!(effective_tool_secrets(Some("A,B"), Some(&[])).is_empty());
+
+        // No host list is no secrets, whatever the user layer says.
+        assert!(effective_tool_secrets(None, Some(&["A".to_string()])).is_empty());
+    }
 
     #[test]
     fn a_reasoning_default_without_a_declared_depth_is_not_sent() {
@@ -1185,6 +1480,59 @@ mod tests {
         assert_eq!(effort, None);
         assert_eq!(source, "unsupported");
     }
+
+    #[test]
+    fn the_reasoning_depth_comes_from_the_profile_then_the_model_then_high() {
+        let caps = |efforts: Vec<ReasoningEffort>, default: Option<ReasoningEffort>| {
+            ResolvedModelCapabilities {
+                capabilities: ModelCapabilities {
+                    context_window_tokens: 1_000,
+                    max_output_tokens: 100,
+                    reasoning_efforts: efforts,
+                    default_reasoning_effort: default,
+                },
+                source: agent_protocol::model::ModelCapabilitySource::Bundled,
+            }
+        };
+
+        // A profile's explicit choice wins when the model declares it.
+        let (effort, source) = reasoning_effort_for(
+            &Some(ReasoningEffort::Low),
+            &caps(vec![ReasoningEffort::Low, ReasoningEffort::High], None),
+            "route",
+        )
+        .expect("a declared depth");
+        assert_eq!((effort, source), (Some(ReasoningEffort::Low), "explicit"));
+
+        // A depth the model never declared is refused, and the refusal names
+        // the route so the operator knows which one asked.
+        let error = reasoning_effort_for(
+            &Some(ReasoningEffort::Max),
+            &caps(vec![ReasoningEffort::Low], None),
+            "route-x",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("route-x"), "{error}");
+
+        // The model's own default is next, and only when it declared it.
+        let (effort, source) = reasoning_effort_for(
+            &None,
+            &caps(vec![ReasoningEffort::Low, ReasoningEffort::High], Some(ReasoningEffort::Low)),
+            "route",
+        )
+        .expect("the model's default");
+        assert_eq!((effort, source), (Some(ReasoningEffort::Low), "model_default"));
+
+        // With no default, the nearest depth at or below `high`.
+        let (effort, source) = reasoning_effort_for(
+            &None,
+            &caps(vec![ReasoningEffort::Off, ReasoningEffort::Max], None),
+            "route",
+        )
+        .expect("a depth to send");
+        assert_eq!((effort, source), (Some(ReasoningEffort::Off), "default"));
+    }
+
     #[test]
     fn the_fast_route_gets_its_own_complete_summary_budget() {
         // The main model holds a million tokens; the fast one that writes the
@@ -1265,6 +1613,16 @@ mod tests {
     }
 
     #[test]
+    fn internet_requires_the_app_container_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match environment_for(SandboxMode::LocalProcess, dir.path(), dir.path(), true) {
+            Ok(_) => panic!("local must not accept broad network egress"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("app-container"), "{error}");
+    }
+
+    #[test]
     fn the_redaction_mode_is_warn_unless_told_otherwise_and_refuses_typos() {
         assert_eq!(high_entropy_from(None).unwrap(), HighEntropy::Warn);
         assert_eq!(high_entropy_from(Some("  ")).unwrap(), HighEntropy::Warn);
@@ -1291,6 +1649,94 @@ mod tests {
             StackError::SandboxUnavailable { mode: "docker", reason } => {
                 assert!(reason.contains("Docker"), "{reason}");
             }
+            other => panic!("expected a docker refusal, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn assembly_refuses_agent_state_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join(".agent-data");
+        let error = match assemble(Inputs {
+            session: agent_protocol::ids::SessionId::from_string("s"),
+            workspace_root: dir.path().to_path_buf(),
+            data_dir: data.clone(),
+            resolved: agent_config::resolve(agent_config::Layers::default())
+                .expect("the defaults resolve"),
+            model: None,
+            decisions: Decisions::Unobserved,
+            sandbox: SandboxMode::LocalProcess,
+            network_allowed: false,
+            judgment: false,
+        })
+        .await
+        {
+            Ok(_) => panic!("the ledger cannot be inside the model-writable workspace"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StackError::UnsafeDataDir(_)), "{error:?}");
+        assert!(!data.exists(), "the refused state directory was created");
+    }
+
+    #[tokio::test]
+    async fn a_bad_network_entry_is_refused_before_the_backend_is_probed() {
+        // A configuration typo must not be reported as "this build has no
+        // backend". The docker mode is unavailable on every build, so a test
+        // that probed the backend first would see SandboxUnavailable here. This
+        // is the ordering the product needs: the person can fix the line they
+        // wrote without first installing something.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut resolved =
+            agent_config::resolve(agent_config::Layers::default()).expect("the defaults resolve");
+        resolved.network_allow = vec!["https://docs.rs/serde".to_string()];
+
+        let error = assemble(Inputs {
+            session: agent_protocol::ids::SessionId::from_string("s"),
+            workspace_root: workspace,
+            data_dir: dir.path().join("data"),
+            resolved,
+            model: None,
+            decisions: Decisions::Unobserved,
+            sandbox: SandboxMode::Container,
+            network_allowed: false,
+            judgment: false,
+        })
+        .await
+        .err()
+        .expect("a bad allowlist must stop assembly");
+
+        assert!(matches!(error, StackError::NetworkAllowlist(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_sandbox_never_falls_back_to_local() {
+        // The same refusal seen from the caller: `assemble` answers with the
+        // named backend and nothing else. A run that asked for a container and
+        // got a local process would enforce nothing while every line about it
+        // still said `docker`, so there is no runtime to inspect here — the
+        // refusal is the whole result.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let error = assemble(Inputs {
+            session: agent_protocol::ids::SessionId::from_string("s"),
+            workspace_root: workspace,
+            data_dir: dir.path().join("data"),
+            resolved: agent_config::resolve(agent_config::Layers::default())
+                .expect("the defaults resolve"),
+            model: None,
+            decisions: Decisions::Unobserved,
+            sandbox: SandboxMode::Container,
+            network_allowed: false,
+            judgment: false,
+        })
+        .await
+        .err()
+        .expect("a backend this build does not ship must not be built");
+        match error {
+            StackError::SandboxUnavailable { mode: "docker", .. } => {}
             other => panic!("expected a docker refusal, got {other}"),
         }
     }
@@ -1351,5 +1797,50 @@ mod tests {
         let kept =
             reachable_servers(servers(), &SandboxMode::LocalProcess.advertised_capabilities());
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn the_judgment_arm_has_one_word_for_both_halves_of_a_run() {
+        for (arm, flag) in
+            [(JudgmentArm::Full, "on"), (JudgmentArm::Gates, "gates"), (JudgmentArm::Off, "off")]
+        {
+            assert_eq!(arm.as_flag(), flag);
+        }
+        // A disabled pipeline does not even read the environment: the caller
+        // said off, and a stray variable cannot turn it back on.
+        assert_eq!(judgment_arm(false).unwrap(), JudgmentArm::Off);
+    }
+
+    #[test]
+    fn the_default_reasoning_depth_never_exceeds_high() {
+        // The rule names `high`: the deepest declared depth that does not
+        // exceed it wins, and a model that only offers deeper ones is asked
+        // for its shallowest rather than for a depth it never declared.
+        assert_eq!(
+            nearest_high(&[ReasoningEffort::Off, ReasoningEffort::High, ReasoningEffort::Max]),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            nearest_high(&[ReasoningEffort::Low, ReasoningEffort::Max]),
+            ReasoningEffort::Low
+        );
+        assert_eq!(nearest_high(&[ReasoningEffort::Max]), ReasoningEffort::Max);
+        assert_eq!(nearest_high(&[ReasoningEffort::Off]), ReasoningEffort::Off);
+    }
+
+    #[test]
+    fn a_path_inside_the_workspace_is_recognized_before_it_exists() {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).expect("the workspace");
+        let inside = root.join("nested").join("not-yet-there.txt");
+        assert!(path_is_within(&inside, &root), "a missing child is still inside");
+        assert!(path_is_within(&root, &root), "a directory is within itself");
+        assert!(!path_is_within(&temp.path().join("other"), &root), "a sibling is not inside");
+
+        // A relative path is resolved against the current directory rather
+        // than compared as text.
+        let resolved = canonicalize_with_missing(std::path::Path::new("relative/child"));
+        assert!(resolved.is_absolute(), "{}", resolved.display());
     }
 }

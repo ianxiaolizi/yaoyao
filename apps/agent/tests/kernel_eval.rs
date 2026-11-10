@@ -100,7 +100,7 @@ const INVOCATION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Approval is a pause, not a failure. Ten is generous for these fixtures and
 /// small enough that a loop in the harness itself is caught.
-const MAX_APPROVALS: usize = 10;
+const MAX_APPROVALS: usize = 64;
 
 /// The check command as the model is told to run it.
 ///
@@ -1044,18 +1044,28 @@ fn run_turn(
         };
         approved.insert(id.clone());
 
+        // `deny` is answerable from anywhere — it only takes permission away.
+        // `approve` is not: since B4 it needs a terminal, because a pipe cannot
+        // prove a person is watching. High-risk calls also require one
+        // confirmation per action, so approve `once` and let the loop raise the
+        // next command's approval if the model needs another call. A fixture
+        // that starts to raise one under a pipe still fails with the terminal
+        // diagnostic; this target is run from an interactive personal console.
         let decision = if deny_approvals {
             run_agent(repo, &["deny", &id, "--only", "--session", SESSION, "--events"])
         } else {
-            run_agent(repo, &["approve", &id, "turn", "--session", SESSION, "--events"])
+            run_agent(repo, &["approve", &id, "once", "--session", SESSION, "--events"])
         };
         assert!(decision.status.success(), "settle {id} failed: {}", decision.stderr);
         // The decision's own record belongs to the chain the fixture reads: a
         // grant is the world's yes, and the fixture that asks for one must be
         // able to find it before the call it let through.
         events.extend(parse_events(&decision.stdout));
-        last =
-            run_agent(repo, &["resume", "the decision is made", "--session", SESSION, "--events"]);
+        // Let the kernel compose the continuation from the settlement and the
+        // user's original request. A generic caller-supplied line makes every
+        // approval round look like the same new instruction and gives the model
+        // no call result to continue from.
+        last = run_agent(repo, &["resume", "--session", SESSION, "--events"]);
     }
 
     (events, last, pending)
@@ -1617,10 +1627,14 @@ fn chain_reading(events: &[Value]) -> ChainReading {
 /// Whether the step budget, rather than the loop, ended a turn in this run.
 ///
 /// The kernel writes `stop_reason: "max_steps"` on the terminal event since
-/// 2026-10-24; before that the log said nothing and only stdout did.
+/// 2026-10-24; before that the log said nothing and only stdout did. Since
+/// 2026-11-01 that terminal is `turn/yielded` (a budget stop is a pause), but
+/// the check accepts both spellings: exported logs from before the change are
+/// still readable by this evaluator.
 fn cut_by_budget(events: &[Value]) -> bool {
     events.iter().any(|event| {
-        event["type"] == EventType::TURN_COMPLETED && event["payload"]["stop_reason"] == "max_steps"
+        matches!(event["type"].as_str(), Some(EventType::TURN_COMPLETED | EventType::TURN_YIELDED))
+            && event["payload"]["stop_reason"] == "max_steps"
     })
 }
 

@@ -41,11 +41,36 @@ async fn the_capability_layer_states_the_boundary_and_indexes_the_tools() {
     assert_eq!(messages[0].message_uid.as_str(), format!("msg/capability/{}", turn.run_id));
     let text = messages[0].text_content();
     assert!(text.starts_with("Capabilities in this run:\n"), "{text}");
-    assert!(text.contains("- sandbox: local (commands run on the host"), "{text}");
+    assert!(
+        text.contains("- sandbox: local (file tools are confined to the workspace; actions that"),
+        "{text}"
+    );
     // This backend runs commands on the host; the run cannot deny the
     // network, and the layer does not claim it does.
     assert!(
         text.contains("- network for sandboxed commands: not bounded by this backend"),
+        "{text}"
+    );
+    // The three facts a task plan depends on: whether files can change,
+    // whether a program can start, and whether the run can render or export.
+    // Local refuses the last two, so the layer says so before the first call
+    // rather than after a refusal.
+    assert!(text.contains("- files: read and write inside the workspace"), "{text}");
+    assert!(
+        text.contains(
+            "- commands: not available on this backend (`shell.run` is refused; it needs app-container)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "- browser/render/export: not available (needs a process this backend does not start)"
+        ),
+        "{text}"
+    );
+    // A static file is not the result the task asked for.
+    assert!(
+        text.contains("do not call a static file, an HTML page, or a mock the real result"),
         "{text}"
     );
     // The gateway's two tools plus the loop's own `judgment.update`,
@@ -79,6 +104,58 @@ async fn the_capability_layer_states_the_boundary_and_indexes_the_tools() {
         format!("msg/capability/{}", turn.run_id)
     );
     assert_eq!(payload["context_capability"]["text"], text);
+}
+
+/// A read-only run can look but not change, and starts no program: the layer
+/// says so in the same three lines the other modes use.
+#[tokio::test]
+async fn a_read_only_capability_layer_names_writes_and_commands_as_unavailable() {
+    let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+    let loop_ = DefaultAgentLoop::new(
+        model.clone(),
+        Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
+        no_context(),
+        one_model_router(),
+    );
+
+    let mut turn = ctx();
+    turn.capability = Some(TurnCapabilityFacts {
+        sandbox: SandboxMode::ReadOnly,
+        network_allowed: false,
+        tool_secrets: Vec::new(),
+    });
+    run_turn(&loop_, &turn).await;
+
+    let text = model.requests()[0].messages[0].text_content();
+    assert!(text.contains("- files: read-only (writes are refused)"), "{text}");
+    assert!(text.contains("- commands: not available (this backend starts no process)"), "{text}");
+    assert!(text.contains("- browser/render/export: not available"), "{text}");
+}
+
+/// An app-container run can start commands and, if a tool offers the renderer,
+/// render or export; the layer states both without promising a program it was
+/// not given.
+#[tokio::test]
+async fn an_app_container_capability_layer_names_commands_as_available() {
+    let model = Arc::new(FakeModelProvider::new(vec![FakeModelProvider::answer("done")]));
+    let loop_ = DefaultAgentLoop::new(
+        model.clone(),
+        Arc::new(FakeToolGateway::new(Arc::new(FakeToolProvider::new()))),
+        no_context(),
+        one_model_router(),
+    );
+
+    let mut turn = ctx();
+    turn.capability = Some(TurnCapabilityFacts {
+        sandbox: SandboxMode::WorkspaceSandbox,
+        network_allowed: false,
+        tool_secrets: Vec::new(),
+    });
+    run_turn(&loop_, &turn).await;
+
+    let text = model.requests()[0].messages[0].text_content();
+    assert!(text.contains("- commands: available under the app-container confinement"), "{text}");
+    assert!(text.contains("- browser/render/export: available only if an offered tool"), "{text}");
 }
 
 /// A secret name is the one thing the model cannot guess, so the layer

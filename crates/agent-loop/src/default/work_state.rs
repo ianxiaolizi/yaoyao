@@ -32,11 +32,20 @@ pub(super) fn place_work_state(turn: &mut LoopTurn) -> Option<String> {
     Some(text)
 }
 
+/// How the objective names the current step, with a denominator only when the
+/// run actually configured a ceiling.
+fn step_progress(step: u32, max_steps: Option<u32>) -> String {
+    match max_steps {
+        Some(max_steps) => format!("step {step} of {max_steps}"),
+        None => format!("step {step}"),
+    }
+}
+
 /// What the block says, from the numbers this step already holds.
 pub(super) fn block(turn: &LoopTurn, work: &agent_protocol::state::WorkState) -> String {
     let mut objective = Vec::new();
     if let Some(facts) = turn.ctx.state.as_ref() {
-        objective.push(format!("step {} of {}", turn.step_index, facts.max_steps));
+        objective.push(step_progress(turn.step_index, facts.max_steps));
     }
     objective.push(format!("{} tool call(s)", turn.tool_calls_made));
     if let Some(max) = turn.budget.max_total_tokens {
@@ -144,4 +153,15 @@ pub(super) fn answer_update(
         events,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unbounded_objective_omits_the_step_denominator() {
+        assert_eq!(step_progress(7, None), "step 7");
+        assert_eq!(step_progress(7, Some(12)), "step 7 of 12");
+    }
 }

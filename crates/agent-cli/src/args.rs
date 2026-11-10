@@ -38,6 +38,12 @@ pub struct Args {
     pub profile: Option<String>,
     /// The model for this run (`--model`), if the line named one.
     pub model: Option<String>,
+    /// The budget class for this run (`--task`), if the line named one.
+    ///
+    /// A selection from the user configuration's `[task_budgets]`, not a
+    /// classification: nothing here inspects the text for what kind of task it
+    /// looks like.
+    pub task: Option<String>,
     pub json: bool,
     pub events: bool,
     /// The command and its arguments, in the order they were given.
@@ -83,6 +89,7 @@ enum ValueOption {
     Session,
     Profile,
     Model,
+    Task,
 }
 
 impl ValueOption {
@@ -91,6 +98,7 @@ impl ValueOption {
             "--session" => Some(Self::Session),
             "--profile" => Some(Self::Profile),
             "--model" => Some(Self::Model),
+            "--task" => Some(Self::Task),
             _ => None,
         }
     }
@@ -102,12 +110,21 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
     let mut session = None;
     let mut profile = None;
     let mut model = None;
+    let mut task = None;
     let mut json = false;
     let mut events = false;
 
     let mut index = 0;
     while index < argv.len() {
         let arg = argv[index].as_str();
+
+        // Everything after `--` belongs to the command's child program. The
+        // separator is part of `rest` because `verify` reads it to switch from
+        // its own flags to the program and that program's arguments.
+        if arg == "--" {
+            rest.extend(argv[index..].iter().cloned());
+            break;
+        }
 
         // `--name value` and `--name=value` are one flag spelled two ways. A
         // command's argument that happens to contain an `=` is left alone: the
@@ -136,6 +153,7 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
                 ValueOption::Session => session = Some(SessionId::from_string(&value)),
                 ValueOption::Profile => profile = Some(value),
                 ValueOption::Model => model = Some(value),
+                ValueOption::Task => task = Some(value),
             }
         } else if name == "--json" {
             json = true;
@@ -158,6 +176,7 @@ pub fn parse(argv: &[String]) -> Result<Args, ArgsError> {
         session: session.unwrap_or_else(|| SessionId::from_string(DEFAULT_SESSION)),
         profile,
         model,
+        task,
         json,
         events,
         rest,
