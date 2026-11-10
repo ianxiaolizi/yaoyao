@@ -24,15 +24,24 @@ if (-not $OutputRoot) {
 $outputRootPath = [IO.Path]::GetFullPath($OutputRoot)
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
 $bundle = Join-Path $outputRootPath "yaoyao-diagnostics-$stamp.zip"
-$latest = Get-ChildItem -LiteralPath $dataRoot -Directory -ErrorAction SilentlyContinue |
-    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'events.jsonl') } |
+
+# `%LOCALAPPDATA%\yaoyao-agent` is the state root. Each workspace owns a
+# hash-named data directory below it, and each session is a directory inside
+# that. Find the latest session log recursively, then point the agent at the
+# session's own data directory; setting AGENT_DATA_DIR to the state root makes
+# `agent doctor` and `agent session list` see no sessions.
+$latestLog = Get-ChildItem -LiteralPath $dataRoot -Recurse -File -Filter 'events.jsonl' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$latest = if ($latestLog) { $latestLog.Directory } else { $null }
+$sessionDataDir = if ($latest -and $latest.Parent) { $latest.Parent.FullName } else { $dataRoot }
 
 if ($DryRun) {
     Write-Output 'diagnose: dry-run'
     Write-Output "exe=$exe"
     Write-Output "data=$dataRoot"
+    Write-Output "session_data=$sessionDataDir"
     Write-Output "bundle=$bundle"
+    if ($latest) { Write-Output "session=$($latest.Name)" }
     Write-Output 'command=agent doctor'
     Write-Output 'command=agent metrics --json --out metrics.txt'
     if ($latest) { Write-Output "command=agent export --session $($latest.Name) --out export --redacted --json" }
@@ -56,7 +65,7 @@ $staging = Join-Path ([IO.Path]::GetTempPath()) ("yaoyao-diagnostics-stage-" + [
 $savedData = $env:AGENT_DATA_DIR
 try {
     New-Item -ItemType Directory -Force -Path $staging,$outputRootPath | Out-Null
-    $env:AGENT_DATA_DIR = $dataRoot
+    $env:AGENT_DATA_DIR = $sessionDataDir
     $doctorExit = Invoke-ToFile @('doctor') (Join-Path $staging 'doctor.txt')
     $metricsPath = Join-Path $staging 'metrics.txt'
     $metricsExit = Invoke-ToFile @('metrics', '--json', '--out', $metricsPath) (Join-Path $staging 'metrics-command.txt')
@@ -92,6 +101,8 @@ try {
     }
     $manifest = [pscustomobject]@{
         created_at = (Get-Date).ToString('o')
+        data_root = $dataRoot
+        session_data_dir = $sessionDataDir
         latest_session = if ($latest) { $latest.Name } else { $null }
         doctor_exit = $doctorExit
         metrics_exit = $metricsExit

@@ -1061,8 +1061,11 @@ fn run_turn(
         // grant is the world's yes, and the fixture that asks for one must be
         // able to find it before the call it let through.
         events.extend(parse_events(&decision.stdout));
-        last =
-            run_agent(repo, &["resume", "the decision is made", "--session", SESSION, "--events"]);
+        // Let the kernel compose the continuation from the settlement and the
+        // user's original request. A generic caller-supplied line makes every
+        // approval round look like the same new instruction and gives the model
+        // no call result to continue from.
+        last = run_agent(repo, &["resume", "--session", SESSION, "--events"]);
     }
 
     (events, last, pending)

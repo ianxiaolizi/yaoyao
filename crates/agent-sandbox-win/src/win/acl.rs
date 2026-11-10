@@ -35,7 +35,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    FILE_READ_ATTRIBUTES, FILE_TRAVERSE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 
@@ -49,6 +49,12 @@ pub const MODIFY: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EX
 /// Read and execute only, for a toolchain directory the sandbox uses but does
 /// not own.
 pub const READ_EXECUTE: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+
+/// Pass through a directory without listing or reading its children. The
+/// launcher grants this on each workspace ancestor so Windows can resolve the
+/// workspace path from inside the container; it does not enlarge the
+/// workspace tree grant.
+pub const TRAVERSE: u32 = FILE_TRAVERSE | FILE_READ_ATTRIBUTES;
 
 /// An AppContainer package SID, freed when the value is dropped.
 pub struct Sid(PSID);
@@ -241,6 +247,29 @@ pub fn create_or_derive(profile: &str) -> Result<(Sid, bool), String> {
 /// inherited ACEs and keeps every explicit one, which is the same operation
 /// `icacls /T` performs.
 pub fn grant_tree(path: &Path, sid: PSID, access: u32) -> Result<(), String> {
+    grant(path, sid, access, SUB_CONTAINERS_AND_OBJECTS_INHERIT, true)
+}
+
+/// Grant a process permission to pass through an ancestor directory.
+///
+/// This is deliberately non-inheriting and is not propagated: a child may be
+/// reached through the ancestor, but the ancestor's other children gain
+/// nothing. `SetCurrentDirectory`/PowerShell's real-path `Set-Location` need
+/// traverse on every component of the path; the workspace grant alone does not
+/// supply it. Without this, PowerShell starts in `C:\` because it cannot adopt
+/// the inherited workspace cwd, and every relative path in the command is
+/// resolved somewhere else.
+pub fn grant_traverse(path: &Path, sid: PSID) -> Result<(), String> {
+    grant(path, sid, TRAVERSE, NO_INHERITANCE, false)
+}
+
+fn grant(
+    path: &Path,
+    sid: PSID,
+    access: u32,
+    inheritance: u32,
+    propagate: bool,
+) -> Result<(), String> {
     let wide_path = wide(&path.to_string_lossy());
     let mut old_dacl: *mut ACL = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
@@ -277,7 +306,7 @@ pub fn grant_tree(path: &Path, sid: PSID, access: u32) -> Result<(), String> {
         ));
     }
 
-    let entry = explicit_access(sid, access, GRANT_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
+    let entry = explicit_access(sid, access, GRANT_ACCESS, inheritance);
     let mut new_dacl: *mut ACL = null_mut();
     // SAFETY: `entry` names `sid` and stays alive for the call; `old_dacl` is a
     // valid ACL from the descriptor; `new_dacl` receives an allocation.
@@ -313,39 +342,47 @@ pub fn grant_tree(path: &Path, sid: PSID, access: u32) -> Result<(), String> {
         return Err(format!("could not set the DACL of {}: {}", path.display(), win32_message(rc)));
     }
 
-    // The same DACL is applied down the tree with `RESET_KEEP_EXPLICIT`, which
-    // recomputes inherited ACEs and leaves every explicit one in place. This is
-    // the `icacls /T` half of the operation. The DACL must be passed here: with
-    // a null one the API reports `ERROR_INVALID_ACL` (observed on this
-    // toolchain) instead of inferring the parent's.
-    // SAFETY: the path is NUL-terminated, `new_dacl` is alive until after this
-    // call, and `descriptor` is unchanged.
-    let rc = unsafe {
-        TreeSetNamedSecurityInfoW(
-            wide_path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            new_dacl,
-            null(),
-            TREE_SEC_INFO_RESET_KEEP_EXPLICIT,
-            None,
-            ProgressInvokeNever,
-            null(),
-        )
-    };
-    // SAFETY: `new_dacl` and `descriptor` are allocations owned by this function.
-    unsafe {
-        LocalFree(new_dacl as *mut c_void);
-        LocalFree(descriptor);
-    }
-    if rc != 0 {
-        return Err(format!(
-            "could not propagate the grant through {}: {}",
-            path.display(),
-            win32_message(rc)
-        ));
+    if propagate {
+        // The same DACL is applied down the tree with `RESET_KEEP_EXPLICIT`,
+        // which recomputes inherited ACEs and leaves every explicit one in
+        // place. This is the `icacls /T` half of the operation. The DACL must be
+        // passed here: with a null one the API reports `ERROR_INVALID_ACL`
+        // (observed on this toolchain) instead of inferring the parent's.
+        // SAFETY: the path is NUL-terminated, `new_dacl` is alive until after
+        // this call, and `descriptor` is unchanged.
+        let rc = unsafe {
+            TreeSetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                new_dacl,
+                null(),
+                TREE_SEC_INFO_RESET_KEEP_EXPLICIT,
+                None,
+                ProgressInvokeNever,
+                null(),
+            )
+        };
+        // SAFETY: `new_dacl` and `descriptor` are allocations owned by this function.
+        unsafe {
+            LocalFree(new_dacl as *mut c_void);
+            LocalFree(descriptor);
+        }
+        if rc != 0 {
+            return Err(format!(
+                "could not propagate the grant through {}: {}",
+                path.display(),
+                win32_message(rc)
+            ));
+        }
+    } else {
+        // SAFETY: `new_dacl` and `descriptor` are allocations owned by this function.
+        unsafe {
+            LocalFree(new_dacl as *mut c_void);
+            LocalFree(descriptor);
+        }
     }
     Ok(())
 }
@@ -696,5 +733,14 @@ mod tests {
         assert_eq!(MODIFY & 0x0004_0000, 0);
         assert_eq!(MODIFY & 0x0008_0000, 0, "WRITE_OWNER must not be granted");
         assert_ne!(MODIFY & DELETE, 0);
+    }
+
+    #[test]
+    fn the_traverse_grant_cannot_list_or_change_a_directory() {
+        // FILE_LIST_DIRECTORY/FILE_READ_DATA, FILE_ADD_FILE,
+        // FILE_ADD_SUBDIRECTORY, FILE_WRITE_DATA, FILE_DELETE_CHILD and DELETE.
+        let forbidden =
+            0x0000_0001 | 0x0000_0002 | 0x0000_0004 | 0x0000_0010 | 0x0000_0040 | DELETE;
+        assert_eq!(TRAVERSE & forbidden, 0, "ancestor access must stop at pass-through");
     }
 }

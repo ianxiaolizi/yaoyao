@@ -319,6 +319,7 @@ version = "0.1.0"
 dependencies = [
  "agent-ports",
  "agent-protocol",
+ "agent-sandbox-win",
  "async-trait",
  "chrono",
  "encoding_rs",

@@ -3,6 +3,7 @@ param(
     [switch]$DryRun,
     [switch]$SkipBuild,
     [string]$Workspace = 'G:\yaoyao-work',
+    [string]$AgentExe = '',
     [ValidateSet('safe', 'coding', 'coding-online', 'research')]
     [string]$Mode = 'coding'
 )
@@ -108,7 +109,7 @@ if (-not $SkipBuild) {
         Pop-Location
     }
 }
-$exe = Join-Path $repo 'target\debug\agent.exe'
+$exe = if ($AgentExe) { [IO.Path]::GetFullPath($AgentExe) } else { Join-Path $repo 'target\debug\agent.exe' }
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     Stop-Setup "setup: missing $exe; run without -SkipBuild" 2
 }
@@ -124,7 +125,8 @@ try {
     $env:AGENT_PROFILE = $Mode
     $env:AGENT_SANDBOX = $sandbox
     $env:AGENT_SANDBOX_NETWORK = $network
-    $doctorOutput = & $exe doctor 2>&1
+    $doctorArgs = @('--profile', $Mode, 'doctor')
+    $doctorOutput = & $exe @doctorArgs 2>&1
     $doctorCode = $LASTEXITCODE
     $doctorOutput | ForEach-Object { Write-Output "  $_" }
 } finally {

@@ -86,6 +86,7 @@ jobs:
           pwsh -File scripts/personal/eval.selftest.ps1
           pwsh -File scripts/personal/package.selftest.ps1
           pwsh -File scripts/personal/backup.selftest.ps1
+          pwsh -File scripts/personal/diagnose.selftest.ps1
 
   web:
     # The page is compiled into the binary (`crates/agent-web/build.rs`), so
