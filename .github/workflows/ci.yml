@@ -72,6 +72,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Prepare the AppContainer backend
+        # A few regressions build the real backend rather than standing a fake
+        # one behind the policy chain. The one-time setup needs an elevated
+        # prompt; GitHub's Windows runners are elevated. Without this a test
+        # about configuration fails on the runner's missing state instead of on
+        # the behavior it names.
+        run: cargo run -p agent -- sandbox setup
+
       - name: Test
         # The same script the developer machine runs. On a hosted runner the
         # integrity and TEMP steps are no-ops, but one entry point means the

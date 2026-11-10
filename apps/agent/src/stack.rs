@@ -690,6 +690,11 @@ pub async fn assemble_with_delegation(
     inputs: Inputs,
     delegation: subagents::Delegation,
 ) -> Result<Runtime, StackError> {
+    // What the configuration says is checked before the host is touched. A
+    // typo in `[network] allow` is the person's to fix; probing the backend
+    // first would report the machine's state and hide the configuration error
+    // behind it.
+    validate_before_backend(&inputs)?;
     // The backend is chosen before anything is built on it, and a backend this
     // build cannot supply stops assembly. Nothing below decides to use a less
     // confined one instead: that would run the tools under a boundary nobody
@@ -701,6 +706,25 @@ pub async fn assemble_with_delegation(
         inputs.network_allowed,
     )?;
     assemble_over(inputs, delegation, env).await
+}
+
+/// The refusals that do not depend on the host, made before a backend is built.
+///
+/// `assemble_over` repeats them for callers that supply their own backend: the
+/// checks are a path comparison and a parse, so the second reading costs
+/// nothing and the two entry points cannot disagree about what a valid
+/// configuration is.
+fn validate_before_backend(inputs: &Inputs) -> Result<(), StackError> {
+    if path_is_within(&inputs.data_dir, &inputs.workspace_root) {
+        return Err(StackError::UnsafeDataDir(format!(
+            "{} is inside the model-writable workspace {}",
+            inputs.data_dir.display(),
+            inputs.workspace_root.display()
+        )));
+    }
+    NetworkAllowlist::from_origins(&inputs.resolved.network_allow)
+        .map_err(|error| StackError::NetworkAllowlist(error.to_string()))?;
+    Ok(())
 }
 
 /// Assemble the stack over a backend the caller already built.
@@ -719,6 +743,13 @@ pub async fn assemble_over(
     delegation: subagents::Delegation,
     env: Arc<dyn ExecutionEnvironment>,
 ) -> Result<Runtime, StackError> {
+    // The ledger, snapshots and artifact store are evidence about the run. If
+    // any of them sits inside the model-writable workspace, the model can
+    // rewrite the evidence, so assembly refuses before opening a store. The
+    // network allowlist is validated in the same pass, so a caller that supplied
+    // its own backend gets the same refusal as the product path.
+    validate_before_backend(&inputs)?;
+
     let Inputs {
         session,
         workspace_root,
@@ -734,17 +765,6 @@ pub async fn assemble_over(
         network_allowed,
         judgment,
     } = inputs;
-
-    // The ledger, snapshots and artifact store are evidence about the run.
-    // If any of them sits inside the model-writable workspace, the model can
-    // rewrite the evidence, so assembly refuses before opening a store.
-    if path_is_within(&data_dir, &workspace_root) {
-        return Err(StackError::UnsafeDataDir(format!(
-            "{} is inside the model-writable workspace {}",
-            data_dir.display(),
-            workspace_root.display()
-        )));
-    }
 
     let store = Arc::new(JsonlEventStore::new(&data_dir));
 
@@ -1606,6 +1626,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bad_network_entry_is_refused_before_the_backend_is_probed() {
+        // A configuration typo must not be reported as "this build has no
+        // backend". The docker mode is unavailable on every build, so a test
+        // that probed the backend first would see SandboxUnavailable here. This
+        // is the ordering the product needs: the person can fix the line they
+        // wrote without first installing something.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut resolved =
+            agent_config::resolve(agent_config::Layers::default()).expect("the defaults resolve");
+        resolved.network_allow = vec!["https://docs.rs/serde".to_string()];
+
+        let error = assemble(Inputs {
+            session: agent_protocol::ids::SessionId::from_string("s"),
+            workspace_root: workspace,
+            data_dir: dir.path().join("data"),
+            resolved,
+            model: None,
+            decisions: Decisions::Unobserved,
+            sandbox: SandboxMode::Container,
+            network_allowed: false,
+            judgment: false,
+        })
+        .await
+        .err()
+        .expect("a bad allowlist must stop assembly");
+
+        assert!(matches!(error, StackError::NetworkAllowlist(_)), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn an_unavailable_sandbox_never_falls_back_to_local() {
         // The same refusal seen from the caller: `assemble` answers with the
         // named backend and nothing else. A run that asked for a container and
@@ -1613,10 +1665,12 @@ mod tests {
         // still said `docker`, so there is no runtime to inspect here — the
         // refusal is the whole result.
         let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
         let error = assemble(Inputs {
             session: agent_protocol::ids::SessionId::from_string("s"),
-            workspace_root: dir.path().to_path_buf(),
-            data_dir: dir.path().to_path_buf(),
+            workspace_root: workspace,
+            data_dir: dir.path().join("data"),
             resolved: agent_config::resolve(agent_config::Layers::default())
                 .expect("the defaults resolve"),
             model: None,
