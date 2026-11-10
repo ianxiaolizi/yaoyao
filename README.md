@@ -234,19 +234,20 @@ node scripts/gui/smoke.mjs
 - `coding-online` 把只读 `web.request` 与宽泛 `internetClient` 分开描述；前者仍受用户配置的
   站点 allowlist 约束，后者不受站点列表约束。
 - 真实 OpenAI-compatible 端点的 3 次 `kernel_eval` 必须产生并保存报告，且全部任务通过，
-  才可称为 personal build ready。2026-11-09 的 3 次全量报告为 18/36 通过，当前版本仍不算
-  ready。
+  才可称为 personal build ready。2026-11-10 的 3 次全量报告为 36/36 通过，报告在
+  `%LOCALAPPDATA%\yaoyao-agent\eval\`；真实模型评测门已过，其余验收项（新机器 setup、
+  真实任务重启与审批续跑、备份不泄密）仍以对应脚本或手工记录为准。
 - 公网监听、账号、租户、配额、计费和多租户隔离不在个人模式范围内。
 
 ## 验证状态
 
-以下是 2026-11-09 本次本地审计的验证边界；CI 会按自己的 job 重新运行对应检查。
+以下是 2026-11-10 本次更新后的验证边界；此前记录保留，CI 会按自己的 job 重新运行对应检查。
 
 | 验证 | 状态 | 说明 |
 |---|---|---|
 | Rust 离线门（fmt / clippy / workspace tests） | 已跑 | `powershell -ExecutionPolicy Bypass -File scripts\test.ps1` |
 | TTY 下 stdin 与工具子进程审批回归 | 已跑 | `agent-tools-fs` stdin 测试与 `security_regression` 审批回归 |
-| 真实 OpenAI-compatible endpoint | 已跑，未通过 | 2026-11-09 3 次全量 `kernel_eval` 为 18/36；报告在 `%LOCALAPPDATA%\yaoyao-agent\eval\` |
+| 真实 OpenAI-compatible endpoint | 已跑，通过 | 2026-11-10 3 次全量 `kernel_eval` 为 36/36；报告在 `%LOCALAPPDATA%\yaoyao-agent\eval\` |
 | AppContainer live | 已跑 | `scripts\sandbox-live.ps1 -DebugBuild -Jobs 1`：受限进程、stdin/stdout、内核拒绝、文件/Git 与 headless Edge 渲染通过 |
 | 真实公网 `web.request` | 未跑 | 需要显式运行对应 live 测试 |
 | 第三方 MCP | 已跑 | `mcp_third_party` 使用 npm 与真实 stdio server |

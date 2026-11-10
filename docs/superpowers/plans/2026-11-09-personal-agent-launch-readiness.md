@@ -10,6 +10,12 @@
 
 **Spec:** `G:\yaoyao-public\PROJECT.md`, `G:\yaoyao-public\CONTRACT.md`, `G:\yaoyao-public\SECURITY.md`, `G:\yaoyao-public\README.md`
 
+## Status (2026-11-10)
+
+Tasks 1–6 are implemented. Task 7's documentation and CI self-test steps are in place; the real-model gate now passes at 36/36 (3 runs × 12 fixtures on `deepseek-flash`, report under `%LOCALAPPDATA%\yaoyao-agent\eval\`). Task 7 Step 3's manual restart/approval acceptance is still unrecorded.
+
+Fixes found while running the gate: AppContainer PowerShell cwd and execution policy, and the eval continuation (both `88885bf`); configuration validation now precedes backend probing (`004dddc`).
+
 ## Global Constraints
 
 - Target one trusted Windows 10/11 user and one local workspace at a time.
